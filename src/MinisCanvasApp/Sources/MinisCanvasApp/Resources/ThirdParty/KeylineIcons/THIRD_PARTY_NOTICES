@@ -1,0 +1,10 @@
+# Third-Party Notices
+
+MinisCanvas vendors selected duotone SVG assets from Keyline Icons.
+
+- Repository: https://github.com/keyline-icons/keyline-icons
+- Commit: 403f023d0861d01807cdec045b5fb3fec984468d
+- Source scope: icons/duotone/*.svg
+- Additional source: v2.1.0 (2026-10-20), commit 5473de565159a7cc5725ab23bd80cd43b90285e6, icons/two-tone/{wand-sparkles,box,cpu,hand-open}.svg
+- License: MIT (see LICENSE in this directory)
+- Keyline name and logo are not used as MinisCanvas branding or endorsement.

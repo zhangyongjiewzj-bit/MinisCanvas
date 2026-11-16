@@ -1,0 +1,1346 @@
+import Foundation
+
+/// Error thrown when every provider in the fallback chain failed.
+public enum FallbackRouterError: Error, Equatable, Sendable {
+    /// The route chain was empty — nothing to try.
+    case emptyChain
+    /// Every provider failed; carries the recorded failure trail.
+    case allProvidersFailed([FallbackRouter.FallbackEvent])
+}
+
+extension FallbackRouterError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .emptyChain:
+            return "Fallback chain is empty — no provider configured."
+        case .allProvidersFailed(let events):
+            let lines = events.map { "  ✗ \($0.providerID): \($0.errorDescription)" }
+            return "All providers failed:\n" + lines.joined(separator: "\n")
+        }
+    }
+}
+
+/// One existing backoff wait, optionally presented by the owning conversation.
+/// No raw error body or response header crosses this boundary.
+public struct LLMRateLimitWaitRequest: Sendable {
+    public let delay: Duration
+    public let sleep: @Sendable (Duration) async throws -> Void
+    public init(delay: Duration, sleep: @escaping @Sendable (Duration) async throws -> Void) {
+        self.delay = delay
+        self.sleep = sleep
+    }
+}
+
+public enum LLMRetryWaitContext {
+    @TaskLocal public static var rateLimitWait: (@Sendable (LLMRateLimitWaitRequest) async throws -> Void)?
+}
+
+/// Transient metadata carried only with the exact terminal request error.
+public struct ProviderRetryExhaustion: LocalizedError {
+    public let underlyingError: any Error
+    public let statusCode: Int
+
+    init(underlyingError: any Error, statusCode: Int) {
+        self.underlyingError = underlyingError
+        self.statusCode = statusCode
+    }
+
+    public func preservingFact(with error: any Error) -> Self {
+        Self(underlyingError: error, statusCode: statusCode)
+    }
+
+    public var errorDescription: String? { underlyingError.localizedDescription }
+}
+
+/// F18b: exponential-backoff retry policy for LLM calls.
+///
+/// Consumes `LLMError.isRetryable` (previously zero-consumption): only
+/// transient errors — 429, 5xx (`httpStatus`/`transientError`) and clear
+/// pre-dispatch network refusals — are retried on the SAME provider;
+/// ambiguous timeout/connection-loss failures require an explicit stable
+/// request key from the provider; everything else propagates immediately.
+///
+/// Defaults: up to 3 retries (4 total calls) with 0.5s / 1s / 2s backoff.
+/// `sleeper` is injectable so tests can run without real waiting.
+public struct LLMRetryPolicy: Sendable {
+    /// Maximum number of retries AFTER the initial attempt (3 → up to 4 calls).
+    public let maxRetries: Int
+    /// Backoff before retry `attempt` (1-based). Default: 0.5s / 1s / 2s.
+    public let backoff: @Sendable (Int) -> Duration
+    /// Injectable sleep (tests inject a no-op recorder).
+    public let sleeper: @Sendable (Duration) async throws -> Void
+
+    private var limitsRetriesToRateLimitAndOverload = false
+    private var carriesExhaustion = false
+
+    fileprivate func trackingExhaustion() -> Self {
+        var policy = self
+        policy.carriesExhaustion = limitsRetriesToRateLimitAndOverload
+        return policy
+    }
+
+
+    public static var rateLimitAndOverloadOnly: Self {
+        var policy = Self()
+        policy.limitsRetriesToRateLimitAndOverload = true
+        return policy
+    }
+
+    private func admitsRetry(_ error: Error) -> Bool {
+        guard limitsRetriesToRateLimitAndOverload else { return true }
+        switch error as? LLMError {
+        case .httpStatus(code: 429, detail: _)?, .httpStatus(code: 529, detail: _)?: return true
+        default: return false
+        }
+    }
+
+    /// Default backoff schedule: retry 1 → 0.5s, retry 2 → 1s, retry 3 → 2s.
+    public static let defaultBackoff: @Sendable (Int) -> Duration = { attempt in
+        .milliseconds(500 * (1 << max(0, attempt - 1)))
+    }
+
+    public init(
+        maxRetries: Int = 3,
+        backoff: @escaping @Sendable (Int) -> Duration = LLMRetryPolicy.defaultBackoff,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
+        self.maxRetries = max(0, maxRetries)
+        self.backoff = backoff
+        self.sleeper = sleeper
+    }
+
+    /// Run `operation` with exponential-backoff retry.
+    ///
+    /// Only errors passing `LLMError.isRetryable(_:)` and `shouldRetry` are
+    /// retried (429/5xx/clear pre-dispatch network errors); all other errors
+    /// propagate immediately. A cancelled Task never retries. Backoff
+    /// `backoff(k)` is awaited before retry `k`.
+    /// `shouldRetry` is an additional request-replay fence.  Callers that
+    /// cannot prove a failed operation was never accepted by its remote
+    /// endpoint must return false for ambiguous post-dispatch transport
+    /// failures.  The default preserves the policy's historical decision for
+    /// callers that do not have a request-dispatch boundary.
+    // Retry closures remain on their caller actor across backoff suspension.
+    // A non-Sendable provider operation must not be transferred to the generic executor.
+    public func run<T>(
+        _ operation: () async throws -> T,
+        isolation: isolated (any Actor)? = #isolation,
+        shouldRetry: @escaping @Sendable (Error) -> Bool = { _ in true }
+    ) async throws -> T {
+        var retriesUsed = 0
+        while true {
+            do {
+                return try await operation()
+            } catch {
+                guard !Task.isCancelled,
+                      !ProviderCancellationPolicy.isCancellation(error),
+                      LLMError.isRetryable(error),
+                      admitsRetry(error),
+                      shouldRetry(error) else {
+                    throw error
+                }
+                guard retriesUsed < maxRetries else {
+                    if carriesExhaustion, maxRetries > 0,
+                       let statusCode = ProviderRequestFailureKind.httpStatusCode(from: error) {
+                        throw ProviderRetryExhaustion(underlyingError: error, statusCode: statusCode)
+                    }
+                    throw error
+                }
+                retriesUsed += 1
+                let localDelay = backoff(retriesUsed)
+                let delay: Duration
+                let isRateLimited: Bool
+                switch error as? LLMError {
+                case .httpStatus(code: 429, detail: let detail)?:
+                    isRateLimited = true
+                    delay = max(localDelay, Self.compatibleRetryAfter(detail) ?? localDelay)
+                case .httpStatus(code: 529, detail: _)? where limitsRetriesToRateLimitAndOverload:
+                    isRateLimited = true
+                    delay = localDelay
+                case .rateLimited?:
+                    isRateLimited = true
+                    delay = localDelay
+                default:
+                    isRateLimited = false
+                    delay = localDelay
+                }
+                if isRateLimited, let wait = LLMRetryWaitContext.rateLimitWait {
+                    try await wait(LLMRateLimitWaitRequest(delay: delay, sleep: sleeper))
+                } else {
+                    try await sleeper(delay)
+                }
+                try Task.checkCancellation()
+            }
+        }
+    }
+
+    /// Consume only the OpenAI-compatible adapter's complete safe projection.
+    /// The hint is advisory and bounded independently of the error's origin.
+    private static func compatibleRetryAfter(_ detail: String) -> Duration? {
+        let prefix = "status=429; category=rateLimited; retry_after="
+        let suffix = "; request_id=present"
+        guard detail.hasPrefix(prefix) else { return nil }
+        var digits = detail.dropFirst(prefix.count)
+        if digits.hasSuffix(suffix) { digits = digits.dropLast(suffix.count) }
+        guard (1...5).contains(digits.utf8.count),
+              digits.utf8.allSatisfy({ (48...57).contains($0) }),
+              let seconds = Int(digits), seconds <= 86_400,
+              digits == String(seconds) else { return nil }
+        return .seconds(seconds)
+    }
+}
+
+/// A provider may opt into retrying an ambiguous buffered POST only when it
+/// binds one stable key to the same logical request on every attempt.  The
+/// key is deliberately obtained from the provider rather than synthesized by
+/// the router: the provider owns the wire header/parameter and its server-side
+/// idempotency contract.  Providers that do not implement this protocol are
+/// fail-closed for timeout/connection-lost failures.
+public protocol StableRequestIdempotencyKeyProvider: LLMProvider {
+    func stableRequestIdempotencyKey(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?
+    ) -> String?
+}
+
+private func providerHasStableRequestIdempotencyKey(
+    _ provider: any LLMProvider,
+    messages: [LLMMessage],
+    systemPrompt: String?,
+    tools: [AgentToolDefinition],
+    maxTokens: Int,
+    temperature: Double?
+) -> Bool {
+    guard let keyed = provider as? any StableRequestIdempotencyKeyProvider,
+          let key = keyed.stableRequestIdempotencyKey(
+              messages: messages,
+              systemPrompt: systemPrompt,
+              tools: tools,
+              maxTokens: maxTokens,
+              temperature: temperature
+          ) else {
+        return false
+    }
+    let value = key.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !value.isEmpty, value.utf8.count <= 256 else { return false }
+    return value.utf8.allSatisfy { byte in
+        switch byte {
+        case 0x30...0x39, 0x41...0x5A, 0x61...0x7A,
+             0x2D, 0x2E, 0x3A, 0x5F:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Safe terminal error emitted when a buffered provider request may already
+/// have reached the remote endpoint.  It carries only a stable category; raw
+/// URLSession errors, URLs, headers and response bodies never cross the
+/// boundary.
+public struct ProviderRequestReplayBlockedError: Error, LocalizedError, CustomStringConvertible, Equatable, Sendable {
+    public enum Code: String, Equatable, Sendable {
+        case timedOut
+        case connectionLost
+    }
+
+    public let code: Code
+
+    public init(code: Code) {
+        self.code = code
+    }
+
+    public var errorDescription: String? {
+        switch code {
+        case .timedOut:
+            return "Request timed out; it was not retried because delivery status is unknown"
+        case .connectionLost:
+            return "Connection lost; the request was not retried because delivery status is unknown"
+        }
+    }
+
+    public var description: String {
+        errorDescription ?? "Provider request was not replayed"
+    }
+}
+
+/// D-PROVIDER-11/12: stable, payload-free classification of provider request
+/// failures carried by fallback events and frozen-route observations.
+///
+/// The classifier only reads typed error signals: `LLMError` cases, HTTP
+/// status codes, URLSession transport codes, cancellation markers, replay
+/// fences and snapshot provenance errors. Free-form provider text, URLs,
+/// headers and response bodies never influence the classification and never
+/// cross the observation boundary. Unknown errors fail closed to `nil`
+/// (unclassified) instead of being guessed into a category.
+public enum ProviderRequestFailureKind: String, Codable, Equatable, Sendable {
+    case unconfigured
+    case unauthorized
+    case permissionDenied
+    case notFound
+    case rateLimited
+    case server
+    case timeout
+    case cancelled
+    case transport
+
+    /// Classify any thrown error into a stable failure kind.
+    public static func classify(_ error: Error) -> ProviderRequestFailureKind? {
+        if error is CancellationError
+            || ProviderCancellationPolicy.isCancellation(error) {
+            return .cancelled
+        }
+        if let llmError = error as? LLMError {
+            return classify(llmError)
+        }
+        if let blocked = error as? ProviderRequestReplayBlockedError {
+            return blocked.code == .timedOut ? .timeout : .transport
+        }
+        if let snapshotError = error as? ProviderRuntimeSnapshotError {
+            switch snapshotError {
+            case .missingProvider, .missingPrimaryProvenance, .missingFallbackProvenance:
+                return .unconfigured
+            default:
+                return nil
+            }
+        }
+        if let factoryError = error as? ProviderFactory.FactoryError {
+            if case .noCredentials = factoryError { return .unconfigured }
+        }
+        if let transportCodeError = error as? ProviderTransportCodeError {
+            switch transportCodeError.code {
+            case NSURLErrorCancelled:
+                return .cancelled
+            case NSURLErrorTimedOut:
+                return .timeout
+            default:
+                return .transport
+            }
+        }
+        if isTransportDomainError(error) {
+            let transport = ProviderHTTPErrorAdapter.classify(transport: error)
+            if transport.isCancelled {
+                return .cancelled
+            }
+            return kind(forCategory: transport.category)
+        }
+        return nil
+    }
+
+    static func classify(_ llmError: LLMError) -> ProviderRequestFailureKind? {
+        if case .cancelled = llmError {
+            return .cancelled
+        }
+        guard let category = llmError.providerFailureCategory else {
+            return nil
+        }
+        return kind(forCategory: category)
+    }
+
+    /// HTTP status carried by a typed error, bounded to wire-valid codes.
+    public static func httpStatusCode(from error: Error) -> Int? {
+        guard let llmError = error as? LLMError,
+              case .httpStatus(let code, _) = llmError else {
+            return nil
+        }
+        return (100...599).contains(code) ? code : nil
+    }
+
+    static func kind(
+        forCategory category: ProviderReadinessFailureCategory
+    ) -> ProviderRequestFailureKind {
+        switch category {
+        case .invalidConfiguration, .missingCredential:
+            return .unconfigured
+        case .unauthorized:
+            return .unauthorized
+        case .permissionDenied:
+            return .permissionDenied
+        case .notFound, .modelNotFound:
+            return .notFound
+        case .rateLimited:
+            return .rateLimited
+        case .server, .unavailable:
+            return .server
+        case .timeout:
+            return .timeout
+        case .transport, .malformedResponse:
+            return .transport
+        }
+    }
+
+    private static func isTransportDomainError(_ error: Error) -> Bool {
+        if error is URLError || error is ProviderTransportCodeError {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain
+    }
+}
+
+/// Boxes a non-Sendable `any LLMProvider` for the retry decorator
+/// (same pattern as the App layer's `LLMProviderBox`).
+struct RetryingProviderBox: @unchecked Sendable {
+    var value: any LLMProvider
+}
+
+/// F18b: `LLMProvider` decorator — wraps every call in exponential-backoff
+/// retry (`LLMRetryPolicy`), mirroring the `BudgetRecordingProvider`
+/// decorator pattern (no engine/provider intrusion).
+///
+/// - `sendMessage`: the whole call is retried.
+/// - `streamMessage`: only stream ACQUISITION is retried; once a stream is
+///   created, mid-stream errors are the caller's concern (same discipline as
+///   `FallbackRouter.streamMessage`).
+/// - A buffered `sendMessage` retry is additionally fenced: timeout and
+///   connection-lost errors are not replayed unless the base provider opts
+///   into `StableRequestIdempotencyKeyProvider`.
+///
+/// Retry exhaustion rethrows the LAST error unchanged, so upstream fallback
+/// logic (`LLMError.isFallbackable` / `FallbackRouter`) sees the original.
+public struct RetryingLLMProvider: UsageRouteIdentityProviding, LLMProvider, StableRequestIdempotencyKeyProvider, Sendable {
+    private var baseBox: RetryingProviderBox
+    public let policy: LLMRetryPolicy
+    /// Optional session-owned budget.  Every retry attempt borrows from this
+    /// same tracker so retries cannot reset budget before fallback begins.
+    public let requestBudget: BudgetTracker?
+
+    public var usageRouteIdentity: UsageServedRoute? { UsageTelemetryContext.directRoute(of: baseBox.value) }
+    public var name: String { baseBox.value.name }
+    public var model: LLMModel {
+        get { baseBox.value.model }
+        set { baseBox.value.model = newValue }
+    }
+    public var capabilities: Set<ProviderCapability> { baseBox.value.capabilities }
+
+    public func stableRequestIdempotencyKey(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?
+    ) -> String? {
+        guard let keyed = baseBox.value as? any StableRequestIdempotencyKeyProvider else {
+            return nil
+        }
+        return keyed.stableRequestIdempotencyKey(
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: tools,
+            maxTokens: maxTokens,
+            temperature: temperature
+        )
+    }
+
+    public init(
+        base: any LLMProvider,
+        policy: LLMRetryPolicy = LLMRetryPolicy(),
+        requestBudget: BudgetTracker? = nil
+    ) {
+        self.baseBox = RetryingProviderBox(value: base)
+        self.policy = policy
+        self.requestBudget = requestBudget
+    }
+
+    private func runBudgeted<T>(
+        isolation: isolated (any Actor)? = #isolation,
+        operation: () async throws -> T,
+        usage: @escaping (T) -> LLMUsage? = { _ in nil }
+    ) async throws -> T {
+        let lease: BudgetRequestLease? = if let requestBudget {
+            try await requestBudget.beginRequest(enforceExhaustion: true)
+        } else {
+            nil
+        }
+        do {
+            try Task.checkCancellation()
+            let value = try await operation()
+            try Task.checkCancellation()
+            if let requestBudget, let lease {
+                if let terminalPolicy = await requestBudget.completeRequest(
+                    lease,
+                    usage: usage(value)
+                ), terminalPolicy == .pause {
+                    throw BudgetTrackerError.exhausted
+                }
+            }
+            try Task.checkCancellation()
+            return value
+        } catch {
+            if let requestBudget, let lease {
+                await requestBudget.failRequest(lease)
+            }
+            throw error
+        }
+    }
+
+    public func sendMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        maxTokens: Int,
+        temperature: Double?
+    ) async throws -> LLMResponse {
+        let box = baseBox
+        let policy = policy
+        let allowsAmbiguousReplay = providerHasStableRequestIdempotencyKey(
+            baseBox.value,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: [],
+            maxTokens: maxTokens,
+            temperature: temperature
+        )
+        return try await policy.run {
+            try await self.runBudgeted {
+                try await box.value.sendMessage(
+                    messages: messages, systemPrompt: systemPrompt,
+                    maxTokens: maxTokens, temperature: temperature
+                )
+            } usage: { $0.usage }
+        } shouldRetry: { error in
+            !FallbackRouter.isAmbiguousPostDispatchTransport(error)
+                || allowsAmbiguousReplay
+        }
+    }
+
+    public func sendMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?
+    ) async throws -> LLMResponse {
+        let box = baseBox
+        let policy = policy
+        let allowsAmbiguousReplay = providerHasStableRequestIdempotencyKey(
+            baseBox.value,
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: tools,
+            maxTokens: maxTokens,
+            temperature: temperature
+        )
+        return try await policy.run {
+            try await self.runBudgeted {
+                try await box.value.sendMessage(
+                    messages: messages,
+                    systemPrompt: systemPrompt,
+                    tools: tools,
+                    maxTokens: maxTokens,
+                    temperature: temperature
+                )
+            } usage: { $0.usage }
+        } shouldRetry: { error in
+            !FallbackRouter.isAmbiguousPostDispatchTransport(error)
+                || allowsAmbiguousReplay
+        }
+    }
+
+    public func streamMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        maxTokens: Int,
+        temperature: Double?
+    ) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
+        let box = baseBox
+        let policy = policy
+        return try await policy.run {
+            try await self.runBudgeted {
+                try await box.value.streamMessage(
+                    messages: messages, systemPrompt: systemPrompt,
+                    maxTokens: maxTokens, temperature: temperature
+                )
+            }
+        }
+    }
+}
+
+// D-CHAT-03：assistant 增量流装饰器。遵守与 `streamMessage` 相同的纪律：
+// 只对流的「获取」重试，一旦流建立、中途错误归调用方处理。base 不符合
+// 流式协议时，合成单 `.completed` 事件并复用本类型自己的缓冲
+// `sendMessage(tools:)` 路径 —— 重试退避、POST 幂等回放栅栏、预算语义
+// 与今天逐字节一致（零行为变化）。
+extension RetryingLLMProvider: AssistantStreamingLLMProvider {
+    public func streamAssistantMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?
+    ) async throws -> AsyncThrowingStream<LLMAssistantStreamEvent, Error> {
+        return try await streamAssistantMessage(messages: messages, systemPrompt: systemPrompt, tools: tools, maxTokens: maxTokens, temperature: temperature, thinkingLevel: nil)
+    }
+
+    public func streamAssistantMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?, thinkingLevel: ThinkingLevel?
+    ) async throws -> AsyncThrowingStream<LLMAssistantStreamEvent, Error> {
+        let box = baseBox
+        if let streaming = box.value as? any AssistantStreamingLLMProvider {
+            let policy = policy
+            return try await policy.run {
+                try await self.runBudgeted {
+                    try await streaming.streamAssistantMessage(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        tools: tools,
+                        maxTokens: maxTokens,
+                        temperature: temperature, thinkingLevel: thinkingLevel
+                    )
+                }
+            }
+        }
+        let response = try await self.sendMessage(
+            messages: messages,
+            systemPrompt: systemPrompt,
+            tools: tools,
+            maxTokens: maxTokens,
+            temperature: temperature
+        )
+        return llmAssistantCompletedStream(response)
+    }
+}
+
+/// Model fallback router.
+///
+/// Holds an ordered route chain of provider IDs. A request is attempted on the
+/// first provider; on failure (timeout, provider error, …) the router
+/// automatically moves to the next one, recording every fallback in `events`.
+///
+/// Port of the group-level fallback discipline in OpenMinis
+/// `AIChatViewModel+Fallback`:
+/// - The chain is tried strictly in order; a provider already tried is never
+///   retried within the same request.
+/// - `shouldFallback` lets callers distinguish permanent provider rejection
+///   (fallback immediately) from errors that should propagate as-is.
+/// - The final error carries the full trail (`FallbackRouterError.allProvidersFailed`).
+///
+/// B1i wiring status (F18b):
+/// - RETRY-BEFORE-FALLBACK is wired: when `retryPolicy` is non-nil, each
+///   resolved provider is wrapped in `RetryingLLMProvider` — retryable errors
+///   are retried with exponential backoff on that provider until exhaustion;
+///   ambiguous buffered POST failures are fail-closed unless the provider
+///   supplies a stable request key. Only then does the router fall back to the
+///   next provider. `nil` (default) = legacy behavior (no retry).
+/// - Provider resolution is still injected via the `factory` closure.
+///   TODO(B1i) remainder: a string-ID → ProviderConfig registry so IDs resolve
+///   directly through `ProviderFactory`, mirroring `streamWithGroupFallback`'s
+///   session-binding update (the serving provider ID is already returned).
+public struct FallbackRouter: Sendable {
+
+    /// One recorded fallback attempt.
+    public struct FallbackEvent: Codable, Sendable, Equatable {
+        public let providerID: String
+        public let errorDescription: String
+        /// 1-based attempt number within this request.
+        public let attempt: Int
+        /// D-PROVIDER-11/12: stable typed failure category (D-PROVIDER-11
+        /// coverage), or `nil` when the error failed closed to unclassified.
+        /// Optional so previously persisted events keep decoding.
+        public let failureKind: ProviderRequestFailureKind?
+        /// HTTP status that produced the failure, when the typed error
+        /// carried one. Bounded to wire-valid codes; `nil` otherwise.
+        public let statusCode: Int?
+
+        public init(
+            providerID: String,
+            errorDescription: String,
+            attempt: Int,
+            failureKind: ProviderRequestFailureKind? = nil,
+            statusCode: Int? = nil
+        ) {
+            self.providerID = Self.boundedProviderID(providerID)
+            self.errorDescription = Self.boundedErrorDescription(errorDescription)
+            self.attempt = Self.boundedAttempt(attempt)
+            self.failureKind = failureKind
+            self.statusCode = Self.boundedStatusCode(statusCode)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case providerID
+            case errorDescription
+            case attempt
+            case failureKind
+            case statusCode
+        }
+
+        /// Decode through the same projection as programmatic event creation;
+        /// persisted or imported route metadata is not trusted merely because
+        /// it came from Codable storage. Legacy payloads without the typed
+        /// fields decode to `nil` (unclassified), never a guessed category.
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(
+                providerID: try container.decode(String.self, forKey: .providerID),
+                errorDescription: try container.decode(String.self, forKey: .errorDescription),
+                attempt: try container.decode(Int.self, forKey: .attempt),
+                failureKind: try container.decodeIfPresent(
+                    ProviderRequestFailureKind.self,
+                    forKey: .failureKind
+                ),
+                statusCode: try container.decodeIfPresent(Int.self, forKey: .statusCode)
+            )
+        }
+
+        /// Status codes are diagnostic metadata, so keep malformed direct
+        /// construction or imported payloads from persisting unbounded or
+        /// non-wire values while preserving ordinary HTTP codes unchanged.
+        private static func boundedStatusCode(_ raw: Int?) -> Int? {
+            guard let raw, (100...599).contains(raw) else { return nil }
+            return raw
+        }
+
+        /// Provider IDs are provenance labels, not a free-form diagnostic
+        /// channel. Keep the ordinary registry IDs readable while rejecting
+        /// URL/path/query syntax, control characters, and unbounded labels.
+        /// Shared with the runtime observation boundary so displayed
+        /// provenance uses the same projection as fallback events while the
+        /// router keeps its canonical route IDs internally.
+        static func boundedProviderID(_ raw: String) -> String {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, value.utf8.count <= 128 else {
+                return "provider"
+            }
+            guard value.utf8.allSatisfy({ byte in
+                switch byte {
+                case 0x30...0x39, 0x41...0x5A, 0x61...0x7A,
+                     0x20, 0x2D, 0x2E, 0x3A, 0x5F:
+                    return true
+                default:
+                    return false
+                }
+            }) else {
+                return "provider"
+            }
+            return value
+        }
+
+        /// Attempt numbers are route metadata, so keep malformed direct
+        /// constructions from creating negative or unbounded observation
+        /// values while preserving ordinary route attempts unchanged.
+        private static func boundedAttempt(_ raw: Int) -> Int {
+            min(max(raw, 1), 1_024)
+        }
+
+        /// Fallback reasons are user/log surfaces. Keep known short reasons
+        /// useful, while rejecting control characters, URL/path syntax,
+        /// credential markers, and unbounded imported text.
+        private static func boundedErrorDescription(_ raw: String) -> String {
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, value.utf8.count <= 256 else {
+                return "Provider error"
+            }
+            guard !value.unicodeScalars.contains(where: { scalar in
+                scalar.value < 0x20 || scalar.value == 0x7F
+            }) else {
+                return "Provider error"
+            }
+
+            let lowercased = value.lowercased()
+            let sensitiveMarkers = [
+                "authorization", "proxy-authorization", "bearer", "api_key",
+                "apikey", "token", "secret", "password", "credential", "cookie"
+            ]
+            guard !sensitiveMarkers.contains(where: lowercased.contains),
+                  !value.contains("/"),
+                  !value.contains("\\"),
+                  !value.contains("?"),
+                  !value.contains("#") else {
+                return "Provider error"
+            }
+            return value
+        }
+    }
+
+    /// Ordered route chain. Tried front-to-back.
+    public let providerIDs: [String]
+
+    /// Failure trail recorded during the last request(s).
+    public private(set) var events: [FallbackEvent] = []
+    private(set) var lastRetryExhaustion: ProviderRetryExhaustion?
+    var tracksRetryExhaustion = false
+
+
+    /// Decide whether a thrown error should trigger fallback. Defaults to true
+    /// (the plain-text `LLMProvider` protocol has no structured error type, so
+    /// every error is treated as fallbackable unless the caller says otherwise).
+    public var shouldFallback: @Sendable (Error) -> Bool
+
+    /// F18b (B1i): retry policy applied to each provider BEFORE falling back.
+    /// Non-nil → every resolved provider is wrapped in `RetryingLLMProvider`
+    /// (exponential backoff, retryable errors only); ambiguous buffered POST
+    /// failures require a stable request key. Fallback happens only after
+    /// retries are exhausted. `nil` = legacy immediate-fallback behavior.
+    public var retryPolicy: LLMRetryPolicy?
+
+    /// Session-owned budget shared by fallback and retry attempts.  The router
+    /// never resets this tracker; a later provider only starts when the same
+    /// remaining budget still admits it.
+    public let requestBudget: BudgetTracker?
+
+    public init(
+        providerIDs: [String],
+        shouldFallback: @escaping @Sendable (Error) -> Bool = { _ in true },
+        retryPolicy: LLMRetryPolicy? = nil,
+        requestBudget: BudgetTracker? = nil
+    ) {
+        self.providerIDs = providerIDs
+        self.shouldFallback = shouldFallback
+        self.retryPolicy = retryPolicy
+        self.requestBudget = requestBudget
+    }
+
+    /// Resolve a provider ID to a provider instance.
+    ///
+    /// TODO(B1i): replace with `ProviderFactory.provider(for:)` once ProviderFactory
+    /// lands; until then callers inject resolution via the `factory` parameter.
+    public typealias ProviderFactory = @Sendable (String) async throws -> any LLMProvider
+
+    private func runBudgeted<T>(
+        operation: () async throws -> T,
+        usage: @escaping (T) -> LLMUsage? = { _ in nil }
+    ) async throws -> T {
+        guard let requestBudget else {
+            try Task.checkCancellation()
+            let value = try await operation()
+            try Task.checkCancellation()
+            return value
+        }
+        let lease = try await requestBudget.beginRequest(enforceExhaustion: true)
+        do {
+            try Task.checkCancellation()
+            let value = try await operation()
+            try Task.checkCancellation()
+            if let terminalPolicy = await requestBudget.completeRequest(
+                lease,
+                usage: usage(value)
+            ), terminalPolicy == .pause {
+                throw BudgetTrackerError.exhausted
+            }
+            try Task.checkCancellation()
+            return value
+        } catch {
+            await requestBudget.failRequest(lease)
+            throw error
+        }
+    }
+
+    private func preflightBudget() async throws {
+        try await requestBudget?.checkCanBeginRequest()
+        try Task.checkCancellation()
+    }
+
+    private func isTerminalBoundary(_ error: Error) -> Bool {
+        error is BudgetTrackerError
+            || error is ProviderRequestReplayBlockedError
+            || Task.isCancelled
+            || ProviderCancellationPolicy.isCancellation(error)
+    }
+
+    private func terminalError(_ error: Error) -> Error {
+        if Task.isCancelled || ProviderCancellationPolicy.isCancellation(error) {
+            return CancellationError()
+        }
+        return error
+    }
+
+    /// Keep the fallback trail on the same payload-free surface as provider
+    /// errors. A provider implementation supplied by a registry or plugin can
+    /// still throw a raw NSError/LocalizedError; copying its localized text
+    /// into a durable event would retain URLs, headers, bodies, or paths.
+    /// Known provider projections retain their stable user-facing reason, while
+    /// unknown errors fail closed to a generic provider failure.
+    private static func safeFailureDescription(for error: Error) -> String {
+        ProviderErrorDiagnosticProjectionPolicy.project(error)
+    }
+
+    /// A timeout or connection loss can happen after URLSession dispatched a
+    /// buffered POST.  The transport code is the only accepted input; no
+    /// localized text or URL is inspected.
+    fileprivate static func isAmbiguousPostDispatchTransport(_ error: Error) -> Bool {
+        guard let code = transportCode(from: error) else { return false }
+        return code == NSURLErrorTimedOut || code == NSURLErrorNetworkConnectionLost
+    }
+
+    private static func transportCode(from error: Error, depth: Int = 0) -> Int? {
+        guard depth < 4 else { return nil }
+        if let urlError = error as? URLError {
+            return urlError.code.rawValue
+        }
+        if let transport = error as? ProviderTransportCodeError {
+            return transport.code
+        }
+        if let llmError = error as? LLMError,
+           case .networkError(let underlying) = llmError {
+            return transportCode(from: underlying, depth: depth + 1)
+        }
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else { return nil }
+        return nsError.code
+    }
+
+    private static func replayBlockedCode(for error: Error) -> ProviderRequestReplayBlockedError.Code? {
+        guard let code = transportCode(from: error) else { return nil }
+        switch code {
+        case NSURLErrorTimedOut:
+            return .timedOut
+        case NSURLErrorNetworkConnectionLost:
+            return .connectionLost
+        default:
+            return nil
+        }
+    }
+
+    // MARK: - Non-streaming request
+
+    /// Send a message through the chain, falling back on failure.
+    ///
+    /// - Returns: the successful response plus the provider ID that served it.
+    /// - Throws: `FallbackRouterError.allProvidersFailed` when the chain is
+    ///   exhausted, or the original error when `shouldFallback` rejects it.
+    public mutating func sendMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        maxTokens: Int,
+        temperature: Double?,
+        factory: ProviderFactory
+    ) async throws -> (response: LLMResponse, providerID: String) {
+        var tried: Set<String> = []
+        var failures: [FallbackEvent] = []
+
+        for providerID in providerIDs {
+            guard !tried.contains(providerID) else { continue }
+            tried.insert(providerID)
+            lastRetryExhaustion = nil
+
+            var resolvedProvider: (any LLMProvider)?
+            do {
+                try await preflightBudget()
+                // F18b (B1i): retry clear transient errors on this provider
+                // with backoff first; the buffered POST fence below refuses
+                // ambiguous timeout/connection-loss replay without a key.
+                let resolved = try await factory(providerID)
+                resolvedProvider = resolved
+                let provider: any LLMProvider
+                if let policy = retryPolicy {
+                    provider = RetryingLLMProvider(
+                        base: resolved,
+                        policy: tracksRetryExhaustion ? policy.trackingExhaustion() : policy,
+                        requestBudget: requestBudget
+                    )
+                } else {
+                    provider = resolved
+                }
+                let response: LLMResponse
+                if retryPolicy == nil {
+                    response = try await runBudgeted {
+                        try await provider.sendMessage(
+                            messages: messages,
+                            systemPrompt: systemPrompt,
+                            maxTokens: maxTokens,
+                            temperature: temperature
+                        )
+                    } usage: { $0.usage }
+                } else {
+                    response = try await provider.sendMessage(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        maxTokens: maxTokens,
+                        temperature: temperature
+                    )
+                }
+                return (response, providerID)
+            } catch {
+                lastRetryExhaustion = error as? ProviderRetryExhaustion
+                let error = lastRetryExhaustion?.underlyingError ?? error
+                if isTerminalBoundary(error) { throw terminalError(error) }
+                if let resolvedProvider,
+                   Self.isAmbiguousPostDispatchTransport(error),
+                   !providerHasStableRequestIdempotencyKey(
+                       resolvedProvider,
+                       messages: messages,
+                       systemPrompt: systemPrompt,
+                       tools: [],
+                       maxTokens: maxTokens,
+                       temperature: temperature
+                   ) {
+                    let code = Self.replayBlockedCode(for: error)
+                    if let code {
+                        throw ProviderRequestReplayBlockedError(code: code)
+                    }
+                }
+                guard shouldFallback(error) else {
+                    // Non-fallbackable — propagate the original error untouched.
+                    throw error
+                }
+                let event = FallbackEvent(
+                    providerID: providerID,
+                    errorDescription: Self.safeFailureDescription(for: error),
+                    attempt: failures.count + 1,
+                    failureKind: ProviderRequestFailureKind.classify(error),
+                    statusCode: ProviderRequestFailureKind.httpStatusCode(from: error)
+                )
+                failures.append(event)
+                events.append(event)
+            }
+        }
+
+        if providerIDs.isEmpty {
+            throw FallbackRouterError.emptyChain
+        }
+        throw FallbackRouterError.allProvidersFailed(failures)
+    }
+
+    /// Send a tools-aware message through the same ordered chain.
+    ///
+    /// Tool schemas are part of the request contract, so each provider is
+    /// called through the protocol requirement rather than falling back to the
+    /// plain-text overload (which would silently drop tools).
+    public mutating func sendMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?,
+        factory: ProviderFactory
+    ) async throws -> (response: LLMResponse, providerID: String) {
+        var tried: Set<String> = []
+        var failures: [FallbackEvent] = []
+
+        for providerID in providerIDs {
+            guard !tried.contains(providerID) else { continue }
+            tried.insert(providerID)
+            lastRetryExhaustion = nil
+
+            var resolvedProvider: (any LLMProvider)?
+            do {
+                try await preflightBudget()
+                let resolved = try await factory(providerID)
+                resolvedProvider = resolved
+                let provider: any LLMProvider
+                if let policy = retryPolicy {
+                    provider = RetryingLLMProvider(
+                        base: resolved,
+                        policy: tracksRetryExhaustion ? policy.trackingExhaustion() : policy,
+                        requestBudget: requestBudget
+                    )
+                } else {
+                    provider = resolved
+                }
+                let response: LLMResponse
+                if retryPolicy == nil {
+                    response = try await runBudgeted {
+                        try await provider.sendMessage(
+                            messages: messages,
+                            systemPrompt: systemPrompt,
+                            tools: tools,
+                            maxTokens: maxTokens,
+                            temperature: temperature
+                        )
+                    } usage: { $0.usage }
+                } else {
+                    response = try await provider.sendMessage(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        tools: tools,
+                        maxTokens: maxTokens,
+                        temperature: temperature
+                    )
+                }
+                return (response, providerID)
+            } catch {
+                lastRetryExhaustion = error as? ProviderRetryExhaustion
+                let error = lastRetryExhaustion?.underlyingError ?? error
+                if isTerminalBoundary(error) { throw terminalError(error) }
+                if let resolvedProvider,
+                   Self.isAmbiguousPostDispatchTransport(error),
+                   !providerHasStableRequestIdempotencyKey(
+                       resolvedProvider,
+                       messages: messages,
+                       systemPrompt: systemPrompt,
+                       tools: tools,
+                       maxTokens: maxTokens,
+                       temperature: temperature
+                   ) {
+                    let code = Self.replayBlockedCode(for: error)
+                    if let code {
+                        throw ProviderRequestReplayBlockedError(code: code)
+                    }
+                }
+                guard shouldFallback(error) else { throw error }
+                let event = FallbackEvent(
+                    providerID: providerID,
+                    errorDescription: Self.safeFailureDescription(for: error),
+                    attempt: failures.count + 1,
+                    failureKind: ProviderRequestFailureKind.classify(error),
+                    statusCode: ProviderRequestFailureKind.httpStatusCode(from: error)
+                )
+                failures.append(event)
+                events.append(event)
+            }
+        }
+
+        if providerIDs.isEmpty {
+            throw FallbackRouterError.emptyChain
+        }
+        throw FallbackRouterError.allProvidersFailed(failures)
+    }
+
+    // MARK: - Streaming request
+
+    /// Start a stream through the chain. A provider "succeeds" as soon as its
+    /// stream is created; mid-stream errors are the caller's concern
+    /// (follows OpenMinis's approach: return the stream for upstream consumption).
+    public mutating func streamMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        maxTokens: Int,
+        temperature: Double?,
+        factory: ProviderFactory
+    ) async throws -> (stream: AsyncThrowingStream<LLMStreamChunk, Error>, providerID: String) {
+        var tried: Set<String> = []
+        var failures: [FallbackEvent] = []
+
+        for providerID in providerIDs {
+            guard !tried.contains(providerID) else { continue }
+            tried.insert(providerID)
+            lastRetryExhaustion = nil
+
+            do {
+                try await preflightBudget()
+                // F18b (B1i): same retry-before-fallback as sendMessage; only
+                // stream ACQUISITION is retried (mid-stream errors are the
+                // caller's concern, per the streamMessage contract).
+                let resolved = try await factory(providerID)
+                let provider: any LLMProvider
+                if let policy = retryPolicy {
+                    provider = RetryingLLMProvider(
+                        base: resolved,
+                        policy: tracksRetryExhaustion ? policy.trackingExhaustion() : policy,
+                        requestBudget: requestBudget
+                    )
+                } else {
+                    provider = resolved
+                }
+                let stream: AsyncThrowingStream<LLMStreamChunk, Error>
+                if retryPolicy == nil {
+                    stream = try await runBudgeted {
+                        try await provider.streamMessage(
+                            messages: messages,
+                            systemPrompt: systemPrompt,
+                            maxTokens: maxTokens,
+                            temperature: temperature
+                        )
+                    }
+                } else {
+                    stream = try await provider.streamMessage(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        maxTokens: maxTokens,
+                        temperature: temperature
+                    )
+                }
+                return (stream, providerID)
+            } catch {
+                lastRetryExhaustion = error as? ProviderRetryExhaustion
+                let error = lastRetryExhaustion?.underlyingError ?? error
+                if isTerminalBoundary(error) { throw terminalError(error) }
+                guard shouldFallback(error) else { throw error }
+                let event = FallbackEvent(
+                    providerID: providerID,
+                    errorDescription: Self.safeFailureDescription(for: error),
+                    attempt: failures.count + 1,
+                    failureKind: ProviderRequestFailureKind.classify(error),
+                    statusCode: ProviderRequestFailureKind.httpStatusCode(from: error)
+                )
+                failures.append(event)
+                events.append(event)
+            }
+        }
+
+        if providerIDs.isEmpty {
+            throw FallbackRouterError.emptyChain
+        }
+        throw FallbackRouterError.allProvidersFailed(failures)
+    }
+
+    /// D-CHAT-03: tools-aware assistant streaming through the same ordered
+    /// chain.
+    ///
+    /// Providers conforming to `AssistantStreamingLLMProvider` have their real
+    /// event stream (live `textDelta`s) forwarded; with a retry policy the
+    /// acquisition runs through `RetryingLLMProvider`'s streaming decorator so
+    /// retry-before-fallback stays identical to `streamMessage`. Non-conforming
+    /// providers keep the buffered `sendMessage` path and synthesize a single
+    /// `.completed` event — including the legacy "empty tools uses the no-tools
+    /// overload" delegation, the buffered POST replay fence, and budget
+    /// semantics — so their behavior stays byte-for-byte what the runtime
+    /// route produced before live forwarding existed. As with `streamMessage`,
+    /// only stream ACQUISITION participates in fallback; mid-stream errors are
+    /// the caller's concern.
+    public mutating func streamAssistantMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?,
+        factory: ProviderFactory
+    ) async throws -> (stream: AsyncThrowingStream<LLMAssistantStreamEvent, Error>, providerID: String) {
+        return try await streamAssistantMessage(messages: messages, systemPrompt: systemPrompt, tools: tools, maxTokens: maxTokens, temperature: temperature, thinkingLevel: nil, factory: factory)
+    }
+
+    public mutating func streamAssistantMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        tools: [AgentToolDefinition],
+        maxTokens: Int,
+        temperature: Double?, thinkingLevel: ThinkingLevel?,
+        factory: ProviderFactory
+    ) async throws -> (stream: AsyncThrowingStream<LLMAssistantStreamEvent, Error>, providerID: String) {
+        var tried: Set<String> = []
+        var failures: [FallbackEvent] = []
+
+        for providerID in providerIDs {
+            guard !tried.contains(providerID) else { continue }
+            tried.insert(providerID)
+            lastRetryExhaustion = nil
+
+            var resolvedProvider: (any LLMProvider)?
+            var streamingAcquisition = false
+            do {
+                try await preflightBudget()
+                let resolved = try await factory(providerID)
+                resolvedProvider = resolved
+                if let baseStreaming = resolved as? any AssistantStreamingLLMProvider {
+                    streamingAcquisition = true
+                    let provider: any AssistantStreamingLLMProvider
+                    if let policy = retryPolicy {
+                        // The decorator forwards the inner real stream and
+                        // keeps retry/budget discipline on the acquisition.
+                        provider = RetryingLLMProvider(
+                            base: baseStreaming,
+                            policy: tracksRetryExhaustion ? policy.trackingExhaustion() : policy,
+                            requestBudget: requestBudget
+                        )
+                    } else {
+                        provider = baseStreaming
+                    }
+                    let stream: AsyncThrowingStream<LLMAssistantStreamEvent, Error>
+                    if retryPolicy == nil {
+                        stream = try await runBudgeted {
+                            try await provider.streamAssistantMessage(
+                                messages: messages,
+                                systemPrompt: systemPrompt,
+                                tools: tools,
+                                maxTokens: maxTokens,
+                                temperature: temperature, thinkingLevel: thinkingLevel
+                            )
+                        }
+                    } else {
+                        stream = try await provider.streamAssistantMessage(
+                            messages: messages,
+                            systemPrompt: systemPrompt,
+                            tools: tools,
+                            maxTokens: maxTokens,
+                            temperature: temperature, thinkingLevel: thinkingLevel
+                        )
+                    }
+                    return (stream, providerID)
+                }
+                // Non-conforming: buffered synthesis, identical to the
+                // legacy runtime-route assistant-stream behavior.
+                let provider: any LLMProvider
+                if let policy = retryPolicy {
+                    provider = RetryingLLMProvider(
+                        base: resolved,
+                        policy: tracksRetryExhaustion ? policy.trackingExhaustion() : policy,
+                        requestBudget: requestBudget
+                    )
+                } else {
+                    provider = resolved
+                }
+                let response: LLMResponse
+                if retryPolicy == nil {
+                    response = try await runBudgeted {
+                        if tools.isEmpty {
+                            try await provider.sendMessage(
+                                messages: messages,
+                                systemPrompt: systemPrompt,
+                                maxTokens: maxTokens,
+                                temperature: temperature
+                            )
+                        } else {
+                            try await provider.sendMessage(
+                                messages: messages,
+                                systemPrompt: systemPrompt,
+                                tools: tools,
+                                maxTokens: maxTokens,
+                                temperature: temperature
+                            )
+                        }
+                    } usage: { $0.usage }
+                } else if tools.isEmpty {
+                    response = try await provider.sendMessage(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        maxTokens: maxTokens,
+                        temperature: temperature
+                    )
+                } else {
+                    response = try await provider.sendMessage(
+                        messages: messages,
+                        systemPrompt: systemPrompt,
+                        tools: tools,
+                        maxTokens: maxTokens,
+                        temperature: temperature
+                    )
+                }
+                return (llmAssistantCompletedStream(response), providerID)
+            } catch {
+                lastRetryExhaustion = error as? ProviderRetryExhaustion
+                let error = lastRetryExhaustion?.underlyingError ?? error
+                if isTerminalBoundary(error) { throw terminalError(error) }
+                // The buffered POST replay fence belongs to the buffered
+                // path only; stream acquisition failures fall back exactly
+                // like `streamMessage` (no fence there today).
+                if !streamingAcquisition, let resolvedProvider,
+                   Self.isAmbiguousPostDispatchTransport(error),
+                   !providerHasStableRequestIdempotencyKey(
+                       resolvedProvider,
+                       messages: messages,
+                       systemPrompt: systemPrompt,
+                       tools: tools,
+                       maxTokens: maxTokens,
+                       temperature: temperature
+                   ) {
+                    let code = Self.replayBlockedCode(for: error)
+                    if let code {
+                        throw ProviderRequestReplayBlockedError(code: code)
+                    }
+                }
+                guard shouldFallback(error) else { throw error }
+                let event = FallbackEvent(
+                    providerID: providerID,
+                    errorDescription: Self.safeFailureDescription(for: error),
+                    attempt: failures.count + 1,
+                    failureKind: ProviderRequestFailureKind.classify(error),
+                    statusCode: ProviderRequestFailureKind.httpStatusCode(from: error)
+                )
+                failures.append(event)
+                events.append(event)
+            }
+        }
+
+        if providerIDs.isEmpty {
+            throw FallbackRouterError.emptyChain
+        }
+        throw FallbackRouterError.allProvidersFailed(failures)
+    }
+
+}

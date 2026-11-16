@@ -1,0 +1,150 @@
+[
+  {
+    "id": "aws-access-token",
+    "description": "Identified a pattern that may indicate AWS credentials, risking unauthorized cloud resource access and data breaches on AWS platforms.",
+    "regex": "\\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16})\\b",
+    "entropy": 3,
+    "keywords": [
+      "a3t",
+      "akia",
+      "asia",
+      "abia",
+      "acca"
+    ],
+    "allowlists": [
+      {
+        "regexes": [
+          ".+EXAMPLE$"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "github-app-token",
+    "description": "Identified a GitHub App Token, which may compromise GitHub application integrations and source code security.",
+    "regex": "(?:ghu|ghs)_[0-9a-zA-Z]{36}",
+    "entropy": 3,
+    "keywords": [
+      "ghu_",
+      "ghs_"
+    ],
+    "allowlists": [
+      {
+        "paths": [
+          "(?:^|/)@octokit/auth-token/README\\.md$"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "github-fine-grained-pat",
+    "description": "Found a GitHub Fine-Grained Personal Access Token, risking unauthorized repository access and code manipulation.",
+    "regex": "github_pat_\\w{82}",
+    "entropy": 3,
+    "keywords": [
+      "github_pat_"
+    ]
+  },
+  {
+    "id": "github-oauth",
+    "description": "Discovered a GitHub OAuth Access Token, posing a risk of compromised GitHub account integrations and data leaks.",
+    "regex": "gho_[0-9a-zA-Z]{36}",
+    "entropy": 3,
+    "keywords": [
+      "gho_"
+    ]
+  },
+  {
+    "id": "github-pat",
+    "description": "Uncovered a GitHub Personal Access Token, potentially leading to unauthorized repository access and sensitive content exposure.",
+    "regex": "ghp_[0-9a-zA-Z]{36}",
+    "entropy": 3,
+    "keywords": [
+      "ghp_"
+    ],
+    "allowlists": [
+      {
+        "paths": [
+          "(?:^|/)@octokit/auth-token/README\\.md$"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "gitlab-pat",
+    "description": "Identified a GitLab Personal Access Token, risking unauthorized access to GitLab repositories and codebase exposure.",
+    "regex": "glpat-[\\w-]{20}",
+    "entropy": 3,
+    "keywords": [
+      "glpat-"
+    ]
+  },
+  {
+    "id": "npm-access-token",
+    "description": "Uncovered an npm access token, potentially compromising package management and code repository access.",
+    "regex": "(?i)\\b(npm_[a-z0-9]{36})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+    "entropy": 2,
+    "keywords": [
+      "npm_"
+    ]
+  },
+  {
+    "id": "openai-api-key",
+    "description": "Found an OpenAI API Key, posing a risk of unauthorized access to AI services and data manipulation.",
+    "regex": "\\b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+    "entropy": 3,
+    "keywords": [
+      "t3blbkfj"
+    ]
+  },
+  {
+    "id": "private-key",
+    "description": "Identified a Private Key, which may compromise cryptographic security and sensitive data encryption.",
+    "regex": "(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\\s\\S-]{64,}?KEY(?: BLOCK)?-----",
+    "keywords": [
+      "-----begin"
+    ]
+  },
+  {
+    "id": "pypi-upload-token",
+    "description": "Discovered a PyPI upload token, potentially compromising Python package distribution and repository integrity.",
+    "regex": "pypi-AgEIcHlwaS5vcmc[\\w-]{50,1000}",
+    "entropy": 3,
+    "keywords": [
+      "pypi-ageichlwas5vcmc"
+    ]
+  },
+  {
+    "id": "slack-bot-token",
+    "description": "Identified a Slack Bot token, which may compromise bot integrations and communication channel security.",
+    "regex": "xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*",
+    "entropy": 3,
+    "keywords": [
+      "xoxb"
+    ]
+  },
+  {
+    "id": "slack-user-token",
+    "description": "Found a Slack User token, posing a risk of unauthorized user impersonation and data access within Slack workspaces.",
+    "regex": "xox[pe](?:-[0-9]{10,13}){3}-[a-zA-Z0-9-]{28,34}",
+    "entropy": 2,
+    "keywords": [
+      "xoxp-",
+      "xoxe-"
+    ]
+  },
+  {
+    "id": "stripe-access-token",
+    "description": "Found a Stripe Access Token, posing a risk to payment processing services and sensitive financial data.",
+    "regex": "\\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\\x60'\"\\s;]|\\\\[nr]|$)",
+    "entropy": 2,
+    "keywords": [
+      "sk_test",
+      "sk_live",
+      "sk_prod",
+      "rk_test",
+      "rk_live",
+      "rk_prod"
+    ]
+  }
+]

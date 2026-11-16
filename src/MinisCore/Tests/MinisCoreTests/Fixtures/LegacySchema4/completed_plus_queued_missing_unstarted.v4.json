@@ -1,0 +1,64 @@
+{
+  "facts": {
+    "26#task2588-synthetic-session1#717#completed-message28#task2588-synthetic-operation16#task2588-attempt1#116#completed-search": {
+      "attemptID": "task2588-attempt",
+      "attemptNumber": 1,
+      "compositeKey": {
+        "attemptID": "task2588-attempt",
+        "attemptNumber": 1,
+        "messageID": "completed-message",
+        "operationID": "task2588-synthetic-operation",
+        "sessionID": "task2588-synthetic-session",
+        "toolCallID": "completed-search",
+        "turnID": 7
+      },
+      "executionIdentity": {
+        "attempt": 1,
+        "operationID": "task2588-synthetic-operation",
+        "turn": {
+          "messageID": "completed-message",
+          "sessionID": "task2588-synthetic-session",
+          "turnID": 7
+        }
+      },
+      "receiptID": "15692F71-4F42-4A9D-9856-D804A5484EFA",
+      "status": "succeeded",
+      "toolCallID": "completed-search",
+      "toolName": "web_search"
+    }
+  },
+  "fence": 4,
+  "order": [
+    "26#task2588-synthetic-session1#717#completed-message28#task2588-synthetic-operation16#task2588-attempt1#116#completed-search",
+    "26#task2588-synthetic-session1#714#queued-message28#task2588-synthetic-operation16#task2588-attempt1#113#queued-search"
+  ],
+  "pending": {
+    "26#task2588-synthetic-session1#714#queued-message28#task2588-synthetic-operation16#task2588-attempt1#113#queued-search": {
+      "attemptID": "task2588-attempt",
+      "attemptNumber": 1,
+      "compositeKey": {
+        "attemptID": "task2588-attempt",
+        "attemptNumber": 1,
+        "messageID": "queued-message",
+        "operationID": "task2588-synthetic-operation",
+        "sessionID": "task2588-synthetic-session",
+        "toolCallID": "queued-search",
+        "turnID": 7
+      },
+      "executionIdentity": {
+        "attempt": 1,
+        "operationID": "task2588-synthetic-operation",
+        "turn": {
+          "messageID": "queued-message",
+          "sessionID": "task2588-synthetic-session",
+          "turnID": 7
+        }
+      },
+      "receiptID": "BEE778F2-816F-41FA-88AA-CAD85B803149",
+      "toolCallID": "queued-search",
+      "toolName": "web_search"
+    }
+  },
+  "schemaVersion": 4,
+  "writerID": "E89BF863-A9FD-4209-8753-2F025EDBD0CE"
+}

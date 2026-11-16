@@ -1,0 +1,36 @@
+# Swift Package Manager 构建产物
+.build/
+.swiftpm/
+DerivedData/
+
+# 打包产物（.app 二进制 bundle）
+dist/
+*.app
+
+# Xcode
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# 日志与临时
+*.log.tmp
+
+# QA 运行产生的 SwiftPM scratch/artifact（保留精选文本日志，避免把二进制
+# scratch、dSYM、checkouts 和 xctest bundle 纳入版本库）。
+QA/**/scratch-*/
+QA/**/总控日志/**
+QA/**/MinisCanvasModelSwitchCurrent.app/
+QA/**/artifacts/
+QA/**/checkouts/
+QA/**/repositories/
+QA/**/*.dSYM/
+
+# Hermes project continuity memory (not part of repo)
+.hermes-project-memory/
+
+# 额外的本地构建目录
+.build-*/
+*.xcresult
