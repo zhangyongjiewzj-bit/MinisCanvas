@@ -44,7 +44,8 @@ struct ChatGenerationFailureProjectionTests {
         let copy = HTTPStatusMessages.message(for: status)
         let expected = "\(copy.zh)，\(copy.suggestionZH)（HTTP \(status)）"
         #expect(!projection.retryable)
-        #expect(projection.actionableRecoveryAction == .none)
+        // 402 归入授权类（欠费/额度）：给“检查 API Key”入口去服务商配置；400/422 没有可执行的恢复动作。
+        #expect(projection.actionableRecoveryAction == (status == 402 ? .reauthenticate : .none))
         #expect(projection.message == expected)
         #expect(projection.userFacingMessage == expected)
         #expect(!projection.message.contains("请稍后重试"))
@@ -107,5 +108,17 @@ struct ChatGenerationFailureProjectionTests {
         #expect(!projection.failureMessage.contains(payload))
         #expect(!projection.failureMessage.contains("Authorization"))
         #expect(!projection.failureMessage.contains("Bearer"))
+    }
+
+    @Test func contextOverflowOffersCompactAndRetryOnlyWhenThereIsHistory() {
+        let projection = ChatGenerationFailureProjection(error: LLMError.contextLengthExceeded)
+        #expect(projection.category == .contextLength)
+        #expect(projection.actionableRecoveryAction == .compactAndRetry)
+        #expect(ChatGenerationRecoveryAction.compactAndRetry.title == "压缩后重试")
+        #expect(projection.recovery(conversationHasHistory: true).action == .compactAndRetry)
+
+        let empty = projection.recovery(conversationHasHistory: false)
+        #expect(empty.action == .none)
+        #expect(empty.message.contains("没有可压缩的历史"))
     }
 }

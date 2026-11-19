@@ -78,6 +78,13 @@ public enum HTTPStatusMessages {
                 suggestionZH: "请稍后重试",
                 suggestionEN: "Please retry later"
             )
+        case 413:
+            return StatusMessage(
+                zh: "请求内容太大，服务端拒收",
+                en: "Request body too large",
+                suggestionZH: "请缩短这条消息或减少附件（图片、视频帧）的数量，或改为路径引用后分批发送",
+                suggestionEN: "Please shorten this message or reduce attachments, or send them by path reference in batches"
+            )
         case 422:
             return StatusMessage(
                 zh: "请求内容无法处理",
@@ -142,9 +149,9 @@ public enum HTTPStatusMessages {
             )
         case .permissionDenied:
             return StatusMessage(
-                zh: "认证失败：API Key 没有访问权限",
-                en: "Authentication failed: API key lacks access permission",
-                suggestionZH: "请检查 API Key 权限、账户额度及模型访问权限",
+                zh: "API Key 没有访问权限，或账户余额、额度不足",
+                en: "API key lacks access permission, or the account balance or quota is insufficient",
+                suggestionZH: "请到供应商处确认账户余额或额度（不足请充值），再检查 API Key 权限及模型访问权限",
                 suggestionEN: "Check API key permissions, account quota, and model access"
             )
         case .notFound:

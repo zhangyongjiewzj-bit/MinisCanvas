@@ -77,6 +77,7 @@ enum AppCommandCatalog {
     @MainActor
     static func assembled(
         bridge: BridgeStore,
+        customCommands: [CustomSlashCommand] = [],
         dependencies: CommandDependencies = CommandDependencies()
     ) -> (registry: CommandRegistry, display: [String: PaletteDisplayInfo]) {
         let presets = PresetCommands.all(dependencies: dependencies).filter {
@@ -122,6 +123,26 @@ enum AppCommandCatalog {
                     bridge: bridge
                 ) ?? spec.shortcut
             )
+        }
+        // 自定义斜杠命令（用户级 ~/.claude/commands）也进命令面板：选中后把 "/名称 " 放进输入框，
+        // 由用户补参数后发送；项目级命令随会话变化，只在输入框的斜杠菜单里出现。
+        for command in customCommands where command.source != .builtinPrompt {
+            let id = "custom.\(command.id)"
+            guard registry.command(id: id) == nil else { continue }
+            let name = command.name
+            registry.register(CommandDefinition(
+                id: id,
+                title: "/\(name)　\(command.description)",
+                keywords: [name, command.description, "自定义命令", "custom command"],
+                category: .agent
+            ) { [weak bridge] _ in
+                guard let bridge else {
+                    throw CommandExecutionError.disabled(commandID: id, reason: "命令宿主已释放")
+                }
+                await MainActor.run { bridge.chat.draftText = "/\(name) " }
+                return .success("")
+            })
+            display[id] = PaletteDisplayInfo(icon: "slash.circle", shortcut: nil)
         }
         return (registry, display)
     }
@@ -655,7 +676,12 @@ final class CommandPaletteModel {
     /// 当前输入（经 `updateQuery` 修改才会触发防抖重算）。
     private(set) var query: String = ""
     /// 侧栏选中分类；nil = 全部。
-    var selectedCategory: CommandCategory?
+    /// 切分类立即重算，不等输入防抖。
+    var selectedCategory: CommandCategory? {
+        didSet {
+            if oldValue != selectedCategory { refresh() }
+        }
+    }
     /// 当前展示的分组结果。
     private(set) var sections: [PaletteSection] = []
 
@@ -740,8 +766,11 @@ final class CommandPaletteModel {
             }
             sections = result
         } else {
-            // 有输入：注册表检索（相关度排序）→ 分类过滤 → 收藏置顶
-            let hits = registry.search(trimmed, limit: 50).filter(categoryFilter)
+            // 有输入：注册表检索（相关度排序）→ 分类过滤 → 收藏置顶。
+            // 以 / 开头的是命令写法（菜单给带参命令预填 "/provider.use "）：按命令编号检索。
+            let searchText = trimmed.hasPrefix("/")
+                ? String(trimmed.dropFirst().split(separator: " ", maxSplits: 1).first ?? "") : trimmed
+            let hits = registry.search(searchText, limit: 50).filter(categoryFilter)
             let favs = hits.filter { favoriteIDs.contains($0.id) }.map(paletteCommand)
             let rest = hits.filter { !favoriteIDs.contains($0.id) }.map(paletteCommand)
             var result: [PaletteSection] = []

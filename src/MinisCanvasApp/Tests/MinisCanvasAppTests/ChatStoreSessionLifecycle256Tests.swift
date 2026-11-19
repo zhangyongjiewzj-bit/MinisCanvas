@@ -182,3 +182,107 @@ struct ChatStoreSessionLifecycle256Tests {
         #expect(survivor.title == "重命名后标题")
     }
 }
+
+@Suite("会话归档遇到后台生成（D-1）")
+@MainActor
+struct ChatStoreArchiveWhileGeneratingTests {
+    @Test("手动归档正在后台生成的非活动会话被拒绝，会话留在活动列表")
+    func manualArchiveRefusesBackgroundGeneratingSession() throws {
+        let chat = ChatStore()
+        chat.newSession()
+        let busy = try #require(chat.activeSessionID)
+        chat.installLegacySafetyDrainStateForTests(writebackMessageID: nil)
+        chat.newSession()
+        let other = try #require(chat.activeSessionID)
+        #expect(other != busy)
+        #expect(chat.isSessionGenerating(busy))
+        #expect(chat.archiveSession(id: busy) == false)
+        #expect(chat.sessions.contains { $0.id == busy })
+        #expect(!chat.archivedSessions.contains { $0.id == busy })
+    }
+
+    /// MC4-027：侧栏手动归档当前正在生成的会话，要在停止回复之前拦下并提示先停止。
+    @Test("侧栏归档当前正在生成的会话：给出先停止的提示，不动回复")
+    func sidebarArchiveBlocksActiveGeneratingSessionBeforeStopping() throws {
+        let chat = ChatStore()
+        chat.newSession()
+        let active = try #require(chat.activeSessionID)
+        chat.installLegacySafetyDrainStateForTests(writebackMessageID: nil)
+        #expect(chat.isSessionGenerating(active))
+        let message = try #require(SessionSidebarArchiveConsumer.generatingBlockMessage(for: active, in: chat))
+        #expect(message.contains("先点停止"))
+        #expect(chat.isSessionGenerating(active))
+        chat.newSession()
+        #expect(SessionSidebarArchiveConsumer.generatingBlockMessage(for: chat.activeSessionID!, in: chat) == nil)
+    }
+
+    @Test("超过 50 个会话时自动归档跳过正在生成的会话")
+    func autoArchiveSkipsGeneratingSession() throws {
+        let chat = ChatStore()
+        chat.newSession()
+        let busy = try #require(chat.activeSessionID)
+        chat.installLegacySafetyDrainStateForTests(writebackMessageID: nil)
+        for _ in 0..<(ChatStore.maxSessionListCount + 2) { chat.newSession() }
+        #expect(chat.sessions.contains { $0.id == busy })
+        #expect(!chat.archivedSessions.contains { $0.id == busy })
+    }
+
+    /// S-05：定时任务回合只登记 scheduledSessionBusy、不登记 streamingTasks；手动归档和自动归档都要认它。
+    @Test("正在跑定时任务回合的会话：手动归档被拒，自动归档也跳过（即使排在候选最前）")
+    func scheduledTurnSessionIsNeitherManuallyNorAutomaticallyArchived() throws {
+        let chat = ChatStore()
+        chat.newSession()
+        let busy = try #require(chat.activeSessionID)
+        chat.installScheduledSessionBusyForTests(sessionID: busy)
+        chat.newSession()
+        #expect(chat.isSessionGenerating(busy))
+        #expect(chat.archiveSession(id: busy) == false)
+        #expect(chat.sessions.contains { $0.id == busy })
+        for _ in 0..<(ChatStore.maxSessionListCount + 2) { chat.newSession() }
+        #expect(chat.sessions.contains { $0.id == busy })
+        #expect(!chat.archivedSessions.contains { $0.id == busy })
+    }
+
+    /// S-06：对话里恢复（不激活）的归档会话，活动会话已满时不能刚恢复就被自动归档回去。
+    @Test("活动会话已满时对话里恢复归档会话：恢复的会话留在活动列表")
+    func restoreWithoutActivatingSurvivesTheSessionLimit() throws {
+        let chat = ChatStore()
+        let oldest = try #require(chat.activeSessionID)
+        chat.appendUser("最旧的会话")
+        chat.newSession()
+        #expect(chat.archiveSession(id: oldest))
+        #expect(chat.archivedSessions.contains { $0.id == oldest })
+        while chat.sessions.count < ChatStore.maxSessionListCount { chat.newSession() }
+        let current = try #require(chat.activeSessionID)
+        chat.restoreSession(id: oldest, activating: false)
+        #expect(chat.activeSessionID == current)
+        #expect(chat.sessions.contains { $0.id == oldest })
+        #expect(!chat.archivedSessions.contains { $0.id == oldest })
+    }
+
+    /// S-09：复制 / 分叉正在生成的会话被拒时要说明原因，不能点了没反应。
+    @Test("复制或分叉正在生成的会话被拒时有说明；空闲会话没有")
+    func refusedDuplicateOrForkExplainsWhy() throws {
+        let chat = ChatStore()
+        chat.newSession()
+        let busy = try #require(chat.activeSessionID)
+        chat.appendUser("一个问题")
+        let messageID = try #require(chat.messages.last?.id)
+        #expect(chat.duplicateRefusalNotice(sessionID: busy) == nil)
+        chat.installLegacySafetyDrainStateForTests(writebackMessageID: nil)
+        #expect(chat.duplicateRefusalNotice(sessionID: busy) == ChatStore.duplicateWhileGeneratingNotice)
+        #expect(chat.forkSession(id: busy, atMessageID: messageID, inclusive: true) == nil)
+        #expect(chat.pastedTextActionFeedback == ChatStore.duplicateWhileGeneratingNotice)
+    }
+
+    @Test("复制正在生成的会话被拒绝")
+    func duplicateRefusesGeneratingSession() throws {
+        let chat = ChatStore()
+        chat.newSession()
+        let busy = try #require(chat.activeSessionID)
+        chat.installLegacySafetyDrainStateForTests(writebackMessageID: nil)
+        let before = chat.sessions.count
+        #expect(chat.applyDuplicateSession(id: busy) == nil)
+        #expect(chat.sessions.count == before)
+    }
+}

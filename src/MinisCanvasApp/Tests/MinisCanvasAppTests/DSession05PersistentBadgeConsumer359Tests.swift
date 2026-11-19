@@ -182,6 +182,9 @@ struct DSession05PersistentBadgeConsumer359Tests {
         let fixture = try makeFixture()
         let sessionA = try #require(fixture.chat.activeSessionID)
         fixture.chat.appendUser("synthetic interrupted execution")
+        // a350e70e：只有用户消息、没有任何助手回复就被杀的一轮，重启后现在标成"失败，可重试"
+        // （见 Goal18 测试）。本测试守的是"带半截回复的运行中状态恢复成空闲"，所以先落一条半截回复。
+        fixture.chat.appendAssistant("synthetic partial reply")
         let sessionB = fixture.chat.applyNewSession(title: "synthetic unaffected keeper")
         fixture.chat.appendUser("synthetic keeper")
         // Use the production state producer's own time. There is no provider

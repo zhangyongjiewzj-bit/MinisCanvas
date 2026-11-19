@@ -50,17 +50,19 @@ struct RecoveryLegacyThemeColdConsumer0400Tests {
                 // No settings update is performed. The production initializer must
                 // persist its migration before its ordinary settings mirror is used.
                 let first = center(root: pairRoot, defaults: firstDefaults)
-                let expected = ThemePreset.nearest(for: appearance, accentTheme: accent)
+                // 第 1 套配色起：旧「浅色」直接是产品主题；旧「深色/跟随系统」先收敛为跟随系统，
+                // 再被一次性迁移改为产品主题——18 种旧组合重新打开后都是产品主题。
+                let expected = ThemePreset.light
                 let firstGeneral = first.settingsMirror.general
                 #expect(first.themePreset == expected)
                 #expect(ThemePreset.selectable.contains(first.themePreset))
                 #expect(firstGeneral == first.settingsStore.settings.general)
-                #expect(first.appearance == expected.appearanceProjection)
+                #expect(first.appearance == (appearance == .light ? .light : .system))
                 #expect(first.accentTheme == ThemePreset.canonicalAccentTheme)
                 let oldCombination = "\(appearance.rawValue)|\(accent.rawValue)"
-                // Canonical light/system + pseudo have no displaced legacy axes.
-                // All other sixteen old combinations must preserve their exact raw marker.
-                let expectedLegacyMarker: String? = ["system|pseudo", "light|pseudo"].contains(oldCombination)
+                // 只有 system|pseudo 的外观投影与旧值一致，没有被替换掉的旧轴；
+                // 其余十七种旧组合（含 light|pseudo，产品主题现在投影为 system）都保留原始标记。
+                let expectedLegacyMarker: String? = ["system|pseudo"].contains(oldCombination)
                     ? nil : oldCombination
                 #expect(firstGeneral.legacyThemePresetRawValue == expectedLegacyMarker)
                 #expect(first.settingsStore.lastMigrationProvenance?.fromVersion == 3)
@@ -68,10 +70,13 @@ struct RecoveryLegacyThemeColdConsumer0400Tests {
                 #expect(first.settingsStore.lastPersistenceError == nil)
                 let renderer = ThemeTokenProvider(center: first)
                 #expect(renderer.center === first)
-                #expect(renderer.mode == expected.resolvedMode(systemIsDark: renderer.systemAppearanceMode == .dark))
+                #expect(renderer.mode == (appearance == .light
+                    ? .light
+                    : expected.resolvedMode(systemIsDark: renderer.systemAppearanceMode == .dark)))
                 #expect(ThemeContrast.violations(tokens: renderer.tokens, background: renderer.tokens.background).isEmpty)
                 if expected == .light {
-                    #expect(renderer.tokens == ThemePreset.light.semanticTokens(systemIsDark: false))
+                    #expect(renderer.tokens == ThemePreset.light.semanticTokens(
+                        systemIsDark: renderer.mode == .dark))
                 }
                 let persisted = try Data(contentsOf: file)
                 #expect(persisted != original)

@@ -118,6 +118,19 @@ struct CrossTurnHandleTraceTests {
         #expect(!rawArguments.contains(String(secret.prefix(8))))
     }
 
+    // MARK: R3-12 后台命令不设时限：启动结果 timeout_seconds 为 null，这一对仍要保留且任务号在内
+
+    @Test func backgroundStartWithoutTimeoutStillKeepsTaskHandle() throws {
+        let call = try makeCall("r312-start", "shell_execute", ["command": "sleep 600", "run_in_background": true])
+        let result = #"{"background":true,"max_timeout_seconds":600,"note":"x","status":"running","task_id":"bg-0a1b2c3d","timeout_seconds":null}"#
+        let pair = try #require(CrossTurnToolTracePolicy.transcript(call: call, result: result, knownSecrets: []))
+        let kept = try #require(pair.last?.content.data(using: .utf8))
+        let envelope = try #require(try JSONSerialization.jsonObject(with: kept) as? [String: Any])
+        #expect(envelope["task_id"] as? String == "bg-0a1b2c3d")
+        #expect(envelope["timeout_seconds"] == nil)
+        #expect(envelope["max_timeout_seconds"] as? Int == 600)
+    }
+
     // MARK: T3 file_write / file_edit 结果行，正文不留
 
     @Test func fileWriteAndEditResultLinesCrossTurnsWithoutBody() async throws {

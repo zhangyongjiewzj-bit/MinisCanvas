@@ -97,19 +97,18 @@ struct ThemeSystemAppearanceObservation1524Tests {
         #expect(provider.tokens == ThemeTokenProvider.nativeSystemTokens(for: .light))
     }
 
+    /// 产品主题自第 1 套配色起带深色版：明暗跟随系统，各取预设自己的浅/深两套（且走缓存的静态常量）。
     @Test(arguments: [ThemePreset.light])
-    func fixedPresetsKeepTheirExactTokensAcrossSystemChanges(preset: ThemePreset) throws {
+    func productPresetFollowsSystemWithItsOwnLightAndDarkTokens(preset: ThemePreset) throws {
         let center = try makeCenter()
         center.themePreset = preset
         let provider = ThemeTokenProvider(center: center)
-        let expectedTokens = provider.tokens
-        let expectedOverlay = provider.aj38
-        let expectedScheme = center.colorSchemePreference
-        for name in [NSAppearance.Name.aqua, .darkAqua, .aqua] {
+        for (name, isDark) in [(NSAppearance.Name.aqua, false), (.darkAqua, true), (.aqua, false)] {
             provider.updateSystemAppearance(NSAppearance(named: name))
-            #expect(provider.tokens == expectedTokens)
-            #expect(provider.aj38 == expectedOverlay)
-            #expect(center.colorSchemePreference == expectedScheme)
+            #expect(provider.tokens == preset.semanticTokens(systemIsDark: isDark))
+            #expect(provider.aj38 == (isDark ? Aj38Palette.readableDark : Aj38Palette.readableLight))
+            // 不固定明暗：根视图不强制 preferredColorScheme，由系统决定窗口明暗。
+            #expect(center.colorSchemePreference == nil)
             #expect(center.themePreset == preset)
             #expect(center.settingsMirror.general.themePreset == preset)
         }

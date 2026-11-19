@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import MinisCore
+import os
 
 /// The actual confirmation sheet's warning and required phrase are derived
 /// from the producer's recovery contract, without requiring a UI launch.
@@ -84,6 +85,7 @@ private struct SettingsDeletionExpiredNotice: View {
 }
 
 private struct SettingsDeletionPrompt: View {
+    @Environment(\.themeTokens) private var theme
     let request: SettingsDeletionRequest
     let onCancel: () -> Void
     let onConfirm: (OperationIntent) -> Void
@@ -148,7 +150,7 @@ private struct SettingsDeletionPrompt: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 MinisIconView(.delete, size: 12)
-                    .foregroundPalette(.red)
+                    .foregroundPalette(theme?.statusDanger ?? AppStatusColor.danger)
                 Text("确认删除")
                     .font((typography?.headline ?? .title3).weight(.semibold))
                 Spacer()
@@ -161,7 +163,7 @@ private struct SettingsDeletionPrompt: View {
             Text(request.intent.impactSummary)
                 .foregroundStyle(.secondary)
             Text(SettingsDeletionPresentation(intent: request.intent).warning)
-                .foregroundStyle(request.intent.reversible ? Color.secondary : Color.red)
+                .foregroundStyle(request.intent.reversible ? Color.secondary : (theme?.statusDangerText ?? AppStatusColor.danger))
 
             switch step {
             case .first:
@@ -238,8 +240,202 @@ private enum BackupProtectionAction: Identifiable {
     }
 }
 
+// MARK: - 设置页失败文案（按错误类型给中文原因与做法）
+
+/// 文件读写类错误的归类。
+enum SettingsFailureCategory: Equatable {
+    case noPermission, noSpace, notFound, fileFormat, other
+}
+
+/// 备份失败：文案 + 是否应回到密码框。
+struct SettingsBackupFailure: Equatable {
+    let message: String
+    let needsPasswordRetry: Bool
+}
+
+enum SettingsBackupOperation { case preview, export }
+
+/// 设置页 catch 分支用的纯函数映射。主句只放中文原因与下一步；内部代码写日志，不进主句。
+enum SettingsFailureMessage {
+    private static let logger = Logger(subsystem: "MinisCanvas", category: "settings-failure")
+
+    /// 内部代码只记日志（错误类型名与代码，不记描述，避免路径外泄）。
+    static func log(code: String, error: Error) {
+        logger.error("\(code, privacy: .public) \(String(reflecting: type(of: error)), privacy: .public)")
+    }
+
+    static func fileCategory(_ error: Error, depth: Int = 0) -> SettingsFailureCategory {
+        if error is DecodingError { return .fileFormat }
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain {
+            switch ns.code {
+            case CocoaError.Code.fileReadNoPermission.rawValue,
+                 CocoaError.Code.fileWriteNoPermission.rawValue,
+                 CocoaError.Code.fileWriteVolumeReadOnly.rawValue:
+                return .noPermission
+            case CocoaError.Code.fileWriteOutOfSpace.rawValue:
+                return .noSpace
+            case CocoaError.Code.fileNoSuchFile.rawValue, CocoaError.Code.fileReadNoSuchFile.rawValue:
+                return .notFound
+            case CocoaError.Code.fileReadCorruptFile.rawValue,
+                 CocoaError.Code.fileReadInapplicableStringEncoding.rawValue,
+                 CocoaError.Code.propertyListReadCorrupt.rawValue:
+                return .fileFormat
+            default: break
+            }
+        } else if ns.domain == NSPOSIXErrorDomain {
+            switch Int32(ns.code) {
+            case EACCES, EPERM, EROFS: return .noPermission
+            case ENOSPC, EDQUOT: return .noSpace
+            case ENOENT: return .notFound
+            default: break
+            }
+        }
+        if depth < 3, let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error {
+            return fileCategory(underlying, depth: depth + 1)
+        }
+        return .other
+    }
+
+    private static func categoryReason(_ category: SettingsFailureCategory, writing: Bool) -> String? {
+        switch category {
+        case .noPermission:
+            return writing
+                ? "没有写入该位置的权限。请换一个可写的文件夹，或在“系统设置 → 隐私与安全性”中授权后重试"
+                : "没有读取该文件的权限。请把文件放到可访问的位置，或在“系统设置 → 隐私与安全性”中授权后重试"
+        case .noSpace:
+            return "磁盘空间不足。请清理磁盘后重试"
+        case .notFound:
+            return "找不到目标文件，可能已被移动或删除。请重新选择"
+        case .fileFormat:
+            return "文件格式不对，无法解析。请确认选择的是本应用导出的文件"
+        case .other:
+            return nil
+        }
+    }
+
+    /// 备份预览 / 导出失败。
+    static func backup(_ error: Error, operation: SettingsBackupOperation) -> SettingsBackupFailure {
+        let writing = operation == .export
+        let prefix = writing ? "备份导出未完成：" : "备份预览未完成："
+        if let protection = error as? SyncProtectionError {
+            switch protection {
+            case .wrongPasswordOrCorrupt:
+                return SettingsBackupFailure(
+                    message: "密码错误，或备份文件已损坏。请重新输入密码；若确认密码无误，请换一份备份文件",
+                    needsPasswordRetry: true)
+            case .protectionRequired:
+                return SettingsBackupFailure(message: "此备份受密码保护，请输入密码后重试", needsPasswordRetry: true)
+            case .unsupportedEnvelope, .unsupportedScheme, .unsupportedVersion:
+                return SettingsBackupFailure(
+                    message: prefix + "备份的保护格式或版本不受支持，可能来自更新版本的应用。请升级应用，或换一份备份",
+                    needsPasswordRetry: false)
+            case .invalidParameters, .resourceLimit:
+                return SettingsBackupFailure(
+                    message: prefix + "文件过大或参数异常。请确认选择的是本应用导出的 .minissync 文件",
+                    needsPasswordRetry: false)
+            case .randomSourceFailed, .keyDerivationFailed:
+                return SettingsBackupFailure(
+                    message: prefix + "系统暂时无法完成加解密准备（可能内存不足）。请稍后重试",
+                    needsPasswordRetry: false)
+            case .cancelled:
+                return SettingsBackupFailure(message: "备份操作已取消", needsPasswordRetry: false)
+            }
+        }
+        if let manifest = error as? SyncManifestError {
+            switch manifest {
+            case .unsupportedVersion(let expected, let found):
+                return SettingsBackupFailure(
+                    message: prefix + "备份版本不匹配（需要 v\(expected)，文件是 v\(found)）。请用对应版本的应用导出，或换一份备份",
+                    needsPasswordRetry: false)
+            case .wrongSourceApplication:
+                return SettingsBackupFailure(message: prefix + "该备份来自其他应用，无法导入", needsPasswordRetry: false)
+            case .emptyScopes, .missingScopes, .incompletePayload, .invalidSnapshot:
+                return SettingsBackupFailure(
+                    message: prefix + "文件格式不对或内容不完整。请确认选择的是本应用导出的 .minissync 文件",
+                    needsPasswordRetry: false)
+            }
+        }
+        if let metadata = error as? SettingsCenter.AtomicBackupMetadataError,
+           let text = metadata.errorDescription {
+            return SettingsBackupFailure(message: prefix + text, needsPasswordRetry: false)
+        }
+        if error is SyncSnapshotExportError {
+            return SettingsBackupFailure(
+                message: prefix + "有记忆条目与审批来源绑定，无法改写后导出（推断）。请先在“设置 → 记忆”中处理这类条目",
+                needsPasswordRetry: false)
+        }
+        if let reason = categoryReason(fileCategory(error), writing: writing) {
+            return SettingsBackupFailure(message: prefix + reason, needsPasswordRetry: false)
+        }
+        log(code: writing ? "BACKUP-EXPORT-FAILED" : "BACKUP-PREVIEW-FAILED", error: error)
+        return SettingsBackupFailure(
+            message: prefix + "原因未识别。请检查文件格式与访问权限后重试；详情已写入日志",
+            needsPasswordRetry: false)
+    }
+
+    /// 删除失败（三处设置页共用）。`.expired` 由调用方单独处理。
+    static func deletion(_ error: Error) -> String {
+        if let gate = error as? DeletionGateError {
+            switch gate {
+            case .targetChanged:
+                return "删除未完成：待删除的内容在确认后发生了变化。请刷新列表，重新选择并确认"
+            case .alreadyExecuting:
+                return "删除未完成：同一删除正在执行。请稍候，完成后再刷新列表"
+            case .alreadyConsumed:
+                return "删除未完成：这次确认已经使用过。请刷新列表后重新发起删除"
+            case .cancelled:
+                return "删除已取消，没有改动任何数据"
+            case .expired:
+                return "删除未完成：确认已过期。请重新发起删除"
+            case .firstConfirmationRequired, .secondConfirmationRequired, .irreversibleRequiresPhrase,
+                 .invalidScope, .invalidIntent:
+                return "删除未完成：确认步骤不完整。请重新发起删除并完成全部确认"
+            }
+        }
+        if let failure = error as? SettingsDeletionError {
+            switch failure {
+            case .notFound:
+                return "删除未完成：要删除的项目已不存在。请刷新列表"
+            case .operationFailed(let reason):
+                return "删除未生效：\(reason)。请刷新列表后重试"
+            case .rollbackFailed:
+                return "删除中途失败，且自动回滚没有完全成功。请先不要继续操作，重新打开应用后检查数据"
+            }
+        }
+        if let reason = categoryReason(fileCategory(error), writing: true) {
+            return "删除未完成：" + reason
+        }
+        log(code: "DELETE-FAILED", error: error)
+        return "删除未完成：原因未识别。请刷新列表，必要时重新打开应用后再检查；详情已写入日志"
+    }
+
+    /// 记忆检索 / 导出 / 导入等通用动作。`hint` 是原因未识别时的下一步。
+    static func memoryAction(_ error: Error, action: String, code: String, hint: String,
+                             writing: Bool = false) -> String {
+        if let known = error as? MemoryMarkdownImportError, let text = known.errorDescription {
+            return "\(action)未完成：" + text
+        }
+        if let known = error as? MemoryFileExportError, let text = known.errorDescription {
+            return "\(action)未完成：" + text
+        }
+        if let known = error as? MemoryProposalConsumerError, let text = known.errorDescription {
+            return "\(action)未完成：" + text
+        }
+        if let known = error as? MemoryMarkdownCodec.Error, let text = known.errorDescription {
+            return "\(action)未完成：\(text)请对照导出的文件修正后重试"
+        }
+        if let reason = categoryReason(fileCategory(error), writing: writing) {
+            return "\(action)未完成：" + reason
+        }
+        log(code: code, error: error)
+        return "\(action)未完成：原因未识别。\(hint)详情已写入日志"
+    }
+}
+
 private struct BackupProtectionSheet: View {
     let action: BackupProtectionAction
+    var errorMessage: String? = nil
     let onCancel: @MainActor () -> Void
     let onSubmit: @MainActor (SyncSnapshotProtection) -> Void
 
@@ -276,6 +472,12 @@ private struct BackupProtectionSheet: View {
                     .foregroundStyle(.secondary)
                 SecureField("输入备份密码", text: $password)
                     .textFieldStyle(.roundedBorder)
+                if let errorMessage {
+                    Text(errorMessage)
+                        .modifier(ReadableStatusForeground(status: .danger))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("settings.backup.password-error")
+                }
             }
 
             HStack {
@@ -295,6 +497,7 @@ private struct BackupProtectionSheet: View {
 }
 
 private struct SettingsPersistenceErrorBanner: View {
+    @Environment(\.themeTokens) private var theme
     let error: SettingsPersistenceError
     let onDismiss: () -> Void
 
@@ -316,7 +519,7 @@ private struct SettingsPersistenceErrorBanner: View {
     var body: some View {
         HStack(spacing: 8) {
             MinisIconView(.warning, size: 14, accessibilityLabel: "设置保存错误")
-                .foregroundPalette(.orange)
+                .foregroundPalette(theme?.statusWarning ?? AppStatusColor.warning)
             Text(message)
                 .accessibilityIdentifier("settings.persistence.error.message")
                 .fixedSize(horizontal: false, vertical: true)
@@ -328,7 +531,7 @@ private struct SettingsPersistenceErrorBanner: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .background((theme?.statusWarning ?? AppStatusColor.warning).opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("settings.persistence.error")
         .padding(.horizontal, 12)
@@ -369,12 +572,16 @@ enum SettingsPage: String, CaseIterable, Identifiable {
     var icon: MinisIcon {
         switch self {
         case .general: return .settings
-        case .safety, .privacy, .permissions: return .lock
+        case .safety: return .lock
+        case .permissions: return .handOpen // 审批/授权，与“安全”的锁区分
+        case .privacy: return .eyeOff
         case .typography: return .edit
         case .shortcuts: return .command
         case .agent: return .user
         case .mcp: return .server
-        case .skills, .memory, .projects: return .library
+        case .skills: return .library
+        case .memory: return .archive
+        case .projects: return .folder
         case .scheduler: return .schedule
         case .usage: return .analytics
         case .storage: return .database
@@ -436,11 +643,11 @@ struct SettingsSearchResult: Identifiable {
     static let hooksAnchor = "settings-navigation-hooks"
 
     private static let pageKeywords: [SettingsPage: String] = [
-        .general: "语言 外观 主题 默认模型 通知 审批通知 任务完成通知", .typography: "字号 字体 排版",
+        .general: "语言 外观 主题 默认模型 通知 审批通知 任务完成通知 后台任务完成后自动继续 自动续跑 文件检查点 回答风格 打断并发送", .typography: "字号 字体 排版",
         .shortcuts: "快捷键 键盘 按键", .environment: "API Key 服务商 密钥 模型",
-        .safety: "安全模式 紧急停止 保护", .permissions: "权限 授权 审批 已允许 持久审批规则 撤销",
-        .agent: "绕过 上限 预算 循环 循环上限 运行安全上限 允许访问的网站 工具审批 已允许", .privacy: "隐私 日志级别 数据保护",
-        .mcp: "MCP 工具 服务器", .skills: "技能 插件 能力", .browser: "浏览器 页面 网页",
+        .safety: "安全模式 紧急停止 保护", .permissions: "权限 授权 审批 已允许 持久审批规则 规则管理 拒绝 每次询问 导入 撤销",
+        .agent: "绕过 上限 预算 循环 循环上限 运行安全上限 允许访问的网站 工具审批 已允许 审批等待超时 超时自动拒绝 审批提示条 弹窗", .privacy: "隐私 日志级别 数据保护",
+        .mcp: "MCP 工具 服务器", .skills: "技能 插件 能力", .browser: "浏览器 页面 网页 联网搜索 web_search Brave Tavily SearXNG 用户代理",
         .scheduler: "定时任务 自动化 运行记录", .projects: "项目 工作区 工作目录",
         .memory: "记忆 事实 搜索", .storage: "备份 删除 回收站 恢复",
         .usage: "用量 消耗 统计", .logs: "日志 诊断 清空", .about: "关于 版本 应用",
@@ -1029,6 +1236,7 @@ private struct SettingsAppliedStateBanner: View {
 // MARK: - Safe Mode / Kill Switch（P3-SAFE-01 / P3-SET-01 / P3-REC-01）
 
 private struct SafetyRuntimeSettingsTab: View {
+    @Environment(\.themeTokens) private var theme
     @Bindable var center: SettingsCenter
 
     var body: some View {
@@ -1096,7 +1304,7 @@ private struct SafetyRuntimeSettingsTab: View {
                             Text(flag.feature.displayName)
                             Spacer()
                             Text(flag.isEnabled ? "开启" : "关闭")
-                                .foregroundStyle(flag.isEnabled ? Color.secondary : Color.orange)
+                                .foregroundStyle(flag.isEnabled ? Color.secondary : (theme?.statusWarningText ?? AppStatusColor.warning))
                         }
                         safetyRow(
                             "默认 / 当前",
@@ -1158,6 +1366,7 @@ enum ThemePresetCatalogPickerGate {
 }
 
 private struct GeneralSettingsTab: View {
+    @Environment(\.themeTokens) private var theme
     @Bindable var center: SettingsCenter
     @State private var showingResetDefaultsConfirmation = false
     @Environment(\.typographyTokens) private var typography
@@ -1195,6 +1404,18 @@ private struct GeneralSettingsTab: View {
                 .accessibilityLabel("主题预设")
                 .accessibilityIdentifier("settings.general.theme-preset")
 
+                Picker("明暗", selection: Binding(
+                    get: { center.appearance },
+                    set: { center.appearance = $0 }
+                )) {
+                    Text("浅色").tag(Appearance.light)
+                    Text("深色").tag(Appearance.dark)
+                    Text("跟随系统").tag(Appearance.system)
+                }
+                .pickerStyle(.menu)
+                .accessibilityLabel("明暗")
+                .accessibilityIdentifier("settings.general.appearance-mode")
+
                 // 旧调色板（codex/graphite/ocean/crimson/emerald）与高对比
                 // 若将来拿到批准色板，需要 C0 另开预设验收；此处不得
                 // 恢复成第二个自由轴，也不新增可见行（A7-A 布局保持）。
@@ -1204,8 +1425,29 @@ private struct GeneralSettingsTab: View {
                 // 默认模型候选 = 内置聊天 Provider + 用户自定义供应商记录（U5）。
                 // 此前只列内置 ProviderType → 自定义供应商「只能加 key、模型选不了」；
                 // 合并后自定义供应商同样可设为默认 Provider / 默认模型。
-                let providerOptions = center.providers.map { ChatStore.ChatProvider.builtIn($0) }
+                let allProviderOptions = center.providers.map { ChatStore.ChatProvider.builtIn($0) }
                     + center.providerRecords.map { ChatStore.ChatProvider.custom($0) }
+                // 默认模型只列“检查通过、可用于对话”的：选了没通过的模型会静默不生效。
+                let readyKeys = Set(center.chatModelPickerProjection.items.filter(\.isSelectable).map {
+                    ProviderReadinessRevision.canonicalProviderID($0.providerID) + "\u{1F}" + $0.modelID
+                })
+                let readinessKey: (ChatStore.ChatProvider, String) -> String = { option, modelID in
+                    let name: String
+                    switch option {
+                    case .builtIn(let t): name = t.rawValue
+                    case .custom(let r): name = r.name
+                    }
+                    return ProviderReadinessRevision.canonicalProviderID(name) + "\u{1F}" + ChatStore.canonicalModelID(modelID)
+                }
+                let providerOptions = allProviderOptions.filter { option in
+                    let tag: String
+                    switch option {
+                    case .builtIn(let t): tag = t.rawValue
+                    case .custom(let r): tag = "custom.\(r.name)"
+                    }
+                    return tag == center.defaultProviderID
+                        || option.modelOptions.contains { readyKeys.contains(readinessKey(option, $0.id)) }
+                }
                 // 持久化 tag：内置 = rawValue（与旧配置兼容）；自定义 = "custom.<name>"
                 let providerTag: (ChatStore.ChatProvider) -> String = { option in
                     switch option {
@@ -1226,8 +1468,17 @@ private struct GeneralSettingsTab: View {
 
                 // 模型目录随选中 Provider 取：内置 = builtInModels；自定义 = record.modelNames
                 let models: [LLMModel] = {
-                    guard let pid = center.defaultProviderID else { return [] }
-                    return providerOptions.first { providerTag($0) == pid }?.modelOptions ?? []
+                    guard let pid = center.defaultProviderID,
+                          let option = providerOptions.first(where: { providerTag($0) == pid }) else { return [] }
+                    return option.modelOptions.filter {
+                        readyKeys.contains(readinessKey(option, $0.id)) || $0.id == center.defaultModelID
+                    }
+                }()
+                // 已保存的默认模型没有通过检查：给出提示，说明它不会生效。
+                let defaultModelNotEffective: Bool = {
+                    guard let pid = center.defaultProviderID, let mid = center.defaultModelID,
+                          let option = providerOptions.first(where: { providerTag($0) == pid }) else { return false }
+                    return !readyKeys.contains(readinessKey(option, mid))
                 }()
                 Picker("模型", selection: Binding(
                     get: { center.defaultModelID },
@@ -1241,6 +1492,11 @@ private struct GeneralSettingsTab: View {
                 .pickerStyle(.menu)
                 .disabled(models.isEmpty)
                 .help(models.isEmpty ? "请先选择服务商" : "默认模型")
+                if defaultModelNotEffective {
+                    Text("当前默认模型尚未通过连接检查，新会话不会使用它。请先到「模型服务」检查连接，或改选已通过检查的模型。")
+                        .font(.caption)
+                        .foregroundStyle(theme?.statusWarningText ?? AppStatusColor.warning)
+                }
 
                 // AJ-40：辅助模型 —— 轻量任务（标题生成/摘要等）的默认模型，未选继承主模型。
                 Picker("辅助模型", selection: Binding(
@@ -1254,7 +1510,7 @@ private struct GeneralSettingsTab: View {
                 }
                 .pickerStyle(.menu)
                 .disabled(models.isEmpty)
-                .help(models.isEmpty ? "请先选择服务商" : "辅助模型（轻量任务用，未选则继承主模型）")
+                .help(models.isEmpty ? "请先选择服务商" : "辅助模型目前只用于画布里的轻量任务，对话的标题生成和摘要不使用它；未选则继承主模型。")
             }
 
             Section("语言") {
@@ -1286,7 +1542,7 @@ private struct GeneralSettingsTab: View {
                     }
                 }
                 .pickerStyle(.menu)
-                .help("默认模型速度档位：极快 / 快 / 均衡 / 质量")
+                .help("速度档位用来在模型列表里挑选对应档位的模型（极快 / 快 / 均衡 / 质量），不会改变发给服务商的请求参数。")
 
                 Picker("回答风格", selection: Binding(
                     get: { center.chatOutputMode },
@@ -1306,6 +1562,11 @@ private struct GeneralSettingsTab: View {
                     set: { center.fileCheckpointsEnabled = $0 }
                 ))
                 .help(FileCheckpointStore.scopeDisclosure + "关闭后保留已有记录。")
+                Toggle("后台任务完成后自动继续", isOn: Binding(
+                    get: { center.backgroundAutoContinueEnabled },
+                    set: { center.backgroundAutoContinueEnabled = $0 }
+                ))
+                .help("后台命令或后台子任务完成后，如果这个会话空闲，自动接着跑一轮。仍遵守当前权限模式和审批；连续自动继续 3 次后停下，等你发话。关闭后，结果只在你下一条消息时带上。")
                 Toggle("生成中回车打断并发送（默认排队）", isOn: Binding(
                     get: { center.newMessageInterruptsGeneration },
                     set: { center.newMessageInterruptsGeneration = $0 }
@@ -1457,7 +1718,7 @@ private struct TypographySettingsTab: View {
                 Text("默认 14 pt；范围 \(range.lowerBound)-\(range.upperBound) pt，步长 \(TypographySettings.uiBaseFontSizeStep)。")
                     .font(typography.status)
                     .foregroundStyle(.secondary)
-                Text("正文、Composer、侧栏与任务卡会使用同一排版基准。")
+                Text("正文、输入框、侧栏与任务卡会使用同一排版基准。")
                     .font(typography.status)
                     .foregroundStyle(.secondary)
             }.id(SettingsSearchResult.fontSizeAnchor)
@@ -1489,7 +1750,7 @@ final class ShortcutRecorderModel {
     var conflictError: ShortcutConflict?
     private var monitor: Any?
 // B1213_DIAGNOSTIC_BEGIN
-#if MINISCANVAS_SHORTCUT_EVENT_DIAGNOSTICS
+#if MINISCANVAS_SHORTCUT_EVENT_DIAGNOSTICS || DEBUG
     struct NativeMonitorObservation: Sendable {
         let keyCode: UInt16
         let modifiers: UInt
@@ -1513,7 +1774,7 @@ final class ShortcutRecorderModel {
         recordingAction = action
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
 // B1213_DIAGNOSTIC_BEGIN
-#if MINISCANVAS_SHORTCUT_EVENT_DIAGNOSTICS
+#if MINISCANVAS_SHORTCUT_EVENT_DIAGNOSTICS || DEBUG
             ShortcutRecorderModel.testLocalMonitorObserver?(.init(
                 keyCode: event.keyCode, modifiers: event.modifierFlags.rawValue,
                 windowNumber: event.windowNumber, timestamp: event.timestamp,
@@ -1804,7 +2065,10 @@ private struct PermissionScopeSettingsTab: View {
                         VStack(alignment: .leading) {
                             Text(ContentSecretRedactor.redact(row.path))
                             Text(row.hash).font(typography?.monospaced ?? .system(.body, design: .monospaced))
-                            Button("撤销此项目的指令信任", role: .destructive) {
+                            if row.refused {
+                                Text("已选择不加载（记住）；文件内容变了才会再询问").font(typography?.caption ?? .caption)
+                            }
+                            Button(row.refused ? "恢复询问" : "撤销此项目的指令信任", role: .destructive) {
                                 perform { try center.revokeProjectInstructionTrust?(row.projectID) }
                             }.accessibilityIdentifier("permissions.project-instructions-revoke-" + row.projectID)
                         }
@@ -1833,7 +2097,7 @@ private struct PermissionScopeSettingsTab: View {
                         .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
                 }
                 if let rules = center.persistentRules {
-                    Section("持久审批规则") { PersistentApprovalRulesSettingsView(store: rules) }
+                    Section("规则管理") { PersistentApprovalRulesSettingsView(store: rules, approvalCenter: center) }
                 }
                 if let feedback { Text(feedback).font(typography?.caption ?? .caption) }
             } else { Text("当前权限来源未接入，不能添加目录授权。") }
@@ -1910,8 +2174,6 @@ private struct AgentSettingsTab: View {
                             showSkillBypassRisk = true
                         } else if Policy05BypassSettingsConfirmation.setConfirmed(false, in: center) {
                             bypassConfirmationMessage = nil
-                        } else if confirmed && center.policyRuntimeDefaults.autonomyLevel != .l3 {
-                            bypassConfirmationMessage = "已保存的自主权上限尚未允许绕过权限。请在“运行安全上限”选择“绕过权限” 并点击“保存运行上限”；以其中只读“最高模式”显示“绕过权限” 为准，再开启本开关。"
                         } else {
                             bypassConfirmationMessage = "绕过权限确认未保存，请检查设置持久化后重试。"
                         }
@@ -1940,6 +2202,13 @@ private struct AgentSettingsTab: View {
                 .disabled(center.composerPolicy.mode != .bypassPermission)
                 .accessibilityLabel("绕过权限需二次确认")
                 .accessibilityIdentifier("settings.agent.composer-policy.bypass-confirmed")
+
+                if center.composerPolicy.mode != .bypassPermission {
+                    Text("此开关当前不可用：请先在上方把权限模式选为“绕过权限”。")
+                        .font(typography?.caption ?? .caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("settings.agent.composer-policy.bypass-disabled-reason")
+                }
 
                 if center.composerPolicy.mode == .bypassPermission,
                    center.policyRuntimeDefaults.autonomyLevel != .l3 {
@@ -1986,8 +2255,8 @@ private struct AgentSettingsTab: View {
                 .accessibilityIdentifier("settings.agent.composer-policy.protect-credentials")
 
                 Text(center.composerPolicy.mode == .bypassPermission
-                     ? "确认后可读写删除电脑上任意文件、执行任意命令；操作系统文件、已安装软件、MinisCanvas 自身数据目录、测试配置目录与钥匙串仍不可改动（命令层只能尽力拦截，不是安全边界）。删除会移入废纸篓。模型修改权限或审批设置仍须用户批准。"
-                     : "每次 Composer 提交都会冻结当前策略；已开始的回合不会被设置变更改写。")
+                     ? "确认后可读写删除电脑上任意文件、执行任意命令；操作系统文件、已安装软件、MinisCanvas 自身数据目录、测试配置目录与钥匙串仍不可改动（命令层只能尽力拦截，不是安全边界）。删除：文件检查点开启（默认）时先留检查点再删除，可从恢复入口找回，不进废纸篓；关闭检查点时才移入废纸篓。模型修改权限或审批设置仍须用户批准。"
+                     : "每次发送消息都会冻结当前策略；已开始的回合不会被设置变更改写。")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1997,7 +2266,7 @@ private struct AgentSettingsTab: View {
                 Section("工具审批") {
                     ApprovalPresentationSettingsView(center: approvalCenter)
                     if let rules = approvalCenter.persistentRules {
-                        PersistentApprovalRulesSettingsView(store: rules).id(ruleRefreshID)
+                        PersistentApprovalRulesSettingsView(store: rules, approvalCenter: approvalCenter).id(ruleRefreshID)
                     }
                     if let browserRules = approvalCenter.browserInteractionRules {
                         BrowserInteractionRulesSettingsView(store: browserRules)
@@ -2187,7 +2456,7 @@ private struct AgentSettingsTab: View {
             }
 
             Section("终端命令策略") {
-                Text("规则只影响新命令；已提交的终端请求和 Agent 回合继续使用各自冻结的策略快照。")
+                Text("规则只影响新命令；已提交的终端请求和 Agent 回合继续使用各自冻结的策略快照。“自动允许”只影响你自己在终端里敲的命令；智能体执行命令是否询问，由输入框的模式和已保存的“以后都允许”规则决定，只有“拒绝”和“每次确认”对智能体同样生效。")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2248,7 +2517,7 @@ private struct AgentSettingsTab: View {
                         ? "默认拒绝（无域名）"
                         : center.policyRuntimeDefaults.networkDomains.sorted().joined(separator: "、")
                 )
-                Text("这些是生产运行时的保守上限；Composer 只能选择请求策略，不能放宽预算、时限、自主权或网络域名边界。")
+                Text("这些是生产运行时的保守上限；输入框里只能选择请求策略，不能放宽预算、时限、自主权或网络域名边界。")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2297,7 +2566,7 @@ private struct AgentSettingsTab: View {
                 Text("预算单位为工具调用次数（每次计 1）；上限为非负整数。填 0 时，不允许消耗预算的工具调用。时限为非负有限分钟，且截止日期必须可表示。无效输入不会保存。")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
-                Picker("自主权上限", selection: $policyAutonomyDraft) {
+                Picker("最高模式", selection: $policyAutonomyDraft) {
                     ForEach([AutonomyLevel.l0, .l1, .l2, .l3], id: \.rawValue) { level in
                         Text(autonomyLabel(level)).tag(level)
                     }
@@ -2328,12 +2597,12 @@ private struct AgentSettingsTab: View {
                     )) {
                         Text("模型自身上限").tag(ThinkingLevel?.none)
                         ForEach(ThinkingLevel.allCases, id: \.self) { level in
-                            Text(level.rawValue).tag(Optional(level))
+                            Text(ComposerThinkingSelection.label(level)).tag(Optional(level))
                         }
                     }
                     .accessibilityIdentifier("settings.agent.child-thinking-ceiling")
                 }
-                Text("默认继承父级；开启后仅可选择已配置且就绪的模型，仍遵循父会话权限与审批。设置变更仅影响后续派发。")
+                Text("默认继承父级；开启后仅可选择已配置且就绪的模型，仍遵循父会话权限与审批。注意：子任务选的模型可能属于另一家供应商，开启后对话内容会发到那一家，不想外发就保持关闭。设置变更仅影响后续派发。")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2450,9 +2719,16 @@ private struct AgentSettingsTab: View {
 
             Section("智能体可用模型") {
                 // AJ-40：可用模型白名单（多选 chip，可选）。空 = 全部可用（不限制）。
-                let allModels = center.providers
+                // F1-05：自定义服务商的模型也要能选；只列内置模型会让一旦设了白名单，
+                // 自定义服务商的模型被整体拦掉又选不回来。按模型 ID 去重（列表以 ID 为键）。
+                let builtInModels = center.providers
                     .flatMap { p in center.models(forProviderID: p.rawValue).map { (provider: p.displayName, id: $0.id, display: $0.displayName) } }
-                    .map { $0 }
+                let customModels = center.providerRecords
+                    .flatMap { r in r.modelNames.map { (provider: r.providerDisplayName, id: $0, display: $0) } }
+                let allModels: [(provider: String, id: String, display: String)] = {
+                    var seen = Set<String>()
+                    return (builtInModels + customModels).filter { seen.insert($0.id).inserted }
+                }()
                 if allModels.isEmpty {
                     Text("暂无可用模型")
                         .foregroundStyle(.secondary)
@@ -2550,6 +2826,9 @@ private struct AgentSettingsTab: View {
                     get: { center.fallbackEnabled },
                     set: { center.fallbackEnabled = $0 }
                 ))
+                Text("默认关闭。开启后，主服务出现授权、限流或额度问题时，消息会改发到另一个已配置的供应商，请确认你接受内容发送给它。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -2750,6 +3029,7 @@ private struct MCPSettingsTab: View {
 /// 设置窗口的「技能」tab：技能列表 + 启用开关 + 详情（描述/路径）+ 刷新。
 private struct SkillsSettingsTab: View {
     @Bindable var store: SkillsStore
+    @Environment(\.themeTokens) private var theme
     var chat: ChatStore? = nil
 
     private var currentReviewScope: MemoryScope? {
@@ -2819,11 +3099,16 @@ private struct SkillsSettingsTab: View {
                     if let importReviewErrorMessage, importReview == nil {
                         Text(importReviewErrorMessage)
                             .font(typography?.caption ?? .caption)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(theme?.statusDangerText ?? AppStatusColor.danger)
                     }
                 }
                 .padding(.horizontal, 12)
                 .padding(.bottom, 8)
+            }
+
+            if let chat {
+                ExternalSkillsSection(chat: chat)
+                ProjectSubagentsSection(chat: chat)
             }
 
             DisclosureGroup("技能目录") {
@@ -2913,7 +3198,7 @@ private struct SkillsSettingsTab: View {
                             Spacer()
                             Button("恢复") {
                                 do { try store.restoreDeletedSkill(receipt) }
-                                catch { importReviewErrorMessage = "恢复失败：\(error.localizedDescription)" }
+                                catch { importReviewErrorMessage = "恢复失败：\(UserFacingErrorText.describe(error))" }
                             }
                             .accessibilityIdentifier("settings.skills.restore.\(receipt.targetID)")
                         }
@@ -2996,7 +3281,7 @@ private struct SkillsSettingsTab: View {
                     deletionReview = nil
                     importReviewErrorMessage = nil
                 } catch {
-                    importReviewErrorMessage = "技能删除或恢复记录未完成：\(error.localizedDescription)"
+                    importReviewErrorMessage = "技能删除或恢复记录未完成：\(UserFacingErrorText.describe(error))"
                     deletionReview = nil
                 }
             }, onClose: { deletionReview = nil })
@@ -3063,7 +3348,7 @@ private struct SkillsSettingsTab: View {
                         do {
                             deletionReview = SkillDeletionReviewDraft(intent: try store.previewSkillDeletion(entry.id))
                         } catch {
-                            importReviewErrorMessage = "无法准备删除：\(error.localizedDescription)"
+                            importReviewErrorMessage = "无法准备删除：\(UserFacingErrorText.describe(error))"
                         }
                     }
                     .buttonStyle(.borderless)
@@ -3152,6 +3437,7 @@ private struct SkillDeletionReviewSheet: View {
 }
 
 private struct SkillImportReviewSheet: View {
+    @Environment(\.themeTokens) private var theme
     let draft: SkillImportReviewDraft
     let errorMessage: String?
     let onApprove: () -> Void
@@ -3162,8 +3448,13 @@ private struct SkillImportReviewSheet: View {
             Text("审核本地技能")
                 .font(.title2)
             Text(draft.replacesExistingApproval
-                 ? "正在审核已安装副本。确认会替换此技能原有作用域授权；保留当前启用开关，可在列表中启用。"
+                 ? "正在审核已安装副本。确认后，这个技能只在当前会话和项目里获得批准，会替换它原来的批准范围；保留当前启用开关。"
                  : "已导入 App 技能库，当前为待批准、未启用。只有明确批准后才会激活。")
+            if draft.replacesGlobalApproval {
+                Text("注意：这个技能现在是全局批准的。确认后全局批准会被取代，其它会话和项目需要各自重新审核才能使用它。")
+                    .foregroundStyle(theme?.statusWarningText ?? AppStatusColor.warning)
+                    .accessibilityIdentifier("settings.skills.review.global-replace-warning")
+            }
             Text("名称：\(draft.name) · 版本：\(draft.version)")
             Text("所选来源／现有快照：\(draft.sourcePath)")
                 .textSelection(.enabled)
@@ -3217,13 +3508,14 @@ private struct SkillImportReviewSheet: View {
 }
 
 private struct SkillToggleErrorBanner: View {
+    @Environment(\.themeTokens) private var theme
     let message: String
     let onDismiss: () -> Void
 
     var body: some View {
         HStack(spacing: 8) {
             MinisIconView(.warning, size: 14, accessibilityLabel: "技能状态错误")
-                .foregroundPalette(.orange)
+                .foregroundPalette(theme?.statusWarning ?? AppStatusColor.warning)
             Text(message)
                 .accessibilityIdentifier("settings.skills.toggle-error.message")
                 .fixedSize(horizontal: false, vertical: true)
@@ -3235,7 +3527,7 @@ private struct SkillToggleErrorBanner: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .background((theme?.statusWarning ?? AppStatusColor.warning).opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("settings.skills.toggle-error")
         .padding(.horizontal, 12)
@@ -3265,15 +3557,6 @@ private struct PrivacySettingsTab: View {
 
     var body: some View {
         Form {
-            Section("数据脱敏") {
-                Toggle("环境变量值脱敏设置（尚未启用）", isOn: Binding(
-                    get: { center.redactEnvValues },
-                    set: { center.redactEnvValues = $0 }
-                ))
-                .disabled(true)
-                .help("此选项暂不可用。")
-            }
-
             Section("日志") {
                 Picker("日志级别", selection: Binding(
                     get: { center.privacyLogLevel },
@@ -3286,18 +3569,9 @@ private struct PrivacySettingsTab: View {
                 .pickerStyle(.menu)
             }
 
-            Section("统计") {
-                Toggle("匿名使用统计（尚未启用）", isOn: Binding(
-                    get: { center.collectAnalytics },
-                    set: { center.collectAnalytics = $0 }
-                ))
-                .disabled(true)
-                .help("当前版本尚未接入匿名使用统计。")
-            }
-
             // AJ-28：文件访问权限设置入口 —— 联动 ToolExecutor.allowedRoot / deniedRoots。
             Section {
-                LabeledContent("可访问根目录") {
+                LabeledContent("授权目录") {
                     Text(center.effectiveAllowedRoot)
                         .font(typography?.monospaced ?? .system(.body, design: .monospaced))
                         .lineLimit(2)
@@ -3311,7 +3585,7 @@ private struct PrivacySettingsTab: View {
                     Button("添加") {
                         if center.setFileAccessAllowedRoot(newAllowedRoot) {
                             newAllowedRoot = ""
-                            showFeedback("授权根目录已更新。")
+                            showFeedback("授权目录已更新。")
                         } else {
                             showFeedback("请输入有效的绝对路径（以 / 开头）。", isError: true)
                         }
@@ -3321,7 +3595,7 @@ private struct PrivacySettingsTab: View {
 
                 if !center.effectiveDeniedRoots.isEmpty {
                     Divider()
-                    Text("被拒绝的目录")
+                    Text("拒绝目录")
                         .font(typography?.caption ?? .caption)
                         .foregroundStyle(.secondary)
                     ForEach(center.effectiveDeniedRoots, id: \.self) { path in
@@ -3345,7 +3619,7 @@ private struct PrivacySettingsTab: View {
                 }
 
                 HStack {
-                    TextField("输入被拒绝目录绝对路径…", text: $newDeniedRoot)
+                    TextField("输入拒绝目录绝对路径…", text: $newDeniedRoot)
                         .textFieldStyle(.roundedBorder)
                     Button("添加") {
                         if center.addFileAccessDeniedRoot(newDeniedRoot) {
@@ -3371,7 +3645,7 @@ private struct PrivacySettingsTab: View {
             } header: {
                 Text("文件访问权限")
             } footer: {
-                Text("Agent 的文件工具（读/写/编辑/终端）只能访问授权根目录内的路径；被拒绝目录即使位于根目录内也会被拦截。默认拒绝目录包含 App 自身数据目录（Application Support）。")
+                Text("Agent 的文件工具（读/写/编辑/终端）只能访问授权目录内的路径；拒绝目录即使位于授权目录内也会被拦截。默认拒绝目录包含 App 自身数据目录（Application Support）。")
             }
 
             Section {
@@ -3430,7 +3704,7 @@ private struct PrivacySettingsTab: View {
             } header: {
                 Text("挂载文件夹")
             } footer: {
-                Text("已挂载的外部文件夹会加入 Agent 可访问白名单；挂载目录在项目会话中可读写。最多同时挂载 \(PrivacySettings.maxMountedFolders) 个。挂载目录同样受被拒绝目录拦截。")
+                Text("已挂载的外部文件夹会加入授权目录；挂载目录在项目会话中可读写。最多同时挂载 \(PrivacySettings.maxMountedFolders) 个。挂载目录同样受拒绝目录拦截。")
             }
         }
         .formStyle(.grouped)
@@ -3452,7 +3726,11 @@ private struct PrivacySettingsTab: View {
             if ExternalSessionMountQualification.requiresDisclosure(forMountedPath: path),
                !confirmExternalSessionMount() { return }
             if center.mountFolder(path) {
-                showFeedback("已挂载文件夹：\(path)")
+                if [".codex", ".claude"].contains((path as NSString).lastPathComponent) {
+                    showFeedback("已挂载文件夹：\(path)。注意：该目录包含 Codex / Claude Code 的外部会话记录，文件工具可读写其中内容；如只需读取会话，建议改挂其中的 sessions 或 projects 子目录。")
+                } else {
+                    showFeedback("已挂载文件夹：\(path)")
+                }
             } else if center.effectiveMountedFolders.contains(path) {
                 showFeedback("该文件夹已在挂载列表中。", isError: true)
             } else if center.effectiveMountedFolders.count >= PrivacySettings.maxMountedFolders {
@@ -3492,6 +3770,7 @@ private struct StorageSettingsTab: View {
     var chatStore: ChatStore? = nil
     @State private var importDraft: SettingsCenter.AtomicBackupDraft?
     @State private var backupProtectionAction: BackupProtectionAction?
+    @State private var backupPasswordError: String?
     @State private var backupOperation: Task<Void, Never>?
     @State private var backupGeneration = UUID()
 
@@ -3660,7 +3939,9 @@ private struct StorageSettingsTab: View {
         .sheet(item: $backupProtectionAction) { action in
             BackupProtectionSheet(
                 action: action,
+                errorMessage: backupPasswordError,
                 onCancel: {
+                    backupPasswordError = nil
                     backupGeneration = UUID()
                     backupOperation?.cancel()
                     backupOperation = nil
@@ -3718,7 +3999,7 @@ private struct StorageSettingsTab: View {
         } catch {
             pendingDeletion = nil
             lastActionIsError = true
-            lastActionMessage = "删除未完成（DELETE-FAILED）。请刷新列表，必要时重新打开应用后再检查。"
+            lastActionMessage = SettingsFailureMessage.deletion(error)
         }
     }
 
@@ -3769,7 +4050,7 @@ private struct StorageSettingsTab: View {
                 }
             } catch {
                 guard generation == backupGeneration, !Task.isCancelled else { return }
-                lastActionMessage = "备份预览未完成（BACKUP-PREVIEW-FAILED）。请检查文件格式与访问权限后重试。"
+                lastActionMessage = SettingsFailureMessage.backup(error, operation: .preview).message
                 lastActionIsError = true
             }
         }
@@ -3783,6 +4064,7 @@ private struct StorageSettingsTab: View {
         let generation = UUID()
         backupGeneration = generation
         let url = action.url
+        backupPasswordError = nil
         backupOperation = Task { @MainActor in
             defer { if generation == backupGeneration { backupOperation = nil } }
             switch action {
@@ -3802,9 +4084,15 @@ private struct StorageSettingsTab: View {
                     lastActionIsError = false
                 } catch {
                     guard generation == backupGeneration, !Task.isCancelled else { return }
-                    backupProtectionAction = nil
-                    lastActionMessage = "备份预览未完成（BACKUP-PREVIEW-FAILED）。请检查文件格式与访问权限后重试。"
-                    lastActionIsError = true
+                    let failure = SettingsFailureMessage.backup(error, operation: .preview)
+                    if failure.needsPasswordRetry {
+                        // 密码错误：留在密码框，原因显示在框内，可直接重输。
+                        backupPasswordError = failure.message
+                    } else {
+                        backupProtectionAction = nil
+                        lastActionMessage = failure.message
+                        lastActionIsError = true
+                    }
                 }
             }
         }
@@ -3884,6 +4172,11 @@ struct AtomicBackupImportSheet: View {
                     .font(.caption)
                     .modifier(ReadableStatusForeground(status: .warning))
             }
+            if !plainHTTPRecoveredProviderNames.isEmpty {
+                Text("备份里的供应商 \(plainHTTPRecoveredProviderNames.joined(separator: "、")) 使用 http 地址，恢复后 Key 会在网络上明文传输，有被截获的风险。仅在你信任该网络和服务时导入。")
+                    .font(.caption)
+                    .modifier(ReadableStatusForeground(status: .warning))
+            }
             if selected.contains(.memories) {
                 Text("明确记忆目标范围；目标必须与备份中的来源一致。")
                 TextField("项目标识", text: $projectID)
@@ -3899,7 +4192,10 @@ struct AtomicBackupImportSheet: View {
                 Text("预演完成：\(preview.selected.count) 个域，现有 \(preview.destinationFileCount) 个文件。确认后先保存完整自动备份，再执行导入。")
                 ForEach(preview.domains, id: \.scope) { domain in Text(Self.conflictSummary(domain)) }
                 Text("预演有效至 \(preview.expiresAt.formatted(date: .omitted, time: .standard))。选择变化后需要重新预演。")
-                Toggle("我已核对恢复范围，并知悉完成后必须重新打开应用", isOn: $acknowledged)
+                Toggle(plainHTTPRecoveredProviderNames.isEmpty
+                       ? "我已核对恢复范围，并知悉完成后必须重新打开应用"
+                       : "我已核对恢复范围，知悉完成后必须重新打开应用，并了解 http 地址会明文传输 Key 的风险",
+                       isOn: $acknowledged)
             }
             if let message { Text(message).textSelection(.enabled) }
                 }
@@ -3938,13 +4234,21 @@ struct AtomicBackupImportSheet: View {
             Text("过程中会暂停数据写入；失败时恢复全部原始目标文件。导入成功后需要重新打开应用。")
         }
     }
+    /// 备份里地址为 http 公网的供应商：恢复后 Key 会以明文在网络上传输。
+    private var plainHTTPRecoveredProviderNames: [String] {
+        guard selected.contains(.settings), let providers = draft.settingsRecovery?.providers else { return [] }
+        return providers.filter {
+            $0.baseURL.map(ProviderEndpointPolicy.isPlainHTTPToPublicHost) == true
+        }.map(\.name)
+    }
+
     private func dryRun() {
         do {
             preview = try center.previewAtomicBackup(draft, selecting: selected, memoryScope: targetScope)
             acknowledged = false; message = nil
         } catch {
             preview = nil
-            message = "备份预览未通过（BACKUP-PREVIEW-FAILED），当前选择与输入已保留。请检查备份文件和密码后重试。"
+            message = "当前选择与输入已保留。" + SettingsFailureMessage.backup(error, operation: .preview).message
         }
     }
     private func commit() {
@@ -3957,7 +4261,10 @@ struct AtomicBackupImportSheet: View {
             } catch {
                 message = center.atomicBackupRecoveryRequired
                     ? "回滚尚未完整验证。数据写入已停止，原始备份和日志已保留；请重新打开应用恢复。"
-                    : "导入未提交（BACKUP-IMPORT-FAILED）。请检查恢复状态，必要时重新打开应用后再继续。"
+                    : {
+                        SettingsFailureMessage.log(code: "BACKUP-IMPORT-FAILED", error: error)
+                        return "导入未提交。请检查恢复状态，必要时重新打开应用后再继续；详情已写入日志。"
+                    }()
             }
             self.preview = nil; acknowledged = false; runningTask = nil
         }
@@ -3968,6 +4275,72 @@ struct AtomicBackupImportSheet: View {
 
 /// 设置中心的「浏览器」Tab：UA 预设/自定义、viewport（默认/自定义宽高）、空闲标签页超时。
 /// 接线 SettingsCenter → AppSettings.browser（持久化），供内置浏览器 WKWebView 消费。
+/// E1 联网搜索设置：选搜索服务、填密钥所在的环境变量名（不在这里存密钥）、SearXNG 地址、条数。
+/// 配置存在 WebSearchSettingsStore；改动对新的对话回合立即生效。
+private struct WebSearchSettingsSection: View {
+    @State private var draft = WebSearchSettingsStore.shared.configuration
+    @State private var saveFailed = false
+
+    private var keyEnvVarName: String {
+        draft.normalized().apiKeyEnvVar ?? draft.backend.defaultKeyEnvVar ?? ""
+    }
+
+    private var keyStatus: String {
+        switch EnvCredentials.resolution(for: keyEnvVarName).status {
+        case .configured: return "已找到该环境变量的值"
+        case .unset: return "还没有这个环境变量，请到「环境变量」里添加"
+        case .invalidName, .disallowedName: return "变量名需以 _API_KEY、_TOKEN 等结尾，例如 BRAVE_API_KEY"
+        }
+    }
+
+    private func save() {
+        saveFailed = !WebSearchSettingsStore.shared.update(draft)
+    }
+
+    var body: some View {
+        Section("联网搜索") {
+            Picker("搜索服务", selection: Binding(
+                get: { draft.backend },
+                set: { draft.backend = $0; save() }
+            )) {
+                ForEach(WebSearchBackend.allCases, id: \.self) { Text($0.displayName).tag($0) }
+            }
+            .accessibilityIdentifier("settings.web-search.backend")
+            if draft.backend == .brave || draft.backend == .tavily {
+                TextField("密钥所在的环境变量名", text: Binding(
+                    get: { draft.apiKeyEnvVar ?? draft.backend.defaultKeyEnvVar ?? "" },
+                    set: { draft.apiKeyEnvVar = $0 }
+                ))
+                .onSubmit { save() }
+                .accessibilityIdentifier("settings.web-search.key-env-var")
+                Text(keyStatus).font(.caption).foregroundStyle(.secondary)
+            }
+            if draft.backend == .searxng {
+                TextField("SearXNG 地址，例如 http://localhost:8080", text: Binding(
+                    get: { draft.searxngBaseURL ?? "" },
+                    set: { draft.searxngBaseURL = $0 }
+                ))
+                .onSubmit { save() }
+                .accessibilityIdentifier("settings.web-search.searxng-url")
+                Text("实例需要在设置里开启 JSON 输出格式。").font(.caption).foregroundStyle(.secondary)
+            }
+            if draft.backend != .off {
+                Stepper("每次最多返回 \(draft.maxResults) 条", value: Binding(
+                    get: { draft.maxResults },
+                    set: { draft.maxResults = $0; save() }
+                ), in: WebSearchConfiguration.maxResultsRange)
+                .accessibilityIdentifier("settings.web-search.max-results")
+            }
+            Text("默认关闭。选好服务并配置好密钥后，对话里才会出现联网搜索；搜索词会发给所选服务，请勿让它搜索私密内容。回车保存输入框里的改动。")
+                .font(.caption).foregroundStyle(.secondary)
+            if saveFailed {
+                Text("保存失败，请检查应用数据目录是否可写。").font(.caption).foregroundStyle(.red)
+            }
+        }
+        .onDisappear { save() }
+    }
+}
+
 private struct BrowserSettingsTab: View {
     @Bindable var center: SettingsCenter
     @Environment(\.typographyTokens) private var typography
@@ -3984,6 +4357,7 @@ private struct BrowserSettingsTab: View {
                 Text("默认开启；点击、输入、下载、上传仍逐项审批，绕过模式也不跳过。可以关闭；备份导入后会关闭，需要你重新开启。仅支持无需登录的同站表单上传；需要登录或额外字段的页面会失败。不自动使用浏览器 Cookie，也不回退到页面文件对象或文件选择器。")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            WebSearchSettingsSection()
             Section("用户代理（User Agent）") {
                 Picker("浏览器身份", selection: Binding(
                     get: { center.userAgentPreset },
@@ -4434,7 +4808,13 @@ private struct MemorySettingsTab: View {
 
             Divider()
 
-            if center.memoryFacts.isEmpty {
+            if center.memoryFacts.isEmpty && center.memoryFactsLoadFailed {
+                ContentUnavailableView {
+                    Label { Text("记忆读取失败") } icon: { MinisIconView(.warning, size: 28) }
+                } description: {
+                    Text("记忆文件读不出来，不是没有记忆。原文件没有被改动，请检查文件后重新打开设置。")
+                }
+            } else if center.memoryFacts.isEmpty {
                 ContentUnavailableView(
                     "暂无记忆",
                     systemImage: "brain",
@@ -4776,7 +5156,8 @@ private struct MemorySettingsTab: View {
             memorySearchError = nil
         } catch {
             clearMemorySearchResult()
-            memorySearchError = "记忆检索未完成（MEMORY-SEARCH-FAILED）。请检查检索词后重试。"
+            memorySearchError = SettingsFailureMessage.memoryAction(
+                error, action: "记忆检索", code: "MEMORY-SEARCH-FAILED", hint: "请检查检索词后重试。")
         }
     }
 
@@ -4827,7 +5208,7 @@ private struct MemorySettingsTab: View {
             expiredDeletion = request
         } catch {
             pendingDeletion = nil
-            lastActionMessage = "删除未完成（DELETE-FAILED）。请刷新列表，必要时重新打开应用后再检查。"
+            lastActionMessage = SettingsFailureMessage.deletion(error)
         }
     }
 
@@ -4859,7 +5240,9 @@ private struct MemorySettingsTab: View {
                 // 总数而不是 Memory tab 的 active 投影，避免文案与文件内容不一致。
                 lastActionMessage = "已导出 \(center.memoryFactTotalCount) 条记忆为 \(receipt.format.label)：\(receipt.url.lastPathComponent)（\(receipt.byteCount) B）"
             } catch {
-                lastActionMessage = "导出未完成（EXPORT-FAILED）。请检查目标目录与写入权限后重试。"
+                lastActionMessage = SettingsFailureMessage.memoryAction(
+                    error, action: "记忆导出", code: "EXPORT-FAILED",
+                    hint: "请检查目标目录与写入权限后重试。", writing: true)
             }
         }
     }
@@ -4898,7 +5281,9 @@ private struct MemorySettingsTab: View {
                 } catch MemoryProposalConsumerError.restoreConflict {
                     lastActionMessage = "导入失败：记忆文件与现有记录冲突；请核对目标会话、项目及文件版本，未写入记忆。"
                 } catch {
-                    lastActionMessage = "导入未完成（IMPORT-FAILED）。请检查文件格式、当前授权和存储空间后重试。"
+                    lastActionMessage = SettingsFailureMessage.memoryAction(
+                        error, action: "记忆导入", code: "IMPORT-FAILED",
+                        hint: "请检查文件格式、当前授权和存储空间后重试。", writing: true)
                 }
             }
         }
@@ -4936,7 +5321,9 @@ private struct MemorySettingsTab: View {
                 lastActionMessage = "已读取 \(preview.factCount) 条记忆，请核对内容和作用域。"
             } catch {
                 guard markdownImportGeneration == generation else { return }
-                lastActionMessage = "Markdown 导入预览未完成（MARKDOWN-PREVIEW-FAILED）。请检查文本格式与文件访问权限后重试。"
+                lastActionMessage = SettingsFailureMessage.memoryAction(
+                    error, action: "Markdown 导入预览", code: "MARKDOWN-PREVIEW-FAILED",
+                    hint: "请检查文本格式与文件访问权限后重试。")
             }
         }
     }
@@ -4954,7 +5341,9 @@ private struct MemorySettingsTab: View {
                 )
                 lastActionMessage = "已导入 \(result.added) 条 Markdown 记忆（跳过重复 \(result.skipped) 条）。"
             } catch {
-                lastActionMessage = "Markdown 导入未完成（MARKDOWN-IMPORT-FAILED）。请刷新待导入内容并重新确认目标范围。"
+                lastActionMessage = SettingsFailureMessage.memoryAction(
+                    error, action: "Markdown 导入", code: "MARKDOWN-IMPORT-FAILED",
+                    hint: "请刷新待导入内容并重新确认目标范围。", writing: true)
             }
         }
     }
@@ -5127,6 +5516,7 @@ struct EnvironmentSettingsTab: View {
     @State private var hasOpenedConnectionFlow = false
     @State private var showingAddSheet = false
     @State private var showingAddProviderSheet = false
+    @State private var showingKeyImportSheet = false
     @State private var editingEntry: EnvVarEntry?
     @State private var editingProvider: EnvVarEntry?
     /// AJ-39：普通环境变量 → 模型供应商 的转换请求（携带自动建议供预填）。
@@ -5167,6 +5557,14 @@ struct EnvironmentSettingsTab: View {
                         .accessibilityIdentifier("settings.environment.add-provider")
 
                         Button {
+                            showingKeyImportSheet = true
+                        } label: {
+                            Label { Text("导入 Key") } icon: { MinisIconView(.download, size: 14) }
+                        }
+                        .help("从环境变量、Claude Code 或 Codex 的配置文件导入 API Key（不导入登录令牌）")
+                        .accessibilityIdentifier("settings.environment.import-key")
+
+                        Button {
                             showingAddSheet = true
                         } label: {
                             Label { Text("新增变量") } icon: { MinisIconView(.add, size: 14) }
@@ -5176,7 +5574,7 @@ struct EnvironmentSettingsTab: View {
                         Button {
                             presentProcessEnvironmentImportPreview()
                         } label: {
-                            Label { Text("从进程导入") } icon: { MinisIconView(.download, size: 14) }
+                            Label { Text("导入本机环境变量") } icon: { MinisIconView(.download, size: 14) }
                         }
                         .accessibilityIdentifier("settings.environment.import-process")
                     }
@@ -5199,6 +5597,8 @@ struct EnvironmentSettingsTab: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
 
+            ChatGPTAccountCard(center: center)
+
             Divider()
 
             if center.envEntries.isEmpty {
@@ -5217,7 +5617,7 @@ struct EnvironmentSettingsTab: View {
                         }
                     }
                     if !plainEnvEntries.isEmpty {
-                        Section("环境变量") {
+                        Section("其它环境变量（供应商之外）") {
                             ForEach(plainEnvEntries) { entry in
                                 envRow(entry)
                             }
@@ -5231,7 +5631,22 @@ struct EnvironmentSettingsTab: View {
         .onAppear {
             if opensProviderConnection, !hasOpenedConnectionFlow {
                 hasOpenedConnectionFlow = true
-                showingAddProviderSheet = true
+                // 已有供应商（但没有可用模型）时直接打开它的编辑表单；没有才新增。
+                let preferredID = ProviderConnectionRoute.preferredProviderID
+                ProviderConnectionRoute.preferredProviderID = nil
+                if preferredID == ChatGPTAccountSession.providerName {
+                    // ChatGPT 账号没有 Key 可编辑：停在页面上方的登录卡，由用户重新登录。
+                } else if let preferredID,
+                   let preferred = center.providerRecords.first(where: {
+                       $0.isProviderRecord && $0.name.caseInsensitiveCompare(preferredID) == .orderedSame
+                   }) {
+                    editingProvider = preferred
+                } else if let repair = ChatStore.providerRecordNeedingRepair(
+                    records: center.providerRecords, readiness: center.providerReadinessStore.records) {
+                    editingProvider = repair
+                } else {
+                    showingAddProviderSheet = true
+                }
             }
         }
         .sheet(isPresented: $showingAddSheet) {
@@ -5251,8 +5666,13 @@ struct EnvironmentSettingsTab: View {
                 if center.saveExplicitlyClassifiedEnvironmentVariable(name: name, value: value, isSecret: isSecret) {
                     lastImportMessage = "已更新 \(EnvVarStore.canonicalName(name))。"
                 } else {
-                    lastImportMessage = "保存失败：变量名不合法（需字母开头，仅含字母/数字/下划线）。"
+                    lastImportMessage = "保存失败：没有写入成功（钥匙串或磁盘写入出错），原值未改动。"
                 }
+            }
+        }
+        .sheet(isPresented: $showingKeyImportSheet) {
+            ProviderKeyImportSheet(center: center) { summary in
+                lastImportMessage = summary
             }
         }
         .sheet(isPresented: $showingAddProviderSheet) {
@@ -5271,12 +5691,16 @@ struct EnvironmentSettingsTab: View {
                 }
             ) { draft in
                 guard !center.providerExists(named: draft.name) else {
-                    lastImportMessage = "保存失败：已存在同名供应商「\(draft.name)」（L1：不允许静默覆盖）。"
+                    lastImportMessage = "保存失败：已存在同名供应商「\(draft.name)」，不会覆盖已有的。请换个名字。"
                     return .failed(.duplicateName)
                 }
                 if center.saveProvider(name: draft.name, credential: draft.credential, baseURL: draft.baseURL,
                                        modelNames: draft.modelNames, protocolType: draft.protocolType, displayName: draft.displayName,
                                        modelContextWindows: draft.modelContextWindows) {
+                    center.envStore.setModelModalityDeclarations(
+                        name: draft.name, image: draft.modelImageInput, audio: draft.modelAudioInput)
+                    center.envStore.setModelMaxOutputTokens(name: draft.name, tokens: draft.modelMaxOutputTokens)
+                    center.envStore.setProviderNetworkOptions(name: draft.name, options: draft.networkOptions)
                     lastImportMessage = "已保存供应商 \(EnvVarStore.canonicalName(draft.name))（\(draft.modelNames.count) 个模型）。"
                     _ = center.startProviderReadinessAfterSave(forProviderName: draft.name)
                     return .saved
@@ -5294,8 +5718,13 @@ struct EnvironmentSettingsTab: View {
                 let modelNames = draft.modelNames
                 let protocolType = draft.protocolType
                 let modelContextWindows = draft.modelContextWindows
+                let modelImageInput = draft.modelImageInput
+                let modelAudioInput = draft.modelAudioInput
+                let modelMaxOutputTokens = draft.modelMaxOutputTokens
+                let networkOptions = draft.networkOptions
+                let envStore = center.envStore
                 return SettingsDeletionRequest(intent: intent, executeAsync: { confirmedIntent in
-                    try await center.renameProviderAsync(
+                    let receipt = try await center.renameProviderAsync(
                         from: old,
                         to: new,
                         apiKey: apiKey,
@@ -5305,6 +5734,11 @@ struct EnvironmentSettingsTab: View {
                         modelContextWindows: modelContextWindows,
                         intent: confirmedIntent
                     )
+                    envStore.setModelModalityDeclarations(
+                        name: new, image: modelImageInput, audio: modelAudioInput)
+                    envStore.setModelMaxOutputTokens(name: new, tokens: modelMaxOutputTokens)
+                    envStore.setProviderNetworkOptions(name: new, options: networkOptions)
+                    return receipt
                 })
             }, onProbe: { name, apiKey, baseURL, protocolType in
                 await center.probeProviderDraft(
@@ -5315,12 +5749,16 @@ struct EnvironmentSettingsTab: View {
                 )
             }) { draft in
                 guard !center.providerExists(named: draft.name, excluding: provider.id) else {
-                    lastImportMessage = "保存失败：已存在同名供应商「\(draft.name)」（L1：不允许静默覆盖）。"
+                    lastImportMessage = "保存失败：已存在同名供应商「\(draft.name)」，不会覆盖已有的。请换个名字。"
                     return .failed(.duplicateName)
                 }
                 if center.saveProvider(name: draft.name, credential: draft.credential, baseURL: draft.baseURL,
                                        modelNames: draft.modelNames, protocolType: draft.protocolType, displayName: draft.displayName,
                                        modelContextWindows: draft.modelContextWindows) {
+                    center.envStore.setModelModalityDeclarations(
+                        name: draft.name, image: draft.modelImageInput, audio: draft.modelAudioInput)
+                    center.envStore.setModelMaxOutputTokens(name: draft.name, tokens: draft.modelMaxOutputTokens)
+                    center.envStore.setProviderNetworkOptions(name: draft.name, options: draft.networkOptions)
                     lastImportMessage = "已更新供应商 \(EnvVarStore.canonicalName(draft.name))。"
                     _ = center.startProviderReadinessAfterSave(forProviderName: draft.name)
                     return .saved
@@ -5340,8 +5778,13 @@ struct EnvironmentSettingsTab: View {
                 let modelNames = draft.modelNames
                 let protocolType = draft.protocolType
                 let modelContextWindows = draft.modelContextWindows
+                let modelImageInput = draft.modelImageInput
+                let modelAudioInput = draft.modelAudioInput
+                let modelMaxOutputTokens = draft.modelMaxOutputTokens
+                let networkOptions = draft.networkOptions
+                let envStore = center.envStore
                 return SettingsDeletionRequest(intent: intent, executeAsync: { confirmedIntent in
-                    try await center.renameProviderAsync(
+                    let receipt = try await center.renameProviderAsync(
                         from: old,
                         to: new,
                         apiKey: apiKey,
@@ -5351,6 +5794,11 @@ struct EnvironmentSettingsTab: View {
                         modelContextWindows: modelContextWindows,
                         intent: confirmedIntent
                     )
+                    envStore.setModelModalityDeclarations(
+                        name: new, image: modelImageInput, audio: modelAudioInput)
+                    envStore.setModelMaxOutputTokens(name: new, tokens: modelMaxOutputTokens)
+                    envStore.setProviderNetworkOptions(name: new, options: networkOptions)
+                    return receipt
                 })
             }, onProbe: { name, apiKey, baseURL, protocolType in
                 await center.probeProviderDraft(
@@ -5361,12 +5809,16 @@ struct EnvironmentSettingsTab: View {
                 )
             }) { draft in
                 guard !center.providerExists(named: draft.name) || draft.name.caseInsensitiveCompare(request.entry.name) == .orderedSame else {
-                    lastImportMessage = "保存失败：已存在同名供应商「\(draft.name)」（L1：不允许静默覆盖）。"
+                    lastImportMessage = "保存失败：已存在同名供应商「\(draft.name)」，不会覆盖已有的。请换个名字。"
                     return .failed(.duplicateName)
                 }
                 if center.saveProvider(name: draft.name, credential: draft.credential, baseURL: draft.baseURL,
                                        modelNames: draft.modelNames, protocolType: draft.protocolType, displayName: draft.displayName,
                                        modelContextWindows: draft.modelContextWindows) {
+                    center.envStore.setModelModalityDeclarations(
+                        name: draft.name, image: draft.modelImageInput, audio: draft.modelAudioInput)
+                    center.envStore.setModelMaxOutputTokens(name: draft.name, tokens: draft.modelMaxOutputTokens)
+                    center.envStore.setProviderNetworkOptions(name: draft.name, options: draft.networkOptions)
                     _ = center.startProviderReadinessAfterSave(forProviderName: draft.name)
                     lastImportMessage = "已将 \(EnvVarStore.canonicalName(draft.name)) 转为模型供应商（\(draft.modelNames.count) 个模型）。"
                     return .saved
@@ -5578,8 +6030,19 @@ struct EnvironmentSettingsTab: View {
                     .help(provider.modelNames.joined(separator: "、"))
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("逐个模型测试")
-                        .font((typography?.caption ?? .caption).weight(.medium))
+                    HStack(spacing: 8) {
+                        Text("逐个模型测试")
+                            .font((typography?.caption ?? .caption).weight(.medium))
+                        if provider.modelNames.count > 1 {
+                            Button("检查全部") {
+                                _ = center.startCheckAllProviderModels(forProviderName: provider.name)
+                            }
+                            .buttonStyle(.borderless)
+                            .font(typography?.caption ?? .caption)
+                            .accessibilityIdentifier("settings.provider.model.readiness.check-all.\(provider.name)")
+                            .help("依次检查该供应商的全部模型（同时最多 3 个）")
+                        }
+                    }
                     ForEach(provider.modelNames, id: \.self) { modelID in
                         savedModelReadinessRow(provider: provider, modelID: modelID)
                     }
@@ -5770,7 +6233,7 @@ struct EnvironmentSettingsTab: View {
         let modelID = rawModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         let state = center.providerModelReadiness(for: provider, modelID: modelID)
         let isLoading = state?.status == .loading
-        let actionTitle = state?.status == .failed ? "重试" : "检查"
+        let actionTitle = state?.status == .failed ? "重试" : "测试连接"
         let actionIcon = state?.status == .failed ? "arrow.clockwise" : "checkmark.shield"
         let isBoundBuiltIn = ChatStore.chatProviderTypes.contains {
             $0.rawValue.caseInsensitiveCompare(provider.name) == .orderedSame
@@ -6131,7 +6594,7 @@ struct EnvironmentSettingsTab: View {
             expiredDeletion = request
         } catch {
             pendingDeletion = nil
-            lastImportMessage = "删除未完成（DELETE-FAILED）。请刷新列表，必要时重新打开应用后再检查。"
+            lastImportMessage = SettingsFailureMessage.deletion(error)
         }
     }
 
@@ -6153,6 +6616,7 @@ struct EnvironmentSettingsTab: View {
 }
 
 private struct ProviderReadinessReportView: View {
+    @Environment(\.themeTokens) private var theme
     let report: SettingsProviderReadinessReport
     @Environment(\.typographyTokens) private var typography
 
@@ -6202,7 +6666,7 @@ private struct ProviderReadinessReportView: View {
             Text("\(name)：\(stageName(stage.status))")
         } icon: {
             MinisIconView(stage.status == .passed ? .check : .status, size: 14)
-                .foregroundPalette(stage.status == .failed ? .red : .secondary)
+                .foregroundPalette(stage.status == .failed ? (theme?.statusDanger ?? AppStatusColor.danger) : Color.secondary)
         }
     }
 
@@ -6239,10 +6703,10 @@ private struct ProviderReadinessReportView: View {
 
     private var stateColor: Color {
         switch report.state {
-        case .mock, .local: return .green
-        case .live: return .blue
-        case .beta: return .orange
-        case .blocked: return .red
+        case .mock, .local: return theme?.statusSuccess ?? AppStatusColor.success
+        case .live: return theme?.statusInfo ?? AppStatusColor.info
+        case .beta: return theme?.statusWarning ?? AppStatusColor.warning
+        case .blocked: return theme?.statusDanger ?? AppStatusColor.danger
         case .unverified: return .secondary
         }
     }
@@ -6399,7 +6863,7 @@ private struct EnvVarProcessImportPreviewSheet: View {
     var body: some View {
         ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("从进程导入预览")
+                Text("导入本机环境变量预览")
                     .font(typography?.headline ?? .headline)
                 Text("仅新增，不覆盖。以下为进程环境与当前存储的只读比对；确认前不会写入任何数据。")
                     .font(typography?.caption ?? .caption)
@@ -6518,6 +6982,27 @@ private struct ProviderEditDraft {
     let protocolType: ProviderWireProtocol
     /// C8：自定义模型窗口（tokens），键为 `modelNames` 中的模型名；留空的行不出现。
     let modelContextWindows: [String: Int]
+    /// 用户与推断不一致的图片/音频输入声明（与推断一致的不写入，推断升级可继续生效）。
+    let modelImageInput: [String: Bool]
+    let modelAudioInput: [String: Bool]
+    /// 自定义模型的单次最大输出（tokens），键为 `modelNames` 中的模型名；留空的行不出现。
+    let modelMaxOutputTokens: [String: Int]
+    /// 自定义请求头与代理（默认值 = 无自定义头、跟随系统代理）。
+    let networkOptions: ProviderNetworkOptions
+}
+
+/// 供应商编辑表单的一行自定义请求头。
+private struct ProviderHeaderRow: Identifiable {
+    let id = UUID()
+    var name: String = ""
+    var value: String = ""
+    /// true：`value` 是环境变量名，运行时才取值（密钥类内容用这个）。
+    var valueIsEnvVar: Bool = false
+
+    var isBlank: Bool {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 private struct ProviderModelRow: Identifiable {
@@ -6525,6 +7010,19 @@ private struct ProviderModelRow: Identifiable {
     var modelName: String
     /// C8：窗口大小输入文本；留空 = 按目录/启发式。
     var contextWindowText: String = ""
+    /// 最大输出输入文本；留空 = 按内置目录或默认值请求。
+    var maxOutputText: String = ""
+    /// 用户显式勾选/取消；nil = 未声明，显示与保存都按模型名推断。
+    var imageInputOverride: Bool?
+    var audioInputOverride: Bool?
+    var supportsImage: Bool {
+        get { imageInputOverride ?? ModelModalityInference.supportsImageInput(modelID: modelName) }
+        set { imageInputOverride = newValue }
+    }
+    var supportsAudio: Bool {
+        get { audioInputOverride ?? ModelModalityInference.supportsAudioInput(modelID: modelName) }
+        set { audioInputOverride = newValue }
+    }
 }
 
 /// C8：供应商模型“窗口大小（tokens）”输入的解析。留空合法（按目录/启发式取值），
@@ -6758,6 +7256,7 @@ enum ProviderEditSaveTransition: Equatable, Sendable {
 }
 
 private struct ProviderEditSheet: View {
+    @Environment(\.themeTokens) private var theme
     let existing: EnvVarEntry?
     private let credentialSettings: SettingsCenter?
     @State private var credentialControlsModel: ProviderCredentialControlsModel?
@@ -6777,11 +7276,19 @@ private struct ProviderEditSheet: View {
     @State private var baseURL = ""
     @State private var protocolType: ProviderWireProtocol = .openaiCompatible
     @State private var modelRows: [ProviderModelRow] = []
+    @State private var headerRows: [ProviderHeaderRow] = []
+    @State private var proxyMode: ProviderProxySetting.Mode = .system
+    @State private var proxyURL = ""
     @State private var pendingRename: SettingsDeletionRequest?
     @State private var errorMessage: String?
     @State private var providerRecoveryState: ProviderRecoveryState = .idle
     @State private var draftProbeState: ProviderDraftProbeState = .idle
     @State private var draftProbeTask: Task<Void, Never>?
+    /// 最近一次由显示名自动推导出的凭据名（用来判断用户是否手改过）。
+    @State private var autoDerivedName: String?
+    /// S11：目录里被勾选要追加的模型（获取成功后默认全选）与搜索词。
+    @State private var catalogSelection: Set<String> = []
+    @State private var catalogSearch = ""
     @FocusState private var focusedField: ProviderEditFocus?
     @State private var didInitializeDraft = false
     /// U-04：新增供应商时的预设选择状态（仅新增路径使用）。
@@ -6862,6 +7369,26 @@ private struct ProviderEditSheet: View {
         }
     }
 
+    /// 有模型名的行里，最大输出文本非空且不是正整数的行。
+    private var hasInvalidMaxOutputRow: Bool {
+        modelRows.contains { row in
+            !row.modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && ProviderModelContextWindowInput.parse(row.maxOutputText) == .invalid
+        }
+    }
+
+    private var cleanedModelMaxOutputTokens: [String: Int] {
+        var result: [String: Int] = [:]
+        for row in modelRows {
+            let name = row.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty,
+                  case .valid(let limit) = ProviderModelContextWindowInput.parse(row.maxOutputText)
+            else { continue }
+            result[name] = limit
+        }
+        return result
+    }
+
     private var cleanedModelContextWindows: [String: Int] {
         var result: [String: Int] = [:]
         for row in modelRows {
@@ -6874,31 +7401,160 @@ private struct ProviderEditSheet: View {
         return result
     }
 
+    /// 仅记录与推断不一致的声明；同一模型名多行时以首行为准。
+    private var cleanedModalityDeclarations: (image: [String: Bool], audio: [String: Bool]) {
+        var image: [String: Bool] = [:]
+        var audio: [String: Bool] = [:]
+        for row in modelRows {
+            let name = row.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            if let value = row.imageInputOverride,
+               value != ModelModalityInference.supportsImageInput(modelID: name), image[name] == nil {
+                image[name] = value
+            }
+            if let value = row.audioInputOverride,
+               value != ModelModalityInference.supportsAudioInput(modelID: name), audio[name] == nil {
+                audio[name] = value
+            }
+        }
+        return (image, audio)
+    }
+
+    /// 表单里的请求头与代理（空行忽略）。
+    private var cleanedNetworkOptions: ProviderNetworkOptions {
+        ProviderNetworkOptions(
+            headers: headerRows.filter { !$0.isBlank }.map {
+                ProviderCustomHeader(
+                    name: $0.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    value: $0.value.trimmingCharacters(in: .whitespacesAndNewlines),
+                    valueIsEnvVar: $0.valueIsEnvVar)
+            },
+            proxy: ProviderProxySetting(
+                mode: proxyMode,
+                url: proxyMode == .custom ? proxyURL.trimmingCharacters(in: .whitespacesAndNewlines) : nil))
+    }
+
+    /// 第一条不合法请求头或代理地址的中文说明；nil = 全部可用。
+    private var networkOptionsProblem: String? {
+        let options = cleanedNetworkOptions
+        for header in options.headers {
+            switch ProviderNetworkOptionsPolicy.issue(for: header) {
+            case .invalidName: return "请求头名称「\(header.name)」不合法，只能用英文字母、数字和连字符。"
+            case .reservedName: return "请求头「\(header.name)」是认证或协议头，不能自定义。"
+            case .emptyValue: return "请求头「\(header.name)」的值不能为空。"
+            case .invalidValue: return "请求头「\(header.name)」的值不合法（环境变量名只能含字母、数字、下划线，值里不能有换行）。"
+            case nil: continue
+            }
+        }
+        if options.proxy.mode == .custom,
+           (try? ProviderNetworkOptionsPolicy.proxyDictionary(for: options.proxy)) == nil {
+            return "代理地址不合法：请填 http:// 或 https:// 开头的地址，如 http://127.0.0.1:7890，不要带用户名密码。"
+        }
+        return nil
+    }
+
+    /// 已保存的 Key 是否仍可沿用：只有 Base URL 和协议都没变时才可以。
+    /// 任一变化都必须重新输入 Key，避免把旧 Key 发给新地址（安全）。
+    private var savedCredentialUsable: Bool {
+        guard let existing, existing.isProviderRecord, existing.isSecret, existing.valueInKeychain else { return false }
+        func normalized(_ value: String) -> String {
+            var text = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            while text.hasSuffix("/") { text.removeLast() }
+            return text
+        }
+        return normalized(effectiveBaseURL) == normalized(existing.baseURL ?? "")
+            && protocolType == existing.protocolType
+    }
+
+    /// 编辑中且已有保存的 Key，但地址或协议改了、又没重输 Key。
+    private var needsKeyReentryAfterEndpointChange: Bool {
+        guard let existing, existing.isProviderRecord, existing.isSecret, existing.valueInKeychain else { return false }
+        return !savedCredentialUsable && !blankKeyAllowed
+            && apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 保存前还缺哪些项（列出来，而不是让保存按钮悄悄变灰）。
+    private var missingItems: [String] {
+        var items: [String] = []
+        if name.trimmingCharacters(in: .whitespaces).isEmpty { items.append("服务商标识") }
+        let hasKeyInput = !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasKeyInput && !savedCredentialUsable && !blankKeyAllowed { items.append("API Key") }
+        if effectiveBaseURL.isEmpty { items.append("Base URL") }
+        if cleanedModelNames.isEmpty && !blankKeyAllowed { items.append("模型名（可用“获取模型列表”选择）") }
+        return items
+    }
+
+    /// 内置供应商占用的凭据名；自动推导时不能与它们重名，免得新供应商悄悄绑到内置路由。
+    private static let builtinCredentialNames: Set<String> = [
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY",
+        "DASHSCOPE_API_KEY", "GEMINI_API_KEY", "MOONSHOT_API_KEY", "ZHIPU_API_KEY", "SILICONFLOW_API_KEY",
+        "HERMES_CUSTOM_NEW_API_KEY", "OLLAMA_API_KEY", "LMSTUDIO_API_KEY"
+    ]
+
+    /// 由显示名推导凭据名：只留英文字母和数字，其余变下划线；结果以 _API_KEY 结尾，且不与内置名重名。
+    static func derivedCredentialName(fromDisplayName displayName: String) -> String? {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var slug = ""
+        for scalar in trimmed.uppercased().unicodeScalars {
+            if scalar.isASCII, CharacterSet.alphanumerics.contains(scalar) {
+                slug.unicodeScalars.append(scalar)
+            } else if !slug.hasSuffix("_") {
+                slug += "_"
+            }
+        }
+        slug = slug.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        if slug.isEmpty { slug = "CUSTOM" }
+        if let first = slug.unicodeScalars.first, CharacterSet.decimalDigits.contains(first) { slug = "P_" + slug }
+        var candidate = slug + "_API_KEY"
+        if builtinCredentialNames.contains(candidate) { candidate = slug + "_CUSTOM_API_KEY" }
+        return candidate
+    }
+
     private var canSave: Bool {
-        let hasExistingProviderReference = existing.map {
-            $0.isProviderRecord && $0.isSecret && $0.valueInKeychain
-        } == true
+        let hasExistingProviderReference = savedCredentialUsable
         let hasCredentialInput = !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         return !name.trimmingCharacters(in: .whitespaces).isEmpty
-            && (hasCredentialInput || hasExistingProviderReference)
+            && (hasCredentialInput || hasExistingProviderReference || blankKeyAllowed)
             && (isEditing || !EnvVarStore.canonicalName(name).isEmpty)
             && !hasInvalidContextWindowRow
+            && !hasInvalidMaxOutputRow
+            && networkOptionsProblem == nil
     }
 
     private var credentialForSave: ProviderCredentialUpdate {
         let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
-            let hasExistingProviderReference = existing.map {
-                $0.isProviderRecord && $0.isSecret && $0.valueInKeychain
-            } == true
-            return hasExistingProviderReference ? .keepExisting : .missing
+            let hasExistingProviderReference = savedCredentialUsable
+            if hasExistingProviderReference { return .keepExisting }
+            // 本机/局域网模型服务不需要 Key：内部存一个占位值，聊天与检查连接都能照常工作。
+            return blankKeyAllowed ? .replace(ProviderEndpointPolicy.localPlaceholderAPIKey) : .missing
         }
         return .replace(trimmed)
     }
 
+    private var trimmedBaseURL: String {
+        baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// S9：当前凭据名对应的预设默认地址（没有预设则为 nil）。
+    private var presetDefaultBaseURL: String? {
+        ProviderPreset.defaultBaseURL(forCredentialName: name)
+    }
+
+    /// 基础地址留空时用预设默认地址。
+    private var effectiveBaseURL: String {
+        trimmedBaseURL.isEmpty ? (presetDefaultBaseURL ?? "") : trimmedBaseURL
+    }
+
+    /// S1：基础地址是本机或私网时，API Key 可以留空。
+    private var blankKeyAllowed: Bool {
+        ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: effectiveBaseURL)
+    }
+
     private var canProbe: Bool {
-        !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        (!apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || blankKeyAllowed || savedCredentialUsable)
+            && !effectiveBaseURL.isEmpty
     }
 
     var body: some View {
@@ -6915,7 +7571,7 @@ private struct ProviderEditSheet: View {
                 let safeMessage = ProviderStatusTextProjection.project(errorMessage)
                 Text(safeMessage)
                     .font(typography?.caption ?? .caption)
-                    .foregroundStyle(Color.red)
+                    .foregroundStyle(theme?.statusDangerText ?? AppStatusColor.danger)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel("保存错误")
                     .accessibilityValue(safeMessage)
@@ -6926,23 +7582,28 @@ private struct ProviderEditSheet: View {
                 Text("显示名").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
                 TextField("如 我的模型服务", text: $displayName)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("显示名")
                     .accessibilityIdentifier("settings.provider.displayName")
-                Text("修改显示名不会更改内部编号、凭据引用或历史归属。")
+                Text("修改显示名不会更改服务商标识、密钥引用或历史归属。")
                     .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("内部编号 / 凭据名").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                Text("服务商标识（也是密钥的保存名）").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                Text("用来在本机区分不同服务商、保存 API Key，不会发给模型；建议用英文大写加下划线。")
+                    .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
                 // 编辑时也可改名（保存时 onRename 删除旧记录，防 upsert 残留）。
                 TextField("如 MY_PROVIDER_API_KEY", text: $name)
                     .font(typography?.monospaced ?? .system(.body, design: .monospaced))
                     .textFieldStyle(.roundedBorder)
                     .focused($focusedField, equals: .name)
+                    .accessibilityLabel("服务商标识")
                     .onSubmit { focusedField = .apiKey }
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("API Key").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                Text(blankKeyAllowed ? "API Key（本机或局域网服务可留空）" : "API Key")
+                    .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
                 ProviderSecretField(
                     value: $apiKey,
                     focus: $focusedField,
@@ -6954,11 +7615,13 @@ private struct ProviderEditSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Base URL（可选）").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
-                TextField("如 https://api.openai.com/v1", text: $baseURL)
+                Text(presetDefaultBaseURL == nil ? "Base URL" : "Base URL（可选，留空使用预设地址）")
+                    .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                TextField(presetDefaultBaseURL ?? "如 https://api.openai.com/v1", text: $baseURL)
                     .font(typography?.monospaced ?? .system(.body, design: .monospaced))
                     .textFieldStyle(.roundedBorder)
                     .focused($focusedField, equals: .baseURL)
+                    .accessibilityLabel("服务地址（Base URL）")
                     .accessibilityIdentifier("settings.provider.baseURL")
                     .onSubmit {
                         if let firstModel = modelRows.first {
@@ -6967,6 +7630,17 @@ private struct ProviderEditSheet: View {
                             submitIfValid()
                         }
                     }
+                if effectiveBaseURL.isEmpty {
+                    Text("没有默认地址：留空会导致无法检查连接，请填写服务商提供的基础地址。")
+                        .font(typography?.caption ?? .caption)
+                        .modifier(ReadableStatusForeground(status: .warning))
+                        .accessibilityIdentifier("settings.provider.baseURL.missing")
+                } else if ProviderEndpointPolicy.isPlainHTTPToPublicHost(effectiveBaseURL) {
+                    Text("该地址使用 http，明文传输 Key 有风险；仅在你信任该网络和服务时使用。")
+                        .font(typography?.caption ?? .caption)
+                        .modifier(ReadableStatusForeground(status: .warning))
+                        .accessibilityIdentifier("settings.provider.baseURL.plainHTTP")
+                }
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -6978,7 +7652,15 @@ private struct ProviderEditSheet: View {
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
+                .accessibilityLabel("接口协议类型")
                 .help("该 Base URL 支持的接口协议（参照 Codex/Hermes 的 wire API 类型）")
+            }
+
+            if needsKeyReentryAfterEndpointChange {
+                Text("Base URL 或协议已更改：为避免把已保存的 Key 发给新地址，请重新输入 API Key。")
+                    .font(typography?.caption ?? .caption)
+                    .foregroundStyle(theme?.statusWarningText ?? AppStatusColor.warning)
+                    .accessibilityIdentifier("settings.provider.reenterKeyHint")
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -7012,20 +7694,7 @@ private struct ProviderEditSheet: View {
                         .font(typography?.caption ?? .caption)
                         .foregroundStyle(.secondary)
                 case .loaded(let modelIDs):
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("已发现 \(modelIDs.count) 个模型")
-                            .font(typography?.caption ?? .caption)
-                            .foregroundStyle(.secondary)
-                        Text(modelIDs.joined(separator: "、"))
-                            .font(typography?.caption2 ?? .system(.caption, design: .monospaced))
-                            .lineLimit(3)
-                        Button("应用目录") {
-                            applyDiscoveredModels(modelIDs)
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityIdentifier("settings.provider.fetchModels.apply")
-                        .help("保留手动模型，仅追加目录中的新模型")
-                    }
+                    catalogPicker(modelIDs)
                 case .empty:
                     Text("目录为空，没有可应用的模型。")
                         .font(typography?.caption ?? .caption)
@@ -7064,12 +7733,20 @@ private struct ProviderEditSheet: View {
                             .modifier(ReadableStatusForeground(status: .danger))
                             .accessibilityIdentifier("settings.provider.context-window.invalid")
                     }
+                    if hasInvalidMaxOutputRow {
+                        Text("最大输出必须是正整数（或留空）。")
+                            .font(typography?.caption ?? .caption)
+                            .modifier(ReadableStatusForeground(status: .danger))
+                            .accessibilityIdentifier("settings.provider.max-output.invalid")
+                    }
                     ForEach($modelRows) { $row in
+                        VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 8) {
                             TextField("模型名，如 gpt-4o", text: $row.modelName)
                                 .font(typography?.monospaced ?? .system(.body, design: .monospaced))
                                 .textFieldStyle(.roundedBorder)
                                 .focused($focusedField, equals: .model(row.id))
+                                .accessibilityLabel("模型名")
                                 .accessibilityIdentifier(modelAccessibilityIdentifier(for: row))
                                 .onSubmit {
                                     if let next = modelRows.drop(while: { $0.id != row.id }).dropFirst().first {
@@ -7082,6 +7759,7 @@ private struct ProviderEditSheet: View {
                                 .font(typography?.monospaced ?? .system(.body, design: .monospaced))
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 150)
+                                .accessibilityLabel("上下文窗口大小（tokens）")
                                 .accessibilityIdentifier(modelAccessibilityIdentifier(for: row) + ".context-window")
                                 .help("留空 = 按内置目录或默认值；填写后作为该模型的上下文窗口")
                             Button(role: .destructive) {
@@ -7093,10 +7771,53 @@ private struct ProviderEditSheet: View {
                             .help("删除该模型")
                             .accessibilityLabel("删除该模型")
                         }
+                        HStack(spacing: 16) {
+                            Toggle("支持图片", isOn: $row.supportsImage)
+                                .accessibilityIdentifier(modelAccessibilityIdentifier(for: row) + ".image-input")
+                                .help("默认按模型名推断；勾选后该模型可接收图片附件")
+                            Toggle("支持音频", isOn: $row.supportsAudio)
+                                .accessibilityIdentifier(modelAccessibilityIdentifier(for: row) + ".audio-input")
+                                .help("默认按模型名推断；勾选后该模型可接收音频附件")
+                            TextField("最大输出（tokens，可选）", text: $row.maxOutputText)
+                                .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 190)
+                                .accessibilityLabel("单次最大输出（tokens，可选）")
+                                .accessibilityIdentifier(modelAccessibilityIdentifier(for: row) + ".max-output")
+                                .help("留空 = 按内置目录或默认值请求；该模型的单次输出上限低于默认值时请填写，否则服务商可能拒绝请求")
+                        }
+                        .toggleStyle(.checkbox)
+                        .font(typography?.caption ?? .caption)
+                        if row.contextWindowText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           !row.modelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           ModelContextWindowCatalog.usesFallbackWindow(
+                               explicitWindow: nil,
+                               modelID: row.modelName.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                            Text("上下文窗口为估计值（按 128,000 计），可在上面的窗口大小里改成实际值。")
+                                .font(typography?.caption ?? .caption)
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier(modelAccessibilityIdentifier(for: row) + ".context-window.estimated")
+                        }
+                        }
                     }
                 }
             }
 
+            networkOptionsSection
+
+            if !missingItems.isEmpty {
+                Text("还缺：" + missingItems.joined(separator: "、"))
+                    .font(typography?.caption ?? .caption)
+                    .modifier(ReadableStatusForeground(status: .warning))
+                    .accessibilityIdentifier("settings.provider.missingItems")
+            }
+
+            if cleanedModelNames.isEmpty, catalogSelection.isEmpty {
+                Text("还没有添加模型，保存后不能对话。可先点“获取模型列表”，或手动添加模型名。")
+                    .font(typography?.caption ?? .caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("settings.provider.noModelsHint")
+            }
             HStack {
                 Spacer()
                 Button("取消") {
@@ -7133,6 +7854,16 @@ private struct ProviderEditSheet: View {
                 credentialControlsModel?.close()
             }
         }
+        // 新增时凭据名留空（或仍是上次自动推导的值）就跟着显示名自动推导，用户手改后不再覆盖。
+        .onChange(of: displayName) { _, value in
+            guard existing == nil else { return }
+            let current = name.trimmingCharacters(in: .whitespaces)
+            guard current.isEmpty || current == autoDerivedName else { return }
+            if let derived = Self.derivedCredentialName(fromDisplayName: value) {
+                autoDerivedName = derived
+                name = derived
+            }
+        }
         .onDisappear { credentialControlsModel?.close() }
         .onAppear {
             if let existing {
@@ -7142,7 +7873,8 @@ private struct ProviderEditSheet: View {
             didInitializeDraft = true
             if let existing {
                 name = existing.name
-                displayName = existing.providerDisplayName
+                // 与列表标题同一规则（按 Base URL 认出内置服务商），保存时不会把名字换掉。
+                displayName = ProviderDisplayLabel.resolve(record: existing)
                 // Never read a legacy plaintext value or a Keychain-backed
                 // value into the form. A replacement is explicit user input;
                 // an existing provider record can retain its opaque Keychain
@@ -7156,13 +7888,23 @@ private struct ProviderEditSheet: View {
                     modelRows = existing.modelNames.map { name in
                         ProviderModelRow(
                             modelName: name,
-                            contextWindowText: existing.modelContextWindows?[name].map(String.init) ?? ""
+                            contextWindowText: existing.modelContextWindows?[name].map(String.init) ?? "",
+                            maxOutputText: existing.modelMaxOutputTokens?[name].map(String.init) ?? "",
+                            imageInputOverride: existing.modelImageInput?[name],
+                            audioInputOverride: existing.modelAudioInput?[name]
                         )
                     }
                 } else if let suggestion {
                     baseURL = suggestion.baseURL ?? ""
                     protocolType = suggestion.protocolType
                     modelRows = suggestion.modelNames.map { ProviderModelRow(modelName: $0) }
+                }
+                if let options = existing.networkOptions {
+                    headerRows = options.headers.map {
+                        ProviderHeaderRow(name: $0.name, value: $0.value, valueIsEnvVar: $0.valueIsEnvVar)
+                    }
+                    proxyMode = options.proxy.mode
+                    proxyURL = options.proxy.url ?? ""
                 }
             }
             // 新增或转换时默认给一行空白模型输入，降低首次使用门槛。
@@ -7183,19 +7925,158 @@ private struct ProviderEditSheet: View {
         }
     }
 
+    /// 自定义请求头与代理（高级，默认折叠不影响现有流程：不填就是无自定义头、跟随系统代理）。
+    @ViewBuilder
+    private var networkOptionsSection: some View {
+        DisclosureGroup("高级：自定义请求头与代理") {
+            VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("自定义请求头").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            headerRows.append(ProviderHeaderRow())
+                        } label: {
+                            Label { Text("添加请求头") } icon: { MinisIconView(.add, size: 14) }
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("settings.provider.headers.add")
+                    }
+                    Text("不能设置认证和协议头（如 Authorization、Content-Type）。密钥类的值请勾选“环境变量名”，只保存变量名，不保存密钥本身。")
+                        .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                    ForEach($headerRows) { $row in
+                        HStack(spacing: 8) {
+                            TextField("名称，如 X-Org-Id", text: $row.name)
+                                .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                                .textFieldStyle(.roundedBorder)
+                                .accessibilityLabel("请求头名称")
+                            TextField(row.valueIsEnvVar ? "环境变量名，如 MY_ORG_TOKEN" : "值", text: $row.value)
+                                .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                                .textFieldStyle(.roundedBorder)
+                                .accessibilityLabel("请求头的值")
+                            Toggle("环境变量名", isOn: $row.valueIsEnvVar)
+                                .toggleStyle(.checkbox)
+                                .font(typography?.caption ?? .caption)
+                            Button(role: .destructive) {
+                                headerRows.removeAll { $0.id == row.id }
+                            } label: {
+                                MinisIconView(.delete, size: 12)
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("删除该请求头")
+                        }
+                    }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("代理").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                    Picker("", selection: $proxyMode) {
+                        Text("跟随系统").tag(ProviderProxySetting.Mode.system)
+                        Text("不用代理").tag(ProviderProxySetting.Mode.direct)
+                        Text("指定地址").tag(ProviderProxySetting.Mode.custom)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityLabel("代理方式")
+                    .accessibilityIdentifier("settings.provider.proxy.mode")
+                    if proxyMode == .custom {
+                        TextField("如 http://127.0.0.1:7890", text: $proxyURL)
+                            .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                            .textFieldStyle(.roundedBorder)
+                            .accessibilityLabel("代理地址")
+                            .accessibilityIdentifier("settings.provider.proxy.url")
+                    }
+                }
+                if let problem = networkOptionsProblem {
+                    Text(problem)
+                        .font(typography?.caption ?? .caption)
+                        .modifier(ReadableStatusForeground(status: .danger))
+                        .accessibilityIdentifier("settings.provider.network.invalid")
+                }
+            }
+            .padding(.top, 6)
+        }
+        .accessibilityIdentifier("settings.provider.network.group")
+    }
+
+    private func filteredCatalog(_ modelIDs: [String]) -> [String] {
+        let query = catalogSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return modelIDs }
+        return modelIDs.filter { $0.lowercased().contains(query) }
+    }
+
+    /// S11：目录可搜索、可勾选；默认全选，只追加勾选的模型。
+    @ViewBuilder
+    private func catalogPicker(_ modelIDs: [String]) -> some View {
+        let visible = filteredCatalog(modelIDs)
+        let selectedCount = modelIDs.filter { catalogSelection.contains($0) }.count
+        VStack(alignment: .leading, spacing: 6) {
+            Text("已发现 \(modelIDs.count) 个模型，已选 \(selectedCount) 个")
+                .font(typography?.caption ?? .caption)
+                .foregroundStyle(.secondary)
+            TextField("搜索模型", text: $catalogSearch)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("settings.provider.fetchModels.search")
+            HStack(spacing: 12) {
+                Button("全选当前列表") { catalogSelection.formUnion(visible) }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("settings.provider.fetchModels.selectAll")
+                Button("取消选择当前列表") { catalogSelection.subtract(visible) }
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("settings.provider.fetchModels.selectNone")
+            }
+            .font(typography?.caption ?? .caption)
+            ScrollView(.vertical) {
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(visible, id: \.self) { modelID in
+                        Toggle(isOn: Binding(
+                            get: { catalogSelection.contains(modelID) },
+                            set: { isOn in
+                                if isOn { catalogSelection.insert(modelID) } else { catalogSelection.remove(modelID) }
+                            }
+                        )) {
+                            Text(modelID)
+                                .font(typography?.caption2 ?? .system(.caption, design: .monospaced))
+                        }
+                        .toggleStyle(.checkbox)
+                    }
+                    if visible.isEmpty {
+                        Text("没有匹配的模型。")
+                            .font(typography?.caption ?? .caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(maxHeight: 160)
+            Button("应用所选（\(selectedCount)）") {
+                applyDiscoveredModels(modelIDs.filter { catalogSelection.contains($0) }, fullCatalog: modelIDs)
+            }
+            .buttonStyle(.borderless)
+            .disabled(selectedCount == 0)
+            .accessibilityIdentifier("settings.provider.fetchModels.apply")
+            .help("保留手动模型，仅追加勾选的新模型")
+        }
+    }
+
     private func submitIfValid() {
         guard canSave else { return }
+        // 已获取模型列表、勾选了模型但没点“应用”就直接保存：自动应用所选，避免存成 0 个模型。
+        if cleanedModelNames.isEmpty, case .loaded(let discovered) = draftProbeState {
+            let picked = discovered.filter { catalogSelection.contains($0) }
+            if !picked.isEmpty { applyDiscoveredModels(picked, fullCatalog: discovered) }
+        }
         let draft = ProviderEditDraft(
             displayName: displayName,
             name: name,
             apiKey: apiKey,
             credential: credentialForSave,
-            baseURL: baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                ? nil
-                : baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            baseURL: effectiveBaseURL.isEmpty ? nil : effectiveBaseURL,
             modelNames: cleanedModelNames,
             protocolType: protocolType,
-            modelContextWindows: cleanedModelContextWindows
+            modelContextWindows: cleanedModelContextWindows,
+            modelImageInput: cleanedModalityDeclarations.image,
+            modelAudioInput: cleanedModalityDeclarations.audio,
+            modelMaxOutputTokens: cleanedModelMaxOutputTokens,
+            networkOptions: cleanedNetworkOptions
         )
         let recoveryScope = existing.flatMap { record in
             record.isProviderRecord
@@ -7324,13 +8205,45 @@ private struct ProviderEditSheet: View {
         draftProbeTask?.cancel()
         draftProbeState = .loading
         draftProbeTask = Task { @MainActor in
+            // 地址和协议都没变时，用已保存的凭据获取模型列表，不必重输 Key；
+            // 任一变化都不会走到这里（canProbe 会要求重新输入 Key）。
+            // 等待期间用户可能改了地址或协议：发出前先记下，等待后复核，变了就丢弃这次请求，
+            // 免得旧 Key 发到新地址。
+            let probeName = name
+            let probeBaseURL = effectiveBaseURL
+            let probeProtocol = protocolType
+            @MainActor func formUnchanged() -> Bool {
+                name == probeName && effectiveBaseURL == probeBaseURL && protocolType == probeProtocol
+            }
+            var probeKey = apiKey
+            if probeKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               savedCredentialUsable, let existing, let credentialSettings {
+                probeKey = await credentialSettings.providerCredentialAsync(named: existing.name) ?? ""
+            }
+            guard !Task.isCancelled else { return }
+            guard formUnchanged() else {
+                draftProbeState = .cancelled
+                draftProbeTask = nil
+                return
+            }
             let result = await onProbe(
-                name,
-                apiKey,
-                baseURL,
-                protocolType
+                probeName,
+                probeKey,
+                probeBaseURL,
+                probeProtocol
             )
             guard !Task.isCancelled else { return }
+            guard formUnchanged() else {
+                // 地址或协议已变，这份目录属于旧地址，不套用到当前表单。
+                draftProbeState = .cancelled
+                draftProbeTask = nil
+                return
+            }
+            if case .loaded(let modelIDs) = result {
+                // 默认勾选可能是对话的模型；向量、重排、语音、图像等名字的模型默认不勾，用户仍可手动勾选。
+                catalogSelection = Set(modelIDs.filter { !ProviderModelNameHeuristics.likelyNonChat($0) })
+                catalogSearch = ""
+            }
             draftProbeState = result
             draftProbeTask = nil
         }
@@ -7342,7 +8255,7 @@ private struct ProviderEditSheet: View {
         draftProbeState = .cancelled
     }
 
-    private func applyDiscoveredModels(_ modelIDs: [String]) {
+    private func applyDiscoveredModels(_ modelIDs: [String], fullCatalog: [String]) {
         let merged = ProviderDraftModelMerger.merge(
             manual: modelRows.map(\.modelName),
             discovered: modelIDs
@@ -7351,8 +8264,15 @@ private struct ProviderEditSheet: View {
             modelRows.map { ($0.modelName, $0.contextWindowText) },
             uniquingKeysWith: { first, _ in first }
         )
-        modelRows = merged.map { ProviderModelRow(modelName: $0, contextWindowText: typedWindows[$0] ?? "") }
-        draftProbeState = .loaded(modelIDs)
+        let typedRows = Dictionary(modelRows.map { ($0.modelName, $0) }, uniquingKeysWith: { first, _ in first })
+        modelRows = merged.map {
+            ProviderModelRow(
+                modelName: $0, contextWindowText: typedWindows[$0] ?? "",
+                maxOutputText: typedRows[$0]?.maxOutputText ?? "",
+                imageInputOverride: typedRows[$0]?.imageInputOverride,
+                audioInputOverride: typedRows[$0]?.audioInputOverride)
+        }
+        draftProbeState = .loaded(fullCatalog)
     }
 }
 

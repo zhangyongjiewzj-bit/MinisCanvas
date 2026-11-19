@@ -203,9 +203,9 @@ struct SessionDocumentWorkspaceView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("\(index + 1). \(stage.name)").font(.headline)
-                Text(stage.execution?.state.rawValue ?? "pending")
+                Text((stage.execution?.state ?? .pending).displayName)
                     .accessibilityIdentifier("document.stage.state.\(stage.id)")
-                Text(stage.status.rawValue).foregroundStyle(.secondary)
+                Text(stage.status.displayName).foregroundStyle(.secondary)
             }
             Picker("Provider / 模型", selection: Binding(
                 get: { chat.chatModelPickerItems.first { $0.providerID == stage.providerID && $0.modelID == stage.modelID }?.id ?? "" },
@@ -319,7 +319,7 @@ struct SessionDocumentWorkspaceView: View {
                 pipeline: pipeline, expectedRevision: current.documentRevision,
                 expectedPipeline: current.documentPipeline)
             state = store.state(for: current.sessionID)
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = UserFacingErrorText.describe(error) }
     }
 
     private func providerRevisions() -> [String: String] {
@@ -392,7 +392,7 @@ struct SessionDocumentWorkspaceView: View {
                     }
                 }
             }
-        } catch { errorMessage = error.localizedDescription }
+        } catch { errorMessage = UserFacingErrorText.describe(error) }
     }
 
     private var tabBar: some View {
@@ -500,7 +500,7 @@ struct SessionDocumentWorkspaceView: View {
                     replace(updated)
                     refreshRecoveryStatus(for: sessionID)
                 } catch {
-                    errorMessage = error.localizedDescription
+                    errorMessage = UserFacingErrorText.describe(error)
                 }
             }
         )
@@ -552,7 +552,7 @@ struct SessionDocumentWorkspaceView: View {
             stageInputSnapshot = nil
             refreshRecoveryStatus(for: sessionID)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -564,7 +564,7 @@ struct SessionDocumentWorkspaceView: View {
             stageInputSnapshot = nil
             refreshRecoveryStatus(for: sessionID)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -582,7 +582,7 @@ struct SessionDocumentWorkspaceView: View {
             stageInputSnapshot = nil
             refreshRecoveryStatus(for: sessionID)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -593,7 +593,7 @@ struct SessionDocumentWorkspaceView: View {
             replace(saved)
             refreshRecoveryStatus(for: sessionID)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -609,7 +609,7 @@ struct SessionDocumentWorkspaceView: View {
             replace(saved)
             refreshRecoveryStatus(for: sessionID)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -626,7 +626,7 @@ struct SessionDocumentWorkspaceView: View {
                 refreshRecoveryStatus(for: sessionID)
             }
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -645,7 +645,7 @@ struct SessionDocumentWorkspaceView: View {
             refreshRecoveryStatus(for: sessionID)
         } catch {
             closeTargetID = nil
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 
@@ -657,7 +657,7 @@ struct SessionDocumentWorkspaceView: View {
             chat.draftText = "请处理会话文档「\(snapshot.title)」：\n\n\(snapshot.text)"
             chat.submitComposer()
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = UserFacingErrorText.describe(error)
         }
     }
 

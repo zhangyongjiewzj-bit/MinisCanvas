@@ -86,6 +86,18 @@ struct RestoredPendingReadCommand309Tests {
         }
         center.replaySubmittedCommand = { _ in counters.replays += 1 }
         center.openCanonicalSettings = { counters.settings += 1 }
+        // 用户自己提交的 /compact 在所有档位直接执行，不会再有待审状态；
+        // 这里改用仍必须审批的 /add-dir 做“待审命令”（合成的目录授权，不触碰真实目录）。
+        center.prepareAdditionalDirectory = { request, snapshot, facts in
+            .init(request: request, snapshot: snapshot, facts: facts,
+                physicalDirectory: URL(fileURLWithPath: request.args["path"] ?? "/synthetic/pending309"),
+                directoryIdentity: "synthetic-device:inode", projectID: "synthetic-project",
+                workingDirectory: "/synthetic/project", attachmentGeneration: 1)
+        }
+        center.applyApprovedAdditionalDirectory = { context in
+            .init(requestID: context.request.id, sessionID: context.snapshot.sessionID,
+                  path: context.physicalDirectory.path)
+        }
         center.onPendingTerminalResolution = { [weak chat] resolution in
             counters.terminals += 1
             let disposition: ComposerCommandPolicyDecision
@@ -102,10 +114,10 @@ struct RestoredPendingReadCommand309Tests {
     }
 
     private func seedPending(_ fixture: Harness) throws -> PendingCommandRequest {
-        fixture.chat.draftText = "/compact synthetic-hint"
+        fixture.chat.draftText = "/add-dir /synthetic/pending309"
         fixture.chat.submitComposer()
         let pending = try #require(fixture.chat.pendingComposerCommand)
-        #expect(pending.commandID == "compact")
+        #expect(pending.commandID == "add-dir")
         #expect(fixture.chat.lastComposerCommandReceipt?.disposition == .pending)
         #expect(fixture.center.pendingAdjudication?.id == pending.id)
         #expect(fixture.provider.calls == 0)

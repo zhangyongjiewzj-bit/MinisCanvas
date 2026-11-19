@@ -131,11 +131,11 @@ public enum ContentSecretRedactor {
     // MARK: Patterns
 
     /// `sk-...` provider keys (OpenAI-style): mask the whole match.
-    private static let skKeyPattern = #"\bsk-[A-Za-z0-9_\-]{8,}"#
+    private static let skKeyPattern = #"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_\-]{8,}"#
 
     /// `Bearer <token>`: mask the token, keep the `Bearer ` prefix.
     /// Token char class allows `.` `_` `-` `=` `+` `/` (JWT / API tokens).
-    private static let bearerTokenPattern = #"(?i)\bBearer\s+([A-Za-z0-9_\-\.=+/]{8,})"#
+    private static let bearerTokenPattern = #"(?i)(?<![A-Za-z0-9_])Bearer\s+([A-Za-z0-9_\-\.=+/]{8,})"#
 
     /// Credential query params: `?api_key=...` / `&token=...` — mask the value.
     /// Name must END with a sensitive term (`(?![A-Za-z0-9_\-])`) so `keyword=`
@@ -149,13 +149,13 @@ public enum ContentSecretRedactor {
     private static let quotedSingleQueryParamPattern = "(?i)([?&][A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)'([^'\\r\\n]{1,})'"
     /// Credential assignments: `export FOO_KEY=...` / `FOO_TOKEN=...`.
     /// Value class excludes `&` so a trailing query string (`...&page=2`) survives.
-    private static let assignmentPattern = "(?i)(\\b[A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)(?=[^&\\s\"'`]{4,})([；，。][^&\\s\"'`]*|[^&\\s\"'`；，。]+)"
-    private static let quotedDoubleAssignmentPattern = "(?i)(\\b[A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)\"([^\"\\r\\n]{1,})\""
-    private static let quotedSingleAssignmentPattern = "(?i)(\\b[A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)'([^'\\r\\n]{1,})'"
+    private static let assignmentPattern = "(?i)((?<![A-Za-z0-9_])[A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)(?=[^&\\s\"'`]{4,})([；，。][^&\\s\"'`]*|[^&\\s\"'`；，。]+)"
+    private static let quotedDoubleAssignmentPattern = "(?i)((?<![A-Za-z0-9_])[A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)\"([^\"\\r\\n]{1,})\""
+    private static let quotedSingleAssignmentPattern = "(?i)((?<![A-Za-z0-9_])[A-Za-z0-9_\\-]*" + sensitiveName + "(?![A-Za-z0-9_\\-])[A-Za-z0-9_\\-]*=)'([^'\\r\\n]{1,})'"
     /// Auth / API-key header values (whole rest-of-line). `\s*` in group 1 can
     /// split the single space before `Bearer` either side of `:`, so the guard
     /// must tolerate leading whitespace before the value (`(?!\\s*Bearer\\b)`).
-    private static let authHeaderPattern = "(?i)((?:api[_-]?key|x-api-key|proxy-authorization|authorization)\\s*:\\s*)(?!\\s*Bearer\\b)([^\r\n\"']{4,})"
+    private static let authHeaderPattern = "(?i)((?:api[_-]?key|x-api-key|proxy-authorization|authorization)\\s*:\\s*)(?!\\s*Bearer(?![A-Za-z0-9_]))([^\r\n\"']{4,})"
     /// URL userinfo: `https://user:pass@` — mask the userinfo, keep `@`.
     private static let userinfoPattern = "(https?://)([^/@\\s:]+:[^/@\\s]*)@"
 
@@ -176,7 +176,7 @@ public enum ContentSecretRedactor {
     private static let authHeaderRegex = try? NSRegularExpression(pattern: authHeaderPattern)
     private static let userinfoRegex = try? NSRegularExpression(pattern: userinfoPattern)
 
-    private static let cookieHeaderRegex = try? NSRegularExpression(pattern: #"(?i)\b(?:cookie|set-cookie)[ \t]*:[ \t]*"#)
+    private static let cookieHeaderRegex = try? NSRegularExpression(pattern: #"(?i)(?<![A-Za-z0-9_])(?:cookie|set-cookie)[ \t]*:[ \t]*"#)
     private static let cookiePairRegex = try? NSRegularExpression(pattern: #"([^\s;=\"'\r\n]+[ \t]*=[ \t]*)?(\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s;\"'\r\n]*)"#)
     private static let cookieSeparatorRegex = try? NSRegularExpression(pattern: #"[ \t]*;[ \t]*"#)
 

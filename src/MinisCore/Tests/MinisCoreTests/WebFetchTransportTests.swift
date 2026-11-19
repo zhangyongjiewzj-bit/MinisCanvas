@@ -91,6 +91,28 @@ struct WebFetchTransportTests {
         }
     }
 
+    /// T-04：每种失败都有给模型看的中文说明，状态码不丢，不再是系统默认的"操作无法完成"。
+    @Test func everyFailureHasAReadableExplanationWithTheStatusCode() {
+        let cases: [WebFetchError] = [
+            .policyDenied(.invalidURL), .invalidResponse, .unexpectedRedirect, .redirectLimit, .redirectLoop,
+            .missingRedirectLocation, .httpStatus(404), .httpStatus(403), .httpStatus(429), .httpStatus(502),
+            .httpStatus(418), .responseTooLarge, .unsupportedContentType, .unsupportedEncoding,
+        ]
+        for error in cases {
+            let text = error.localizedDescription
+            #expect(text.contains("网页抓取"), "\(error) 没有可读说明：\(text)")
+            #expect(!text.contains("MinisCore.") && !text.contains("couldn’t be completed")
+                    && !text.contains("couldn't be completed"))
+        }
+        #expect(WebFetchError.httpStatus(404).localizedDescription.contains("404"))
+        #expect(WebFetchError.httpStatus(418).localizedDescription.contains("418"))
+        #expect(WebFetchError.httpStatus(403).localizedDescription.contains("浏览器工具"))
+        #expect(WebFetchError.responseTooLarge.localizedDescription.contains("2 MB"))
+        #expect(WebFetchError.unsupportedContentType.localizedDescription.contains("浏览器工具"))
+        // 域名不在允许列表的原有说明不变。
+        #expect(WebFetchError.policyDenied(.domainNotAuthorized).localizedDescription.contains("允许列表"))
+    }
+
     @Test func adapterCannotHideFollowedRedirectOrOversizedBody() async throws {
         let original = url("https://example.test/")
         let wrongURL = url("https://other.test/")
@@ -121,7 +143,7 @@ struct WebFetchTransportTests {
             try WebFetchRenderer.text(from: Data(), mimeType: "image/png", characterEncoding: nil)
         }
         #expect(throws: WebFetchError.unsupportedEncoding) {
-            try WebFetchRenderer.text(from: Data(), mimeType: "text/html", characterEncoding: "shift_jis")
+            try WebFetchRenderer.text(from: Data(), mimeType: "text/html", characterEncoding: "x-unknown-charset")
         }
         #expect(throws: WebFetchError.unsupportedEncoding) {
             try WebFetchRenderer.text(from: Data([0xff]), mimeType: "text/plain", characterEncoding: nil)

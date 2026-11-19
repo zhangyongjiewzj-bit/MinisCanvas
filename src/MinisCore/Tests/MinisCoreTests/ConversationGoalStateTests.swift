@@ -334,6 +334,28 @@ struct ConversationGoalStateTests {
         #expect(recovered == goal)
     }
 
+    // B2-21：用户确认已处理后可清除待办与提醒；没有待办或已结束的目标不能清。
+    @Test func clearingBlockersRemovesThemAndTheirReminder() throws {
+        var goal = try #require(ConversationGoalState(sessionID: UUID(), objective: "Review the drafts"))
+        let firstClear = goal.clearBlockers()
+        #expect(!firstClear)
+        let blocker = try #require(ConversationGoalBlocker(summary: "Review the second draft",
+            reason: "The second draft is missing", options: ["Upload": "Attach the second draft"],
+            userAction: "Attach the second draft"))
+        let recorded = goal.recordBlocker(blocker)
+        #expect(recorded)
+        #expect(goal.reminderDueAt != nil)
+        let cleared = goal.clearBlockers()
+        #expect(cleared)
+        #expect(goal.blockers.isEmpty)
+        #expect(goal.reminderDueAt == nil)
+        #expect(goal.status == .active)
+        let clearedAgain = goal.clearBlockers()
+        #expect(!clearedAgain)
+        let restored = try ConversationGoalState.reopen(JSONEncoder().encode(goal), for: goal.sessionID)
+        #expect(restored.blockers.isEmpty)
+    }
+
     @Test func goalReminderBackoffSurvivesRestartAndResetsOnlyForItsOwner() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

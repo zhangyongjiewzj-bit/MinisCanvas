@@ -55,6 +55,11 @@ struct FileAccessRebindKeepsFieldLoopback_R11_Tests {
         // so the ownership guard passes and the callback must be installed.
         try #require(settings.onFileAccessSettingsChanged != nil)
         settings.onFileAccessSettingsChanged?()
+        // 11/16 F5: the callback now publishes its asynchronous reattach so the
+        // project-folder auto-mount retry can wait for the new roots.
+        let pending = try #require(settings.pendingFileAccessAttachment)
+        await pending.value
+        #expect(bridge.productionControlledFieldLoopbackAllowed)
         // The reattach runs in a detached Task the callback does not return;
         // give it time to publish before asserting.
         for _ in 0..<40 {

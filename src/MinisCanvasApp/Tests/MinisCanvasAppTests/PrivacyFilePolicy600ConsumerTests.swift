@@ -226,7 +226,7 @@ struct PrivacyFilePolicy600ConsumerTests {
 
     private func reject(_ engine: AgentLoopChatEngine, path: URL, deniedInsideAllowedRoot: Bool = false) async {
         let refusal: ToolExecutorError = deniedInsideAllowedRoot
-            ? .invalidParameter(ToolExecutorError.pathViolation(path.path).localizedDescription) : .invalidParameter("Policy violation: fileRootNotAllowed")
+            ? .invalidParameter(ToolExecutorError.pathViolation(path.path).localizedDescription) : .invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)
         await #expect(throws: refusal) { _ = try await engine.composedExecutor.execute(name: "file_read", input: ["path": path.path]) }
         await #expect(throws: refusal) { _ = try await engine.composedExecutor.execute(name: "file_write", input: ["path": path.path, "content": "forbidden", "create_dirs": true]) }
         await #expect(throws: refusal) { _ = try await engine.composedExecutor.execute(name: "file_edit", input: ["path": path.path, "old_string": "owned-control", "new_string": "forbidden"]) }
@@ -324,7 +324,12 @@ struct PrivacyFilePolicy600ConsumerTests {
             try #require(request.sessionID == sessionID.uuidString)
             try #require(request.inputDigest == ComposerToolInput(values: ["path": .string(path.path)]).digest)
             try #require(request.identityDigest != nil)
-            if expectedError { try #require(request.persistentAllowOffer == nil) }
+            // 2026-11-16：file_read 卡片可以提供“以后都允许读取此目录”，但只限这一个目录，
+            // 且只是一个提议：不等于恢复挂载，本次是否读取仍由这张卡的决定为准。
+            if expectedError, let offer = request.persistentAllowOffer {
+                try #require(offer.capability == "file_read")
+                try #require(offer.summary == path.deletingLastPathComponent().path)
+            }
             let approves = freshReadApproval == true
             f.bridge.approvalCenter.resolve(approved: approves,
                 reason: approves ? "N07 owned one-call approval" : unmountedReadRefusal2945,
@@ -496,20 +501,22 @@ struct PrivacyFilePolicy600ConsumerTests {
             identity: ProjectSessionGrantRegistry.directoryIdentity(f.outside), sessionID: sessionID,
             projectID: "session:\(sessionID)", workingDirectory: f.workspace.path, persistForProject: false)
         let path = f.outside.appendingPathComponent("note.txt")
+        // 用户已定（对齐 Claude Code）：本会话已授权目录内的读取，即使在“总是询问”模式下
+        // 也不弹审批卡；helper 在 freshReadApproval 为 nil 时不处理任何卡片，若弹卡会超时失败。
         let allowed = try await ordinaryRead2945(f, path: path, callID: "n07-before-remove",
             input: "读取本会话已授权目录中的 note.txt。", expectedError: false,
-            freshReadApproval: independentFreshApproval ? true : nil)
+            freshReadApproval: nil)
         #expect(allowed.body.contains("owned-control"))
+        #expect(f.bridge.approvalCenter.pendingRequest == nil)
         let row = try #require(f.bridge.approvalCenter.permissionDirectories?().first { $0.path == f.outside.path })
         let revoke = try #require(f.bridge.approvalCenter.revokePermissionDirectory)
+        // 撤销授权后，已经准备好的普通回合里的读取必须被围栏拒绝，两种审批模式都一样。
         let regularRefused = try await ordinaryRead2945(f, path: path, callID: "n07-prepared-after-remove",
-            input: "读取相同目录中的 note.txt。", expectedError: !independentFreshApproval,
+            input: "读取相同目录中的 note.txt。", expectedError: true,
             beforeModelRelease: { try revoke(row.id) }, expectFreshReadDecision: false,
-            freshReadApproval: independentFreshApproval ? true : nil)
-        #expect(regularRefused.body.contains("owned-control") == independentFreshApproval)
-        if !independentFreshApproval {
-            #expect(regularRefused.body.contains(ProjectSessionAppError.grantChanged.localizedDescription))
-        }
+            freshReadApproval: nil)
+        #expect(!regularRefused.body.contains("owned-control"))
+        #expect(regularRefused.body.contains(ProjectSessionAppError.grantChanged.localizedDescription))
         #expect(f.bridge.approvalCenter.permissionDirectories?().contains { $0.id == row.id } == false)
         #expect(try String(contentsOf: path, encoding: .utf8) == "owned-control")
 
@@ -522,17 +529,15 @@ struct PrivacyFilePolicy600ConsumerTests {
             projectID: "session:\(sessionID)", workingDirectory: f.workspace.path, persistForProject: false)
         let calibration = try await ordinaryRead2945(f, path: fifo, callID: "n07-fifo-calibration",
             input: "读取获准目录中的合成管道。", expectedError: false, observeReader: true,
-            freshReadApproval: independentFreshApproval ? true : nil, ioProbeOnly: true)
+            freshReadApproval: nil, ioProbeOnly: true)
         try #require(calibration.opened)
         let fifoRow = try #require(f.bridge.approvalCenter.permissionDirectories?().first { $0.path == f.outside.path })
         let refused = try await ordinaryRead2945(f, path: fifo, callID: "n07-fifo-after-remove",
-            input: "再次读取同一合成管道。", expectedError: !independentFreshApproval, observeReader: true,
+            input: "再次读取同一合成管道。", expectedError: true, observeReader: true,
             beforeModelRelease: { try revoke(fifoRow.id) }, expectFreshReadDecision: false,
-            freshReadApproval: independentFreshApproval ? true : nil, ioProbeOnly: true)
-        #expect(refused.opened == independentFreshApproval)
-        if !independentFreshApproval {
-            #expect(refused.body.contains(ProjectSessionAppError.grantChanged.localizedDescription))
-        }
+            freshReadApproval: nil, ioProbeOnly: true)
+        #expect(!refused.opened)
+        #expect(refused.body.contains(ProjectSessionAppError.grantChanged.localizedDescription))
         #expect(try String(contentsOf: path, encoding: .utf8) == "owned-control")
         let fresh = try await ordinaryRead2945(f, path: path, callID: "n07-fresh-after-remove",
             input: "再次请求读取目录中的 note.txt。", expectedError: true)
@@ -568,7 +573,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         let deniedID = "privacy2945-unmounted-" + suffix
         let positive = try await ordinaryRead2945(f, path: positiveURL, callID: positiveID,
             input: "读取已挂载的合成目录文件", expectedError: false)
-        #expect(positive.body == "owned-control")
+        #expect(positive.body == "     1\towned-control")
         let positivePolicy = try #require(policy(positive.engine.composedExecutor))
         #expect(positivePolicy.acceptedExecutionCount == 1)
         #expect(positive.facts.allowedWriteRoots.contains(f.mounted.path))
@@ -720,10 +725,12 @@ struct PrivacyFilePolicy600ConsumerTests {
         _ = try await turn(f, phase: "allow-deny") { (engine: AgentLoopChatEngine) async throws -> Void in
             let local = f.workspace.appendingPathComponent("new.txt")
             _ = try await engine.composedExecutor.execute(name: "file_write", input: ["path": local.path, "content": "actual-write"])
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": local.path]) == "actual-write")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": local.path]) == "     1\tactual-write")
             let overwrite = f.workspace.appendingPathComponent("note.txt")
+            // 覆盖已有文件前必须先读（2026-11-16）。
+            _ = try await engine.composedExecutor.execute(name: "file_read", input: ["path": overwrite.path])
             _ = try await engine.composedExecutor.execute(name: "file_write", input: ["path": overwrite.path, "content": "actual-overwrite"])
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": overwrite.path]) == "actual-overwrite")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": overwrite.path]) == "     1\tactual-overwrite")
             await reject(engine, path: external)
             await reject(engine, path: deniedNote, deniedInsideAllowedRoot: true)
             await reject(engine, path: denied.appendingPathComponent("nested/new.txt"), deniedInsideAllowedRoot: true)
@@ -749,7 +756,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         #expect(reloaded.fileAccessAllowedRoot == f.workspace.path)
         #expect(reloaded.fileAccessDeniedRoots.contains(denied.path))
         _ = try await turn(f, phase: "reloaded-allow-deny") { (engine: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("new.txt").path]) == "actual-write")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("new.txt").path]) == "     1\tactual-write")
             await reject(engine, path: deniedNote, deniedInsideAllowedRoot: true)
             await reject(engine, path: external)
         }
@@ -771,7 +778,7 @@ struct PrivacyFilePolicy600ConsumerTests {
             let frozen = try #require(policy(engine.composedExecutor))
             let frozenGoal = frozen.goal
             #expect(frozenGoal.fileRoots.contains(f.mounted.path))
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path]) == "owned-control")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path]) == "     1\towned-control")
             f.center.unmountFolder(f.mounted.path)
             try await requireCommittedFileComposition(f, settings: f.center, replacing: mountedOwner)
             let later = try #require(f.bridge.chat.agentEngine as? AgentLoopChatEngine)
@@ -790,7 +797,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         let currentOwner = f.bridge.productionBuiltinToolExecutor
         #expect(currentOwner !== mountedOwner)
         let second = try await turn(f, phase: "unmounted-new-task") { (engine: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]) == "owned-control")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]) == "     1\towned-control")
             await reject(engine, path: external)
             await reject(engine, path: f.mounted.appendingPathComponent("new/new.txt"))
         }
@@ -803,7 +810,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         #expect(reloaded.mountFolder(f.mounted.path))
         try await requireCommittedFileComposition(f, settings: reloaded, replacing: ownerBeforeNewGrant)
         _ = try await turn(f, phase: "new-grant") { (engine: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path]) == "owned-control")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path]) == "     1\towned-control")
         }
         #expect(try Data(contentsOf: external) == before)
         #expect(!FileManager.default.fileExists(atPath: f.mounted.appendingPathComponent("new").path))
@@ -863,7 +870,7 @@ struct PrivacyFilePolicy600ConsumerTests {
             mountedGoalID = grantedGoal.goalID
             #expect(grantedGoal.fileRoots.contains(f.mounted.path))
             mountedTask = try await turn(f, phase: "witness-before-unmount") { (engine: AgentLoopChatEngine) async throws -> Void in
-                #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]) == "owned-control")
+                #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]) == "     1\towned-control")
             }
             let grantedOwner = f.bridge.productionBuiltinToolExecutor
             f.center.unmountFolder(f.mounted.path)
@@ -877,9 +884,9 @@ struct PrivacyFilePolicy600ConsumerTests {
         }
         let target = requested
         let refusal: ToolExecutorError = location == .nestedDenied
-            ? .invalidParameter(ToolExecutorError.pathViolation(target.path).localizedDescription) : .invalidParameter("Policy violation: fileRootNotAllowed")
+            ? .invalidParameter(ToolExecutorError.pathViolation(target.path).localizedDescription) : .invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)
         let refusedTask = try await turn(f, phase: "zero-reader-\(location)-\(tool)") { (engine: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]) == "owned-control")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]) == "     1\towned-control")
             let witness = ReaderWitness(path: physical.path)
             try witness.waitReady()
             let input: [String: String] = tool == "file_read"
@@ -914,7 +921,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         try await requireCommittedFileComposition(f, settings: f.center, replacing: ownerBeforeMount)
         let oldOwner = try #require(f.bridge.productionBuiltinToolExecutor)
         _ = try await turn(f, phase: "captured-active-unmount-\(tool)") { (captured: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await captured.composedExecutor.execute(name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]) == "owned-control")
+            #expect(try await captured.composedExecutor.execute(name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]) == "     1\towned-control")
             let frozen = try #require(policy(captured.composedExecutor)).goal
             f.center.unmountFolder(f.mounted.path)
             try await requireCommittedFileComposition(f, settings: f.center, replacing: oldOwner)
@@ -952,7 +959,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         _ = try await turn(f, phase: "read-grant-old-turn") { (captured: AgentLoopChatEngine) async throws -> Void in
             #expect(try await captured.composedExecutor.execute(name: "file_read", input: [
                 "path": f.mounted.appendingPathComponent("note.txt").path
-            ]) == "owned-control")
+            ]) == "     1\towned-control")
             let oldGoal = try #require(policy(captured.composedExecutor)).goal
             f.center.unmountFolder(f.mounted.path)
             try await requireCommittedFileComposition(f, settings: f.center, replacing: mountedOwner)
@@ -990,7 +997,7 @@ struct PrivacyFilePolicy600ConsumerTests {
             #expect(oldGoal.fileRoots.contains(f.mounted.path))
             #expect(try await captured.composedExecutor.execute(
                 name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]
-            ) == "owned-control")
+            ) == "     1\towned-control")
 
             f.center.unmountFolder(f.mounted.path)
             try await requireCommittedFileComposition(f, settings: f.center, replacing: mountedOwner)
@@ -1021,7 +1028,7 @@ struct PrivacyFilePolicy600ConsumerTests {
                 try await AgentExecutionContext.$current.withValue(newContext) {
                     let witness = ReaderWitness(path: target.path)
                     try witness.waitReady()
-                    await #expect(throws: ToolExecutorError.invalidParameter("Policy violation: fileRootNotAllowed")) {
+                    await #expect(throws: ToolExecutorError.invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)) {
                         _ = try await fresh.composedExecutor.execute(
                             name: "file_read", input: ["path": target.path]
                         )
@@ -1030,7 +1037,7 @@ struct PrivacyFilePolicy600ConsumerTests {
                     #expect(!opened, "revoked fresh task opened the prior mounted file")
                     #expect(try await fresh.composedExecutor.execute(
                         name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]
-                    ) == "owned-control")
+                    ) == "     1\towned-control")
                     print("PRIVACY2481_FRESH_CROSS old=\(oldIdentity.taskID) new=\(newIdentity.taskID) oldGoal=\(oldGoal.goalID) newGoal=\(freshGoal.goalID) revoked-reader=\(opened ? 1 : 0)")
                 }
                 await newHandle.finish()
@@ -1073,7 +1080,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         let deniedBefore = try Data(contentsOf: deniedNote)
         try FileManager.default.createSymbolicLink(at: f.workspace.appendingPathComponent("portal"), withDestinationURL: f.outside)
         _ = try await turn(f, phase: "mounted-deny-and-escape") { (engine: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]) == "owned-control")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.mounted.appendingPathComponent("note.txt").path]) == "     1\towned-control")
             await reject(engine, path: deniedNote, deniedInsideAllowedRoot: true)
             await reject(engine, path: f.workspace.appendingPathComponent("../outside/note.txt"))
             await reject(engine, path: f.workspace.appendingPathComponent("portal/note.txt"))
@@ -1095,7 +1102,7 @@ struct PrivacyFilePolicy600ConsumerTests {
         do { _ = try Data(contentsOf: file) } catch { rejected = true }
         try #require(rejected, "PARTIAL: current UID/volume cannot create a genuine owned EACCES; never count this condition PASS")
         _ = try await turn(f, phase: "real-os-permission-denied") { (engine: AgentLoopChatEngine) async throws -> Void in
-            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]) == "owned-control")
+            #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": f.workspace.appendingPathComponent("note.txt").path]) == "     1\towned-control")
             await #expect(throws: ToolExecutorError.permissionDenied(file.path)) {
                 _ = try await engine.composedExecutor.execute(name: "file_read", input: ["path": file.path])
             }

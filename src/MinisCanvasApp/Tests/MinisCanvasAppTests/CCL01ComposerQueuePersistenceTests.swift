@@ -53,4 +53,23 @@ import MinisCore
             try ComposerQueuePersistence.load(using: DraftStore(directory: root))
         }
     }
+
+    /// 11/19 安装包首次运行：别的模块先按 0755 建出根目录，草稿子目录还不存在，
+    /// 新装用户一打开就看到"队列恢复失败"。
+    @Test func firstRunWithSharedRootAndNoDraftsIsAnEmptyQueueButExistingDraftsStayFenced() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("CCL01-first-run-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o755])
+        defer { try? FileManager.default.removeItem(at: root) }
+        // 存储层照旧拒绝读取 0755 根目录（见 EmptyDraftRestore667），但没有草稿目录就没有可恢复的队列。
+        #expect(try ComposerQueuePersistence.load(using: DraftStore(directory: root)).isEmpty)
+
+        // 草稿子目录已存在而根目录不是私有权限：读取仍按不安全拒绝，不当成空队列。
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("drafts"),
+                                                withIntermediateDirectories: false,
+                                                attributes: [.posixPermissions: 0o700])
+        #expect(throws: (any Error).self) {
+            try ComposerQueuePersistence.load(using: DraftStore(directory: root))
+        }
+    }
 }

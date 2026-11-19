@@ -15,7 +15,7 @@ public struct ComposerEffortExecutionProfile: Equatable, Sendable {
     public let maxTokens: Int
 
     public static let maxIterationCap = 100
-    public static let maxTokenCap = 16_384
+    public static let maxTokenCap = 64_000
 
     public init(
         effort: ComposerEffort,

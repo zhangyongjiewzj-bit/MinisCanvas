@@ -104,7 +104,7 @@ private final class ProviderLoopbackReadinessServer2687: @unchecked Sendable {
                 }
             }
             let response: Data
-            if path == "/redirect" {
+            if path.hasPrefix("/redirect") {
                 response = Data((
                     "HTTP/1.1 302 Found\r\n" +
                     "Location: https://outside.invalid/blocked\r\n" +
@@ -189,9 +189,10 @@ struct ProviderLoopbackReadiness2687Tests {
         }
         #expect(server.requestPaths == ["/v1"])
         await #expect(throws: SettingsProviderReadinessTransportError.redirectRejected) {
-            try await transport.send(request(server.url("/redirect")))
+            // 地址带版本段（/v1）时不再补 /v1，请求路径就是 /redirect/v1。
+            try await transport.send(request(server.url("/redirect/v1")))
         }
-        #expect(server.requestPaths == ["/v1", "/redirect"])
+        #expect(server.requestPaths == ["/v1", "/redirect/v1"])
     }
 
     private func request(_ baseURL: URL) -> ProviderReadinessTransportRequest {

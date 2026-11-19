@@ -24,8 +24,10 @@ struct ProviderAddFormState: Equatable {
         var missing: [Field] = []
         if blank(name) { missing.append(.name) }
         if blank(baseURL) { missing.append(.baseURL) }
-        if modelNames.allSatisfy(blank) { missing.append(.modelNames) }
-        if blank(apiKey) { missing.append(.apiKey) }
+        // 本机/局域网服务（Ollama、LM Studio 等）：Key 可留空，模型名可稍后用“获取模型列表”选择。
+        let isLocalService = ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: baseURL)
+        if modelNames.allSatisfy(blank) && !isLocalService { missing.append(.modelNames) }
+        if blank(apiKey) && !isLocalService { missing.append(.apiKey) }
         return missing
     }
 

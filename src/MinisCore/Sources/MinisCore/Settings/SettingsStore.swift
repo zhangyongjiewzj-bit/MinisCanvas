@@ -169,6 +169,9 @@ public final class SettingsStore: @unchecked Sendable {
     /// persisted settings payload.  The store does not synthesize a second
     /// settings snapshot from this diagnostic.
     public private(set) var lastMigrationProvenance: SettingsMigrationProvenance? = nil
+    /// F-15：`settings.json` 读不出来（损坏或来自更新版本）而被整体备份后，备份文件的位置。
+    /// 只用于界面提示用户"设置已恢复为默认、原文件在哪"；没有发生备份时为 nil。
+    public private(set) var corruptBackupURL: URL? = nil
 
     /// - Parameters:
     ///   - directory: 持久化目录（可注入，测试传临时目录）。
@@ -360,6 +363,7 @@ public final class SettingsStore: @unchecked Sendable {
             try persistPendingSettingsRecovery(transaction.withPhase(.moved))
             try persistPendingSettingsRecovery(transaction.withPhase(.committed))
             try removePendingSettingsRecovery(transaction)
+            corruptBackupURL = backup
             return backup
         } catch {
             if !moved { try? removePendingSettingsRecovery(transaction) }

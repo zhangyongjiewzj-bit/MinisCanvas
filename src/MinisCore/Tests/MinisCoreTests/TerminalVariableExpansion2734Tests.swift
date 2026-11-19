@@ -127,7 +127,7 @@ struct TerminalVariableExpansion2734Tests {
         let runner = VariableExpansionMarkerRunner2734(marker: marker)
         let boundary = TerminalBoundary(policy: policy(root: root), runner: runner)
 
-        for command in [#"sudo echo "$VAR""#, #"echo $VAR; sudo true"#] {
+        for command in [#"halt echo "$VAR""#, #"echo $VAR; halt true"#] {
             let receipt = await boundary.execute(request(command, root: root))
             #expect(receipt.error == TerminalBoundaryError.denied.rawValue)
             #expect(receipt.exitCode == nil)

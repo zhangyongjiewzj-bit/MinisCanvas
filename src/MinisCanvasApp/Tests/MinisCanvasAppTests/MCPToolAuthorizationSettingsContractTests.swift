@@ -255,8 +255,8 @@ struct MCPToolAuthorizationSettingsContractTests {
         )?.lowerBound ?? source.endIndex
         let saveFunction = String(source[start.lowerBound..<end])
 
-        let failureMessage = "保存失败：配置已变化或写入失败，请核对后重试。"
-        let failureRange = try #require(saveFunction.range(of: failureMessage))
+        // 11/16：保存失败改为按原因分类的提示（配置已被修改 / 写入失败）。
+        let failureRange = try #require(saveFunction.range(of: "MCPFailureMessage.save("))
         let successGuard = try #require(saveFunction.range(of: "if saved {"))
         #expect(successGuard.upperBound <= failureRange.lowerBound)
         #expect(saveFunction.contains("return saved"))

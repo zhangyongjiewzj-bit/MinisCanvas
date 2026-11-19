@@ -464,7 +464,7 @@ struct SessionReadToolTests {
         #expect((byteMessage["text"] as? String)?.count == 4_266)
         #expect(byteMessage["truncated"] as? Bool == true)
         let defaults = try object(authorizedRead(input: ["session_id": session.id, "scope": "messages", "offset": 99], manager: manager))
-        #expect(defaults["offset"] as? Int == 99 && defaults["limit"] as? Int == 20 && defaults["max_chars"] as? Int == 4000)
+        #expect(defaults["offset"] as? Int == 99 && defaults["limit"] as? Int == 20 && defaults["max_chars"] as? Int == 8000)
         #expect((defaults["messages"] as? [[String: Any]])?.isEmpty == true)
         #expect(try persistedBytes(manager, id: session.id, archived: archived) == before)
     }

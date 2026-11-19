@@ -22,7 +22,7 @@ private let expectedComposerVocabulary: [String] = [
     "stop", "compact", "retry", "canvas.run", "canvas.cancel",
     "canvas.minimap", "provider", "provider.use", "model", "workflow",
     "approve", "reject", "memory", "memory.propose", "skills", "permissions", "mcp",
-    "context", "clear", "rewind", "doctor", "usage", "export", "rename", "resume", "plan", "shortcuts",
+    "context", "clear", "rewind", "undo", "diff", "doctor", "usage", "export", "rename", "resume", "plan", "shortcuts",
 ]
 
 private let policyApprovalGatedIDs: Set<String> = [

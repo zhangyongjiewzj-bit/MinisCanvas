@@ -468,3 +468,35 @@ struct WorkflowDeepLinkTests {
         }
     }
 }
+
+// MARK: - 工作流桥接不写死温度（F-12）
+
+private final class WorkflowTemperatureProbe: LLMProvider, @unchecked Sendable {
+    var name: String { "Probe" }
+    var model = LLMModel(id: "probe", displayName: "Probe", provider: "Test")
+    private let lock = NSLock()
+    private var temperatures: [Double?] = []
+    var captured: [Double?] { lock.withLock { temperatures } }
+
+    func sendMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int,
+                     temperature: Double?) async throws -> LLMResponse {
+        lock.withLock { temperatures.append(temperature) }
+        return LLMResponse(text: "ok", stopReason: "end_turn", usage: nil)
+    }
+
+    func streamMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int,
+                       temperature: Double?) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+}
+
+struct WorkflowBridgeTemperatureTests {
+    @Test("F-12 the default workflow provider bridge sends no temperature")
+    func defaultBridgeDoesNotPinATemperature() async throws {
+        let probe = WorkflowTemperatureProbe()
+        let step = WorkflowStep(id: "s1", type: .custom, title: "步骤", promptTemplate: "x", inputs: [], outputKey: "out")
+        _ = try await LLMWorkflowProvider(provider: probe).generate(prompt: "做点事", step: step)
+        #expect(probe.captured.count == 1)
+        #expect(probe.captured.first! == nil)
+    }
+}

@@ -22,6 +22,8 @@ struct MCPServerEditDraft {
     var enabled: Bool
     var envText = ""
     var headerRows: [MCPHeaderEditRow]
+    /// 工具调用超时（秒）；留空使用默认值（10 分钟）。
+    var callTimeoutText: String
 
     init(existing: MCPServer? = nil) {
         original = existing
@@ -35,6 +37,7 @@ struct MCPServerEditDraft {
         headerRows = (existing?.headers.keys.sorted() ?? []).map {
             MCPHeaderEditRow(name: $0, originalName: $0)
         }
+        callTimeoutText = existing?.callTimeoutSeconds.map(String.init) ?? ""
     }
 
     var isEditing: Bool { original != nil }
@@ -46,7 +49,7 @@ struct MCPServerEditDraft {
     }
 
     var isValid: Bool {
-        guard hasValidIdentity else { return false }
+        guard hasValidIdentity, problem == nil else { return false }
         return type == .stdio
             ? stdioLaunchFields?.command.isEmpty == false
             : !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -117,6 +120,80 @@ struct MCPServerEditDraft {
         return arguments
     }
 
+    // MARK: 环境变量与请求头
+
+    /// 每行一个 KEY=VALUE（值里可以有逗号和等号）。兼容旧写法：只有一行、且逗号分隔的每一段都含 = 时按逗号拆。
+    static func parseEnvironment(_ text: String) -> (pairs: [(String, String)]?, problem: String?) {
+        let lines = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        var entries = lines
+        if lines.count == 1, lines[0].contains(",") {
+            let segments = lines[0].split(separator: ",", omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            if segments.allSatisfy({ $0.contains("=") }) { entries = segments }
+        }
+        var pairs: [(String, String)] = []
+        for (index, entry) in entries.enumerated() {
+            guard let equals = entry.firstIndex(of: "=") else {
+                return (nil, "环境变量第 \(index + 1) 行不是 KEY=VALUE 格式：每行写一个，例如 API_KEY=xxx。")
+            }
+            let key = entry[..<equals].trimmingCharacters(in: .whitespaces)
+            let value = entry[entry.index(after: equals)...].trimmingCharacters(in: .whitespaces)
+            guard !key.isEmpty, !key.contains(where: { $0.isWhitespace }) else {
+                return (nil, "环境变量第 \(index + 1) 行的变量名为空或含空格。")
+            }
+            pairs.append((key, value))
+        }
+        return (pairs, nil)
+    }
+
+    static func parseCallTimeout(_ text: String) -> (value: Int??, problem: String?) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return (.some(nil), nil) }
+        guard let seconds = Int(trimmed), (1...86_400).contains(seconds) else {
+            return (nil, "工具调用超时需要是 1 到 86400 之间的秒数，或留空使用默认的 10 分钟。")
+        }
+        return (.some(seconds), nil)
+    }
+
+    private func resolvedHeaders() -> (headers: [String: String]?, problem: String?) {
+        var headers: [String: String] = [:]
+        var names = Set<String>()
+        for row in headerRows {
+            let name = row.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            // 完全空白的行直接忽略。
+            if name.isEmpty, row.value.isEmpty { continue }
+            guard !name.isEmpty else { return (nil, "有一行请求头只填了值，请补上名称或移除该行。") }
+            guard name.utf8.allSatisfy({ byte in
+                (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+                    || "!#$%&'*+-.^_`|~".utf8.contains(byte)
+            }) else { return (nil, "请求头名称「\(name)」含有不允许的字符，只能用字母、数字和 !#$%&'*+-.^_`|~。") }
+            guard !["host", "content-length", "content-type", "accept", "mcp-session-id"].contains(name.lowercased()) else {
+                return (nil, "请求头「\(name)」由程序自动设置，不能在这里填写。")
+            }
+            guard names.insert(name.lowercased()).inserted else { return (nil, "请求头「\(name)」重复了。") }
+            let value: String
+            if row.value.isEmpty, row.originalName == name, let retained = original?.headers[name] { value = retained }
+            else { value = row.value }
+            guard !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else {
+                return (nil, "请求头「\(name)」的值含有换行或控制字符。")
+            }
+            headers[name] = value
+        }
+        return (headers, nil)
+    }
+
+    /// 当前草稿不能保存的具体原因（中文，含下一步）；可以保存时为 nil。
+    var problem: String? {
+        if type == .stdio {
+            if let reason = Self.parseEnvironment(envText).problem { return reason }
+        } else if let reason = resolvedHeaders().problem {
+            return reason
+        }
+        return Self.parseCallTimeout(callTimeoutText).problem
+    }
+
     func server() -> MCPServer? {
         guard hasValidIdentity else { return nil }
         let launch = type == .stdio ? stdioLaunchFields : nil
@@ -133,33 +210,15 @@ struct MCPServerEditDraft {
         result.args = type == .stdio ? launch?.args ?? [] : []
         result.url = type == .http ? url.trimmingCharacters(in: .whitespacesAndNewlines) : nil
         if type == .stdio {
-            for pair in envText.split(separator: ",") {
-                let fields = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                guard fields.count == 2, !fields[0].isEmpty else { return nil }
-                result.env[fields[0]] = fields[1]
-            }
+            guard let pairs = Self.parseEnvironment(envText).pairs else { return nil }
+            for (key, value) in pairs { result.env[key] = value }
         }
         if type == .http {
-            var headers: [String: String] = [:]
-            var names = Set<String>()
-            for row in headerRows {
-                let name = row.name.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !name.isEmpty, names.insert(name.lowercased()).inserted,
-                      name.utf8.allSatisfy({ byte in
-                          (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
-                          || "!#$%&'*+-.^_`|~".utf8.contains(byte)
-                      }), !["host", "content-length", "content-type", "accept", "mcp-session-id"].contains(name.lowercased())
-                else { return nil }
-                let value: String
-                if row.value.isEmpty, row.originalName == name,
-                   let retained = original?.headers[name] { value = retained }
-                else { value = row.value }
-                guard !value.isEmpty, !value.unicodeScalars.contains(where: { $0.value < 32 || $0.value == 127 }) else { return nil }
-                headers[name] = value
-            }
+            guard let headers = resolvedHeaders().headers else { return nil }
             result.headers = headers
         }
+        guard let timeout = Self.parseCallTimeout(callTimeoutText).value else { return nil }
+        result.callTimeoutSeconds = timeout
         return result
     }
 

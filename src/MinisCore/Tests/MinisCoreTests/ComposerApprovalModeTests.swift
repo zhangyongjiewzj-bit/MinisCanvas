@@ -29,7 +29,19 @@ struct ComposerApprovalModeTests {
                // 第七版：向用户提问本身就是等用户；读技能只读取哈希。两者在每次询问下也免卡。
                AskUserQuestionTool.toolName, SkillMaintenanceTool.readName,
                // 用户 2026-11-16 决定：授权目录内只读文件工具与压缩上下文不弹卡（对齐 Claude Code）。
-               "file_read", "file_grep", "file_glob", ContextCompactTool.toolName])
+               "file_read", "file_grep", "file_glob", ContextCompactTool.toolName,
+               // 用户 2026-11-16：查看后台输出、停止后台命令、浏览器只读动作不弹卡。
+               "shell_output", "shell_stop", "browser", "browser_use",
+               // 用户 2026-11-16（会话之间的协作）：共享任务看板只改本地 JSON，不弹卡。
+               TaskBoardTool.toolName])
+        // 用户 2026-11-19：联网搜索（搜索词发给第三方）默认每次询问，各档位下与 web_fetch 一致。
+        #expect(ApprovalGate.defaultPolicies["web_search"] == .alwaysAsk)
+        #expect(alwaysAsk.policy(for: "web_search") == .alwaysAsk)
+        #expect(alwaysAsk.shouldAsk(tool: "web_search", input: ["query": "天气"]))
+        for policy in [ApprovalPolicy.alwaysAsk, .autoApprove, .riskOnlyAsk, .deny, .never] {
+            let overrides = ApprovalGate.policyOverrides(for: policy)
+            #expect(overrides["web_search"] == overrides["web_fetch"], "\(policy)")
+        }
         let executor = ComposerPolicyEnforcedToolExecutor(base: CountingToolExecutor(),
             controller: controller, approvalGate: alwaysAsk)
         let decision = try await executor.authorizationDecision(callID: "todo-always-ask",
@@ -791,7 +803,58 @@ struct ComposerApprovalModeTests {
         #expect(probe.executionCount == 0)
     }
 
-    @Test("an approved archive cannot cover a second session's archive")
+    @Test("plan mode keeps read-only shell and web fetch usable while writes stay dry-run")
+    func planModeAllowsReadOnlyToolsButNotWrites() async throws {
+        let controller = ComposerAuthorizationController(
+            snapshot: snapshot(mode: .plan),
+            facts: facts(granted: ["shell_execute", WebFetchToolContract.toolName, "file_write"]),
+            now: { now })
+        for command in ["git status", "ls -la", "cat README.md", "grep -n foo README.md"] {
+            let decision = try await controller.authorize(
+                capability: "shell_execute", input: ComposerToolInput(["command": command]))
+            #expect(decision != .dryRun, "\(command) is read-only and should run in plan mode")
+        }
+        for command in ["rm x", "git commit -m x", "echo hi > a.txt", "find . -delete", "sort -o a.txt b.txt"] {
+            let decision = try await controller.authorize(
+                capability: "shell_execute", input: ComposerToolInput(["command": command]))
+            #expect(decision == .dryRun, "\(command) changes things and must stay a dry run")
+        }
+        let web = try await controller.authorize(
+            capability: WebFetchToolContract.toolName,
+            input: ComposerToolInput(["url": "https://example.com/"]))
+        #expect(web != .dryRun)
+    }
+
+    @Test("auto mode: read-only git that prints sensitive file contents still asks, plain read-only git does not")
+    func autoModeGitSensitiveReadStillAsks() async throws {
+        let project = FileManager.default.temporaryDirectory
+            .appendingPathComponent("auto-git-sensitive-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: project) }
+        let root = PolicyRuntimePathBoundary.canonicalPath(project.path) ?? project.path
+
+        func askedCount(_ command: String) async throws -> Int {
+            let delegate = RecordingApprovalDelegate(decision: .approve)
+            let controller = ComposerAuthorizationController(
+                snapshot: snapshot(mode: .auto), facts: facts(roots: [root]), now: { now })
+            let executor = ComposerPolicyEnforcedToolExecutor(
+                base: CountingToolExecutor(), controller: controller,
+                approvalGate: ApprovalGate(delegate: delegate))
+            _ = try? await executor.authorizeExecution(
+                callID: "call", name: "shell_execute", input: ["command": command, "cwd": root])
+            return await delegate.requests.count
+        }
+        // 对照：普通只读 git 在自动档免问。
+        #expect(try await askedCount("git status") == 0)
+        #expect(try await askedCount("git log --oneline -5") == 0)
+        #expect(try await askedCount("curl https://example.com/x") == 1)
+        // 能读出敏感文件内容的只读 git 形式仍要弹卡。
+        for command in ["git show HEAD:.env", "git log -p -- .env", "git show HEAD", "git log -p"] {
+            #expect(try await askedCount(command) == 1, "\(command)")
+        }
+    }
+
+        @Test("an approved archive cannot cover a second session's archive")
     func foreignArchiveCannotReuseAConversationSettingsGrant() async throws {
         let tool = BL6SettingsToolApproval.toolName
         let submission = ComposerSubmissionSnapshot(
@@ -1035,7 +1098,7 @@ struct ComposerApprovalModeTests {
         ordinary.setGloballyDerivedSessionCreatePolicy(.alwaysAsk)
         let prepared = ordinary.applyingLegacyUnattendedAutoApproval().applyingLegacyUnattendedAutoApproval()
         #expect(prepared.policy(for: "file_write") == .autoApprove)
-        #expect(prepared.policy(for: "browser") == .alwaysAsk)
+        #expect(prepared.policy(for: "browser") == ordinary.policy(for: "browser"))
         #expect(prepared.policy(for: "session_create") == .autoApprove)
         #expect(prepared.policy(for: "web_search") == .deny)
         #expect(prepared.policy(for: "file_edit") == .alwaysAsk)
@@ -1056,7 +1119,7 @@ struct ComposerApprovalModeTests {
         #expect(!child.shouldAsk(tool: "file_write", input: input, deferringGlobalFilePromptToComposer: true))
         #expect(child.shouldAsk(tool: "file_edit", input: input, deferringGlobalFilePromptToComposer: true))
         #expect(prepared.policy(for: "file_write") == .autoApprove)
-        #expect(prepared.policy(for: "browser") == .alwaysAsk)
+        #expect(prepared.policy(for: "browser") == ordinary.policy(for: "browser"))
         #expect(prepared.policy(for: "session_create") == .autoApprove)
     }
 
@@ -1199,8 +1262,9 @@ struct ComposerApprovalModeTests {
         #expect(settingsRequests.allSatisfy { $0.toolName == tool && $0.requiresApproval &&
             !$0.requiresSecondConfirmation && $0.inputDigest != nil && $0.identityDigest != nil })
 
-        let ordinaryHighTool = "file_write"
-        let ordinaryInput: [String: Any] = ["path": "/tmp/policy05-synthetic.txt"]
+        // 用户 2026-11-16 决定：只有不可逆操作才二次确认（普通写文件一次点击），所以这里用强制推送代表“其余高风险工具保留第二步”。
+        let ordinaryHighTool = "shell_execute"
+        let ordinaryInput: [String: Any] = ["command": "git push --force origin main"]
         let ordinaryDigest = try #require(ApprovalAuthorizationContext.payloadDigest(for: ordinaryInput))
         let ordinaryContext = context("ordinary-high-effect", toolName: ordinaryHighTool,
             digest: ordinaryDigest)
@@ -2326,9 +2390,9 @@ struct ComposerApprovalModeTests {
             facts: facts(granted: ["file_write", "file_delete"], roots: [root.path]),
             now: { now }
         )
-        await #expect(throws: ComposerAuthorizationError.pathOutsideAllowedRoots(foreign.path)) {
-            _ = try await autoController.authorize(capability: "file_write", input: foreignInput)
-        }
+        // 2026-11-16 起：非绕过模式下授权根外写入改为逐次审批（原为直接拒绝）。
+        #expect(try await autoController.authorize(capability: "file_write", input: foreignInput)
+            == .requestApproval(requiresSecondConfirmation: false))
         let noCapability = ComposerPolicyEnforcedToolExecutor(base: runtime.wrap(builtin),
             controller: ComposerAuthorizationController(snapshot: submitted,
                 facts: ComposerPolicyFactSource(

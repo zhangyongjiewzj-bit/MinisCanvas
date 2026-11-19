@@ -220,4 +220,101 @@ struct CanonicalProjectionCompactionTests {
         #expect(try reopened.resumeMessages(sessionID: source.id) == source.messages + [appended])
     }
 
+    /// C-03：压缩后回退到压缩边界之前，下一回合续接不能再因检查点校验失败而报错。
+    /// 回退时不处理检查点，这条会在 resumeMessages 抛错而红。
+    @Test func rewindBeforeCompactionBoundaryKeepsResumeWorking() async throws {
+        let (store, root) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "projection-rewind-past-checkpoint"
+        _ = try store.createSession(id: id)
+        try store.saveMessage(LLMMessage(role: .user, content: "Early question"), sessionID: id)
+        try store.saveMessage(LLMMessage(role: .assistant, content: "Early answer"), sessionID: id)
+        for _ in 0..<40 {
+            try store.saveMessage(LLMMessage(role: .user,
+                content: "Repeated ordinary context with a retained exact constraint."), sessionID: id)
+        }
+        try store.saveMessage(LLMMessage(role: .user, content: "Current question"), sessionID: id)
+        try store.saveMessage(LLMMessage(role: .assistant, content: "Current answer"), sessionID: id)
+        let source = try #require(store.loadSession(id: id))
+        let result = try await Compactor(keepRecentMessages: 2).compact(
+            messages: source.messages, safetyMode: .requireVerbatimText)
+        try store.saveCompactionCheckpoint(CompactionCheckpoint.makeProjection(
+            sessionID: source.id, sourceTranscriptRevision: source.transcriptRevision,
+            sourceMessages: source.messages, result: result, lineage: source.lineageIdentity))
+        #expect(try store.resumeMessages(sessionID: id) == result.messages)
+
+        let anchor = try #require(try store.conversationRewindAnchors(sessionID: id)
+            .first { $0.messageIndex == 1 })
+        let committed = try store.rewindConversation(to: anchor)
+        #expect(committed.messages.count == 2)
+
+        let reader = SessionStore(directory: root)
+        #expect(try reader.resumeMessages(sessionID: id) == committed.messages)
+        try reader.saveMessage(LLMMessage(role: .user, content: "Next turn after rewind"), sessionID: id)
+        #expect(try reader.resumeMessages(sessionID: id) == committed.messages
+            + [LLMMessage(role: .user, content: "Next turn after rewind")])
+    }
+
+    /// MC4-009：链记录曾只增不减，单会话第 512 条前后新压缩被拒绝且没有出口。回退裁剪逻辑，这条会在约 511 次处抛错。
+    @Test func compactionChainStaysUsableBeyondFiveHundredTwelveCheckpoints() async throws {
+        let (writer, root) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try seed(writer, id: "projection-chain-cap")
+        let result = try await Compactor(keepRecentMessages: 2).compact(
+            messages: source.messages, safetyMode: .requireVerbatimText
+        )
+        var last: CompactionCheckpoint?
+        for _ in 0..<520 {
+            let current = try #require(writer.loadSession(id: source.id))
+            last = try writer.saveCompactionCheckpoint(CompactionCheckpoint.makeProjection(
+                sessionID: current.id, sourceTranscriptRevision: current.transcriptRevision,
+                sourceMessages: current.messages, result: result, lineage: current.lineageIdentity
+            ))
+        }
+        let latest = try #require(last)
+        let chainFiles = try FileManager.default.contentsOfDirectory(
+            at: writer.compactionCheckpointsDirectory, includingPropertiesForKeys: nil, options: []
+        ).filter { $0.lastPathComponent.hasSuffix(".chain.json") }
+        #expect(chainFiles.count <= SessionStore.checkpointChainPruneTrigger)
+
+        // 重启后仍能读到最新检查点，并且撤销压缩（要求截止线记录仍在链里）可用。
+        let reader = SessionStore(directory: root)
+        #expect(try reader.loadLatestCompactionCheckpoint(sessionID: source.id) == latest)
+        #expect(try reader.resumeMessages(sessionID: source.id) == result.messages)
+        let current = try #require(reader.loadSession(id: source.id))
+        try reader.undoCompactionProjection(expectedSession: current, expectedCheckpoint: latest)
+        #expect(try SessionStore(directory: root).loadLatestCompactionCheckpoint(sessionID: source.id) == nil)
+    }
+
+    /// 裁剪不放宽完整性：裁剪后再有人删掉保留下来的最老一条链记录，读取仍要报需要恢复。
+    @Test func prunedChainStillDetectsAMissingHeadRecord() async throws {
+        let (writer, root) = try makeStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try seed(writer, id: "projection-chain-head")
+        let result = try await Compactor(keepRecentMessages: 2).compact(
+            messages: source.messages, safetyMode: .requireVerbatimText
+        )
+        for _ in 0..<(SessionStore.checkpointChainPruneTrigger + 2) {
+            let current = try #require(writer.loadSession(id: source.id))
+            _ = try writer.saveCompactionCheckpoint(CompactionCheckpoint.makeProjection(
+                sessionID: current.id, sourceTranscriptRevision: current.transcriptRevision,
+                sourceMessages: current.messages, result: result, lineage: current.lineageIdentity
+            ))
+        }
+        #expect(try SessionStore(directory: root).loadLatestCompactionCheckpoint(sessionID: source.id) != nil)
+        let chainFiles = try FileManager.default.contentsOfDirectory(
+            at: writer.compactionCheckpointsDirectory, includingPropertiesForKeys: nil, options: []
+        ).filter { $0.lastPathComponent.hasSuffix(".chain.json") }
+        #expect(chainFiles.count <= SessionStore.checkpointChainPruneTrigger)
+        let revisions = try chainFiles.map { url -> (URL, Int) in
+            let object = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+            return (url, try #require(object["resultTranscriptRevision"] as? Int))
+        }
+        let oldest = try #require(revisions.min { $0.1 < $1.1 })
+        try FileManager.default.removeItem(at: oldest.0)
+        #expect(throws: SessionStoreError.self) {
+            _ = try SessionStore(directory: root).loadLatestCompactionCheckpoint(sessionID: source.id)
+        }
+    }
+
 }

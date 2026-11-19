@@ -8,6 +8,16 @@ import Testing
 struct BypassOpenPolicyTests {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
+    @Test func discardingWorktreeChangesIsIrreversible() {
+        for command in ["git checkout -- .", "git checkout -- src/a.swift", "git restore src/a.swift",
+                        "git restore --worktree a", "git stash drop", "git stash clear"] {
+            #expect(BypassSystemFloor.requiresIrreversibleDeletionApproval(command: command), "\(command)")
+        }
+        for command in ["git checkout main", "git checkout -b x", "git restore --staged a", "git stash", "git stash list"] {
+            #expect(!BypassSystemFloor.requiresIrreversibleDeletionApproval(command: command), "\(command)")
+        }
+    }
+
     @Test func outsideBypassWriteKeepsADurableCheckpointAndRestoresWithoutWideningTheStore() async throws {
         let project = try makeTempDirectory().resolvingSymlinksInPath()
         let outside = try makeTempDirectory().resolvingSymlinksInPath()
@@ -20,6 +30,7 @@ struct BypassOpenPolicyTests {
         builtin.fileCheckpointsEnabled = true
         builtin.fileCheckpointStore = store
         builtin.fileChangeSessionID = "session-1"
+        builtin.markFileRead(path: path.path) // 覆盖已有文件要求先读
         let controller = ComposerAuthorizationController(
             snapshot: snapshot(mode: .bypassPermission), facts: facts(roots: [project.path]), now: { now })
         let executor = ComposerPolicyEnforcedToolExecutor(base: builtin, controller: controller)
@@ -37,7 +48,9 @@ struct BypassOpenPolicyTests {
         let normal = ComposerPolicyEnforcedToolExecutor(base: builtin,
             controller: ComposerAuthorizationController(snapshot: snapshot(mode: .auto),
                 facts: facts(roots: [project.path]), now: { now }))
-        await #expect(throws: ComposerAuthorizationError.pathOutsideAllowedRoots(path.path)) {
+        // 2026-11-16 起（对齐 Claude Code）：授权根外写入不再直接拒绝而是要审批；
+        // 这里没有审批通道，所以仍然没有写成。
+        await #expect(throws: ComposerAuthorizationError.approvalRequired("file_write")) {
             _ = try await normal.execute(name: "file_write", input: ["path": path.path, "content": "blocked"])
         }
         #expect(try Data(contentsOf: path) == Data("before".utf8))
@@ -339,9 +352,9 @@ struct BypassOpenPolicyTests {
         for mode in [ComposerTaskMode.manual, .autoEdit, .auto] {
             let controller = ComposerAuthorizationController(
                 snapshot: snapshot(mode: mode), facts: facts(roots: roots), now: { now })
-            await #expect(throws: ComposerAuthorizationError.self) {
-                _ = try await controller.authorize(capability: "file_write", input: input)
-            }
+            // 对齐 Claude Code：其它档位写项目外文件改为逐次审批，而不是直接拒绝，也不会自动执行。
+            let decision = try await controller.authorize(capability: "file_write", input: input)
+            #expect(decision != .execute, "\(mode)")
         }
 
         let unconfirmed = ComposerAuthorizationController(
@@ -349,6 +362,88 @@ struct BypassOpenPolicyTests {
         await #expect(throws: ComposerAuthorizationError.bypassConfirmationRequired) {
             _ = try await unconfirmed.authorize(capability: "file_write", input: input)
         }
+    }
+
+    // MARK: - osascript 内层命令与 sudo 后的命令（用户 2026-11-17）
+
+    @Test("bypass: do shell script inner commands and sudo commands hit the same floor, ordinary ones pass")
+    func nestedInnerCommandsHitFloor() {
+        for command in [
+            #"osascript -e 'do shell script "security find-generic-password -s foo -w"'"#,
+            #"osascript -e 'do shell script "diskutil eraseDisk JHFS+ X disk2"'"#,
+            #"osascript -e 'do shell script "sudo diskutil eraseVolume HFS+ X disk2s1" with administrator privileges'"#,
+            "sudo diskutil eraseDisk JHFS+ X disk2",
+            "sudo -u root launchctl bootout system/com.example.x",
+            "sudo security dump-keychain",
+        ] {
+            #expect(ShellNestedCommandInspector.violation(command: command) != nil, "\(command)")
+        }
+        for command in [
+            #"osascript -e 'do shell script "ls /tmp"'"#,
+            #"osascript -e 'tell application "Finder" to activate'"#,
+            "sudo ls /tmp",
+            "sudo -u root echo hi",
+        ] {
+            #expect(ShellNestedCommandInspector.violation(command: command) == nil, "\(command)")
+        }
+    }
+
+    @Test("bypass: plain top-level commands also hit the keychain, disk-erase and service-unload floor")
+    func topLevelCommandsHitConditionalFloor() {
+        for command in [
+            "diskutil eraseDisk JHFS+ X disk2",
+            "security dump-keychain -d login.keychain",
+            "cd /tmp && launchctl bootout system/com.example.x",
+            "bash -c 'diskutil eraseVolume HFS+ X disk2s1'",
+        ] {
+            #expect(ShellNestedCommandInspector.violation(command: command) != nil, "\(command)")
+        }
+        for command in ["diskutil list", "security find-identity -v", "launchctl list", "ls /tmp"] {
+            #expect(ShellNestedCommandInspector.violation(command: command) == nil, "\(command)")
+        }
+    }
+
+    @Test("bypass: osascript whose content cannot be read statically asks, readable ones do not")
+    func opaqueOsascriptDetection() {
+        for command in [
+            "osascript /tmp/x.scpt", "osascript x.applescript",
+            #"osascript -e 'do shell script "echo $HOME"'"#,
+            "osascript -e 'do shell script myCommand'",
+            #"osascript -e 'do shell script "ls " & quoted form of p'"#,
+            "osascript -l JavaScript -e 'app.doShellScript(x)'",
+            "sudo osascript /tmp/x.scpt",
+        ] {
+            #expect(ShellNestedCommandInspector.hasOpaqueScript(command: command), "\(command)")
+        }
+        for command in [
+            #"osascript -e 'do shell script "ls /tmp"'"#,
+            #"osascript -e 'tell application "Finder" to activate'"#,
+            "ls /tmp",
+        ] {
+            #expect(!ShellNestedCommandInspector.hasOpaqueScript(command: command), "\(command)")
+        }
+    }
+
+    @Test("bypass: inner floor hit is refused, opaque osascript asks once per session, plain osascript runs")
+    func bypassOsascriptDecisions() async throws {
+        let controller = ComposerAuthorizationController(
+            snapshot: snapshot(mode: .bypassPermission), facts: facts(roots: ["/tmp/workspace"]), now: { now })
+        let plain = try ComposerToolInput(["command": #"osascript -e 'do shell script "ls /tmp"'"#])
+        #expect(try await controller.authorize(capability: "shell_execute", input: plain) == .execute)
+
+        let floor = try ComposerToolInput(["command": "sudo diskutil eraseDisk JHFS+ X disk2"])
+        do {
+            _ = try await controller.authorize(capability: "shell_execute", input: floor)
+            Issue.record("sudo diskutil eraseDisk must be refused in bypass")
+        } catch let error as ComposerAuthorizationError {
+            guard case .approvalDenied = error else { Issue.record("unexpected \(error)"); return }
+        }
+
+        let opaque = try ComposerToolInput(["command": "osascript /tmp/x.scpt"])
+        #expect(try await controller.authorize(capability: "shell_execute", input: opaque)
+                == .requestApproval(requiresSecondConfirmation: false))
+        await controller.recordSessionShellRules(input: opaque)
+        #expect(try await controller.authorize(capability: "shell_execute", input: opaque) == .execute)
     }
 
     @Test("bypass still refuses system modify/delete but may read system files")
@@ -417,18 +512,21 @@ struct BypassOpenPolicyTests {
         let env = try ComposerToolInput(["path": dir.appendingPathComponent(".env").path])
         let key = try ComposerToolInput(["path": dir.appendingPathComponent("server.pem").path])
         let ssh = try ComposerToolInput(["path": NSHomeDirectory() + "/.ssh/config"])
-        // 绕过：.env、密钥文件、~/.ssh 读都拒绝，原因带「凭据保护」。
+        // 绕过：~/.ssh 等凭据目录读仍直接拒绝，原因带「凭据保护」；
+        // .env、密钥文件名改为弹卡询问（用户 2026-11-16 决定），不再直接拒绝。
         let bypass = ComposerAuthorizationController(
             snapshot: snapshot(mode: .bypassPermission), facts: facts(roots: [dir.path, NSHomeDirectory()]), now: { now })
-        for input in [env, key, ssh] {
-            do {
-                _ = try await bypass.authorize(capability: "file_read", input: input)
-                Issue.record("bypass must refuse a credential path read")
-            } catch let error as ComposerAuthorizationError {
-                guard case .approvalDenied(let reason?) = error, reason.contains("凭据保护") else {
-                    Issue.record("unexpected \(error)"); continue
-                }
+        do {
+            _ = try await bypass.authorize(capability: "file_read", input: ssh)
+            Issue.record("bypass must refuse a credential directory read")
+        } catch let error as ComposerAuthorizationError {
+            guard case .approvalDenied(let reason?) = error, reason.contains("凭据保护") else {
+                Issue.record("unexpected \(error)"); return
             }
+        }
+        for input in [env, key] {
+            #expect(try await bypass.authorize(capability: "file_read", input: input)
+                    == .requestApproval(requiresSecondConfirmation: false))
         }
         // 其他四种模式：读 .env 等不被凭据保护硬拒绝（授权根内读取直接放行，和 7428f83 一致）。
         for mode in [ComposerTaskMode.manual, .autoEdit, .plan, .auto] {

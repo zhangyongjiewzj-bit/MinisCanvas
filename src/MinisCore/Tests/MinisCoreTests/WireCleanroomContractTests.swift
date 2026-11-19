@@ -187,6 +187,7 @@ struct WireCleanroomContractTests {
             switch event {
             case .textDelta(let value): published += value
             case .completed(let response): completions += 1; executable = response.toolCalls.count
+            case .thinkingDelta: break
             }
         }
         #expect(published.isEmpty)
@@ -223,6 +224,7 @@ struct WireCleanroomContractTests {
             switch event {
             case .textDelta(let value): completeText += value
             case .completed(let response): completeCount += 1; completeResponse = response
+            case .thinkingDelta: break
             }
         }
         #expect(completeText == "查找")
@@ -263,6 +265,7 @@ struct WireCleanroomContractTests {
             switch event {
             case .textDelta(let value): text += value
             case .completed(let value): completed += 1; result = value
+            case .thinkingDelta: break
             }
         }
         #expect(text == "AB")

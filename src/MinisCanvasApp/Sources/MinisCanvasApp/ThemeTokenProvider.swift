@@ -57,6 +57,7 @@ final class ThemeTokenProvider {
     func updateSystemAppearance(_ appearance: NSAppearance?) {
         let nextMode = Self.systemMode(for: appearance)
         guard nextMode != systemAppearanceMode else { return }
+        Self.invalidateNativeTokenCache()
         systemAppearanceMode = nextMode
     }
 
@@ -75,7 +76,13 @@ final class ThemeTokenProvider {
     }
 
     /// 当前生效明暗：固定明暗预设直接映射；跟随系统读 macOS 状态。
-    var mode: ThemeMode { effectivePreset.resolvedMode(systemIsDark: systemIsDark) }
+    var mode: ThemeMode {
+        switch center.appearance {
+        case .light: .light
+        case .dark: .dark
+        case .system: effectivePreset.resolvedMode(systemIsDark: systemIsDark)
+        }
+    }
 
     /// 当前主题的 palette 层（亮/暗无关）；全部预设共用 AJ-38 定版伪仙。
     var palette: ThemePalette { effectivePreset.palette ?? AccentTheme.pseudo.palette }
@@ -83,13 +90,53 @@ final class ThemeTokenProvider {
     /// 当前生效的 semantic token（改预设即变）。
     var tokens: ThemeSemanticTokens {
         if effectivePreset == .system { return Self.nativeSystemTokens(for: mode) }
-        return effectivePreset.semanticTokens(systemIsDark: systemIsDark)
+        // 预设的明暗由 `mode` 决定（固定浅色/深色时不看系统明暗）。
+        return effectivePreset.semanticTokens(systemIsDark: mode == .dark)
             ?? AccentTheme.pseudo.semanticTokens(for: mode)
     }
 
     /// Native colors are resolved under the observed appearance, without
     /// changing NSApp/system appearance or storing another theme truth.
     static func nativeSystemTokens(for mode: ThemeMode) -> ThemeSemanticTokens {
+        _ = invalidationObservers
+        let key = nativeTokenCacheKey(for: mode)
+        if let cached = nativeTokenCache[key] { return cached }
+        nativeTokenComputeCount += 1
+        let computed = computeNativeSystemTokens(for: mode)
+        nativeTokenCache[key] = computed
+        return computed
+    }
+
+    // 流畅度第四轮：跟随系统时每次读 token 都重转 14 个系统色并跑对比度修正
+    // （流式输出期间主线程采样 48 个样本）。结果只取决于明暗、「提高对比度」开关与
+    // 系统颜色（强调色等），按这三者缓存，系统颜色/外观/辅助功能显示选项变化时失效。
+    private static var nativeTokenCache: [Int: ThemeSemanticTokens] = [:]
+    /// 真实计算次数（测试用：命中缓存时不增加）。
+    private(set) static var nativeTokenComputeCount = 0
+
+    private static func nativeTokenCacheKey(for mode: ThemeMode) -> Int {
+        (mode == .dark ? 1 : 0) | (NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast ? 2 : 0)
+    }
+
+    /// 清空系统色缓存。系统颜色、外观或辅助功能显示选项变化时调用。
+    static func invalidateNativeTokenCache() {
+        nativeTokenCache.removeAll()
+    }
+
+    /// 只注册一次；闭包不捕获实例。
+    private static let invalidationObservers: Void = {
+        let invalidate: @Sendable (Notification) -> Void = { _ in
+            Task { @MainActor in ThemeTokenProvider.invalidateNativeTokenCache() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSColor.systemColorsDidChangeNotification, object: nil, queue: .main,
+            using: invalidate)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil,
+            queue: .main, using: invalidate)
+    }()
+
+    private static func computeNativeSystemTokens(for mode: ThemeMode) -> ThemeSemanticTokens {
         let appearance = NSAppearance(named: mode == .dark ? .darkAqua : .aqua)
         var result: ThemeSemanticTokens?
         let resolve = {
@@ -122,15 +169,11 @@ final class ThemeTokenProvider {
         return result!
     }
 
-    /// AJ38 controls and links use the platform accent, not the translucent
-    /// keyboard focus indicator. Resolve against the same observed appearance.
-    static func nativeSystemAccent(for mode: ThemeMode) -> ThemeColor {
-        let appearance = NSAppearance(named: mode == .dark ? .darkAqua : .aqua)
-        var result: ThemeColor?
-        let resolve = { result = Self.nativeColor(.controlAccentColor) }
-        if let appearance { appearance.performAsCurrentDrawingAppearance(resolve) }
-        else { resolve() }
-        return result!
+    /// 跟随系统主题时的强调色：与产品主题统一为陶土橙（浅 #A84E2A / 深 #E08B68），
+    /// 不再取系统强调色（系统蓝），避免同一界面一橙一蓝。
+    static func systemThemeAccent(for mode: ThemeMode) -> ThemeColor {
+        let theme = ThemePreset.canonicalAccentTheme
+        return ThemeColor(rgb: mode == .dark ? theme.darkAccentRGB : theme.accentRGB)
     }
 
     private static func nativeColor(_ color: NSColor, over surface: ThemeColor? = nil) -> ThemeColor {
@@ -147,8 +190,7 @@ final class ThemeTokenProvider {
     // MARK: SwiftUI 便捷色（组件直接 `theme.xxx`）
 
     var accentColor: Color {
-        effectivePreset == .system ? Color(nsColor: .controlAccentColor)
-            : effectivePreset.accentColor ?? AccentTheme.pseudo.color
+        effectivePreset.accentColor ?? AccentTheme.pseudo.color
     }
     var background: Color { tokens.background.swiftUIColor }
     var sidebarBackground: Color { tokens.sidebarBackground.swiftUIColor }
@@ -222,6 +264,23 @@ extension EnvironmentValues {
         get { self[ThemeTokenProviderKey.self] }
         set { self[ThemeTokenProviderKey.self] = newValue }
     }
+}
+
+/// 取不到主题对象时（静态函数、预览）使用的状态色后备值：第 1 套状态色，
+/// 浅/深色各一值，由系统动态色随外观切换；各常量只建一次，不在 body 里新建。
+enum AppStatusColor {
+    private static func dynamic(light: UInt32, dark: UInt32) -> Color {
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let hex = isDark ? dark : light
+            return NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
+                           blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+        })
+    }
+    static let success = dynamic(light: 0x2A7549, dark: 0x6FC08F)
+    static let warning = dynamic(light: 0x9A5B0F, dark: 0xE3A64F)
+    static let danger = dynamic(light: 0xB3261E, dark: 0xF08072)
+    static let info = dynamic(light: 0x2F6AAE, dark: 0x7AAEE8)
 }
 
 /// Resolve semantic status foregrounds against the active theme surfaces.

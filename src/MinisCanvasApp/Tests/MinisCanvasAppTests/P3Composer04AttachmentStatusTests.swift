@@ -56,7 +56,7 @@ struct Composer04AttachmentStatusTests {
     @Test func unreadableTextPayloadDowngradesToFailedFileReference() async throws {
         let chat = ChatStore()
         // 非 UTF-8 字节流：文本类型读取解析失败 → 降级文件引用，状态置 failed。
-        let brokenURL = try writeTempFile(name: "broken.txt", data: Data([0xFF, 0xFE, 0xFF, 0xFE]))
+        let brokenURL = try writeTempFile(name: "broken.txt", data: Data([0xFF, 0xFF, 0xFE, 0xFE]))
         defer { try? FileManager.default.removeItem(at: brokenURL.deletingLastPathComponent()) }
 
         chat.addAttachments(urls: [brokenURL])

@@ -239,4 +239,63 @@ struct FileChangeLedgerTests {
             #expect(view.insertions == record.insertions)
             #expect(view.deletions == record.deletions)
     }
+
+    // MARK: 命令生成的产物（未经写入验证）
+
+    private func makeGeneratedDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cmd-generated-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.resolvingSymlinksInPath()
+    }
+
+    @Test func commandGeneratedDetectsFreshFilesSkipsOldAndSensitiveAndDedupes() throws {
+        let dir = try makeGeneratedDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let started = Date()
+        let fresh = dir.appendingPathComponent("chart.png")
+        let old = dir.appendingPathComponent("old.png")
+        let secret = dir.appendingPathComponent("credentials.txt")
+        for url in [fresh, old, secret] { try Data("x".utf8).write(to: url) }
+        try FileManager.default.setAttributes([.modificationDate: started.addingTimeInterval(-3_600)],
+                                              ofItemAtPath: old.path)
+        let command = "python plot.py > chart.png && cp chart.png chart.png; cat old.png credentials.txt"
+        let found = CommandGeneratedArtifacts.detect(command: command, workingDirectory: dir, startedAt: started)
+        #expect(found == [fresh.path])
+    }
+
+    @Test func commandGeneratedAcceptsQuotedPathWithSpaces() throws {
+        let dir = try makeGeneratedDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let started = Date()
+        let report = dir.appendingPathComponent("my report.pdf")
+        try Data("x".utf8).write(to: report)
+        let found = CommandGeneratedArtifacts.detect(command: "make \"my report.pdf\"",
+                                                     workingDirectory: dir, startedAt: started)
+        #expect(found == [report.path])
+    }
+
+    @Test func commandGeneratedFindsScriptOutputNotNamedInCommand() throws {
+        let dir = try makeGeneratedDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let started = Date()
+        let produced = dir.appendingPathComponent("plot_result.png")
+        try Data("x".utf8).write(to: produced)
+        let found = CommandGeneratedArtifacts.detect(command: "python3 plot.py",
+                                                     workingDirectory: dir, startedAt: started)
+        #expect(found == [produced.path])
+    }
+
+    @Test func commandGeneratedFollowsLeadingCD() throws {
+        let dir = try makeGeneratedDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let sub = dir.appendingPathComponent("sub", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        let started = Date()
+        let out = sub.appendingPathComponent("out.pdf")
+        try Data("x".utf8).write(to: out)
+        let found = CommandGeneratedArtifacts.detect(command: "cd sub && make out.pdf",
+                                                     workingDirectory: dir, startedAt: started)
+        #expect(found == [out.path])
+    }
 }

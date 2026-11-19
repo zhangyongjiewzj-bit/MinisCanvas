@@ -33,7 +33,7 @@ struct MinisIconContractTests {
                 // Negative control: the old light primary on the same owned
                 // surface must fail the unchanged predicate.
                 let alpha = MinisIconTokens.disabledOpacity
-                let neutral = Double(0x1C) / 255.0
+                let neutral = Double(0x1F) / 255.0   // 图标中性色已换为暖近黑 #1F1E1D
                 let legacy = ThemeColor(
                     r: alpha * neutral + (1 - alpha) * surface.r,
                     g: alpha * neutral + (1 - alpha) * surface.g,

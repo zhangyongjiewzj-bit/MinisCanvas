@@ -62,7 +62,7 @@ struct TerminalDangerSyntaxParityTests {
             ("(ls)", .confirmation),                           // grouping
             ("ls\npwd", .confirmation),                        // newline separator
             ("ls | qqqnotacommand", .confirmation),            // unknown tail: terminal confirms
-            ("ls && sudo rm -rf /", .denied),                  // nested product hard-deny
+            ("ls && halt now", .denied),                       // nested product hard-deny
             ("ls; rm -rf .", .denied),                         // nested user-denied
             ("echo seed && dd if=/dev/zero of=x", .denied),    // nested hard-deny token
             ("qqqnotacommand", .unknown),                      // well-formed but unlisted
@@ -116,7 +116,7 @@ struct TerminalDangerSyntaxParityTests {
         let executor = self.executor(root: root, policy: policy)
 
         for command in [
-            "echo seed > s.txt && sudo tee s.txt",
+            "echo seed > s.txt && halt s.txt",
             "echo seed > s.txt; dd if=/dev/zero of=s.txt",
         ] {
             await #expect(throws: (any Error).self) {
@@ -155,7 +155,8 @@ struct TerminalDangerSyntaxParityTests {
         let presented = try #require(delegate.requests.first)
         #expect(presented.inputSummary.contains("批准后执行此命令"))
         #expect(presented.inputSummary.contains("qqqnotacommand"))
-        #expect(presented.requiresApproval && presented.requiresSecondConfirmation)
+        // 未登记命令一次确认即可；只有不可逆命令（rm、git push --force 等）才需要第二次确认。
+        #expect(presented.requiresApproval && !presented.requiresSecondConfirmation)
         let capturedReceipt: ApprovalReceipt = try #require(capture.load())
         let result = try await ApprovedShellCallScope.$currentLegacyReceipt.withValue(capturedReceipt) {
             try await executor.execute(name: "shell_execute", input: input)

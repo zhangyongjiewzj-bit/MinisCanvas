@@ -9,7 +9,10 @@ struct InspectorSection<Content: View>: View {
     let catalogIcon: MinisIcon?
     let summary: String?
     private let content: () -> Content
-    @State private var isExpanded: Bool
+    private let defaultExpanded: Bool
+    /// 用户手动展开/收起的记忆：0 = 未操作（跟随“是否有内容”），1 = 展开，2 = 收起。
+    /// 只读写自己这一个键，不依赖任何会话或消息数据。
+    @AppStorage private var storedChoice: Int
     @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
 
@@ -20,6 +23,7 @@ struct InspectorSection<Content: View>: View {
         catalogIcon: MinisIcon? = nil,
         summary: String? = nil,
         initiallyExpanded: Bool = true,
+        hasContent: Bool = true,
         @ViewBuilder content: @escaping () -> Content
     ) {
         self.identifier = identifier
@@ -28,11 +32,26 @@ struct InspectorSection<Content: View>: View {
         self.catalogIcon = catalogIcon
         self.summary = summary
         self.content = content
-        _isExpanded = State(initialValue: initiallyExpanded)
+        // 没有内容的区块默认收起；用户没手动操作过时，内容从无到有会自动展开。
+        defaultExpanded = initiallyExpanded && hasContent
+        _storedChoice = AppStorage(wrappedValue: 0, "inspector.section.expanded.\(identifier)")
+    }
+
+    private var isExpandedBinding: Binding<Bool> {
+        Binding(
+            get: {
+                switch storedChoice {
+                case 1: return true
+                case 2: return false
+                default: return defaultExpanded
+                }
+            },
+            set: { storedChoice = $0 ? 1 : 2 }
+        )
     }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
+        DisclosureGroup(isExpanded: isExpandedBinding) {
             VStack(alignment: .leading, spacing: 8) {
                 content()
             }

@@ -40,6 +40,9 @@ import Foundation
 public enum LLMAssistantStreamEvent: Sendable {
     /// Append-only user-visible assistant reply text.
     case textDelta(String)
+    /// Append-only model reasoning text for display only. It is never part of
+    /// `completed.text` and must not be echoed back as ordinary history.
+    case thinkingDelta(String)
     /// Authoritative terminal response (identical shape to the buffered
     /// `sendMessage` result). Always the last event of a successful stream.
     case completed(LLMResponse)

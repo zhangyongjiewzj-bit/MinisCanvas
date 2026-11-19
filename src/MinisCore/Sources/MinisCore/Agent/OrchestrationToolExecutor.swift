@@ -135,10 +135,14 @@ public final class OrchestrationToolExecutor: ToolExecutor {
     }
 
     /// Opt-in 工具目录定义（调用方自行加入 agent loop 的 tools 列表）。
-    public static func makeDefinition(childModelPolicy: ChildModelBindingPolicy = .init()) -> AgentToolDefinition {
+    public static func makeDefinition(
+        childModelPolicy: ChildModelBindingPolicy = .init(),
+        customSubagents: [CustomSubagentDefinition] = []
+    ) -> AgentToolDefinition {
         AgentToolDefinition(
             name: toolName,
-            description: childModelPolicy.toolDescription + "Split a large task into independent sub-tasks run by built-in or external sub-agents, in parallel or in sequence. Do simple or single-lookup work yourself. A sub-agent cannot see this conversation: each task's instructions must be self-contained (goal, background, files, constraints, what is ruled out, expected output), and parallel tasks need disjoint write areas. Sub-agents cannot ask the user (they return needsClarification), nest orchestrate, or use ask_user, conversation_settings or external_session tools. Asks for approval in most modes (marked higher risk with external agents); plan mode only previews. Each sub-task runs at most about 5 minutes and times out as failed, so split long work or run it yourself in the background. Results are JSON per task: status (succeeded/failed/partial), a summary excerpt, output_ref for full text via child_result, artifact facts. Tell the user results come from a sub-agent, verify key claims before quoting, and do not resend an unchanged failed task. run_in_background=true returns at once; completion arrives as a notification, so do not poll. Use input_version=2 and tasks as a JSON string; built-in tasks inherit your tools and project directory, narrowable by allowed_tool_names, allowed_read_roots, allowed_write_roots, working_directory; your mode and approvals still apply.",
+            description: childModelPolicy.toolDescription + "Split a large task into independent sub-tasks run by built-in or external sub-agents, in parallel or in sequence. Do simple or single-lookup work yourself. A sub-agent cannot see this conversation: each task's instructions must be self-contained (goal, background, files, constraints, what is ruled out, expected output), and parallel tasks need disjoint write areas. Sub-agents cannot ask the user (they return needsClarification), nest orchestrate, or use ask_user, conversation_settings or external_session tools. Asks for approval in most modes (marked higher risk with external agents); plan mode only previews. A sub-task has no short per-task time limit (only a 2-hour safety cap) and shares the parent's request budget, so keep each one small and focused; for work that must keep running, use a background command. Results are JSON per task: status (succeeded/failed/partial), a summary excerpt, output_ref for full text via child_result, artifact facts. Tell the user results come from a sub-agent, verify key claims before quoting, and do not resend an unchanged failed task. run_in_background=true returns at once; finishing does not wake you: the result is shown in the task center and reaches you with the user's next message, so do not poll, and if the user needs the outcome, tell them to send a message once it is done. Use input_version=2 and tasks as a JSON string; built-in tasks inherit your tools and project directory, narrowable by allowed_tool_names, allowed_read_roots, allowed_write_roots, working_directory; your mode and approvals still apply."
+                + CustomSubagentDirectory.text(customSubagents),
             parameters: [
                 "input_version": AgentToolParam(
                     type: .integer,
@@ -147,7 +151,7 @@ public final class OrchestrationToolExecutor: ToolExecutor {
                 "tasks": AgentToolParam(
                     type: .string,
                     description: "子任务对象数组的 JSON。每项字段：id/title/instructions（必填 String）、"
-                        + "context/expected_output（可选 String）、agent（可选 String：builtin 或 external:<name>）、"
+                        + "context/expected_output（可选 String）、agent（可选 String：builtin、external:<name>，或 custom:<名字> 使用 .claude/agents/<名字>.md 里的自定义子智能体：角色设定来自文件，工具范围只能收窄；项目里的需项目已信任，且文件内容经用户确认过，内容改动后要重新确认）、"
                         + (childModelPolicy.allowsOverrides
                             ? "model/thinking_level（需用户授权与就绪清单；不可与旧绑定混用），model_binding（旧显式绑定三者必填），"
                             : "model_binding（显式绑定时 provider_id/model_id/configuration_fingerprint 三者必填），")
@@ -176,7 +180,7 @@ public final class OrchestrationToolExecutor: ToolExecutor {
                 ),
                 "run_in_background": AgentToolParam(
                     type: .boolean,
-                    description: "true returns immediately; same approvals, mode, tool scope; completion shows in the task center with a notification. Default false waits"
+                    description: "true returns immediately; same approvals, mode, tool scope; completion shows in the task center and reaches you with the user's next message (no new turn starts by itself). Default false waits"
                 ),
             ],
             required: ["input_version", "tasks"],
@@ -209,6 +213,12 @@ public final class OrchestrationToolExecutor: ToolExecutor {
                 throw ToolExecutorError.invalidParameter("tasks")
             }
             normalizedInput["tasks"] = tasks
+        }
+        // 自定义子智能体（.claude/agents/*.md）：改写成普通内置子任务，工具范围只收窄。
+        if let rawTasks = normalizedInput["tasks"] as? [[String: Any]],
+           rawTasks.contains(where: { ($0["agent"] as? String)?.hasPrefix(CustomSubagentRewriter.prefix) == true }) {
+            normalizedInput = try CustomSubagentRewriter.rewrite(
+                normalizedInput, definitions: await CustomSubagentCatalog.current())
         }
         // Both public-schema JSON strings and legacy native arrays use the
         // same strict bounds, item, binding and resource validation below.
@@ -422,8 +432,9 @@ public final class OrchestrationToolExecutor: ToolExecutor {
     static func makeResultPage(envelope: ChildResultEnvelope, offset: Int, limit: Int? = nil) throws -> String {
         let raw = envelope.output ?? envelope.error ?? ""
         // Redact before pagination so secrets split across a page boundary
-        // cannot bypass the shared policy. Only model-visible projection changes.
-        let safe = ProductRedactionPolicy.redact(raw, maxLength: Int.max)
+        // cannot bypass the shared policy. Paths stay (aligned with Claude Code:
+        // the parent gets the sub-agent's report as written); secrets are masked.
+        let safe = ProductRedactionPolicy.redactConversationBody(raw)
         guard offset >= 0, offset <= safe.count else {
             throw ToolExecutorError.invalidParameter("offset")
         }
@@ -457,7 +468,7 @@ public final class OrchestrationToolExecutor: ToolExecutor {
     /// Sentence boundaries are preferred within the 1–3KiB target. An
     /// unpunctuated oversized sentence is explicitly an excerpt, never padded.
     public static func resultSummary(_ raw: String) -> String {
-        let safe = ProductRedactionPolicy.redact(raw, maxLength: Int.max)
+        let safe = ProductRedactionPolicy.redactConversationBody(raw)
         guard safe.utf8.count > 3_072 else { return safe }
         var prefix = "", boundary: String?
         for character in safe {
@@ -493,6 +504,9 @@ public final class OrchestrationToolExecutor: ToolExecutor {
                     row["artifacts"] = facts.artifacts.map { ["path": $0.path, "sha256": $0.sha256] }
                     row["artifact_count"] = facts.artifactsComplete ? facts.artifacts.count as Any : NSNull()
                     row["artifacts_status"] = facts.artifactsComplete ? "verified" : "unavailable_or_partial"
+                    // "verified" 只覆盖已证实的文件写入；shell 命令产出的文件不在其中。
+                    row["artifacts_scope"] = "verified_file_writes_only"
+                    row["artifacts_note"] = "artifacts 仅含已证实写入的文件；shell 命令生成的文件未统计，需要时请直接检查目录。"
                     row["settled_tool_calls"] = facts.settledToolCalls.map { $0 as Any } ?? NSNull()
                 }
                 row["output_ref"] = ["task_id": report.taskID, "parent_id": parentID,

@@ -13,9 +13,13 @@ public enum ProviderChatResponseShapePolicyError: Error, Equatable, Sendable, Lo
     case choicesTooMany
     case contentBlocksTooMany
     case toolCallsTooMany
+    /// 流里（或 200 响应里）出现了只有 `error`、没有 `choices` 的错误帧。
+    case upstreamErrorFrame
 
     public var errorDescription: String? {
         switch self {
+        case .upstreamErrorFrame:
+            return "Provider returned an error frame instead of a completion"
         case .invalidRootShape:
             return "Provider response shape is invalid"
         case .nestingTooDeep:
@@ -57,6 +61,12 @@ public enum ProviderChatResponseShapePolicy {
     /// choices, message content, media, and tool-call dictionaries.
     public static func validate(_ json: [String: Any]) throws {
         try validateNesting(json, depth: 0)
+
+        // 兼容服务商在流中途发 {"error":{...}} 再接 [DONE]：不能当成正常结束（半截回答会被当成完整回复）。
+        // 带 choices 的形态（如 finish_reason 为 error）仍走原有分支。
+        if let error = json["error"], !(error is NSNull), json["choices"] == nil {
+            throw ProviderChatResponseShapePolicyError.upstreamErrorFrame
+        }
 
         if let rawChoices = json["choices"] {
             guard let choices = rawChoices as? [[String: Any]] else {

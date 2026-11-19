@@ -132,6 +132,26 @@ struct AJ29SessionMenuTests {
         #expect(restored?.unread == true)
     }
 
+    @Test func onlyChangedSessionsReachDisk() throws {
+        let (store, _) = makeStore()
+        let chat = ChatStore()
+        chat.attachPersistence(store)
+        let firstID = chat.activeSessionID!
+        chat.appendUser("第一会话内容")
+        let secondID = chat.applyNewSession(title: "第二会话")
+        chat.appendUser("第二会话内容")
+        chat.flushPendingSessionPersistence()
+        #expect(store.loadSession(id: firstID.uuidString)?.messages.isEmpty == false)
+        #expect(store.loadSession(id: secondID.uuidString)?.messages.isEmpty == false)
+        let firstCount = store.loadSession(id: firstID.uuidString)?.messages.count
+
+        chat.renameSession(id: secondID, title: "改名后")
+        chat.flushPendingSessionPersistence()
+        #expect(store.loadSession(id: secondID.uuidString)?.title == "改名后")
+        // 改名第二会话不应改动第一会话的落盘内容。
+        #expect(store.loadSession(id: firstID.uuidString)?.messages.count == firstCount)
+    }
+
     // MARK: 深链 / 文件 URL
 
     @Test func sessionDeepLinkFormat() {
@@ -288,7 +308,8 @@ struct AJ29SessionMenuTests {
         #expect(restored.executionSnapshot(forSessionID: sessionID)?.state == .failed)
     }
 
-    @Test func runningExecutionMigratesToIdleAfterReloadWithoutRedispatch() throws {
+    /// a350e70e 起：生成中被杀、没有落盘回复的回合，重启后标成"中断，可重试"，不自动重发。
+    @Test func runningExecutionBecomesRetryableFailureAfterReloadWithoutRedispatch() throws {
         let (store, _) = makeStore()
         let chat = ChatStore()
         chat.attachPersistence(store)
@@ -300,8 +321,10 @@ struct AJ29SessionMenuTests {
 
         let restored = ChatStore()
         restored.attachPersistence(store)
-        #expect(restored.executionSnapshot(forSessionID: sessionID)?.state == .idle)
-        #expect(restored.sessionList.first?.indicator == .idle)
+        #expect(restored.executionSnapshot(forSessionID: sessionID)?.state == .failed)
+        #expect(restored.sessionList.first?.indicator == .failed(reason: "上次回复在生成中被中断，可重试"))
+        #expect(restored.sessionList.first?.retryIdentity?.taskID == "task-running")
+        #expect(!restored.isStreaming)
     }
 
     @Test func failedExternalProjectionWinsOverRunningProjection() throws {
@@ -327,6 +350,37 @@ struct AJ29SessionMenuTests {
         )
         chat.attachAgentTaskStore(taskStore)
         #expect(chat.sessionList.first?.indicator == .failed(reason: "execution-failed"))
+    }
+
+    /// MC4-028：账本里更早的失败不能一直盖住之后新一轮的状态；新一轮开始后才失败的任务照常显示。
+    @Test func earlierLedgerFailureDoesNotCoverALaterTurnButNewFailureStillShows() throws {
+        let chat = ChatStore()
+        let sessionID = try #require(chat.activeSessionID)
+        chat.appendUser("先失败后成功")
+        let taskStore = AgentTaskStore()
+        func addFailed(_ taskID: String) throws {
+            _ = try taskStore.enqueue(taskID: taskID, parentID: sessionID.uuidString,
+                                      providerID: "test-provider", modelID: "test-model")
+            _ = try taskStore.startRun(taskID: taskID, runID: "run-\(taskID)")
+            _ = try taskStore.finish(runID: "run-\(taskID)", outcome: .failed(reason: "failure"))
+        }
+        try addFailed("mc4-028-earlier")
+        chat.attachAgentTaskStore(taskStore)
+        #expect(chat.sessionList.first?.indicator == .failed(reason: "execution-failed"))
+
+        chat.markExecutionRunning(sessionID: sessionID, turnID: 2, taskID: "chat-turn-2")
+        chat.markExecutionSucceeded(sessionID: sessionID)
+        #expect(chat.sessionList.first?.indicator == .idle)
+
+        try addFailed("mc4-028-later-child")
+        #expect(chat.sessionList.first?.indicator == .failed(reason: "execution-failed"))
+    }
+
+    @Test func ledgerSessionIDReadsBareAndPrefixedParents() {
+        let id = UUID()
+        #expect(ChatStore.ledgerSessionID(parentID: id.uuidString) == id)
+        #expect(ChatStore.ledgerSessionID(parentID: "session:\(id.uuidString)") == id)
+        #expect(ChatStore.ledgerSessionID(parentID: "child-task-1") == nil)
     }
 
     @Test func externalFailureRetryUsesImmutableIdentityAndSuppressesOldProjection() async throws {
@@ -414,8 +468,12 @@ struct AJ29SessionMenuTests {
 
         let firstFailure = try #require(rows[firstID]?.retryIdentity)
         #expect(chat.retryFailedSession(firstFailure))
-        #expect(chat.sessionList.first(where: { $0.id == firstID })?.execution?.taskID == "b-next-failure")
-        #expect(chat.executionSnapshot(forSessionID: firstID)?.taskID == "b-next-failure")
+        // MC4-028：重试开始新一轮后，本会话更早的账本失败不再盖住侧栏（任务中心里仍保留）。
+        #expect(chat.executionSnapshot(forSessionID: firstID)?.state == .running)
+        #expect(chat.sessionList.first(where: { $0.id == firstID })?.execution?.taskID
+            == chat.executionSnapshot(forSessionID: firstID)?.taskID)
+        #expect(chat.executionSnapshot(forSessionID: firstID)?.taskID != "b-next-failure")
+        #expect(taskStore.snapshot(taskID: "b-next-failure")?.status == .failed)
         #expect(chat.sessionList.first(where: { $0.id == secondID })?.execution?.taskID == "a-first-queued")
         chat.stopStreaming()
     }

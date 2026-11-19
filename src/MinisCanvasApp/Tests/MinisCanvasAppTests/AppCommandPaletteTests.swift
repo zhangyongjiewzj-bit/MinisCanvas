@@ -42,6 +42,38 @@ struct AppCommandPaletteEdgeTests {
 
     // MARK: ① FavoriteCommandsStore.toggle 顺序语义
 
+    /// 菜单给带参命令预填 "/provider.use "：面板要能找到这条命令，而不是"无匹配命令"。
+    @Test func slashPrefilledQueryFindsTheCommand() {
+        let model = makeModel(commands: [makeCommand("provider.use", .backend), makeCommand("model", .backend)])
+        model.updateQuery("/provider.use ")
+        model.refresh()
+        let ids = model.sections.flatMap(\.commands).map(\.id)
+        #expect(ids == ["provider.use"])
+    }
+
+    /// MC4-035：切分类立即重算，不用再输入一次。
+    @Test func switchingCategoryRecomputesSectionsImmediately() {
+        let model = makeModel(commands: [makeCommand("env.a", .environment), makeCommand("be.b", .backend)])
+        model.updateQuery("")
+        model.refresh()
+        model.selectedCategory = .backend
+        let ids = model.sections.flatMap(\.commands).map(\.id)
+        #expect(ids == ["be.b"])
+    }
+
+    /// MC4-036：回车提交前必须先同步 refresh()，源码守卫。
+    @Test func submitRefreshesBeforeReadingFirstResult() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MinisCanvasApp/CommandPaletteView.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        let start = try #require(source.range(of: "private func runSubmittedQuery() {"))
+        let tail = String(source[start.upperBound...].prefix(400))
+        let refreshAt = try #require(tail.range(of: "model.refresh()"))
+        let firstAt = try #require(tail.range(of: "resolveSubmission("))
+        #expect(refreshAt.lowerBound < firstAt.lowerBound)
+    }
+
     @Test func favoriteToggleAppendsInOrderAndRemovesExactlyOnce() {
         let store = FavoriteCommandsStore(defaults: makeDefaults())
         #expect(store.favoriteIDs().isEmpty, "初始无收藏")

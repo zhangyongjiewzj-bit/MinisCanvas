@@ -51,7 +51,8 @@ struct CompactionSourceSpanTests {
                 messageID: "original-message"), operationID: "original-operation", attempt: 1)
             let receipt = try ledger.mint(toolCallID: "original-call", toolName: "file_read",
                 attemptID: "original-attempt", attemptNumber: 1, executionIdentity: identity)
-            _ = try ledger.settle(receipt, status: .succeeded)
+            // 压缩只带非成功终态的回执，成功的不进背景。
+            _ = try ledger.settle(receipt, status: .failed)
             facts += CompactionFactCapture.capture(sessionID: "budget-source", revision: 1,
                 messages: source, taskStore: nil, effectLedger: ledger)
             #expect(facts.contains { $0.source != nil })

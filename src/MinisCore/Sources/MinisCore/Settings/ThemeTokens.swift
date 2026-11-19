@@ -23,6 +23,15 @@ public struct ThemeColor: Equatable, Hashable, Sendable {
         self.b = min(max(b, 0), 1)
     }
 
+    /// 0xRRGGBB 十六进制色值（8 位通道 ÷ 255）。
+    public init(hex: UInt32) {
+        self.init(
+            r: Double((hex >> 16) & 0xFF) / 255.0,
+            g: Double((hex >> 8) & 0xFF) / 255.0,
+            b: Double(hex & 0xFF) / 255.0
+        )
+    }
+
     public init(rgb: (r: Double, g: Double, b: Double)) {
         self.init(r: rgb.r, g: rgb.g, b: rgb.b)
     }
@@ -272,7 +281,7 @@ extension AccentTheme {
     public func semanticTokens(for mode: ThemeMode) -> ThemeSemanticTokens {
         let p = palette
         return switch mode {
-        case .dark: Self.darkSemantic(palette: p)
+        case .dark: Self.darkSemantic(theme: self, palette: p)
         case .light: Self.lightSemantic(theme: self, palette: p)
         }
     }
@@ -280,20 +289,21 @@ extension AccentTheme {
     // MARK: 各主题 palette（身份色 + 深色中性阶）
 
     private static var pseudoPalette: ThemePalette {
-        // 伪仙定版：赭橙强调（AJ-38 亮 #9D623D / 暗 #A0613C 取中间档）+ 极深冷灰中性阶 + 状态青。
+        // 第 1 套「暖中性 + 陶土橙」：本 palette 取深色侧值（primary 由 `accentRGB` 派生为浅色强调
+        // #A84E2A；accent = 深色强调 #E08B68）；浅色侧中性/状态值见 `lightNeutrals` 与 `pseudoLightStatus`。
         ThemePalette(
-            primary: ThemeColor(r: 0.627, g: 0.380, b: 0.235),
-            accent: ThemeColor(r: 0.70, g: 0.45, b: 0.29),
-            success: ThemeColor(r: 0.42, g: 0.50, b: 0.37),
-            warning: ThemeColor(r: 0.93, g: 0.74, b: 0.22),
-            danger: ThemeColor(r: 0.55, g: 0.23, b: 0.17),
-            info: ThemeColor(r: 0.47, g: 0.75, b: 0.78),
-            surface0: ThemeColor(r: 0.04, g: 0.05, b: 0.06),
-            surface1: ThemeColor(r: 0.078, g: 0.094, b: 0.11),
-            surface2: ThemeColor(r: 0.10, g: 0.125, b: 0.145),
-            text0: ThemeColor(r: 0.98, g: 0.976, b: 0.965),
-            text1: ThemeColor(r: 0.71, g: 0.68, b: 0.64),
-            text2: ThemeColor(r: 0.52, g: 0.50, b: 0.47)
+            primary: ThemeColor(hex: 0xA84E2A),
+            accent: ThemeColor(hex: 0xE08B68),
+            success: ThemeColor(hex: 0x6FC08F),
+            warning: ThemeColor(hex: 0xE3A64F),
+            danger: ThemeColor(hex: 0xF08072),
+            info: ThemeColor(hex: 0x7AAEE8),
+            surface0: ThemeColor(hex: 0x1F1E1C),
+            surface1: ThemeColor(hex: 0x262522),
+            surface2: ThemeColor(hex: 0x2D2C29),
+            text0: ThemeColor(hex: 0xECEAE4),
+            text1: ThemeColor(hex: 0xB5B2A9),
+            text2: ThemeColor(hex: 0x9A978F)
         )
     }
 
@@ -384,12 +394,13 @@ extension AccentTheme {
 
     // MARK: dark semantic（直接引用 palette 深色中性阶；状态色 = palette 状态色）
 
-    private static func darkSemantic(palette p: ThemePalette) -> ThemeSemanticTokens {
+    private static func darkSemantic(theme: AccentTheme, palette p: ThemePalette) -> ThemeSemanticTokens {
         ThemeSemanticTokens(
             background: p.surface0,
             sidebarBackground: p.surface1,
             surfaceRaised: p.surface2,
-            stroke: p.text2,
+            // 第 1 套深色边框 #3A3935；其余主题保持原来的弱文本色描边。
+            stroke: theme == .pseudo ? ThemeColor(hex: 0x3A3935) : p.text2,
             selection: p.accent,
             focusRing: p.accent,
             disabled: p.text2,
@@ -409,22 +420,28 @@ extension AccentTheme {
 
     private static func lightSemantic(theme: AccentTheme, palette p: ThemePalette) -> ThemeSemanticTokens {
         let light = lightNeutrals(for: theme)
+        // 第 1 套浅色：强调与状态色有专门的浅色取值（深色取值在 palette）。
+        let accent = theme == .pseudo ? p.primary : p.accent
+        let status = theme == .pseudo
+            ? (success: ThemeColor(hex: 0x2A7549), warning: ThemeColor(hex: 0x9A5B0F),
+               danger: ThemeColor(hex: 0xB3261E), info: ThemeColor(hex: 0x2F6AAE))
+            : (success: p.success, warning: p.warning, danger: p.danger, info: p.info)
         return ThemeSemanticTokens(
             background: light.background,
             sidebarBackground: light.sidebar,
             surfaceRaised: light.raised,
             stroke: light.stroke,
-            selection: p.accent,
-            focusRing: p.accent,
+            selection: accent,
+            focusRing: accent,
             disabled: light.textTertiary,
             textPrimary: light.textPrimary,
             textSecondary: light.textSecondary,
             textTertiary: light.textTertiary,
-            statusSuccess: p.success,
-            statusWarning: p.warning,
-            statusDanger: p.danger,
-            statusInfo: p.info,
-            statusRunning: p.info,
+            statusSuccess: status.success,
+            statusWarning: status.warning,
+            statusDanger: status.danger,
+            statusInfo: status.info,
+            statusRunning: status.info,
             statusMuted: light.textTertiary
         )
     }
@@ -436,12 +453,13 @@ extension AccentTheme {
     ) {
         switch theme {
         case .pseudo:
-            // 伪仙（赭橙）：米白底带暖微染（对齐 AJ-38 亮色板 backgroundPrimary #FAF9F6）。
+            // 第 1 套浅色：底 #FAF9F5、侧栏 #F3F1EB、卡片 #FFFFFF、边框 #E3E0D7；
+            // 正文 #1F1E1D、次要字 #5E5D59、弱字 #6F6D66。
             return (
-                ThemeColor(r: 0.98, g: 0.976, b: 0.965), ThemeColor(r: 0.945, g: 0.933, b: 0.905),
-                ThemeColor(r: 1.00, g: 1.00, b: 1.00), ThemeColor(r: 0.84, g: 0.82, b: 0.78),
-                ThemeColor(r: 0.22, g: 0.20, b: 0.18), ThemeColor(r: 0.45, g: 0.42, b: 0.38),
-                ThemeColor(r: 0.62, g: 0.59, b: 0.55)
+                ThemeColor(hex: 0xFAF9F5), ThemeColor(hex: 0xF3F1EB),
+                ThemeColor(hex: 0xFFFFFF), ThemeColor(hex: 0xE3E0D7),
+                ThemeColor(hex: 0x1F1E1D), ThemeColor(hex: 0x5E5D59),
+                ThemeColor(hex: 0x6F6D66)
             )
         case .codex:
             return (
@@ -515,14 +533,10 @@ extension ThemePreset {
     }
 
     // Derived immutable token values, not a second settings/cache authority.
-    // Reuse donor 60998e584's approved A7-A light warning shade without importing
-    // its partial result as a whole-role acceptance. The other failing roles are
-    // shaded toward the existing readable primary text; raw palette is intact.
-    private static let readableLightTokens: ThemeSemanticTokens = {
-        var source = canonicalAccentTheme.semanticTokens(for: .light)
-        source.statusWarning = ThemeColor(r: 157.0 / 255.0, g: 98.0 / 255.0, b: 61.0 / 255.0)
-        return ThemeContrast.resolvingPresetContrast(source)
-    }()
+    // 第 1 套浅色状态色（警告 #9A5B0F 等）已按 WCAG 算过；仍经现有对比度修正兜底，raw palette 不变。
+    private static let readableLightTokens = ThemeContrast.resolvingPresetContrast(
+        canonicalAccentTheme.semanticTokens(for: .light)
+    )
 
     private static let readableDarkTokens = ThemeContrast.resolvingPresetContrast(
         canonicalAccentTheme.semanticTokens(for: .dark)
@@ -533,7 +547,15 @@ extension ThemePreset {
         fixedMode ?? (systemIsDark ? .dark : .light)
     }
 
-    /// 根视图 `.tint` 的身份色 RGB（全部预设同一 AJ-38 定版值）。
+    /// 按明暗取身份强调色 RGB（浅 #A84E2A / 深 #E08B68）。
+    public func accentRGB(for mode: ThemeMode) -> (r: Double, g: Double, b: Double)? {
+        guard isAccepted else { return nil }
+        return mode == .dark
+            ? Self.canonicalAccentTheme.darkAccentRGB
+            : Self.canonicalAccentTheme.accentRGB
+    }
+
+    /// 根视图 `.tint` 的身份色 RGB（浅色侧；深色侧见 `accentRGB(for:)`）。
     public var accentRGB: (r: Double, g: Double, b: Double)? {
         guard isAccepted else { return nil }
         return Self.canonicalAccentTheme.accentRGB

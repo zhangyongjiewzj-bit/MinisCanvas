@@ -5,6 +5,8 @@ import Foundation
 public enum SecureAgentLoopFactory {
     /// Production wall-clock bound for provider and tool work.
     public static let defaultTimeout: TimeInterval = 300
+    /// 子任务的墙钟上限：对齐 Claude Code，不再 300 秒；只留 2 小时安全网。
+    public static let defaultChildTimeout: TimeInterval = AgentOrchestrator.hardMaxChildTimeout
 
     /// Build a secure child loop from one immutable capability/scope/
     /// cancellation snapshot. The boundary and snapshot are checked before a
@@ -75,7 +77,7 @@ public enum SecureAgentLoopFactory {
     /// optional gate seam to the composition root.
     public static func makeOrchestrator(
         defaultMaxConcurrent: Int = 4,
-        maxIterationsPerTask: Int = 10,
+        maxIterationsPerTask: Int = AgentOrchestrator.hardMaxIterationsPerTask,
         provider: (any LLMProvider)? = nil,
         toolExecutor: (any ToolExecutor)? = nil,
         externalRunners: [String: any ExternalAgentRunner] = [:],
@@ -87,7 +89,7 @@ public enum SecureAgentLoopFactory {
         turnController: TurnController? = nil,
         makeLoopDetector: @escaping @Sendable () -> ToolLoopDetector? = { ToolLoopDetector() },
         makeChildBudget: (@Sendable () -> BudgetTracker?)? = nil,
-        childTimeout: TimeInterval? = SecureAgentLoopFactory.defaultTimeout,
+        childTimeout: TimeInterval? = SecureAgentLoopFactory.defaultChildTimeout,
         currentConversationID: String? = nil,
         childGovernor: ChildConcurrencyGovernor? = nil
     ) -> AgentOrchestrator {

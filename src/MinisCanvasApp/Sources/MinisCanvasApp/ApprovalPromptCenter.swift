@@ -13,7 +13,7 @@ import MinisCore
 /// It conveys no authority and is never journaled or used to execute a tool.
 struct ApprovalReviewPresentation: Sendable {
     fileprivate let fact: ApprovalLifecycleFact
-    static let explanation = "高风险操作等待第二次确认，尚未授权执行"
+    static let explanation = "不可逆操作等待第二次确认，尚未授权执行"
 
     func matchesCurrentExecution(_ identity: AgentExecutionIdentity?) -> Bool {
         guard let identity else { return false }
@@ -68,6 +68,8 @@ final class ApprovalPromptCenter {
     /// 挂起的 continuation（resolve 时恢复）
     private var continuation: CheckedContinuation<ApprovalDecision, Never>?
     private var expirationTask: Task<Void, Never>?
+    /// 只用于显示“X 分钟后自动拒绝”；超时逻辑仍只由 `expirationTask` 决定，不参与持久化。
+    private(set) var pendingExpirationDisplayDeadline: Date?
     /// Identifies this waiter, independently of reusable public request/call IDs.
     private var pendingPresentationID: UUID?
     /// Read-only waiter metadata for notification deduplication, never UI identity or authority.
@@ -118,14 +120,32 @@ final class ApprovalPromptCenter {
             && matchingPendingPresentation(for: request)?.executionIdentity == executionIdentity
     }
 
-    /// Presentation preferences are process-local and default to the R3 dialog.
+    /// Presentation preference (inline strip vs dialog). The object starts in dialog mode;
+    /// the assembly layer restores the saved setting (whose default is the inline strip),
+    /// and user changes are persisted through `onPresentationPreferenceChanged`.
     var inlineApprovalEnabled = false {
         didSet {
             if oldValue != inlineApprovalEnabled {
                 renderedPresentationID = UUID()
                 if pendingRequest != nil { presentedAt = Date() }
+                notifyPresentationPreferenceChanged()
             }
         }
+    }
+    /// 用户在界面上改了呈现方式或超时后调用（由装配层接到设置落盘）；装配层回填已存值时不触发。
+    var onPresentationPreferenceChanged: ((Bool, TimeInterval) -> Void)?
+    private var applyingPersistedPresentation = false
+    private func notifyPresentationPreferenceChanged() {
+        guard !applyingPersistedPresentation else { return }
+        onPresentationPreferenceChanged?(inlineApprovalEnabled, expirationInterval)
+    }
+    /// 把设置里已保存的审批呈现方式装回来（行内提示条 / 弹窗，超时秒数）。
+    func applyPersistedPresentation(inline: Bool, expiration: TimeInterval) {
+        applyingPersistedPresentation = true
+        defer { applyingPersistedPresentation = false }
+        if inlineApprovalEnabled != inline { inlineApprovalEnabled = inline }
+        let safe = expiration.isFinite ? max(0, expiration) : 0
+        if expirationInterval != safe { expirationInterval = safe }
     }
     var inlineHostAvailable = false {
         didSet {
@@ -142,16 +162,24 @@ final class ApprovalPromptCenter {
     /// Applies to newly presented requests; changing it never renews a waiter.
     private(set) var pendingExecutionOrigin: ApprovalExecutionOrigin = .interactive
 
-    var expirationInterval: TimeInterval
+    var expirationInterval: TimeInterval {
+        didSet {
+            if oldValue != expirationInterval { notifyPresentationPreferenceChanged() }
+        }
+    }
     var rememberSameKindInSession = false
     /// User's "allow from now on" choice for the pending prompt only. It is
     /// cleared for every presentation and applied only to an explicit approval
     /// whose request carries an available offer.
     var persistAllowSelected = false
+    /// 用户在卡片上写的"拒绝并说明"，只随拒绝结果交给模型，每次展示清空。
+    var denialNote = ""
     /// Durable rules shown in Settings. Owned by the Composer grant store;
     /// installed by the production root, nil in isolated fixtures.
     var persistentRules: PersistentApprovalRuleStore?
     var skillRuleFactsProvider: (@MainActor () -> ComposerPolicyFactSource?)? = nil
+    /// 规则管理面板用的当前会话信息（授权根、工作目录、会话 ID）；由根视图安装，隔离测试里为 nil。
+    var permissionRulesContextProvider: (@MainActor () -> PermissionRulesPanelContext)? = nil
     private(set) var awaitingSkillRiskConfirmation = false
     private var skillRiskConfirmedPresentationID: UUID?
 
@@ -205,7 +233,9 @@ final class ApprovalPromptCenter {
         let projectID: String
         let path: String
         let hash: String
-        var id: String { projectID + ":" + path }
+        /// true 表示这是"不加载（记住）"的记录，不是信任。
+        var refused = false
+        var id: String { projectID + (refused ? ":refused:" : ":") + path }
     }
     var projectInstructionTrustRows: (() -> [ProjectInstructionTrustRow])?
     var revokeProjectInstructionTrust: ((String) throws -> Void)?
@@ -252,6 +282,7 @@ final class ApprovalPromptCenter {
     func revokeSessionPermissions() { sessionPermissions.removeAll() }
     func endSession(_ sessionID: String) {
         sessionPermissions.removeAll { $0.sessionID == sessionID }
+        persistentRules?.clearSessionRules(sessionID: sessionID)
         rememberSameKindInSession = false
         persistAllowSelected = false
     }
@@ -293,11 +324,95 @@ final class ApprovalPromptCenter {
     }
 
     /// Return handling is separate from the approval shortcut and cannot fire
-    /// in the first 0.5 seconds. A high-risk prompt always defaults to refusal.
-    func handleReturn() {
+    /// in the first 0.5 seconds. 回车 = 批准（默认按钮，用户 2026-11-17 决定）；
+    /// 不可逆操作的二次确认卡、终端策略已拒绝的卡、等待风险确认的卡不适用：回车按拒绝处理，必须显式点击才能批准。
+    func handleReturn(focusOnDeny: Bool = false) {
         guard let presentedAt, Date().timeIntervalSince(presentedAt) >= 0.5 else { return }
-        if pendingRequest?.riskLevel == .high { actionsForPresentedRequest().deny() }
-        else { actionsForPresentedRequest().approve() }
+        if keyboardApprovalBlocked || focusOnDeny {
+            actionsForPresentedRequest().deny()
+        } else {
+            actionsForPresentedRequest().approve()
+        }
+    }
+
+    /// 回车键在审批卡里的结果（纯函数，便于表格测试）。
+    enum ReturnKeyOutcome: Equatable {
+        /// 交还给系统（例如等待时长输入框里的回车）。
+        case ignored
+        /// 吞掉按键，不批准也不拒绝。
+        case consumed
+        /// 拒绝理由框里的回车：立即带理由拒绝，不受 0.5 秒保护限制。
+        case denyWithReason
+        /// 没有按钮焦点（或焦点在“允许”上）的普通回车：普通卡批准、必须点击的卡拒绝，由 `handleReturn()` 决定。
+        case plainReturn
+        /// 焦点在“拒绝”按钮上：回车 = 拒绝。
+        case denyFocused
+        /// 焦点在“拒绝并说明…”上：回车 = 打开理由框（不批准也不拒绝）。
+        case openDenialNote
+        /// 焦点在“在任务中心查看”上：回车 = 执行该按钮（暂挂审批提示，不批准也不拒绝）。
+        case viewTaskCenter
+        /// ⌘回车：普通卡批准，必须点击的卡不做任何事。
+        case commandReturn
+    }
+
+    /// 审批卡里当前拿着键盘焦点的按钮。
+    enum ReturnFocus: Hashable { case deny, allow, denyWithNote, viewTaskCenter }
+
+    /// 规则（用户 2026-11-17 定，对齐 Claude Code：回车选中高亮项）：回车作用于有焦点的按钮——
+    /// “拒绝”= 拒绝，“拒绝并说明…”= 打开理由框，“在任务中心查看”= 执行该按钮；
+    /// 没有按钮焦点时才按卡片默认：普通卡批准，必须点击的卡一律拒绝、⌘回车不批准；
+    /// 拒绝理由框聚焦时回车 = 带理由拒绝。
+    nonisolated static func returnKeyOutcome(
+        isCommand: Bool, durationOwnsKeyboard: Bool, denialNoteFocused: Bool, focus: ReturnFocus? = nil
+    ) -> ReturnKeyOutcome {
+        if durationOwnsKeyboard { return isCommand ? .consumed : .ignored }
+        if denialNoteFocused { return .denyWithReason }
+        if isCommand { return .commandReturn }
+        switch focus {
+        case .deny: return .denyFocused
+        case .denyWithNote: return .openDenialNote
+        case .viewTaskCenter: return .viewTaskCenter
+        case .allow, nil: return .plainReturn
+        }
+    }
+
+    /// 审批卡回车键的完整接线：按键结果到动作。返回 false 表示交还给系统。
+    func handleReturnKey(
+        isCommand: Bool, durationOwnsKeyboard: Bool, denialNoteFocused: Bool, focus: ReturnFocus?,
+        openDenialNote: () -> Void, viewTaskCenter: (() -> Void)?
+    ) -> Bool {
+        switch Self.returnKeyOutcome(
+            isCommand: isCommand, durationOwnsKeyboard: durationOwnsKeyboard,
+            denialNoteFocused: denialNoteFocused, focus: focus
+        ) {
+        case .ignored: return false
+        case .consumed: return true
+        // 正在写拒绝理由：回车 = 带理由拒绝，绝不批准。
+        case .denyWithReason: actionsForPresentedRequest().deny()
+        case .denyFocused: handleReturn(focusOnDeny: true)
+        case .openDenialNote: openDenialNote()
+        case .viewTaskCenter: viewTaskCenter?()
+        case .plainReturn: handleReturn()
+        case .commandReturn: handleCommandReturn()
+        }
+        return true
+    }
+
+    /// 必须用鼠标点"允许"的情形：敏感文件、项目外写入、不可逆操作二次确认、终端策略已拒绝、
+    /// 浏览器风险提示，以及正在等待确认的阶段。这些情形下任何键盘快捷方式（回车、⌘回车、⌘Y）都不批准。
+    var keyboardApprovalBlocked: Bool {
+        let needsExplicitClick = pendingRequest.map {
+            $0.requiresSecondConfirmation || $0.terminalPolicyDisposition == .denied
+                || $0.browserRiskWarning != nil || $0.requiresExplicitClick
+        } ?? true
+        return needsExplicitClick || awaitingConfirmation || awaitingSkillRiskConfirmation
+    }
+
+    /// ⌘回车：普通卡片批准；必须点击的卡片不做任何事（不批准、也不拒绝）。
+    func handleCommandReturn() {
+        guard let presentedAt, Date().timeIntervalSince(presentedAt) >= 0.5 else { return }
+        guard !keyboardApprovalBlocked else { return }
+        actionsForPresentedRequest().approve()
     }
     /// Bound approvals are consumed once at the UI boundary as well as at
     /// `ApprovalGate`, preventing a prompt result from being replayed by a
@@ -313,7 +428,12 @@ final class ApprovalPromptCenter {
     /// The reason carried only by the card's own Deny action.
     nonisolated static let userDenialReason = "用户拒绝"
 
-    init(expirationInterval: TimeInterval = 300) {
+    /// 审批超时（含请求自带截止时间）按拒绝处理时写给模型和转录的原因。
+    nonisolated static let timeoutDenialReason = "超时未处理，已拒绝"
+
+    /// 直接构造时默认 0（一直等）；产品默认 300 秒由设置装回（`applyPersistedPresentation`），
+    /// 设置里可改，0 = 一直等。无人值守审批不走这个计时。
+    init(expirationInterval: TimeInterval = 0) {
         self.expirationInterval = expirationInterval
     }
 
@@ -329,7 +449,7 @@ final class ApprovalPromptCenter {
             return failClosed("已有审批请求在处理中")
         }
         if let expiresAt = request.expiresAt, expiresAt <= Date() {
-            let detail = "审批请求已过期"
+            let detail = Self.timeoutDenialReason
             record(.expired, requestID: request.id, detail: detail)
             return failClosed(detail, status: .expired, request: request)
         }
@@ -371,6 +491,7 @@ final class ApprovalPromptCenter {
                 dialogFallbackRequested = false
                 rememberSameKindInSession = false
                 persistAllowSelected = false
+                denialNote = ""
                 awaitingSkillRiskConfirmation = false
                 skillRiskConfirmedPresentationID = nil
                 pendingExecutionIdentity = nil
@@ -434,7 +555,9 @@ final class ApprovalPromptCenter {
             deny: { [weak self] in
                 guard let self,
                       self.acceptsRenderedAction(presentationID, renderedID: renderedID, requestID: requestID) else { return }
-                self.resolve(approved: false, reason: Self.userDenialReason, confirmed: false,
+                let note = String(self.denialNote.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
+                let reason = note.isEmpty ? Self.userDenialReason : Self.userDenialReason + "：" + note
+                self.resolve(approved: false, reason: reason, confirmed: false,
                              requestID: requestID)
             },
             dismiss: { [weak self] in
@@ -681,7 +804,7 @@ final class ApprovalPromptCenter {
 
     /// Testable/manual expiry hook. Automatic expiry uses the same path.
     func expirePending() {
-        finishPendingAsFailure(code: .expired, detail: "审批请求已过期")
+        finishPendingAsFailure(code: .expired, detail: Self.timeoutDenialReason)
     }
 
     private func cancelPresentation(_ presentationID: UUID) {
@@ -691,19 +814,27 @@ final class ApprovalPromptCenter {
 
     private func scheduleExpiration(for request: ApprovalRequest, presentationID: UUID) {
         expirationTask?.cancel()
+        pendingExpirationDisplayDeadline = nil
         if pendingExecutionOrigin.isUnattended {
             expirationTask = nil
             return
         }
-        let configured = expirationInterval.isFinite && expirationInterval > 0
-            ? min(expirationInterval, 3600) : 300
         let requestLifetime = request.expiresAt.map { $0.timeIntervalSinceNow }
+        let configured: TimeInterval
+        if expirationInterval.isFinite && expirationInterval > 0 {
+            configured = min(expirationInterval, 3600)
+        } else {
+            // 默认不自动拒绝；只有请求自带的硬截止时间仍然生效。
+            guard let requestLifetime, requestLifetime.isFinite, requestLifetime < 86_400 * 365 else { return }
+            configured = requestLifetime
+        }
         let delay = min(configured, requestLifetime ?? configured)
         guard delay > 0 else {
             expirePending()
             return
         }
         let nanoseconds = UInt64(delay * 1_000_000_000)
+        pendingExpirationDisplayDeadline = Date().addingTimeInterval(delay)
         expirationTask = Task { @MainActor [weak self] in
             do {
                 try await Task.sleep(nanoseconds: nanoseconds)
@@ -763,6 +894,7 @@ final class ApprovalPromptCenter {
     ) {
         expirationTask?.cancel()
         expirationTask = nil
+        pendingExpirationDisplayDeadline = nil
         continuation = nil
         pendingPresentationID = nil
         renderedPresentationID = nil
@@ -776,6 +908,7 @@ final class ApprovalPromptCenter {
         presentedAt = nil
         awaitingConfirmation = false
         persistAllowSelected = false
+        denialNote = ""
         awaitingSkillRiskConfirmation = false
         skillRiskConfirmedPresentationID = nil
         if let diagnostic {
@@ -832,7 +965,10 @@ final class ApprovalDecisionStatusLedger: @unchecked Sendable {
         let reason: String?
         /// Only the card's own Deny action is the user refusing; fail-closed
         /// denials (another card open, consumed identity, ...) are not.
-        var isUserDenial: Bool { status == .denied && reason == ApprovalPromptCenter.userDenialReason }
+        var isUserDenial: Bool {
+            status == .denied && (reason == ApprovalPromptCenter.userDenialReason
+                || reason?.hasPrefix(ApprovalPromptCenter.userDenialReason + "：") == true)
+        }
     }
 
     private let lock = NSLock()
@@ -892,19 +1028,35 @@ struct ApprovalPromptView: View {
     var onViewTaskCenter: (() -> Void)? = nil
     var identityPasteboard: any PasteboardWriting = NSPasteboard.general
     var adjacentDurationIsFocused = false
+    /// 请求所属会话不是当前会话时返回该会话标题（根视图传入）；用于在卡片首行标出来源，不参与授权。
+    var originSessionTitle: ((ApprovalRequest) -> String?)? = nil
+    /// 弹窗被系统关闭时按"关闭"处理；行内卡片消失（例如点了"在弹窗中审批"、切换会话）时不能处理，
+    /// 审批要留给随后出现的弹窗或重新出现的卡片（旅程测试 11/17：点"在弹窗中审批"后审批被当作关闭）。
+    var dismissesOnDisappear = true
     @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
     @FocusState private var focusedAction: ApprovalAction?
     @FocusState private var lifetimeIsFocused: Bool
-    private enum ApprovalAction: Hashable { case deny, allow }
-    @State private var showsRequestDetails = false
+    private typealias ApprovalAction = ApprovalPromptCenter.ReturnFocus
+    @State private var showsDenialNote = false
+    @FocusState private var denialNoteIsFocused: Bool
 
     private var request: ApprovalRequest? { center.pendingRequest }
     private var durationOwnsKeyboard: Bool { lifetimeIsFocused || adjacentDurationIsFocused }
 
     private func approvalShortcut(_ action: ShortcutAction) -> ShortcutBinding {
-        if durationOwnsKeyboard { return ShortcutBinding(key: "", modifiers: ShortcutModifiers.none) }
+        if durationOwnsKeyboard || denialNoteIsFocused { return ShortcutBinding(key: "", modifiers: ShortcutModifiers.none) }
+        // 必须点击批准的卡片：批准快捷键（默认 ⌘Y）不生效。
+        if action == .approveRequest, center.keyboardApprovalBlocked {
+            return ShortcutBinding(key: "", modifiers: ShortcutModifiers.none)
+        }
         return shortcutStore?.binding(for: action) ?? action.defaultBinding
+    }
+
+    /// “拒绝并说明…”按钮和它获得焦点时的回车共用：打开理由框并把焦点交给它。
+    private func openDenialNote() {
+        showsDenialNote = true
+        denialNoteIsFocused = true
     }
 
     var body: some View {
@@ -914,6 +1066,13 @@ struct ApprovalPromptView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
+                if let origin = summary.originNotice {
+                    Text(origin).font(typography?.caption ?? .caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityIdentifier("approval.summary.origin")
+                }
                 HStack(spacing: 8) {
                     MinisIconView(riskIcon, size: 20, accessibilityLabel: riskLabel)
                         .foregroundPalette(riskColor)
@@ -939,21 +1098,15 @@ struct ApprovalPromptView: View {
                         .help(summary.searchDetails ?? summary.target)
                         .textSelection(.enabled)
                         .accessibilityIdentifier("approval.summary.target")
-                    Text(summary.directory).font(typography?.caption ?? .caption)
+                    // 首屏只显示缩写目录；完整路径在悬停提示和“详情”的请求输入里。
+                    Text(Self.shortDirectory(summary.directory)).font(typography?.caption ?? .caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                         .help(summary.directory)
                         .textSelection(.enabled)
+                        .accessibilityLabel(summary.directory)
                         .accessibilityIdentifier("approval.summary.directory")
-                    if let details = summary.searchDetails {
-                        Text(verbatim: details).font(typography?.body ?? .body)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .help(details)
-                            .textSelection(.enabled)
-                            .accessibilityIdentifier("approval.summary.search-details")
-                    }
                 }
                 if let request, request.toolName == "orchestrate", request.riskLevel == .high {
                     Text(verbatim: ApprovalRequestDetailsText.bound(request.inputSummary))
@@ -962,15 +1115,30 @@ struct ApprovalPromptView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .accessibilityIdentifier("approval.summary.orchestration-warning")
                 } else if let request, request.toolName == "shell_execute" {
-                    Text(verbatim: ApprovalRequestDetailsText.bound(request.inputSummary))
+                    // 命令必须完整显示（上限 64KB，更长的命令在核心层已拒绝）：用户批准的就是看到的全部内容。
+                    Text(verbatim: ApprovalRequestDetailsText.full(request.inputSummary))
                         .font(typography?.monospaced ?? .system(.body, design: .monospaced))
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                 } else if let request, request.toolName.hasPrefix("mcp_") {
-                    Text(verbatim: ApprovalRequestDetailsText.bound(request.toolName))
-                        .font(typography?.body ?? .body)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
+                    let mcp = ApprovalMCPPresentation(toolName: request.toolName, inputSummary: request.inputSummary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(verbatim: mcp.identityLine)
+                            .font(typography?.body ?? .body)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("approval.summary.mcp-identity")
+                        Text(verbatim: mcp.argumentsLine)
+                            .font(typography?.caption ?? .caption)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("approval.summary.mcp-arguments")
+                        Text(mcp.irreversibleNotice)
+                            .font(typography?.caption ?? .caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("approval.summary.mcp-irreversible")
+                    }
                 }
                 Text(summary.reason).font(typography?.body ?? .body)
                     .lineLimit(1)
@@ -978,6 +1146,14 @@ struct ApprovalPromptView: View {
                 Text(summary.scope).font(typography?.caption ?? .caption)
                     .lineLimit(1)
                     .accessibilityIdentifier("approval.summary.scope")
+                if let deadline = center.pendingExpirationDisplayDeadline {
+                    TimelineView(.periodic(from: .now, by: 15)) { context in
+                        Text(ApprovalCountdownText.text(deadline: deadline, now: context.date))
+                            .font(typography?.caption ?? .caption)
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("approval.summary.countdown")
+                    }
+                }
             }
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("approval.summary")
@@ -985,10 +1161,10 @@ struct ApprovalPromptView: View {
             if let request {
                 if request.isHookAsk {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("Hook 要求你确认")
+                        Text("钩子要求你确认")
                             .font(typography?.caption ?? .caption)
-                            .foregroundStyle(.orange)
-                        Text(request.hookAskReason.flatMap { $0.isEmpty ? nil : $0 } ?? "Hook 没有给出原因")
+                            .foregroundStyle(theme?.statusWarningText ?? AppStatusColor.warning)
+                        Text(request.hookAskReason.flatMap { $0.isEmpty ? nil : $0 } ?? "钩子没有给出原因")
                             .font(typography?.body ?? .body)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1018,7 +1194,7 @@ struct ApprovalPromptView: View {
                     if let expansion = Self.skillScopeExpansionLines(diff.unifiedDiff) {
                         Text("这次改动新增了可能放宽范围的内容，请确认是你要的：\n" + expansion.joined(separator: "\n"))
                             .font(typography?.caption ?? .caption)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(theme?.statusDangerText ?? AppStatusColor.danger)
                             .textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityElement(children: .ignore)
@@ -1036,7 +1212,9 @@ struct ApprovalPromptView: View {
             }
 
             if request?.sessionScopeEligible == true, !center.pendingExecutionOrigin.isUnattended {
-                Toggle("本对话内都允许", isOn: $center.rememberSameKindInSession)
+                Toggle(request?.persistentAllowOffer.map { SessionTargetApprovalRules.isSessionTargetCapability($0.capability) } == true
+                       ? "本对话内都允许（对此目标会话）" : "本对话内都允许",
+                       isOn: $center.rememberSameKindInSession)
                     .accessibilityIdentifier("approval.scope-choice")
             }
             if let warning = request?.browserRiskWarning {
@@ -1053,9 +1231,7 @@ struct ApprovalPromptView: View {
                             get: { center.persistAllowSelected },
                             set: { center.selectPersistentAllow($0) }))
                             .accessibilityIdentifier("approval.persist-allow")
-                        Text(offer.capability == "browser"
-                             ? "仅对此站点和动作类别生效；页面内容可能诱导误操作。可在 设置 › 智能体运行 › 工具审批 中逐条撤销。"
-                             : "仅对当前项目生效；之后命中同类操作不再询问，但仍会生成调用回执。可在 设置 › 权限 › 持久审批规则 中撤销。")
+                        Text(Self.persistentAllowShortNote(offer) ?? Self.persistentAllowNote(offer))
                             .font(typography?.caption ?? .caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1094,35 +1270,42 @@ struct ApprovalPromptView: View {
             }
 
             if let request {
-                ApprovalIdentityDetailsView(request: request, pasteboard: identityPasteboard)
-                if !isExternalSend || request.source != nil || request.sourceTaskTitle != nil {
-                    DisclosureGroup("请求详情（已脱敏）", isExpanded: $showsRequestDetails) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("工具：" + request.toolName)
-                            if request.source != nil || request.sourceTaskTitle != nil {
-                                Text("来自子任务" + (request.sourceTaskTitle.map {
-                                    "：" + String(ContentSecretRedactor.redact($0).prefix(120))
-                                } ?? ""))
-                                .accessibilityIdentifier("approval-child-task-source")
-                            }
-                            if !isExternalSend {
-                                Text("输入（已脱敏）")
-                                ScrollView {
-                                    Text(ApprovalRequestDetailsText.bound(request.inputSummary))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .textSelection(.enabled)
-                                }
-                                .frame(maxHeight: 180)
-                                .font(typography?.monospaced ?? .system(.body, design: .monospaced))
-                                .textSelection(.enabled)
-                                .padding(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background((theme?.aj38.borderSubtle.swiftUIColor ?? Color.secondary).opacity(0.1))
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                            }
+                // 唯一的“详情”折叠：请求详情（已脱敏）与技术身份九项合并在一起。
+                ApprovalIdentityDetailsView(request: request, pasteboard: identityPasteboard) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("工具：" + request.toolName)
+                        if request.source != nil || request.sourceTaskTitle != nil {
+                            Text("来自子任务" + (request.sourceTaskTitle.map {
+                                "：" + String(ContentSecretRedactor.redact($0).prefix(120))
+                            } ?? ""))
+                            .accessibilityIdentifier("approval-child-task-source")
                         }
-                        .font(typography?.caption ?? .caption)
+                        if !isExternalSend {
+                            Text("输入（已脱敏，完整内容可滚动查看）")
+                            ScrollView {
+                                Text(request.toolName == "shell_execute"
+                                     ? ApprovalRequestDetailsText.full(request.inputSummary)
+                                     : ApprovalRequestDetailsText.bound(request.inputSummary))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxHeight: request.toolName == "shell_execute" ? 240 : 180)
+                            .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background((theme?.aj38.borderSubtle.swiftUIColor ?? Color.secondary).opacity(0.1))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                        }
+                        if request.terminalPolicyDisposition != .denied, !request.isHookAsk,
+                           let offer = request.persistentAllowOffer, offer.isAvailable,
+                           Self.persistentAllowShortNote(offer) != nil {
+                            Text(Self.persistentAllowNote(offer))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
+                    .font(typography?.caption ?? .caption)
                     .accessibilityIdentifier("approval.request-details")
                 }
             }
@@ -1131,13 +1314,30 @@ struct ApprovalPromptView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(maxHeight: 480)
+            if request != nil, showsDenialNote || !center.denialNote.isEmpty {
+                TextField("拒绝时可以告诉助手怎么改（可选）", text: $center.denialNote)
+                    .textFieldStyle(.roundedBorder)
+                    .font(typography?.caption ?? .caption)
+                    .focused($denialNoteIsFocused)
+                    .accessibilityIdentifier("approval.denial-note")
+            }
             HStack {
                 if let onViewTaskCenter {
                     Button("在任务中心查看", action: onViewTaskCenter)
+                        .focusable()
+                        .focused($focusedAction, equals: .viewTaskCenter)
                         .help("暂挂此审批提示，在任务中心查看同一待审批任务；不会批准或拒绝")
                         .accessibilityIdentifier("approval.view-task-center")
                 }
                 Spacer()
+                if request != nil, !showsDenialNote, center.denialNote.isEmpty {
+                    Button("拒绝并说明…") { openDenialNote() }
+                    .buttonStyle(.link)
+                    .focusable()
+                    .focused($focusedAction, equals: .denyWithNote)
+                    .help("拒绝时告诉助手怎么改")
+                    .accessibilityIdentifier("approval.deny-with-note")
+                }
                 Button("拒绝") {
                     actions.deny()
                 }
@@ -1183,19 +1383,16 @@ struct ApprovalPromptView: View {
         }
         .padding(20)
         .frame(minWidth: 300, idealWidth: 460, maxWidth: 460)
-        .onAppear { focusedAction = request?.terminalPolicyDisposition == .denied || riskLevel == .high ? .deny : .allow }
-        .onChange(of: request?.id) { _, _ in focusedAction = request?.terminalPolicyDisposition == .denied || riskLevel == .high ? .deny : .allow }
-        .onChange(of: request?.id) { _, _ in showsRequestDetails = false }
+        .onAppear { focusedAction = Self.defaultFocus(for: request) }
+        .onChange(of: request?.id) { _, _ in focusedAction = Self.defaultFocus(for: request) }
+        .onChange(of: request?.id) { _, _ in showsDenialNote = false }
         .onKeyPress(keys: [.return], phases: .down) { keyPress in
-            if durationOwnsKeyboard {
-                return keyPress.modifiers.contains(.command) ? .handled : .ignored
-            }
-            if keyPress.modifiers.contains(.command) {
-                actions.approve()
-            } else {
-                center.handleReturn()
-            }
-            return .handled
+            // 回车作用于有焦点的按钮（对齐 Claude Code：回车选中高亮项），没有按钮焦点才按卡片默认。
+            center.handleReturnKey(
+                isCommand: keyPress.modifiers.contains(.command),
+                durationOwnsKeyboard: durationOwnsKeyboard, denialNoteFocused: denialNoteIsFocused,
+                focus: focusedAction, openDenialNote: openDenialNote, viewTaskCenter: onViewTaskCenter
+            ) ? .handled : .ignored
         }
         .onKeyPress(.escape) {
             guard !durationOwnsKeyboard else { return .ignored }
@@ -1204,10 +1401,17 @@ struct ApprovalPromptView: View {
         }
         .onDisappear {
             // 系统关闭且尚未裁决时取消；Esc 已走同一 dismiss 路径，pending 清空后不重复处理。
-            if center.pendingRequest != nil {
+            if dismissesOnDisappear, center.pendingRequest != nil {
                 actions.dismiss()
             }
         }
+    }
+
+    /// 默认焦点在“允许”（回车 = 批准）；不可逆操作的二次确认卡、终端策略已拒绝、带浏览器风险提示的卡默认在“拒绝”。
+    private static func defaultFocus(for request: ApprovalRequest?) -> ApprovalAction {
+        guard let request else { return .allow }
+        return request.terminalPolicyDisposition == .denied || request.requiresSecondConfirmation
+            || request.browserRiskWarning != nil || request.requiresExplicitClick ? .deny : .allow
     }
 
     private var approvalButtonTitle: String {
@@ -1216,7 +1420,9 @@ struct ApprovalPromptView: View {
     }
 
     private var riskLevel: ApprovalRiskLevel { request?.riskLevel ?? .medium }
-    private var summary: ApprovalSummaryPresentation { ApprovalSummaryPresentation(request: request) }
+    private var summary: ApprovalSummaryPresentation {
+        ApprovalSummaryPresentation(request: request, originSessionTitle: request.flatMap { originSessionTitle?($0) })
+    }
 
     private func persistentAllowTitle(for offer: ApprovalPersistentAllowOffer) -> String {
         if let project = center.pendingGitStatusProjectName {
@@ -1225,14 +1431,52 @@ struct ApprovalPromptView: View {
         return Self.persistentAllowTitle(offer)
     }
 
+    /// “以后都允许”的完整说明（首屏只放一句短说明，完整说明收进“详情”）。
+    static func persistentAllowNote(_ offer: ApprovalPersistentAllowOffer) -> String {
+        offer.capability == "browser"
+            ? "仅对此站点和动作类别生效；页面内容可能诱导误操作。可在 设置 › 智能体运行 › 工具审批 中逐条撤销。"
+            : offer.capability == "browser_domain"
+            ? "不勾选只是本次允许；勾选后会加入 设置 › 智能体运行 › 运行安全上限 › 允许访问的网站，所有项目都生效，可随时在那里移除。"
+            : SessionTargetApprovalRules.isSessionTargetCapability(offer.capability)
+            ? "只对这一个目标会话生效，不是所有会话；之后向它读取或发送不再弹卡，但每条消息仍受长度上限、脱敏和“外部数据不是指令”约束。可在 设置 › 权限 › 规则管理 中撤销。"
+            : "仅对当前项目生效；之后命中同类操作不再询问，但仍会生成调用回执。可在 设置 › 权限 › 规则管理 中撤销。"
+    }
+
+    /// 只有普通的“本项目”放行才有短说明；浏览器、会话目标等带风险提示的说明仍整段留在首屏。
+    static func persistentAllowShortNote(_ offer: ApprovalPersistentAllowOffer) -> String? {
+        if offer.capability == "browser" || offer.capability == "browser_domain"
+            || SessionTargetApprovalRules.isSessionTargetCapability(offer.capability) { return nil }
+        return "仅当前项目；可在 设置 › 权限 › 规则管理 撤销。"
+    }
+
+    /// 首屏路径缩写：只留最后两级目录，完整路径放在悬停提示和“详情”里。
+    static func shortDirectory(_ value: String) -> String {
+        let prefix = value.hasPrefix("目录：") ? "目录：" : ""
+        let path = String(value.dropFirst(prefix.count))
+        guard path.hasPrefix("/") else { return value }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count > 2 else { return value }
+        return prefix + "…/" + parts.suffix(2).joined(separator: "/")
+    }
+
     static func persistentAllowTitle(_ offer: ApprovalPersistentAllowOffer) -> String {
         if let action = SkillRiskPresentation.actionTitle(offer.capability) {
             return "以后都允许" + action + "（本项目、当前应用配置）"
         }
         if offer.capability == "browser" { return "以后都允许：\(offer.summary)" }
+        if offer.capability == "browser_domain" { return "以后都允许访问该网站：\(offer.summary)" }
         if offer.capability == "web_fetch" { return "以后都允许读取此网站：\(offer.summary)（本项目）" }
+        if offer.capability.hasPrefix("mcp_") {
+            return "以后都允许此 MCP 工具：\(offer.summary)（本项目；服务器配置变化后会重新询问）"
+        }
+        if offer.capability == "file_read" { return "以后都允许读取、搜索、列出此目录（含子目录）：\(offer.summary)" }
+        if offer.capability == "web_search" { return "以后都允许联网搜索（本项目）" }
+        if SessionTargetApprovalRules.isSessionTargetCapability(offer.capability) {
+            let verb = offer.capability == SessionReadTool.toolName ? "读取" : "向其发送消息"
+            return "以后都允许（对此目标会话）\(verb)：\(offer.summary)"
+        }
         return offer.capability == "shell_execute"
-            ? "以后都允许此类命令：\(offer.summary)…（本项目）"
+            ? "以后都允许以下命令前缀：\(offer.summary)（本项目）"
             : "以后都允许在此项目目录内\(offer.capability == "file_edit" ? "编辑" : "写入")：\(offer.summary)"
     }
 
@@ -1338,6 +1582,43 @@ struct ApprovalIdentityPresentation {
 
 /// Five bounded text rows plus the existing decision-button row form the summary.
 /// File/diff previews and risk-consent controls keep their independent contracts.
+/// “X 分钟后自动拒绝”的显示文案（纯函数，只读时间，不改超时逻辑）。
+enum ApprovalCountdownText {
+    static func text(deadline: Date, now: Date) -> String {
+        let remaining = deadline.timeIntervalSince(now)
+        if remaining <= 0 { return "即将自动拒绝" }
+        if remaining < 60 { return "不到 1 分钟后自动拒绝" }
+        return "约 \(Int((remaining / 60).rounded(.up))) 分钟后自动拒绝"
+    }
+}
+
+/// MCP 工具审批卡的身份与参数摘要。服务器/工具名按 `mcp_<服务器>_<工具>` 拆分，
+/// 服务器名含下划线时拆分可能不准，因此同时给出完整名称。
+struct ApprovalMCPPresentation: Equatable {
+    static let argumentLimit = 160
+    let identityLine: String
+    let argumentsLine: String
+    let irreversibleNotice = "外部服务端的操作无法由本应用撤销。"
+
+    init(toolName: String, inputSummary: String) {
+        let full = ApprovalRequestDetailsText.bound(toolName)
+        if let parsed = MCPBoundTool.parseFullName(toolName) {
+            identityLine = "MCP 服务器：\(parsed.serverID)　工具：\(parsed.toolName)（完整名称 \(full)）"
+        } else {
+            identityLine = "MCP 工具：\(full)"
+        }
+        let redacted = ContentSecretRedactor.redact(inputSummary)
+        let trimmed = redacted.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            argumentsLine = "参数：无"
+        } else if trimmed.count > Self.argumentLimit {
+            argumentsLine = "参数（已脱敏，仅显示前 \(Self.argumentLimit) 字）：" + String(trimmed.prefix(Self.argumentLimit)) + "…"
+        } else {
+            argumentsLine = "参数（已脱敏）：" + trimmed
+        }
+    }
+}
+
 struct ApprovalSummaryPresentation {
     let action: String
     let target: String
@@ -1345,7 +1626,16 @@ struct ApprovalSummaryPresentation {
     let directory: String
     let reason: String
     let scope: String
-    init(request: ApprovalRequest?) {
+    /// 请求不属于当前打开的会话时的来源提示（"来自会话：《标题》"）；属于当前会话时为 nil。只显示，不参与授权。
+    let originNotice: String?
+    /// `originSessionTitle`：请求所属会话不是当前会话时由根视图传入该会话标题（空串表示没有标题）。
+    init(request: ApprovalRequest?, originSessionTitle: String? = nil) {
+        if let originSessionTitle {
+            let title = ContentSecretRedactor.redact(originSessionTitle.trimmingCharacters(in: .whitespacesAndNewlines))
+            originNotice = title.isEmpty ? "来自另一个会话" : "来自会话：《" + Self.middleBound(title) + "》"
+        } else {
+            originNotice = nil
+        }
         let tool = request.map { ContentSecretRedactor.redact($0.toolName) }
         let isFileSearch = request?.toolName == "file_grep" || request?.toolName == "file_glob"
         searchDetails = isFileSearch && request?.filePreview?.isSensitive != true
@@ -1364,7 +1654,10 @@ struct ApprovalSummaryPresentation {
         case "skill_delete": action = "删除技能"
         case "browser": action = "浏览器操作"
         case "web_fetch": action = "读取网页"
+        case "web_search": action = "联网搜索"
         case "external_session_send": action = "发送到外部会话"
+        case "session_send": action = "发送到本应用其它会话"
+        case "session_read": action = "读取本应用其它会话"
         default: action = tool.map { "工具调用：" + $0 } ?? "工具调用审批"
         }
         if request?.filePreview?.isSensitive == true {
@@ -1375,6 +1668,14 @@ struct ApprovalSummaryPresentation {
             let url = URL(fileURLWithPath: safe)
             target = Self.middleBound(url.lastPathComponent)
             directory = Self.middleBound(url.deletingLastPathComponent().path)
+        } else if let shell = Self.shellParts(request) {
+            // shell 卡：标题写模型给的说明（没有就写命令首行），下面写目录；完整命令在下方等宽块里。
+            target = Self.middleBound(shell.title ?? shell.firstLine)
+            directory = "目录：" + Self.middleBound(shell.directory)
+        } else if let request, request.toolName == "orchestrate", !request.displayTaskTitles.isEmpty {
+            // 只显示子任务标题（Core 已脱敏、截断）；任务正文仍只在折叠详情里。
+            target = Self.orchestrateTargetText(request.displayTaskTitles)
+            directory = "工具：orchestrate"
         } else {
             target = request?.skillDeletionIntent?.targetName
                 ?? request?.webFetchAuthority.map { ContentSecretRedactor.redact($0) }
@@ -1386,15 +1687,17 @@ struct ApprovalSummaryPresentation {
         switch request?.toolName {
         case "file_write": reason = "可能覆盖目标文件的已有内容。"
         case "file_edit": reason = "将修改目标文件的内容。"
-        // 第七版旅程：模型常常删完才说“永久删除”。弹卡说明只出现在非绕过档（绕过档删除不弹卡、进废纸篓），
+        // 第七版旅程：模型常常删完才说“永久删除”。弹卡说明只出现在非绕过档（绕过档删除不弹卡；
+        // 绕过档且文件检查点关闭才移入废纸篓，检查点开启时与此处一样是永久删除、靠检查点找回），
         // 所以卡上直接写明后果，不依赖模型预告。
-        case "file_delete": reason = "将永久删除目标文件，不进废纸篓（开启文件检查点时可从恢复入口找回），请核对目标。"
+        case "file_delete": reason = "将永久删除目标文件，不进废纸篓。文件检查点开启时可从恢复入口找回；检查点关闭则无法找回。请核对目标。"
         case "shell_execute": reason = "命令可能更改工作区或系统状态。"
+        case "orchestrate": reason = "将派出子智能体执行下列任务，请核对任务和授权范围（见下方详情）后批准。"
         default: reason = "请核对目标和影响后批准本次操作。"
         }
         switch request?.approvalScope {
         case "request": scope = "范围：仅这一次"
-        case "session": scope = "范围：当前会话"
+        case "session": scope = originSessionTitle == nil ? "范围：当前会话" : "范围：该会话"
         case "workspace": scope = "范围：当前工作区"
         case "turn": scope = "范围：本回合"
         default:
@@ -1405,6 +1708,30 @@ struct ApprovalSummaryPresentation {
             }
         }
     }
+    /// shell 审批卡的预览文本固定为 `工作目录：…\n[说明：…\n]命令：\n…`（见 ApprovalFilePreview.capture），在这里拆出来。
+    private static func shellParts(_ request: ApprovalRequest?) -> (title: String?, firstLine: String, directory: String)? {
+        guard let request, request.toolName == "shell_execute",
+              let text = request.filePreview?.text, text.hasPrefix("工作目录："),
+              let commandMarker = text.range(of: "\n命令：\n") else { return nil }
+        let header = String(text[..<commandMarker.lowerBound])
+        let command = String(text[commandMarker.upperBound...])
+        var directory = ""
+        var title: String?
+        for (index, line) in header.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            if index == 0 { directory = String(line.dropFirst("工作目录：".count)) }
+            else if line.hasPrefix("说明：") { title = String(line.dropFirst("说明：".count)) }
+        }
+        let first = command.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let hasMore = command.contains(where: \.isNewline)
+        return (title.flatMap { $0.isEmpty ? nil : $0 }, first + (hasMore ? " …" : ""), directory)
+    }
+
+    /// 前 3 个子任务标题，超出写“等 N 个任务”。
+    static func orchestrateTargetText(_ titles: [String]) -> String {
+        let shown = titles.prefix(3).joined(separator: "、")
+        return titles.count > 3 ? "子任务：\(shown) 等 \(titles.count) 个任务" : "子任务：\(shown)"
+    }
+
     private static func summaryTarget(_ inputSummary: String) -> String? {
         // Core's flattened summary is display text. Only its leading field has
         // a trustworthy boundary, so never scan for embedded field-like text.
@@ -1423,23 +1750,35 @@ struct ApprovalSummaryPresentation {
     }
 }
 
-struct ApprovalIdentityDetailsView: View {
+/// 审批卡唯一的“详情”折叠：技术身份九项 + 调用方传入的请求详情（已脱敏的输入、工具名、子任务来源、完整路径说明）。
+struct ApprovalIdentityDetailsView<Extra: View>: View {
     let request: ApprovalRequest
-    var pasteboard: any PasteboardWriting = NSPasteboard.general
+    var pasteboard: any PasteboardWriting
+    let extra: Extra
     @State private var expanded = false
     @Environment(\.typographyTokens) private var typography
+    init(request: ApprovalRequest,
+         pasteboard: any PasteboardWriting = NSPasteboard.general,
+         @ViewBuilder extra: () -> Extra) {
+        self.request = request
+        self.pasteboard = pasteboard
+        self.extra = extra()
+    }
     private var presentation: ApprovalIdentityPresentation { ApprovalIdentityPresentation(request: request) }
     var body: some View {
         HStack(alignment: .top) {
             DisclosureGroup(isExpanded: $expanded) {
-                ForEach(presentation.rows) { row in
-                    Text(row.text)
-                        .font(typography?.monospaced ?? .system(.caption2, design: .monospaced))
-                        .textSelection(.enabled)
-                        .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 6) {
+                    extra
+                    ForEach(presentation.rows) { row in
+                        Text(row.text)
+                            .font(typography?.monospaced ?? .system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
+                            .accessibilityHidden(true)
+                    }
                 }
             } label: {
-                Text("技术详情与审计标识（9 项）")
+                Text("详情")
             }
             Button("复制全部") {
                 copyTextToClipboard(presentation.copyText, pasteboard: pasteboard)
@@ -1456,11 +1795,12 @@ struct ApprovalIdentityDetailsView: View {
                     .accessibilityLabel("技术身份")
                     .accessibilityValue(presentation.accessibilityValue)
                     .accessibilityIdentifier("approval.technical-identity")
-                Button("技术详情与审计标识（9 项）") {
+                Button("详情") {
                     expanded.toggle()
                 }
                 .accessibilityValue(expanded ? "已展开" : "已折叠")
                 .accessibilityIdentifier("approval.identity.toggle")
+                extra
                 // Keep all nine public fields readable in both visual states.
                 // There is no independent identity ledger or disclosure state.
                 ForEach(presentation.rows) { row in
@@ -1479,6 +1819,15 @@ struct ApprovalIdentityDetailsView: View {
 }
 
 private enum ApprovalRequestDetailsText {
+    /// shell 命令：只脱敏、不截断（上限 72KB，核心层已拒绝超过 64KB 的命令，正常不会触发）。
+    static func full(_ text: String) -> String {
+        let safe = ContentSecretRedactor.redact(text)
+        var data = Data(safe.utf8.prefix(72 * 1024))
+        while String(data: data, encoding: .utf8) == nil && !data.isEmpty { data.removeLast() }
+        let body = String(data: data, encoding: .utf8) ?? ""
+        return body + (body == safe ? "" : "\n…[内容过长，已截断显示]")
+    }
+
     static func bound(_ text: String) -> String {
         let safe = ContentSecretRedactor.redact(text)
         var data = Data(safe.utf8.prefix(4 * 1024))
@@ -1520,75 +1869,132 @@ struct ApprovalFilePreviewView: View {
 struct ApprovalPresentationSettingsView: View {
     @Bindable var center: ApprovalPromptCenter
     var body: some View {
-        Toggle("行内工具审批", isOn: $center.inlineApprovalEnabled)
-        ApprovalDurationField(
-            title: "后续审批等待", value: $center.expirationInterval,
-            identifier: "settings.approval.expiration-interval"
-        )
+        Toggle("审批提示条显示在输入框上方（关闭则用弹窗）", isOn: $center.inlineApprovalEnabled)
+        Toggle("审批等待超时自动拒绝", isOn: Binding(
+            get: { center.expirationInterval > 0 },
+            set: { center.expirationInterval = $0 ? 300 : 0 }))
+        if center.expirationInterval > 0 {
+            ApprovalDurationField(
+                title: "审批等待超时", value: $center.expirationInterval,
+                identifier: "settings.approval.expiration-interval"
+            )
+        }
+        Text("默认 300 秒没处理就自动拒绝，并写明“超时未处理，已拒绝”，审批卡上会显示剩余时间。关闭后审批卡会一直等你处理；无人值守的审批不受影响。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
     }
 }
 
-/// Settings list of durable "allow from now on" rules: view, delete one, clear all.
+/// 规则管理面板（对齐 Claude Code 的 /permissions）：允许、拒绝、每次询问三类规则；
+/// 手动新增、编辑、删除；显示范围、来源、创建时间和最近命中时间；导入 .claude/settings.json。
 struct PersistentApprovalRulesSettingsView: View {
+    @Environment(\.themeTokens) private var theme
     let store: PersistentApprovalRuleStore
-    @State private var rules: [PersistentApprovalRule] = []
-    @State private var diagnostics: [String] = []
+    var approvalCenter: ApprovalPromptCenter?
+    @State private var model: PermissionRulesPanelModel?
     @State private var confirmingClearAll = false
+
+    init(store: PersistentApprovalRuleStore, approvalCenter: ApprovalPromptCenter? = nil) {
+        self.store = store
+        self.approvalCenter = approvalCenter
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("已允许的规则")
-                .font(.headline)
-            if rules.isEmpty {
-                Text("暂无规则。在审批卡中选择“以后都允许”后会出现在这里。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("approval.rules.empty")
+            if let model {
+                panel(model)
             }
-            ForEach(rules) { rule in
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(Self.title(rule))
+        }
+        .sheet(isPresented: Binding(get: { model?.isEditorPresented ?? false },
+                                    set: { model?.isEditorPresented = $0 })) {
+            if let model { PermissionRuleEditorSheet(model: model) }
+        }
+        .sheet(isPresented: Binding(get: { model?.isImportPresented ?? false },
+                                    set: { model?.isImportPresented = $0 })) {
+            if let model { PermissionRulesImportSheet(model: model) }
+        }
+        .confirmationDialog("清除全部持久规则？", isPresented: $confirmingClearAll) {
+            Button("全部清除", role: .destructive) { model?.clearAll() }
+        } message: {
+            Text("允许、拒绝、每次询问规则都会清除（本会话规则不受影响）；之后这些操作按当前权限模式处理。")
+        }
+        .onAppear {
+            if model == nil {
+                let center = approvalCenter
+                model = PermissionRulesPanelModel(store: store) {
+                    center?.permissionRulesContextProvider?() ?? PermissionRulesPanelContext()
+                }
+            }
+            model?.reload()
+        }
+    }
+
+    @ViewBuilder
+    private func panel(_ model: PermissionRulesPanelModel) -> some View {
+        Text("规则管理（对话里输入 /permissions 可打开）")
+            .font(.headline)
+        Text("拒绝规则命中后直接拒绝，所有权限模式都生效；每次询问规则命中后一定弹卡（绕过权限除外）；允许规则命中后免问，但仍要通过敏感文件、构建配置、授权根等检查。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        HStack {
+            Button("新增规则") { model.beginAdd() }
+                .accessibilityIdentifier("approval.rules.add")
+            Button("导入 Claude Code 设置") { model.prepareImport() }
+                .accessibilityIdentifier("approval.rules.import")
+            if !model.entries.isEmpty {
+                Button("全部清除", role: .destructive) { confirmingClearAll = true }
+                    .accessibilityIdentifier("approval.rules.clear-all")
+            }
+        }
+        if let feedback = model.feedback, !model.isEditorPresented {
+            Text(feedback).font(.caption).foregroundStyle(.secondary)
+                .accessibilityIdentifier("approval.rules.feedback")
+        }
+        if model.entries.isEmpty {
+            Text("暂无规则。在审批卡中选择“以后都允许”，或点上方“新增规则”。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("approval.rules.empty")
+        }
+        ForEach(model.entries) { entry in
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(PermissionRulesPanelModel.behaviorLabel(entry.rule.behavior))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(entry.rule.behavior == .deny ? (theme?.statusDangerText ?? AppStatusColor.danger)
+                                : entry.rule.behavior == .ask ? (theme?.statusWarningText ?? AppStatusColor.warning)
+                                : (theme?.statusSuccess ?? AppStatusColor.success))
+                        Text(Self.title(entry.rule))
                             .font(.system(.body, design: .monospaced))
                             .textSelection(.enabled)
-                        Text("项目：\(rule.projectRoots.joined(separator: "、"))")
+                    }
+                    Text("范围：\(PermissionRulesPanelModel.scopeLabel(entry.scope)) · 来源：\(PermissionRulesPanelModel.originLabel(entry.rule.origin)) · 创建：\(PermissionRulesPanelModel.timeText(entry.rule.createdAt)) · 最近命中：\(PermissionRulesPanelModel.timeText(entry.rule.lastMatchedAt))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if entry.scope == .project, !entry.rule.projectRoots.isEmpty {
+                        Text("项目：\(entry.rule.projectRoots.joined(separator: "、"))")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
-                    Spacer()
-                    Button("撤销") {
-                        _ = store.remove(id: rule.id)
-                        reload()
-                    }
-                    .accessibilityLabel("撤销规则 \(Self.title(rule))")
-                    .accessibilityIdentifier("approval.rules.delete")
                 }
-            }
-            if !rules.isEmpty {
-                Button("全部清除", role: .destructive) { confirmingClearAll = true }
-                    .accessibilityIdentifier("approval.rules.clear-all")
-            }
-            ForEach(Array(diagnostics.enumerated()), id: \.offset) { _, line in
-                Text(line)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Spacer()
+                if PermissionRulesPanelModel.isEditable(entry.rule) {
+                    Button("编辑") { model.beginEdit(entry) }
+                        .accessibilityLabel("编辑规则 \(Self.title(entry.rule))")
+                        .accessibilityIdentifier("approval.rules.edit")
+                }
+                Button("撤销") { model.remove(entry.rule.id) }
+                    .accessibilityLabel("撤销规则 \(Self.title(entry.rule))")
+                    .accessibilityIdentifier("approval.rules.delete")
             }
         }
-        .onAppear { reload() }
-        .confirmationDialog("清除全部已允许的规则？", isPresented: $confirmingClearAll) {
-            Button("全部清除", role: .destructive) {
-                _ = store.removeAll()
-                reload()
-            }
-        } message: {
-            Text("之后这些操作会重新逐次询问。")
+        ForEach(Array(model.diagnostics.enumerated()), id: \.offset) { _, line in
+            Text(line)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-    }
-
-    private func reload() {
-        rules = store.allRules()
-        diagnostics = store.diagnostics()
     }
 
     static func title(_ rule: PersistentApprovalRule) -> String {
@@ -1600,9 +2006,16 @@ struct PersistentApprovalRulesSettingsView: View {
         }
         switch rule.kind {
         case .shellCommandPrefix: return "命令前缀 \(rule.pattern)"
-        case .webHost: return "网站 \(rule.pattern)（本项目）"
+        case .webHost: return "网站 \(rule.pattern)"
+        case .mcpTool:
+            return rule.behavior == .allow ? "MCP 工具 \(rule.capability)（当前服务器配置）" : "MCP 工具 \(rule.capability)"
+        case .sessionTarget:
+            return SessionTargetApprovalRules.ruleDescription(capability: rule.capability, pattern: rule.pattern)
+                + "（仅此目标会话）"
         case .projectDirectory:
-            return (rule.capability == "file_edit" ? "编辑 " : "写入 ") + rule.pattern
+            if rule.capability == "web_search" { return "联网搜索" }
+            let verb = rule.capability == "file_read" ? "读取、搜索 " : (rule.capability == "file_edit" ? "编辑 " : "写入 ")
+            return verb + rule.pattern
         }
     }
 }
@@ -1611,16 +2024,15 @@ struct PersistentApprovalRulesSettingsView: View {
 /// the user, the existing dialog remains the presentation fallback.
 struct InlineApprovalPromptView: View {
     @Bindable var center: ApprovalPromptCenter
-    @FocusState private var expirationIsFocused: Bool
+    var originSessionTitle: ((ApprovalRequest) -> String?)? = nil
 
+    // 超时时长是设置项，只在设置页修改；审批卡上只显示剩余时间（11/19 旅途：默认改为 300 秒后
+    // 每张卡都多出一个可编辑的"审批等待超时"输入框）。
     var body: some View {
         InlineInteractionCard(title: "") {
-            ApprovalPromptView(center: center, adjacentDurationIsFocused: expirationIsFocused)
+            ApprovalPromptView(center: center,
+                               originSessionTitle: originSessionTitle, dismissesOnDisappear: false)
             Button("在弹窗中审批") { center.fallBackToDialog() }
-            ApprovalDurationField(
-                title: "后续审批等待", value: $center.expirationInterval,
-                identifier: "approval.inline.expiration-interval", focus: $expirationIsFocused
-            )
         }
     }
 }

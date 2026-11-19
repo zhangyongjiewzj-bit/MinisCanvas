@@ -24,6 +24,8 @@ enum AgentFileOutputFailure: Error, Equatable {
     case actionFailed
     case previewUnsupported
     case stale
+    /// 大文件的摘要正在后台核验，稍后再点即可（不再在主线程逐字节读）。
+    case verifying
 
     var message: String {
         switch self {
@@ -34,8 +36,9 @@ enum AgentFileOutputFailure: Error, Equatable {
         case .outOfBounds: return "文件目标超出授权工作区，操作已阻止。"
         case .notAFile: return "目标不是普通文件，操作已阻止。"
         case .actionFailed: return "系统未能完成文件操作。"
-        case .previewUnsupported: return "当前只支持文本、Markdown 和图片预览；可尝试系统打开。"
+        case .previewUnsupported: return "当前支持文本、Markdown、图片、PDF 和视频预览；这个类型可尝试系统打开。"
         case .stale: return "文件内容已变化，无法打开这次生成的文件。"
+        case .verifying: return "文件较大，正在后台核验内容，请稍后再点一次。"
         }
     }
 }
@@ -129,11 +132,55 @@ enum AgentFileOutputTargetResolver {
         return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 
+    /// 已核验摘要缓存：键含文件身份（设备、inode、大小、修改与变更时间），文件一变就自然失效。
+    private final class DigestCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [String: String] = [:]
+        private var pending: Set<String> = []
+        func key(_ url: URL, _ identity: GeneratedFileIdentity) -> String {
+            "\(url.path)|\(identity.device)|\(identity.inode)|\(identity.size)|\(identity.modifiedSeconds).\(identity.modifiedNanoseconds)|\(identity.changedSeconds).\(identity.changedNanoseconds)"
+        }
+        func value(for key: String) -> String? { lock.lock(); defer { lock.unlock() }; return items[key] }
+        func store(_ digest: String, for key: String) {
+            lock.lock(); defer { lock.unlock() }
+            if items.count >= 64 { items.removeAll() }
+            items[key] = digest
+        }
+        func beginPending(_ key: String) -> Bool { lock.lock(); defer { lock.unlock() }; return pending.insert(key).inserted }
+        func endPending(_ key: String) { lock.lock(); defer { lock.unlock() }; pending.remove(key) }
+        func isPending(prefix: String) -> Bool { lock.lock(); defer { lock.unlock() }; return pending.contains { $0.hasPrefix(prefix) } }
+    }
+    private static let digestCache = DigestCache()
+    /// 超过这个大小的文件在主线程点击时不同步算摘要，改为后台核验。
+    static let inlineDigestLimitBytes = 8 * 1_048_576
+
+    /// 这个文件的摘要是否正在后台核验。
+    static func isDigestVerificationPending(_ url: URL) -> Bool {
+        digestCache.isPending(prefix: url.path + "|")
+    }
+
+    /// 主线程点击用：命中缓存直接返回；小文件同步算；大文件交给后台，本次返回 nil（调用方可查 isDigestVerificationPending）。
+    static func generatedFileDigestDeferringLarge(_ url: URL) -> String? {
+        guard let identity = generatedFileIdentity(url) else { return nil }
+        let key = digestCache.key(url, identity)
+        if let cached = digestCache.value(for: key) { return cached }
+        if identity.size <= Int64(inlineDigestLimitBytes) { return generatedFileDigest(url) }
+        guard digestCache.beginPending(key) else { return nil }
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = generatedFileDigest(url)
+            digestCache.endPending(key)
+        }
+        return nil
+    }
+
     static func generatedFileDigest(_ url: URL) -> String? {
+        let cacheKey = generatedFileIdentity(url).map { digestCache.key(url, $0) }
+        if let cacheKey, let cached = digestCache.value(for: cacheKey) { return cached }
         guard let handle = generatedFileHandle(url) else { return nil }
         defer { try? handle.close() }
         var before = stat()
-        guard fstat(handle.fileDescriptor, &before) == 0 else { return nil }
+        // 超过 100MB 的文件不逐字节核验（按“已变化”处理，用户可在访达中查看）。
+        guard fstat(handle.fileDescriptor, &before) == 0, before.st_size <= 100 * 1_048_576 else { return nil }
         var hash = SHA256()
         do {
             while let bytes = try handle.read(upToCount: 65_536), !bytes.isEmpty { hash.update(data: bytes) }
@@ -144,7 +191,11 @@ enum AgentFileOutputTargetResolver {
               before.st_size == after.st_size,
               before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
               before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec else { return nil }
-        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+        let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        if let cacheKey, generatedFileIdentity(url).map({ digestCache.key(url, $0) }) == cacheKey {
+            digestCache.store(digest, for: cacheKey)
+        }
+        return digest
     }
 
     static func generatedFileStillMatches(_ handle: FileHandle, url: URL) -> Bool {
@@ -295,6 +346,21 @@ enum AgentFileOutputActionConsumer {
         )
     }
 
+    /// “系统打开”统一套用可执行类型拦截：可执行/自动运行类型只在访达显示，
+    /// 脚本类显式用文本编辑器打开，其余才交给系统默认程序。
+    static func guardedSystemOpen(
+        _ url: URL,
+        open: (URL) -> Bool,
+        reveal: (URL) -> Bool,
+        openText: ((URL) -> Bool)?
+    ) -> Bool {
+        switch TranscriptLocalFileLink.openDisposition(for: url) {
+        case .systemOpen: return open(url)
+        case .textEditor: return (openText ?? { TranscriptLocalFileLink.openInTextEditor($0) })(url)
+        case .revealOnly: return reveal(url)
+        }
+    }
+
     static func performTaskArtifact(
         access: TaskCenterFileArtifactAccess,
         validateBinding: () -> Bool,
@@ -305,7 +371,8 @@ enum AgentFileOutputActionConsumer {
         open: (URL) -> Bool,
         reveal: (URL) -> Bool,
         copy: (String) -> Bool,
-        preview: (URL) -> Bool = { _ in false }
+        preview: (URL) -> Bool = { _ in false },
+        openText: ((URL) -> Bool)? = nil
     ) -> AgentFileOutputOutcome {
         let target: URL
         switch AgentFileOutputTargetResolver.resolveTaskArtifact(
@@ -317,11 +384,12 @@ enum AgentFileOutputActionConsumer {
         }
         let succeeded: Bool
         switch intent {
-        case .systemOpen: succeeded = open(target)
+        case .systemOpen:
+            succeeded = guardedSystemOpen(target, open: open, reveal: reveal, openText: openText)
         case .finderReveal: succeeded = reveal(target)
         case .copySafePath: succeeded = copy(target.path)
         case .preview:
-            guard FileKind(url: target).supportsAgentOutputPreview else { return .failed(.previewUnsupported) }
+            guard FileKind.agentPreviewSupported(for: target) else { return .failed(.previewUnsupported) }
             succeeded = preview(target)
         }
         return succeeded ? .completed : .failed(.actionFailed)
@@ -337,7 +405,8 @@ enum AgentFileOutputActionConsumer {
         open: (URL) -> Bool,
         reveal: (URL) -> Bool,
         copy: (String) -> Bool,
-        preview: (URL) -> Bool = { _ in false }
+        preview: (URL) -> Bool = { _ in false },
+        openText: ((URL) -> Bool)? = nil
     ) -> AgentFileOutputOutcome {
         guard let sessionID = viewerSessionID, !sessionID.isEmpty,
               records.contains(where: {
@@ -357,14 +426,59 @@ enum AgentFileOutputActionConsumer {
 
         let succeeded: Bool
         switch intent {
-        case .systemOpen: succeeded = open(physicalTarget)
+        case .systemOpen:
+            succeeded = guardedSystemOpen(physicalTarget, open: open, reveal: reveal, openText: openText)
         case .finderReveal: succeeded = reveal(physicalTarget)
         case .copySafePath: succeeded = copy(physicalTarget.path)
         case .preview:
-            guard FileKind(url: physicalTarget).supportsAgentOutputPreview else {
+            guard FileKind.agentPreviewSupported(for: physicalTarget) else {
                 return .failed(.previewUnsupported)
             }
             succeeded = preview(physicalTarget)
+        }
+        return succeeded ? .completed : .failed(.actionFailed)
+    }
+
+    /// 已证实产物行的操作：按台账记录（会话、diffID）和 outputSHA256 重新核验，不依赖内存里的
+    /// ActionHistory；根取记录自带的 workspaceRoot，缺失时才用台账主根。
+    /// “系统打开”同样走可执行类型拦截。
+    static func performLedgerArtifact(
+        artifact: ProducedFileArtifactEvidence,
+        ledgerRecord: FileChangeRecord?,
+        fallbackRoot: String?,
+        viewerSessionID: String?,
+        intent: AgentFileOutputIntent,
+        preview: (URL) -> Bool,
+        probe: (URL) -> AgentFileOutputProbe,
+        digest: (URL) -> String?,
+        open: (URL) -> Bool,
+        reveal: (URL) -> Bool,
+        copy: (String) -> Bool
+    ) -> AgentFileOutputOutcome {
+        guard let sessionID = viewerSessionID, !sessionID.isEmpty,
+              let record = ledgerRecord, record.sessionID == sessionID,
+              record.diffID == artifact.diffID, record.path == artifact.path,
+              let expected = record.outputSHA256, expected == artifact.outputSHA256 else {
+            return .failed(.unbound)
+        }
+        let target: URL
+        switch AgentFileOutputTargetResolver.resolve(
+            path: record.path, workspaceRoot: record.workspaceRoot ?? fallbackRoot, probe: probe
+        ) {
+        case .failure(let failure): return .failed(failure)
+        case .success(let url): target = url
+        }
+        guard digest(target) == expected else {
+            return .failed(AgentFileOutputTargetResolver.isDigestVerificationPending(target) ? .verifying : .stale)
+        }
+        let succeeded: Bool
+        switch intent {
+        case .systemOpen: succeeded = guardedSystemOpen(target, open: open, reveal: reveal, openText: nil)
+        case .finderReveal: succeeded = reveal(target)
+        case .copySafePath: succeeded = copy(target.path)
+        case .preview:
+            guard FileKind.agentPreviewSupported(for: target) else { return .failed(.previewUnsupported) }
+            succeeded = preview(target)
         }
         return succeeded ? .completed : .failed(.actionFailed)
     }
@@ -405,6 +519,30 @@ enum AgentFileOutputActionConsumer {
 
 private struct AgentFileOutputActionKey: EnvironmentKey {
     static var defaultValue: ((AgentFileChangeRecord, AgentFileOutputIntent) -> AgentFileOutputOutcome)? { nil }
+}
+
+private struct AgentArtifactOutputActionKey: EnvironmentKey {
+    static var defaultValue: ((ProducedFileArtifactEvidence, AgentFileOutputIntent) -> AgentFileOutputOutcome)? { nil }
+}
+
+extension EnvironmentValues {
+    /// 已证实产物行的预览、系统打开、访达显示、复制路径入口（点击时重新核验）。
+    var agentArtifactOutputAction: ((ProducedFileArtifactEvidence, AgentFileOutputIntent) -> AgentFileOutputOutcome)? {
+        get { self[AgentArtifactOutputActionKey.self] }
+        set { self[AgentArtifactOutputActionKey.self] = newValue }
+    }
+}
+
+private struct TranscriptImagePreviewActionKey: EnvironmentKey {
+    static var defaultValue: ((URL) -> Bool)? { nil }
+}
+
+extension EnvironmentValues {
+    /// 对话里的本地图片缩略图点击后，在右侧面板预览（路径已在生成缩略图时校验过）。
+    var transcriptImagePreviewAction: ((URL) -> Bool)? {
+        get { self[TranscriptImagePreviewActionKey.self] }
+        set { self[TranscriptImagePreviewActionKey.self] = newValue }
+    }
 }
 
 extension EnvironmentValues {

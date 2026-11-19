@@ -102,12 +102,15 @@ struct Batch2R_ConversationUsageContextReadTests {
     func catalogContextUnreportedWhenNoReport() async throws {
         let fx = try await Batch2RFixture.make()
         defer { fx.cleanup() }
-        #expect(fx.chat.contextOccupancy == nil)
+        // 2026-11-16：首个用量回报前显示带“约”的本地估算，同时仍明确标注“未回报”。
         let catalog = try await fx.readCatalog()
         #expect(catalog.values["context.reported"] == .toggle(false))
-        #expect(catalog.values["context.used-tokens"] == nil)
-        #expect(catalog.values["context.window-tokens"] == nil)
-        #expect(catalog.values["context.percent"] == nil)
+        if case .text(let percent)? = catalog.values["context.percent"] {
+            #expect(percent.hasPrefix("约"), "估算值必须带“约”，不能冒充模型回报")
+        } else {
+            #expect(catalog.values["context.used-tokens"] == nil)
+            #expect(catalog.values["context.window-tokens"] == nil)
+        }
     }
 
     @Test("a model cannot write a usage or context row; usage records stay unchanged")

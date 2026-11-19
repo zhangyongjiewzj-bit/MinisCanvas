@@ -146,11 +146,13 @@ struct ChatFileArtifactEvidenceTests {
     @Test func failedWriteDoesNotRegisterAnArtifact() async throws {
         let (executor, ledger, root) = try fixture()
         let producer = receipt()
+        // 缺失的父目录现在会自动创建；父路径是普通文件时写入才会失败。
+        try "plain file".write(to: root.appendingPathComponent("not-a-dir"), atomically: true, encoding: .utf8)
         do {
             _ = try await ToolExecutionReceiptContext.$current.withValue(producer) {
                 try await executor.execute(
                     name: "file_write",
-                    input: ["path": root.appendingPathComponent("missing/note.txt").path,
+                    input: ["path": root.appendingPathComponent("not-a-dir/note.txt").path,
                             "content": "never-written"]
                 )
             }

@@ -15,6 +15,10 @@ extension ProductionDomainAssembly {
             return bridge.chat.schedulerProviderPreflight(for: task, now: now)
         }
         schedulerStore.providerPreflightResolver = schedulerProviderPreflightResolver
+        // 定时任务的锚点会话不参与自动归档。
+        bridge.chat.scheduledAnchorSessionIDs = { [weak schedulerStore] in
+            Set(schedulerStore?.allTasks().compactMap(\.targetSessionID) ?? [])
+        }
         return SchedulerTaskRuntime(
             store: schedulerStore,
             now: now,

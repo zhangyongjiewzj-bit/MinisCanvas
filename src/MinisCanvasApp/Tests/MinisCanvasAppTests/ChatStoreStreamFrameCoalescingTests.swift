@@ -15,7 +15,7 @@ struct ChatStoreStreamFrameCoalescingTests {
         #expect(try await waitUntil { chat.messages.last?.content == "首字🙂" })
         let firstVisible = ContinuousClock.now - firstStarted
         #expect(chat.isStreaming, "首段必须在 producer 终态之前可见")
-        engine.continuation.yield(.thinkingDelta("安静前的尾块e\u{301}👨‍👩‍👧‍👦"))
+        engine.continuation.yield(.textDelta("安静前的尾块e\u{301}👨‍👩‍👧‍👦"))
         #expect(try await waitUntil {
             chat.messages.last?.content == "首字🙂安静前的尾块e\u{301}👨‍👩‍👧‍👦"
         })

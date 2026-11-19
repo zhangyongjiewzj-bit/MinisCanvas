@@ -18,17 +18,26 @@ final class OptimizeStubProvider: LLMProvider, @unchecked Sendable {
         return _capturedSystemPrompt
     }
 
+    private var _capturedTemperatures: [Double?] = []
+
+    /// 每次请求收到的温度（F-12：不传温度即 nil）。
+    var capturedTemperatures: [Double?] {
+        lock.lock(); defer { lock.unlock() }
+        return _capturedTemperatures
+    }
+
     /// 同步记录（async 上下文直接调 NSLock 会被 Swift 6 拒绝，经此同步方法中转）
-    private func capture(_ prompt: String?) {
+    private func capture(_ prompt: String?, temperature: Double?) {
         lock.lock()
         _capturedSystemPrompt = prompt
+        _capturedTemperatures.append(temperature)
         lock.unlock()
     }
 
     func sendMessage(
         messages: [LLMMessage], systemPrompt: String?, maxTokens: Int, temperature: Double?
     ) async throws -> LLMResponse {
-        capture(systemPrompt)
+        capture(systemPrompt, temperature: temperature)
         switch result {
         case .success(let text):
             return LLMResponse(text: text, stopReason: "end_turn", usage: nil)
@@ -65,6 +74,23 @@ struct OptimizePromptServiceTests {
         let prompt = try #require(stub.capturedSystemPrompt)
         #expect(prompt.contains("提示词工程师"))
         #expect(prompt.contains("不虚构内容"))
+    }
+
+    /// F-12：不写死温度（OpenAI 推理模型会拒绝自定义温度），请求里不带温度，用模型自己的默认值。
+    @Test func requestDoesNotPinATemperature() async throws {
+        let stub = OptimizeStubProvider()
+        _ = try await makeService(stub).optimize("原稿")
+        #expect(stub.capturedTemperatures.count == 1)
+        #expect(stub.capturedTemperatures.first! == nil)
+    }
+
+    /// F-12：文档分阶段处理的模型调用同样不带温度。
+    @Test func documentStageCallDoesNotPinATemperature() async throws {
+        let stub = OptimizeStubProvider()
+        let call = DocumentStageRunner.makeLLM(provider: stub)
+        _ = try await call("阶段提示词")
+        #expect(stub.capturedTemperatures.count == 1)
+        #expect(stub.capturedTemperatures.first! == nil)
     }
 
     @Test func trimsWhitespaceAroundResult() async throws {

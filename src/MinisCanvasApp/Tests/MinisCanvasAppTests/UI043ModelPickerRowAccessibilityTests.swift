@@ -48,6 +48,19 @@ struct UI043ModelPickerRowAccessibilityTests {
         #expect(body.contains(".accessibilityHint(isEnabled ? \"选择此项\" : \"不可选择，请到设置检查模型连接\")"))
     }
 
+    @Test("未就绪服务商合并为一行可点条目，不再有独立的“去设置 ·”链接行")
+    func unreadyProviderIsSingleClickableRow() throws {
+        let source = try modelMenuSource()
+        #expect(!source.contains("Button(\"去设置 · "))
+        let start = try #require(source.range(of: "private func unreadyProviderRow("))
+        let end = try #require(source.range(of: "/// ① 点内置 Provider", range: start.upperBound..<source.endIndex))
+        let body = String(source[start.lowerBound..<end.lowerBound])
+        #expect(body.contains("Text(\"去设置\")"))
+        #expect(body.contains("openSettingsPage(ProviderConnectionRoute.id)"))
+        #expect(body.contains(".accessibilityAction(.default, open)"))
+        #expect(body.contains(".accessibilityLabel(\"\\(name)，\\(reason)\")"))
+    }
+
     @Test("AX 修复不改变原选择动作与可见行布局")
     func rowPreservesActionAndVisualContract() throws {
         let source = try modelMenuSource()

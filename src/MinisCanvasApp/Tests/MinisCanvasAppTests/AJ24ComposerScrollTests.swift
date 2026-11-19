@@ -87,3 +87,13 @@ struct AJ24ComposerDragDropTests {
                                        pendingAttachmentCount: chat.pendingAttachments.count) == true)
     }
 }
+
+@Suite("Shift+Return newline")
+struct ComposerShiftReturnRoutingTests {
+    @Test func shiftReturnRoutesLikeOptionReturn() {
+        let selector = NSSelectorFromString("insertNewline:")
+        #expect(ComposerNativeKeyRouting.key(for: selector, modifierFlags: [.shift]) == .returnKey(option: true))
+        #expect(ComposerNativeKeyRouting.key(for: selector, modifierFlags: [.option]) == .returnKey(option: true))
+        #expect(ComposerNativeKeyRouting.key(for: selector, modifierFlags: []) == .returnKey(option: false))
+    }
+}

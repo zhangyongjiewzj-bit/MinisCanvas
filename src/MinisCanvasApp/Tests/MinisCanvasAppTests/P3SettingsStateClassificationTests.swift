@@ -169,6 +169,24 @@ struct P3SettingsStateClassificationTests {
         }
     }
 
+    @Test("app-authored save and model-list reasons survive projection verbatim (11/16 F1/F3)")
+    func appAuthoredReasonsSurviveProjection() {
+        let invalidName = ProviderSaveFailureCategory.invalidName.message
+        #expect(ProviderStatusTextProjection.project(invalidName) == invalidName)
+        #expect(!ProviderStatusTextProjection.project(invalidName).contains("替换 API Key"))
+        for message in ProviderStatusTextProjection.appAuthoredMessages {
+            #expect(ProviderStatusTextProjection.project(message) == message)
+        }
+        let wrongKey = ProviderStatusTextProjection.project("获取模型列表失败（HTTP 401）")
+        #expect(wrongKey.contains("HTTP 401"))
+        #expect(wrongKey.contains("API Key 无效或没有权限"))
+        // 再投影一次结果不变，界面重复渲染不会叠加提示。
+        #expect(ProviderStatusTextProjection.project(wrongKey) == wrongKey)
+        // 服务端原文仍然不显示。
+        let raw = ProviderStatusTextProjection.project("获取模型列表失败：server said hello-world-detail")
+        #expect(!raw.contains("hello-world-detail"))
+    }
+
     @Test("keychain typed cause survives display projection without raw detail")
     func keychainCauseRemainsActionableAfterProjection() {
         let raw = "无法从钥匙串读取当前 API Key：访问被拒绝；detail=sk-keychain-0123456789abcdef"

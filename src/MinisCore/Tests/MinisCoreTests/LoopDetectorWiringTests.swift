@@ -140,8 +140,10 @@ struct LoopDetectorWiringTests {
         let root = try minisCoreToolContractRoot("loop-detector-repeated")
         defer { try? FileManager.default.removeItem(at: root) }
         let identity = minisCoreToolContractIdentity("loop-detector-repeated")
+        // web_search 默认要问（11/19）；本测试与审批无关，显式设为自动通过。
         let loop = AgentLoop(
             maxIterations: 6,
+            approvalGate: ApprovalGate(policyByTool: ["web_search": .autoApprove]),
             loopDetector: detector,
             toolExecutionFactLedger: try minisCoreToolContractLedger(at: root)
         )
@@ -187,8 +189,10 @@ struct LoopDetectorWiringTests {
         let root = try minisCoreToolContractRoot("loop-detector-distinct")
         defer { try? FileManager.default.removeItem(at: root) }
         let identity = minisCoreToolContractIdentity("loop-detector-distinct")
+        // web_search 默认要问（11/19）；本测试与审批无关，显式设为自动通过。
         let loop = AgentLoop(
             maxIterations: 6,
+            approvalGate: ApprovalGate(policyByTool: ["web_search": .autoApprove]),
             loopDetector: ToolLoopDetector(),
             toolExecutionFactLedger: try minisCoreToolContractLedger(at: root)
         )
@@ -220,8 +224,10 @@ struct LoopDetectorWiringTests {
         let root = try minisCoreToolContractRoot("loop-detector-below-threshold")
         defer { try? FileManager.default.removeItem(at: root) }
         let identity = minisCoreToolContractIdentity("loop-detector-below-threshold")
+        // web_search 默认要问（11/19）；本测试与审批无关，显式设为自动通过。
         let loop = AgentLoop(
             maxIterations: 6,
+            approvalGate: ApprovalGate(policyByTool: ["web_search": .autoApprove]),
             loopDetector: ToolLoopDetector(),
             toolExecutionFactLedger: try minisCoreToolContractLedger(at: root)
         )
@@ -247,15 +253,16 @@ struct LoopDetectorWiringTests {
 
     @Test func loopDetectorCoexistsWithApprovalGate() async throws {
         // 共存：file_write 被审批拒绝（gate，默认 .alwaysAsk 策略），
-        // web_search（默认 .autoApprove）重复触发 LOOP BLOCKED（detector）。
+        // web_search（显式设为 .autoApprove）重复触发 LOOP BLOCKED（detector）。
         // 两者各自生效、互不干扰。
+        // web_search 默认要问（11/19）；这里显式设为自动通过，才能让 detector 一侧继续被覆盖。
         final class DenyAllDelegate2: ApprovalDelegate {
             func requestApproval(_ request: ApprovalRequest) async -> ApprovalDecision {
                 .deny
             }
         }
         let gate = ApprovalGate(
-            policyByTool: ["file_write": .alwaysAsk],
+            policyByTool: ["file_write": .alwaysAsk, "web_search": .autoApprove],
             delegate: DenyAllDelegate2()
         )
         let executor = RecordingLoopExecutor()

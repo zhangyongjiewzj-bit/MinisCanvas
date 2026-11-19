@@ -13,10 +13,14 @@ public enum MediaPayloadValidation {
         public var reason: String {
             switch self {
             case .emptyOrTooLarge: return "媒体实际字节为空或超过附件上限。"
-            case .unsupportedImageFormat: return "图片格式不适合当前线路；请转换为 PNG、JPEG 或 WebP。"
+            case .unsupportedImageFormat:
+                return "图片实际格式不是 PNG、JPEG 或 WebP。新添加的 HEIC、GIF、TIFF、BMP 等图片会自动转换；"
+                    + "此附件未经转换（可能来自旧记录，或自动转换失败）。请移除后重新添加，或手动转换为 PNG、JPEG 或 WebP。"
             case .declaredFormatMismatch: return "媒体声明格式与实际字节不一致。"
             case .invalidImageDimensions: return "图片实际字节无法完整解码出有效像素与宽高。"
-            case .unsupportedAudioFormat: return "当前音频线路仅接收 WAV 或 MP3；请转换后重试。"
+            case .unsupportedAudioFormat:
+                return "当前音频线路仅接收 WAV 或 MP3。新添加的 m4a、aac、flac、aiff、caf 音频会自动转换为 WAV；"
+                    + "此附件未经转换（可能来自旧记录，或为 ogg 等无法转换的格式）。请移除后重新添加，或手动转换为 WAV/MP3。"
             case .invalidAudioContainer: return "音频实际字节未通过格式结构校验。"
             case .unsupportedWire: return "当前线路不支持此媒体输入。"
             }
@@ -145,6 +149,18 @@ public enum MediaPayloadValidation {
         value.split(separator: ";", maxSplits: 1).first.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         } ?? ""
+    }
+
+    /// 按文件头判定的真实图片 MIME（PNG/JPEG/WebP），扩展名与声明类型不作依据。
+    public static func sniffedImageMIME(_ data: Data) -> String? { imageMIME(data) }
+
+    /// 按容器字节判定的真实音频 MIME（WAV → audio/wav，MP3 → audio/mpeg）；结构不合格返回 nil。
+    public static func sniffedAudioMIME(_ data: Data) -> String? {
+        switch audioFormat(data) {
+        case "wav": return "audio/wav"
+        case "mp3": return "audio/mpeg"
+        default: return nil
+        }
     }
 
     private static func imageMIME(_ data: Data) -> String? {

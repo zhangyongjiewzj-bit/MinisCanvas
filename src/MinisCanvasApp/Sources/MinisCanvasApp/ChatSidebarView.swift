@@ -58,6 +58,15 @@ private struct SessionSidebarScopedRow: Identifiable {
 /// active row that may receive keyboard focus after a successful transition.
 @MainActor
 enum SessionSidebarArchiveConsumer {
+    /// 侧栏手动归档：会话（含当前会话）正在生成回复时不执行，请用户先停止。
+    /// 归档当前会话会先停掉回复，之后磁盘归档若失败，回复已经白白中断，所以在动手前拦下。
+    static func generatingBlockMessage(for id: UUID, in chat: ChatStore) -> String? {
+        guard chat.isSessionGenerating(id) else { return nil }
+        return id == chat.activeSessionID
+            ? "归档未执行：当前会话正在生成回复，请先点停止，再归档。"
+            : "归档未执行：该会话正在生成回复，请先切过去停止，或等它完成后再归档。"
+    }
+
     static func visibleArchivedItems(
         _ archived: [ChatStore.SessionListItem],
         activeIDs: Set<UUID>
@@ -70,7 +79,7 @@ enum SessionSidebarArchiveConsumer {
     }
 
     static func visibleArchivedItems(in chat: ChatStore) -> [ChatStore.SessionListItem] {
-        visibleArchivedItems(chat.archivedList, activeIDs: Set(chat.sessions.map(\.id)))
+        visibleArchivedItems(chat.archivedList, activeIDs: chat.sidebarSessionIDs)
     }
 
     static func archive(
@@ -180,6 +189,12 @@ struct SessionSidebarView: View {
     @State private var sessionSearchModel: SessionSearchModel
     /// Focus identity is the concrete session UUID, never a title or array index.
     @FocusState private var focusedSessionID: UUID?
+
+    /// G-09：提示里的快捷键读用户当前绑定，不写死默认值；拿不到绑定时不显示快捷键。
+    private func shortcutHint(_ title: String, _ action: ShortcutAction) -> String {
+        guard let bridge else { return title }
+        return "\(title)（\(bridge.shortcutStore.binding(for: action).displayString)）"
+    }
 
     /// Focused field instrumentation seam; returns the production row view
     /// without duplicating its layout or typography behavior.
@@ -339,8 +354,9 @@ struct SessionSidebarView: View {
             sessionSearchModel.refresh()
             reconcileSessionRowFocus()
         }
-        .onChange(of: chat.sessions) { _, _ in
-            sessionSearchModel.refresh()
+        .onChange(of: chat.sidebarRevision) { _, _ in
+            // 只在标题/时间/置顶/分组/消息数等摘要变化时触发，流式片段不进来；检索放后台。
+            sessionSearchModel.refreshInBackground()
             reconcileSessionRowFocus()
         }
         .onChange(of: chat.archivedSessions) { _, _ in
@@ -402,6 +418,14 @@ struct SessionSidebarView: View {
     }
 
     private func archiveSession(_ id: UUID) {
+        if let message = SessionSidebarArchiveConsumer.generatingBlockMessage(for: id, in: chat) {
+            deletionFeedback = message
+            return
+        }
+        if let reason = chat.backgroundArchiveBlockReason(sessionID: id.uuidString) {
+            deletionFeedback = reason
+            return
+        }
         if let activeID = SessionSidebarArchiveConsumer.archive(
             id, in: chat, visibleActiveIDs: { visibleSessionRowIDs }
         ) {
@@ -454,7 +478,7 @@ struct SessionSidebarView: View {
                     .font(.system(size: 14, weight: .semibold))
             }
             .buttonStyle(.plain)
-            .help("新建会话（⌘N）")
+            .help(shortcutHint("新建会话", .newSession))
 
             Divider()
 
@@ -480,7 +504,7 @@ struct SessionSidebarView: View {
             MinisIconView(.sidebarLeft, size: 12)
                 .foregroundPalette(.tertiary)
                 .font(.system(size: 11))
-                .help("⌘⇧C 展开会话侧栏")
+                .help(shortcutHint("展开会话侧栏", .toggleSessionSidebar))
         }
         .padding(.vertical, 10)
         .frame(maxHeight: .infinity)
@@ -510,10 +534,20 @@ struct SessionSidebarView: View {
             } catch BuiltinToolExecutor.ProjectDirectoryAuthorizationError.outsideAccessibleRoots {
                 // 用户在原生选择框里选中即是明确授权：把该文件夹加入可访问目录后重试一次，
                 // 不再要求去设置里重复添加。根目录、主目录和系统目录不自动加入。
-                guard let path = ProjectFolderAutoMount.eligiblePath(for: selected),
-                      let settings = SettingsCenter.active, settings.mountFolder(path) else {
-                    throw BuiltinToolExecutor.ProjectDirectoryAuthorizationError.outsideAccessibleRoots
+                guard let path = ProjectFolderAutoMount.eligiblePath(for: selected) else {
+                    throw ProjectFolderAutoMount.Failure.ineligibleFolder
                 }
+                guard let settings = SettingsCenter.active else {
+                    throw ProjectFolderAutoMount.Failure.mountFailed
+                }
+                guard settings.mountFolder(path) else {
+                    throw settings.effectiveMountedFolders.count >= PrivacySettings.maxMountedFolders
+                        ? ProjectFolderAutoMount.Failure.mountLimitReached
+                        : ProjectFolderAutoMount.Failure.mountFailed
+                }
+                // 挂载后的执行器重组是异步的：等它生效再重试，否则重试仍按旧的可访问目录判断，
+                // 刚挂上的目录会被撤掉（11/16 现场"新建项目选普通文件夹也提示不能加入"的根因）。
+                await settings.pendingFileAccessAttachment?.value
                 do {
                     authorized = try await handler.authorizeFolderAndOpenSessionWithInstructionConsent(selected)
                 } catch {
@@ -524,15 +558,20 @@ struct SessionSidebarView: View {
                 if !authorized { settings.unmountFolder(path) }
             }
             projectAuthorizationFeedback = authorized ? "项目目录已授权，已在该项目下新建会话。" : "项目授权已取消。"
+        } catch let failure as ProjectFolderAutoMount.Failure {
+            projectAuthorizationNeedsRoot = true
+            projectAuthorizationFeedback = failure.message
         } catch BuiltinToolExecutor.ProjectDirectoryAuthorizationError.outsideAccessibleRoots {
             projectAuthorizationNeedsRoot = true
-            projectAuthorizationFeedback = "该文件夹不能自动加入 Agent 可访问目录（根目录、主目录、系统目录或已达挂载上限）。请在设置 → 隐私中检查后再授权项目目录。"
+            projectAuthorizationFeedback = ProjectFolderAutoMount.Failure.stillOutsideAfterMount.message
         } catch BuiltinToolExecutor.ProjectDirectoryAuthorizationError.directoryUnavailable {
             projectAuthorizationFeedback = "所选文件夹不存在或已不可用，请重新选择现有文件夹。"
         } catch ProjectSessionAppError.grantUnavailable {
             projectAuthorizationFeedback = "未能授权此项目：目录可能受保护或授权已不可用，请选择其他目录后重试。"
+        } catch let error as ProjectSessionAppError {
+            projectAuthorizationFeedback = "项目授权未完成：\(error.userMessage)"
         } catch {
-            projectAuthorizationFeedback = "项目授权未完成：\(error.localizedDescription)。请重试；若目录受访问策略限制，请在设置 → 隐私中检查权限。"
+            projectAuthorizationFeedback = "项目授权未完成：原因未识别。请重试；若目录受访问策略限制，请在设置 → 隐私中检查权限。"
         }
         }
     }
@@ -556,7 +595,7 @@ struct SessionSidebarView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .help("折叠会话侧栏（⌘⇧C）")
+                .help(shortcutHint("折叠会话侧栏", .toggleSessionSidebar))
                 .accessibilityLabel("折叠会话侧栏")
                 if let handler = chat.projectSessionHandler {
                     let projects = handler.grants.list()
@@ -576,8 +615,16 @@ struct SessionSidebarView: View {
                                     Button("撤销「\(project.displayName)」授权") {
                                         projectAuthorizationNeedsRoot = false
                                         do {
-                                            try handler.revokeProject(id: project.projectID)
-                                            projectAuthorizationFeedback = "项目授权已撤销。"
+                                            let revokedPath = try handler.revokeProject(id: project.projectID)
+                                            // 同时把该文件夹从"可访问目录"移除，不再占用上限。
+                                            if let revokedPath, let settings = SettingsCenter.active {
+                                                settings.unmountFolder(revokedPath)
+                                                if let canonical = ProjectFolderAutoMount.eligiblePath(
+                                                    for: URL(fileURLWithPath: revokedPath)), canonical != revokedPath {
+                                                    settings.unmountFolder(canonical)
+                                                }
+                                            }
+                                            projectAuthorizationFeedback = "项目授权已撤销，该文件夹也已从可访问目录移除。"
                                         } catch {
                                             projectAuthorizationFeedback = "撤销失败，请重试。"
                                         }
@@ -606,7 +653,7 @@ struct SessionSidebarView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(theme?.aj38.accent.swiftUIColor ?? Color.accentColor)
-                .help("新建会话（⌘N）")
+                .help(shortcutHint("新建会话", .newSession))
                 .accessibilityLabel("新建会话")
                 // AJ-59：新建自定义组
                 Button {
@@ -629,11 +676,18 @@ struct SessionSidebarView: View {
             ScrollView(showsIndicators: false) {
                 LazyVStack(spacing: 3) {
                     if !chat.searchText.isEmpty && !sessionSearchModel.results.isEmpty {
+                        if sessionSearchModel.isUpdating {
+                            Text("正在更新结果…")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("session-search.updating")
+                        }
                         ForEach(sessionSearchModel.results) { result in
                             SessionSearchResultRow(
                                 result: result,
                                 isSelected: sessionSearchModel.selectedResultID == result.id,
-                                onSelect: { _ = sessionSearchModel.select(result) }
+                                onSelect: { _ = sessionSearchModel.select(result) },
+                                isUpdating: sessionSearchModel.isUpdating
                             )
                         }
                     } else {
@@ -754,6 +808,14 @@ struct SessionSidebarView: View {
                     .font(.system(size: 8))
             }
             // 目标状态（含后台会话的续跑、暂停、受阻、完成）
+            if chat.backgroundRunSessionIDs.contains(item.session.id) {
+                Text("后台运行")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .accessibilityIdentifier("chat.session.background-run.\(item.session.id.uuidString)")
+            }
             if let goalStatus = chat.conversationGoalSidebarStatuses[item.session.id] {
                 Text(goalStatus.title)
                     .font(.system(size: 9))
@@ -927,7 +989,9 @@ struct SessionSidebarView: View {
     private func conversationIndicatorGlyph(_ presentation: ChatStore.SessionBadgeProjection, isActive: Bool) -> some View {
         switch presentation.presentation.status {
         case .failed:
-            MinisIconView(presentation.budgetPauseReason == nil ? .warning : .pause, state: isActive ? .danger : .normal, size: 12)
+            // 失败标记：温和的带色圆形信息图标（不再是三角警告）。选中与非选中行都用危险色，
+            // 形状仍不同于运行中（虚线圈）、未读（实心点）、空闲（空心圈），不靠颜色也能分辨。
+            MinisIconView(presentation.budgetPauseReason == nil ? .info : .pause, state: .danger, size: 12)
         case .running:
             ProgressView().controlSize(.small).frame(width: 12, height: 12)
         case .idle:
@@ -965,9 +1029,9 @@ struct SessionSidebarView: View {
     ) -> Color {
         switch presentation.status {
         case .failed:
-            return isActive ? (theme?.statusDanger ?? .red) : .secondary
+            return theme?.statusDanger ?? .red
         case .running:
-            return .orange
+            return theme?.statusWarning ?? AppStatusColor.warning
         case .unread:
             return theme?.aj38.accent.swiftUIColor ?? Color.accentColor
         case .idle:
@@ -1004,8 +1068,13 @@ struct SessionSidebarView: View {
     private func sessionMenuItems(_ session: ChatThread) -> [FloatingMenuItem] {
         var items: [FloatingMenuItem] = [
             FloatingMenuItem(kind: .button(title: "重命名…", icon: "pencil", role: nil, help: nil) { beginRename(session) }, catalogIcon: .edit),
-            FloatingMenuItem(kind: .button(title: "复制会话（fork）", icon: "doc.on.doc", role: nil, help: nil) { chat.duplicateSession(id: session.id) }, catalogIcon: .copy),
-            FloatingMenuItem(kind: .button(title: "在新聊天中继续", icon: "plus.bubble", role: nil, help: nil) { chat.duplicateSession(id: session.id) }),
+            FloatingMenuItem(kind: .button(title: "复制会话（fork）", icon: "doc.on.doc", role: nil, help: nil) {
+                if chat.duplicateSession(id: session.id) == nil,
+                   let notice = chat.duplicateRefusalNotice(sessionID: session.id) {
+                    deletionFeedback = notice
+                }
+            }, catalogIcon: .copy),
+            FloatingMenuItem(kind: .button(title: "在新聊天中继续", icon: "plus.bubble", role: nil, help: "生成交接摘要，审阅后带着摘要进入新会话") { chat.continueInNewChat(sessionID: session.id) }),
             FloatingMenuItem(kind: .divider),
         ]
         if session.pinned {
@@ -1045,15 +1114,14 @@ struct SessionSidebarView: View {
         items.append(FloatingMenuItem(kind: .divider))
         items.append(FloatingMenuItem(kind: .button(title: "在 Finder 中显示", icon: "folder", role: nil, help: nil) { chat.revealSessionInFinder(session.id) }, catalogIcon: .folder))
         items.append(FloatingMenuItem(kind: .button(title: "复制会话 ID", icon: "number", role: nil, help: nil) { chat.copySessionID(session.id) }))
-        if let prefill = chat.schedulerTaskTargetPrefill(forSessionID: session.id) {
-            items.append(FloatingMenuItem(kind: .button(title: "为此会话创建定时任务", icon: "clock.badge.plus", role: nil, help: nil) {
-                SchedulerTaskPrefillInbox.shared.pending = prefill
-                openSettingsPage("定时任务")
-            }))
-        } else {
-            items.append(FloatingMenuItem(kind: .button(title: "为此会话创建定时任务", icon: "clock.badge.plus", role: nil, help: nil) {}, isDisabled: true))
-            items.append(FloatingMenuItem(kind: .button(title: "该会话不属于项目，无法创建定时任务", icon: nil, role: nil, help: nil) {}, isDisabled: true))
-        }
+        // 有可预填目标（项目会话且已有回合）时带着目标打开；否则打开编辑器，由用户在列表里选择会话。
+        let schedulerPrefill = chat.schedulerTaskTargetPrefill(forSessionID: session.id)
+        items.append(FloatingMenuItem(kind: .button(title: "为此会话创建定时任务", icon: "clock.badge.plus", role: nil, help: nil) {
+            if let schedulerPrefill {
+                SchedulerTaskPrefillInbox.shared.pending = schedulerPrefill
+            }
+            openSettingsPage("定时任务")
+        }))
         items.append(FloatingMenuItem(kind: .button(title: "复制深度链接", icon: "link", role: nil, help: nil) { chat.copySessionDeepLink(session.id) }, catalogIcon: .link))
         items.append(FloatingMenuItem(kind: .divider))
         items.append(FloatingMenuItem(kind: .button(title: "归档", icon: "archivebox", role: nil, help: nil) { archiveSession(session.id) }, catalogIcon: .archive))
@@ -1182,7 +1250,7 @@ struct SessionSidebarView: View {
                 return "删除未执行：这个会话还有后台运行的子任务。请先在任务中心停止它们，或等它们完成后再删除。"
             }
         }
-        return "删除未执行：\(error.localizedDescription)"
+        return "删除未执行：\(UserFacingErrorText.describe(error))"
     }
 
     /// 归档分组标题
@@ -1402,11 +1470,12 @@ enum SessionDeletionImpactNotice {
         if archived {
             return "恢复后仍回到归档区；该回执仅恢复此会话文件，不包含其他会话或未发送草稿。"
         }
-        return "回收站恢复会话文件及其中已发送消息；未发送草稿、待发附件和生成中回复（如有）不随该回执恢复。"
+        return "移入回收站时，该会话里正在运行的后台命令会立即终止（恢复后不会自动重新运行）；工具输出文件保留，恢复会话后仍可查看，永久删除时才一并清除。回收站恢复会话文件及其中已发送消息；未发送草稿、待发附件和生成中回复（如有）不随该回执恢复。"
     }
 }
 
 private struct SessionDeletionPrompt: View {
+    @Environment(\.themeTokens) private var theme
     enum Step {
         case first
         case second
@@ -1431,7 +1500,7 @@ private struct SessionDeletionPrompt: View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
                 MinisIconView(.delete, size: 12)
-                    .foregroundPalette(.red)
+                    .foregroundPalette(theme?.statusDanger ?? AppStatusColor.danger)
                 Text("删除会话")
                     .font((typography?.headline ?? .title3).weight(.semibold))
                 Spacer()
@@ -1449,7 +1518,7 @@ private struct SessionDeletionPrompt: View {
             ))
                 .foregroundStyle(.secondary)
             Text(request.intent.reversible ? "本次操作会移入回收站。" : "本次操作不可恢复。")
-                .foregroundStyle(request.intent.reversible ? Color.secondary : Color.red)
+                .foregroundStyle(request.intent.reversible ? Color.secondary : (theme?.statusDangerText ?? AppStatusColor.danger))
 
             if !request.intent.reversible {
                 switch step {
@@ -1549,6 +1618,7 @@ struct ChatMainView: View {
     @Environment(BridgeStore.self) private var bridge: BridgeStore?
     @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @State private var exportFeedback: String?
     /// 会话内文档 Tab 面板开关；不改变主布局，也不创建独立 workspace。
@@ -1601,6 +1671,37 @@ struct ChatMainView: View {
         }
         .background(theme?.aj38.backgroundPrimary.swiftUIColor ?? Color(nsColor: .windowBackgroundColor))
         .font(typography?.body ?? .body)
+        .task { await prewarmRecentSessions() }
+    }
+
+    /// 首开预热：启动后空闲时，为最近更新的 3 个非活跃会话预先填充转录格式化缓存。
+    /// 只在无流式、输入框为空时推进；每批约 8ms 让出主线程。字号、调色板、脱敏值、图标修订
+    /// 与真实视图取值一致（见 ChatTranscriptPrewarmer 说明）。
+    private func prewarmRecentSessions() async {
+        try? await Task.sleep(for: .seconds(4))
+        guard !Task.isCancelled, let redactor = transcriptRedactor else { return }
+        await ChatTranscriptStatusIconProjection.preload()
+        guard !Task.isCancelled else { return }
+        let active = chat.activeSessionID
+        let targets = chat.sessions
+            .filter { $0.id != active && !$0.messages.isEmpty }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .prefix(3)
+            .map { thread in
+                ChatTranscriptPrewarmer.Target(
+                    messages: thread.messages,
+                    projectRoot: thread.workingDirectory.flatMap {
+                        $0.isEmpty ? nil : URL(fileURLWithPath: $0)
+                    })
+            }
+        guard !targets.isEmpty else { return }
+        await ChatTranscriptPrewarmer.prewarm(
+            targets: targets,
+            baseSize: ChatTranscriptView.transcriptBaseSize(
+                typography: typography, dynamicTypeSize: dynamicTypeSize),
+            redactor: redactor, palette: theme?.aj38,
+            iconRevision: ChatTranscriptStatusIconProjection.resourceRevision,
+            shouldContinue: { !chat.isStreaming && chat.draftText.isEmpty })
     }
 
     // MARK: 头部：标题 + 只读 Provider 状态
@@ -1610,7 +1711,7 @@ struct ChatMainView: View {
             MinisIconView(.messages, size: 12)
                 .foregroundPalette(theme?.aj38.accent.swiftUIColor ?? Color.accentColor)
                 .font(.system(size: 12))
-            Text(chat.sessions.first { $0.id == chat.activeSessionID }?.title ?? "会话")
+            Text(chat.activeSessionTitle ?? "会话")
                 .font((typography?.headline ?? .system(size: 13)).weight(.semibold))
                 .lineLimit(1)
             Spacer()
@@ -1691,6 +1792,42 @@ struct ChatMainView: View {
 
     // MARK: 消息流
 
+    /// 当前会话最近一次回合失败且可重试时，给对话末尾的"重试"按钮；与会话列表失败行同一条重试通道。
+    private var failedRetryAction: (() -> Void)? {
+        guard !chat.isStreaming, !chat.isActiveSessionGenerating,
+              let sessionID = chat.activeSessionID,
+              let snapshot = chat.executionSnapshot(forSessionID: sessionID),
+              snapshot.state == .failed, snapshot.failureKind != .iterationLimit,
+              snapshot.failureKind != .authorization
+                || chat.providerFailureRecoveredByCheck(sessionID: sessionID) else { return nil }
+        let identity = snapshot.retryIdentity
+        return { [weak chat] in _ = chat?.retryFailedSession(identity) }
+    }
+
+    /// 上下文超出模型窗口的失败：对话末尾多一个“压缩后重试”（先压缩再重发上一条消息）。
+    /// 授权类失败或额度不足：对话末尾显示“检查 API Key”，直接打开供应商连接设置。
+    private var failedCheckAPIKeyAction: (() -> Void)? {
+        guard chat.failedProviderCheckNotice != nil, let bridge else { return nil }
+        let failedProviderID = chat.failedProviderCheckProviderID
+        return {
+            // 直接打开失败的那个供应商，而不是按“哪个没通过”去猜。
+            ProviderConnectionRoute.preferredProviderID = failedProviderID
+            bridge.deepLinkHandler.handle(.openSettings(id: ProviderConnectionRoute.id))
+        }
+    }
+
+    private var failedCompactAndRetryAction: (() -> Void)? {
+        guard chat.canCompactAndRetryFailedSession else { return nil }
+        return { [weak chat] in _ = chat?.compactAndRetryFailedSession() }
+    }
+
+    private var activeProjectRoot: URL? {
+        guard let sessionID = chat.activeSessionID,
+              let directory = chat.sessions.first(where: { $0.id == sessionID })?.workingDirectory,
+              !directory.isEmpty else { return nil }
+        return URL(fileURLWithPath: directory)
+    }
+
     private var messageList: some View {
         ChatTranscriptView(
             sessionID: chat.activeSessionID,
@@ -1710,8 +1847,8 @@ struct ChatMainView: View {
             },
             onOpenAttachment: onOpenAttachment,
             onSendPrompt: { prompt in
+                // 只预填输入框，不替用户发送（未连接模型时发出去会得到一条假回复）。
                 chat.draftText = prompt
-                chat.submitComposer()
             },
             onToggleReferenceCard: { messageID, expanded in
                 _ = chat.setPastedTextReferenceExpanded(
@@ -1739,18 +1876,26 @@ struct ChatMainView: View {
                     _ = await chat.regenerateAnswer(sessionID: viewer, messageID: messageID, expectedRevision: revision)
                 }
             },
+            onForkMessage: { [weak chat] messageID in
+                guard let chat, let sessionID = chat.activeSessionID else { return }
+                _ = chat.forkSession(id: sessionID, atMessageID: messageID, inclusive: true)
+            },
             regenerationDisabledReason: { [weak chat] messageID in
                 guard let chat else { return "会话不可用" }
                 return chat.regenerationDisabledReason(messageID: messageID)
-            }
+            },
+            onRetryFailed: failedRetryAction,
+            onCompactAndRetryFailed: failedCompactAndRetryAction,
+            onCheckAPIKey: failedCheckAPIKeyAction,
+            checkAPIKeyNotice: chat.failedProviderCheckNotice?.text,
+            projectRoot: activeProjectRoot
         )
         .modifier(ComposerMessageEditConfirmation(chat: chat, request: $pendingMessageEdit))
         .id(ChatTranscriptSessionBoundary.viewIdentity(for: chat.activeSessionID))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // E11 拖放：文件拖到消息区 → 自动添加为待发送附件
-        .dropDestination(for: URL.self) { urls, _ in
-            chat.addAttachments(urls: urls)
-            return true
+        .dropDestination(for: ComposerDropItem.self) { items, _ in
+            chat.addDroppedItems(items)
         } isTargeted: { _ in }
     }
 }
@@ -1823,7 +1968,7 @@ private struct ChatMessageMetadataView: View {
             .accessibilityIdentifier("chat.message.metadata.\(message.id.uuidString)")
 
             if let interruption = message.interruptionStatusText {
-                Text(interruption)
+                Text(interruption + " · 输入「继续」接着生成")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("chat.message.interrupted.\(message.id.uuidString)")
@@ -1832,7 +1977,9 @@ private struct ChatMessageMetadataView: View {
                 Text(turnTimingText)
                     .font(typography?.caption2 ?? .system(size: 9))
                     .foregroundStyle(.tertiary)
-                    .lineLimit(2)
+                    // 一行、尾部截断；完整文案在悬停提示里，不让统计行抢正文的视线。
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .monospacedDigit()
                     .textSelection(.enabled)
                     .accessibilityIdentifier("chat.message.turnTiming.\(message.id.uuidString)")
@@ -1894,7 +2041,8 @@ struct ChatBubble: View {
                         if message.isStreaming {
                             MarkdownTextView(
                                 text: message.displayContent,
-                                baseSize: typography?.transcriptBodySize ?? 13
+                                baseSize: typography?.transcriptBodySize ?? 13,
+                                wrapsCodeLines: true
                             )
                                 .font(.system(size: typography?.transcriptBodySize ?? 13))
                         } else {
@@ -1906,7 +2054,8 @@ struct ChatBubble: View {
                 .padding(.vertical, 8)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(theme?.aj38.accent.swiftUIColor ?? Color.accentColor).opacity(0.85)
+                        .fill(theme.map { ThemeContrast.fillMeetingWhiteText($0.aj38.accent).swiftUIColor }
+                              ?? Color.accentColor)
                 )
                 .foregroundStyle(.white)
                 // AJ-71/72：复制按钮常驻（右上角常显可点，复制整条 content）；
@@ -1942,7 +2091,8 @@ struct ChatBubble: View {
                         if message.isStreaming {
                             MarkdownTextView(
                                 text: message.visibleToolContent,
-                                baseSize: typography?.transcriptBodySize ?? 13
+                                baseSize: typography?.transcriptBodySize ?? 13,
+                                wrapsCodeLines: true
                             )
                                 .font(.system(size: typography?.transcriptBodySize ?? 13))
                         } else {
@@ -1987,7 +2137,8 @@ struct ChatBubble: View {
                         // 流式中保持 SwiftUI 渲染（打字机增量重渲染），流式结束后切 NSTextView
                         MarkdownTextView(
                             text: message.content,
-                            baseSize: typography?.transcriptBodySize ?? 13
+                            baseSize: typography?.transcriptBodySize ?? 13,
+                            wrapsCodeLines: true
                         )
                             .font(.system(size: typography?.transcriptBodySize ?? 13))
                             .overlay(alignment: .bottomTrailing) {
@@ -2083,7 +2234,8 @@ struct ChatAttachmentOpenButton: View {
                         Image(nsImage: nsImage)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
-                            .frame(width: 24, height: 24)
+                            .frame(width: attachment.kind == .image ? 64 : 24,
+                                   height: attachment.kind == .image ? 64 : 24)
                             .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                     } else {
                         let icon: MinisIcon = switch attachment.kind {
@@ -2246,15 +2398,32 @@ private struct ChatTranscriptTurnTimingStrip: View {
         return joined.isEmpty ? nil : joined.joined(separator: " · ")
     }
 
-    private func caption(_ text: String?) -> some View {
+    /// 已完成回合的短写法「回合 33 秒 · 模型」；进行中或无时长时沿用完整文案。完整文案放悬停提示。
+    private func compactLine(full: String?) -> String? {
+        guard let message = latestTimedAssistantMessage, let timing = message.turnTiming,
+              let duration = timing.durationMilliseconds else { return full }
+        let time = duration < 1_000 || duration >= 60_000
+            ? ChatTurnTimingMetadata.durationText(milliseconds: duration)
+            : "\(Int((Double(duration) / 1_000).rounded())) 秒"
+        var parts = ["回合 \(time)"]
+        if let model = message.turnModelID, !model.isEmpty { parts.append(model) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func caption(_ full: String?) -> some View {
         Group {
-            if let text {
+            if let full, let text = compactLine(full: full) {
                 Text(text)
+                    .help(full)
                     .font(typography?.caption2 ?? .system(size: 9))
                     .foregroundStyle(.tertiary)
-                    .lineLimit(2)
+                    // 一行、尾部截断；完整文案在悬停提示里，不让统计行抢正文的视线。
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .monospacedDigit()
                     .textSelection(.enabled)
+                    // 与正文同一阅读列左缘对齐（正文段落缩进 horizontalInset）。
+                    .padding(.horizontal, ChatReadingLayout.horizontalInset)
                     .frame(maxWidth: ChatReadingLayout.maxContentWidth, alignment: .leading)
                     .frame(maxWidth: .infinity)
                     .accessibilityLabel("回合时长与模型标识")
@@ -2267,9 +2436,16 @@ private struct ChatTranscriptTurnTimingStrip: View {
         // 未完成的回合按秒自刷新「已处理时长」（同 TaskCenterObservationView 的
         // 周期时钟先例）；已完结回合的数值是稳定值，不需要时钟。
         if hasOpenTurn {
-            TimelineView(.periodic(from: .now, by: 1)) { _ in
-                caption(line(now: Date()))
-            }
+            // 流畅度第五轮：每秒变化的文字只画在 overlay 里；占位行（隐藏、不随秒钟变）
+            // 独自决定本行尺寸，秒钟刷新不再让外层 VStack/ScrollView 重新量一遍整页。
+            caption(line(now: Date()))
+                .hidden()
+                .accessibilityHidden(true)
+                .overlay {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        caption(line(now: Date()))
+                    }
+                }
         } else {
             caption(line(now: Date()))
         }
@@ -2280,7 +2456,38 @@ private struct ChatTranscriptTurnTimingStrip: View {
 /// 生产转录链此前只存在于未接线的 ChatBubble；这里补到单 NSTextView
 /// 转录的原生锚点层，点击 → ChatStore.beginEdit（内容填回输入框，
 /// 回车作为新消息重发，原历史不覆盖）。
+/// 消息操作行的统一外观：点击区域不小于 24×24pt，次级文字色，悬停有淡底色（全部取自主题 token，深浅色通用）。
+private struct ChatActionChip: ViewModifier {
+    @Environment(\.themeTokens) private var theme
+    let isHovered: Bool
+
+    func body(content: Content) -> some View {
+        let tint = theme?.textSecondary ?? Color.secondary
+        content
+            .foregroundStyle(tint)
+            .padding(.horizontal, 4)
+            .frame(minWidth: 24, minHeight: 24)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(tint.opacity(isHovered ? 0.14 : 0))
+            )
+            .contentShape(Rectangle())
+    }
+}
+
+/// 自带悬停状态的操作行按钮外观（菜单、按钮标签用）。
+private struct ChatActionHoverChip: ViewModifier {
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .modifier(ChatActionChip(isHovered: isHovered))
+            .onHover { isHovered = $0 }
+    }
+}
+
 private struct ChatTranscriptEditAffordance: View {
+    @Environment(\.themeTokens) private var theme
     let messageID: UUID
     let onEdit: () -> Void
 
@@ -2294,11 +2501,7 @@ private struct ChatTranscriptEditAffordance: View {
                 size: 12,
                 accessibilityLabel: "编辑"
             )
-            .frame(width: 18, height: 18)
-            .background(
-                Circle()
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(isHovered ? 0.9 : 0.0))
-            )
+            .modifier(ChatActionChip(isHovered: isHovered))
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
@@ -2359,7 +2562,17 @@ struct ChatTranscriptView: View {
     /// Only the non-Canvas main transcript opts into this action.
     var markdownCopyPasteboard: (any PasteboardWriting)? = nil
     var onRegenerateMessage: ((UUID) -> Void)? = nil
+    /// 从某条助手回复处分叉到新会话（只有主聊天转录提供）。
+    var onForkMessage: ((UUID) -> Void)? = nil
     var regenerationDisabledReason: ((UUID) -> String?)? = nil
+    /// 当前会话最近一次回合失败且可重试时由上层给出；在对话末尾显示"重试"按钮。
+    var onRetryFailed: (() -> Void)? = nil
+    var onCompactAndRetryFailed: (() -> Void)? = nil
+    /// 授权类失败/额度不足：对话末尾的“检查 API Key”按钮与说明（供应商名称已写在说明里）。
+    var onCheckAPIKey: (() -> Void)? = nil
+    var checkAPIKeyNotice: String? = nil
+    /// 项目根目录：用于把回复里的相对路径识别为可点链接。
+    var projectRoot: URL? = nil
 
     @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
@@ -2368,6 +2581,7 @@ struct ChatTranscriptView: View {
     @State private var localScrollState = ChatTranscriptScrollState()
     @State private var didAppear = false
     @State private var documentCache = ChatTranscriptDocumentCache()
+    @State private var displayProjection = ChatTranscriptDisplayProjectionCache()
     @State private var inlineToolHeights: [String: CGFloat] = [:]
     @State private var expandedInlineToolTurns = Set<AgentTurnIdentity>()
     private struct ToolOutputExpansion: Hashable {
@@ -2375,6 +2589,8 @@ struct ChatTranscriptView: View {
         let messageID: UUID
     }
     @State private var expandedToolOutputs: Set<ToolOutputExpansion> = []
+    /// 思考过程展开状态（默认折叠，仅显示层）。
+    @State private var expandedThinking: Set<UUID> = []
     @State private var statusIconResourceRevision: UInt64 = 0
 
     private var scrollState: ChatTranscriptScrollState {
@@ -2399,13 +2615,15 @@ struct ChatTranscriptView: View {
     func transcriptDocumentForDisplay(baseSize: CGFloat, palette: Aj38Palette?,
                                       inlineTools: [UUID: [ChatInlineToolGap]] = [:])
         -> ChatTranscriptFormattedDocument? {
+        let perf = PerformanceSignposts.begin(.transcriptDocumentForDisplay); defer { perf.end() }
         let _ = statusIconResourceRevision
+        TranscriptPathLinkContext.shared.projectRoot = projectRoot
         guard let transcriptRedactor else { return nil }
         return documentCache.render(
-            sessionID: sessionID, messages: messages.map { message in
-                ChatTranscriptFormatter.toolOutputDisplayMessage(
-                    message, expanded: isToolOutputExpanded(message.id))
-            },
+            sessionID: sessionID, messages: displayProjection.project(
+                messages,
+                toolExpanded: { isToolOutputExpanded($0) },
+                thinkingExpanded: { expandedThinking.contains($0) }),
             baseSize: baseSize, redactor: transcriptRedactor,
             palette: palette, inlineTools: inlineTools,
             expandedToolOutputIDs: Set(expandedToolOutputs.compactMap {
@@ -2416,6 +2634,14 @@ struct ChatTranscriptView: View {
 
     var body: some View {
         transcriptBody(toolEvents: readToolEvents?() ?? [])
+            .background {
+                // ⌘F：打开对话正文的查找栏。
+                Button("") { _ = TranscriptFindRouter.showFindInterface() }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+            }
             .task {
                 await ChatTranscriptStatusIconProjection.preload()
                 guard !Task.isCancelled else { return }
@@ -2447,6 +2673,7 @@ struct ChatTranscriptView: View {
                                 attachmentRows
                                 referenceCardRows
                                 sessionReferenceCardRows
+                                let messagesByID = ChatTranscriptDisplayProjectionCache.index(messages)
                                 let offsets = documentCache.inlineToolOffsets(
                                     contentWidth: transcriptContentWidth(viewportWidth: viewport.size.width))
                                 let renderedEventIDs = ChatTranscriptInlineTools.positionedEventIDs(
@@ -2500,31 +2727,48 @@ struct ChatTranscriptView: View {
                                         contentWidth: transcriptContentWidth(viewportWidth: viewport.size.width)
                                     )) { anchor in
                                         HStack(spacing: 4) {
-                                            if let message = messages.first(where: { $0.id == anchor.messageID }), !message.isStreaming {
+                                            if let message = messagesByID[anchor.messageID], !message.isStreaming {
                                                 if message.role == .tool {
                                                     toolOutputToggle(messageID: message.id)
                                                 }
-                                                transcriptCopyMenu(message)
-                                                if message.role == .assistant, let markdownCopyPasteboard {
-                                                    Button("复制为 Markdown") {
-                                                        copyMessage(message.id, pasteboard: markdownCopyPasteboard)
+                                                if message.role == .assistant, message.thinkingText?.isEmpty == false {
+                                                    thinkingToggle(messageID: message.id)
+                                                }
+                                                if !(message.role == .assistant && ChatStore.isWelcomeText(message.content)) {
+                                                    transcriptCopyMenu(message)
+                                                }
+                                                if message.role == .assistant, !ChatStore.isWelcomeText(message.content),
+                                                   let onForkMessage {
+                                                    Menu {
+                                                        Button("从这里分叉") { onForkMessage(message.id) }
+                                                            .help("新开一个会话，保留到这条回复为止的历史；原会话不变")
+                                                            .accessibilityIdentifier("chat.transcript.fork.\(message.id.uuidString)")
+                                                    } label: {
+                                                        // 同上：菜单按钮里用文字，不用自定义图标。
+                                                        Text("⋯")
+                                                            .font(.system(size: 13, weight: .semibold))
+                                                            .modifier(ChatActionHoverChip())
                                                     }
-                                                    .buttonStyle(.borderless)
-                                                    .font(typography?.caption2 ?? .system(size: 10))
-                                                    .foregroundStyle(.secondary)
+                                                    .menuStyle(.borderlessButton)
+                                                    .menuIndicator(.hidden)
                                                     .fixedSize()
-                                                    .accessibilityIdentifier("chat.transcript.copyMarkdown.\(message.id.uuidString)")
+                                                    .help("更多操作")
+                                                    .accessibilityLabel("\(attachmentRoleLabel(message.role))消息的更多操作")
+                                                    .accessibilityIdentifier("chat.transcript.more.\(message.id.uuidString)")
                                                 }
                                             }
-                                            if let message = messages.first(where: { $0.id == anchor.messageID }),
-                                               message.role == .assistant, let onRegenerateMessage {
+                                            if let message = messagesByID[anchor.messageID],
+                                               message.role == .assistant, message.id == latestAssistantMessageID,
+                                               let onRegenerateMessage {
                                                 let reason = regenerationDisabledReason?(message.id)
                                                 let presentation = RegenerationButtonPresentation.make(disabledReason: reason)
                                                 HStack(spacing: 4) {
-                                                    Button("重新生成") { onRegenerateMessage(message.id) }
-                                                        .buttonStyle(.borderless)
-                                                        .font(typography?.caption2 ?? .system(size: 10))
-                                                        .foregroundStyle(.secondary)
+                                                    Button { onRegenerateMessage(message.id) } label: {
+                                                        Label { Text("重新生成") } icon: { MinisIconView(.refresh, size: 12) }
+                                                            .font(typography?.caption2 ?? .system(size: 11))
+                                                            .modifier(ChatActionHoverChip())
+                                                    }
+                                                        .buttonStyle(.plain)
                                                         .fixedSize()
                                                         .disabled(presentation.isDisabled)
                                                         .opacity(presentation.opacity)
@@ -2544,6 +2788,8 @@ struct ChatTranscriptView: View {
                                                 }
                                             }
                                         }
+                                        // 右侧让出一小段，使操作按钮落在用户气泡内侧而不是贴着转录列边缘。
+                                        .padding(.trailing, ChatReadingLayout.horizontalInset - UserBubbleTextBlock.textInset)
                                         .frame(maxWidth: .infinity, alignment: .trailing)
                                         .offset(y: anchor.offset)
                                         .id(anchor.messageID)
@@ -2560,11 +2806,14 @@ struct ChatTranscriptView: View {
                                 .frame(maxWidth: ChatReadingLayout.maxContentWidth, alignment: .leading)
                                 .frame(maxWidth: .infinity)
                                 .id(ChatTranscriptLayoutIdentity(sessionID: sessionID, messages: messages))
+                                TranscriptInlineImageStrip(messages: messages, projectRoot: projectRoot)
+                                    .frame(maxWidth: ChatReadingLayout.maxContentWidth, alignment: .leading)
+                                    .frame(maxWidth: .infinity)
                                 let unpositioned = ChatTranscriptToolGroup.groups(
                                     events: toolEvents.filter { !renderedEventIDs.contains($0.id) },
                                     sessionID: sessionID)
                                 if !unpositioned.isEmpty {
-                                    DisclosureGroup("未定位的历史工具活动") {
+                                    DisclosureGroup("上次中断前的工具活动（已无法对应到具体消息）") {
                                         ForEach(unpositioned) { group in
                                             ChatTranscriptToolNode(group: group)
                                         }
@@ -2578,6 +2827,48 @@ struct ChatTranscriptView: View {
                                    lastMessage.role == .assistant,
                                    lastMessage.id == retryExhaustionCard.messageID {
                                     retryExhaustionCard
+                                }
+                                if let onCheckAPIKey, !retryExhaustionCardIsShown {
+                                    HStack(spacing: 8) {
+                                        Button(action: onCheckAPIKey) {
+                                            Text("检查 API Key")
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .help("打开供应商连接设置，检查或更换 API Key")
+                                        .accessibilityIdentifier("chat.transcript.check-api-key")
+                                        if let checkAPIKeyNotice {
+                                            Text(checkAPIKeyNotice)
+                                                .font(typography?.caption2 ?? .system(size: 10))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .padding(.horizontal, ChatReadingLayout.horizontalInset)
+                                }
+                                if let onRetryFailed, !retryExhaustionCardIsShown {
+                                    HStack(spacing: 8) {
+                                        Button(action: onRetryFailed) {
+                                            Label {
+                                                Text("重试")
+                                            } icon: {
+                                                MinisIconView(.retry, size: 12)
+                                            }
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .help("重新回答上一条消息，不重复你的提问")
+                                        .accessibilityIdentifier("chat.transcript.retry-failed")
+                                        if let onCompactAndRetryFailed {
+                                            Button(action: onCompactAndRetryFailed) {
+                                                Text(ChatGenerationRecoveryAction.compactAndRetry.title)
+                                            }
+                                            .buttonStyle(.bordered)
+                                            .help(ChatGenerationRecoveryAction.compactAndRetry.accessibilityHint)
+                                            .accessibilityIdentifier("chat.transcript.compact-and-retry")
+                                        }
+                                        Text("上一次回复没有成功")
+                                            .font(typography?.caption2 ?? .system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .padding(.horizontal, ChatReadingLayout.horizontalInset)
                                 }
                                 // D-CHAT-18：回合时长/阶段耗时/累计总耗时 + Provider/模型标识。
                                 ChatTranscriptTurnTimingStrip(messages: messages)
@@ -2660,6 +2951,7 @@ struct ChatTranscriptView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onChange(of: sessionID) { _, currentSessionID in
             expandedToolOutputs.removeAll()
+            expandedThinking.removeAll()
             if scrollState.identity.sessionID != currentSessionID {
                 scrollState.resetForSession(currentSessionID)
             }
@@ -2681,6 +2973,7 @@ struct ChatTranscriptView: View {
                   currentSessionID.map({ $0() == viewerSessionID }) ?? true,
                   messages.contains(where: { $0.id == messageID && $0.role == .tool }) else { return }
             let identity = ToolOutputExpansion(viewerSessionID: viewerSessionID, messageID: messageID)
+            let perf = PerformanceSignposts.begin(.toolOutputToggle); defer { perf.end() }
             if expandedToolOutputs.contains(identity) {
                 expandedToolOutputs.remove(identity)
             } else {
@@ -2690,6 +2983,25 @@ struct ChatTranscriptView: View {
         .buttonStyle(.borderless)
         .font(.caption)
         .accessibilityIdentifier("chat.tool-output.\(messageID.uuidString).toggle")
+        .accessibilityValue(expanded ? "已展开" : "已折叠")
+        .help("结果正文未在此展示：该工具已真实执行并返回结果；正文按上下文策略未保留，需要时重新调用读取")
+    }
+
+    private func thinkingToggle(messageID: UUID) -> some View {
+        let expanded = expandedThinking.contains(messageID)
+        return Button(expanded ? "收起思考" : "展开思考") {
+            guard messages.contains(where: { $0.id == messageID && $0.role == .assistant }) else { return }
+            if expandedThinking.contains(messageID) {
+                expandedThinking.remove(messageID)
+            } else {
+                expandedThinking.insert(messageID)
+            }
+        }
+        .buttonStyle(.borderless)
+        .font(typography?.caption2 ?? .system(size: 10))
+        .foregroundStyle(.secondary)
+        .fixedSize()
+        .accessibilityIdentifier("chat.thinking.\(messageID.uuidString).toggle")
         .accessibilityValue(expanded ? "已展开" : "已折叠")
     }
 
@@ -2714,6 +3026,12 @@ struct ChatTranscriptView: View {
     }
 
     private var transcriptBaseSize: CGFloat {
+        Self.transcriptBaseSize(typography: typography, dynamicTypeSize: dynamicTypeSize)
+    }
+
+    /// 转录正文字号的唯一算法；预热缓存必须用与真实视图相同的字号才能命中。
+    static func transcriptBaseSize(typography: TypographyTokenProvider?,
+                                   dynamicTypeSize: DynamicTypeSize) -> CGFloat {
         typography?.transcriptBodySize(for: dynamicTypeSize)
             ?? 13 * TypographyTokenProvider.dynamicTypeScale(for: dynamicTypeSize)
     }
@@ -2735,15 +3053,16 @@ struct ChatTranscriptView: View {
             return ChatTranscriptMessageAnchor(
                 messageID: message.id,
                 offset: offsets[index],
-                isEditable: message.role == .user && !message.isStreaming
+                isEditable: message.role == .user && !message.isStreaming && !message.isBackgroundCompletionNotice
             )
         }
     }
 
     /// Resolve redaction again at the user action boundary, retaining session
     /// identity. No copy action captures raw tool output or attachment injection.
-    private func copyMessage(_ messageID: UUID, codeIndex: Int? = nil,
-                             pasteboard: any PasteboardWriting = NSPasteboard.general) {
+    /// The action behind 「复制消息」/ per-code-block items / 「复制为 Markdown」 in the Copy menu.
+    func copyMessage(_ messageID: UUID, codeIndex: Int? = nil,
+                     pasteboard: any PasteboardWriting = NSPasteboard.general) {
         guard currentSessionID.map({ $0() == sessionID }) ?? true,
               let redactor = transcriptRedactor,
               let message = messages.first(where: { $0.id == messageID }),
@@ -2767,25 +3086,78 @@ struct ChatTranscriptView: View {
 
     @ViewBuilder
     private func transcriptCopyMenu(_ message: ChatMessageUI) -> some View {
-        if transcriptEnvStore != nil {
-            let codeBlockCount = ChatTranscriptCopyProjection.codeBlockCount(
-                unredactedBody: message.displayContent
-            )
+        let markdownPasteboard = message.role == .assistant ? markdownCopyPasteboard : nil
+        if transcriptEnvStore != nil || markdownPasteboard != nil {
+            let codeBlockTitles = transcriptEnvStore != nil ? codeBlockMenuTitles(for: message) : []
             Menu {
-                Button("复制消息") { copyMessage(message.id) }
-                ForEach(0..<codeBlockCount, id: \.self) { index in
-                    Button("复制代码块 \(index + 1)") { copyMessage(message.id, codeIndex: index) }
+                if transcriptEnvStore != nil {
+                    Button("复制消息") { copyMessage(message.id) }
+                    ForEach(Array(codeBlockTitles.enumerated()), id: \.offset) { index, title in
+                        Button(title) { copyMessage(message.id, codeIndex: index) }
+                    }
+                }
+                if let markdownPasteboard {
+                    Button("复制为 Markdown") {
+                        copyMessage(message.id, pasteboard: markdownPasteboard)
+                    }
+                    .accessibilityIdentifier("chat.transcript.copyMarkdown.\(message.id.uuidString)")
                 }
             } label: {
+                // 下拉菜单按钮会把自定义图标压成单色剪影（包上实测成了黑方块），这里用文字标签。
                 Text("复制")
-                    .font(typography?.caption2 ?? .system(size: 10))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 11))
+                    .modifier(ChatActionHoverChip())
             }
             .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .fixedSize()
-            .accessibilityLabel("复制消息或代码块")
+            .help("复制")
+            .accessibilityLabel("复制\(attachmentRoleLabel(message.role))消息或代码块")
             .accessibilityIdentifier("chat.transcript.copy.\(message.id.uuidString)")
         }
+    }
+
+    /// 每个代码块一项菜单：带语言和首行预览，便于在多个代码块里挑对的那个。
+    private func codeBlockMenuTitles(for message: ChatMessageUI) -> [String] {
+        let body = message.displayContent
+        guard body.contains("```") || body.contains("~~~") else { return [] }
+        let redactor = transcriptRedactor
+        return displayProjection.codeBlockMenuTitles(
+            messageID: message.id, content: body, secrets: redactor?.secretValues ?? []
+        ) { uncachedCodeBlockMenuTitles(body: body, redactor: redactor) }
+    }
+
+    private func uncachedCodeBlockMenuTitles(body: String, redactor: ChatTranscriptRedactor?) -> [String] {
+        let blocks: [(language: String?, code: String)] = MinisCore.MarkdownParser.parse(body).compactMap { block in
+            if case .codeBlock(let language, let code) = block { return (language, code) }
+            return nil
+        }
+        return blocks.enumerated().map { index, block in
+            let first = block.code.split(whereSeparator: \.isNewline).first
+                .map { String($0).trimmingCharacters(in: .whitespaces) } ?? ""
+            var preview = String(first.prefix(24))
+            if first.count > 24 { preview += "…" }
+            // 预览同样脱敏，菜单标题不能泄露密钥。
+            preview = redactor?.redactVisibleConversationBody(preview) ?? preview
+            let language = (block.language?.isEmpty == false) ? " · \(block.language!)" : ""
+            return preview.isEmpty
+                ? "复制代码块 \(index + 1)\(language)"
+                : "复制代码块 \(index + 1)\(language)：\(preview)"
+        }
+    }
+
+    /// 只有最近一条助手回复显示"重新生成"（对齐 Claude Code：历史回复不重复出现）。
+    private var latestAssistantMessageID: UUID? {
+        messages.last(where: { $0.role == .assistant })?.id
+    }
+
+    private var retryExhaustionCardIsShown: Bool {
+        guard let retryExhaustionCard,
+              sessionID?.uuidString == retryExhaustionCard.identity.turn.sessionID,
+              let lastMessage = messages.last(where: { $0.role != .system }),
+              lastMessage.role == .assistant,
+              lastMessage.id == retryExhaustionCard.messageID else { return false }
+        return true
     }
 
     private func scrollToMessage(
@@ -3215,6 +3587,17 @@ struct TokenUsageBar: View {
 /// 与底部全局对话条互斥（ContentView 在 LayoutPolicy.usesCompanionChat 时隐藏全局条）。
 /// 节点-对话彻底解绑（2026-08-06 用户定案）：前台不再展示选中节点上下文，
 /// 不再自动把节点名注入草稿。后台接口（applySelectedNodeContext）保留供画布指令链路使用。
+/// 订阅草稿逐字符变化的最小作用域：内容闭包在本视图的 body 内求值，
+/// 闭包里读取 chat.draftText 只会让本视图重绘，而不是外层大视图。
+struct ComposerDraftScope<Content: View>: View {
+    let chat: ChatStore
+    @ViewBuilder let content: () -> Content
+    var body: some View {
+        _ = chat.composerDraft.revision
+        return content()
+    }
+}
+
 struct CompanionChatView: View {
     @Bindable var chat: ChatStore
     let bridge: BridgeStore
@@ -3226,6 +3609,8 @@ struct CompanionChatView: View {
     var onToggleCollapse: () -> Void = {}
     /// 聊天附件统一交给 ContentView 路由到右侧应用内预览面板。
     var onOpenAttachment: ((ChatAttachment) -> Void)? = nil
+    /// 未发送附件的“预览”按钮（与主输入框一致）；由 ContentView 路由到右侧面板。
+    var onPreviewAttachment: ((ChatAttachment, UUID) -> Void)? = nil
 
     @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
@@ -3235,6 +3620,8 @@ struct CompanionChatView: View {
     @State private var pendingMessageEdit: ComposerMessageEditRequest?
     /// U4：插件 / 技能选择器 popover 开关
     @State private var showPickerPopover = false
+    @State private var atMentionSelectedID: String?
+    @State private var atMentionDismissedDraft: String?
     @State private var pastedTextEditorState: PastedTextEditorState?
 
     var body: some View {
@@ -3252,7 +3639,8 @@ struct CompanionChatView: View {
                 Divider()
                 tokenRow
                     .fixedSize(horizontal: false, vertical: true)
-                composer
+                // 输入框的逐字符重绘隔离在 ComposerDraftScope 内，不波及消息列表。
+                ComposerDraftScope(chat: chat) { composer }
                     .frame(minHeight: ChatLayoutMetrics.composerMinimumHeight)
                     .layoutPriority(ChatLayoutMetrics.composerLayoutPriority)
             }
@@ -3334,8 +3722,8 @@ struct CompanionChatView: View {
             },
             onOpenAttachment: onOpenAttachment,
             onSendPrompt: { prompt in
+                // 只预填输入框，不替用户发送（未连接模型时发出去会得到一条假回复）。
                 chat.draftText = prompt
-                chat.submitComposer()
             },
             onToggleReferenceCard: { messageID, expanded in
                 _ = chat.setPastedTextReferenceExpanded(
@@ -3360,9 +3748,8 @@ struct CompanionChatView: View {
         .id(ChatTranscriptSessionBoundary.viewIdentity(for: chat.activeSessionID))
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // E11 拖放：文件拖到消息区 → 自动添加为待发送附件
-        .dropDestination(for: URL.self) { urls, _ in
-            chat.addAttachments(urls: urls)
-            return true
+        .dropDestination(for: ComposerDropItem.self) { items, _ in
+            chat.addDroppedItems(items)
         } isTargeted: { _ in }
     }
 
@@ -3374,10 +3761,18 @@ struct CompanionChatView: View {
             Spacer(minLength: 4)
             if chat.isMockMode {
                 // G10 P2-1：Mock 模式常驻醒目徽标（未配置 Provider 时防误当真实模型）
-                Label { Text("演示模式") } icon: { MinisIconView(.warning, size: 14).foregroundPalette(.orange) }
-                    .font((typography?.status ?? .system(size: 9)).weight(.semibold))
-                    .foregroundStyle(.orange)
-                    .help("未配置 API Provider：当前回复为本地演示（Mock），配置后自动切换真实模型")
+                let hasReadyModel = chat.hasReadyChatModel
+                Button {
+                    bridge.deepLinkHandler.handle(.openSettings(id: hasReadyModel ? "常规" : ProviderConnectionRoute.id))
+                } label: {
+                    Label { Text(hasReadyModel ? "演示模式 · 选择模型" : "演示模式 · 连接模型") } icon: { MinisIconView(.warning, size: 14).foregroundPalette(theme?.statusWarning ?? AppStatusColor.warning) }
+                }
+                .buttonStyle(.plain)
+                .font((typography?.status ?? .system(size: 9)).weight(.semibold))
+                .foregroundStyle(theme?.statusWarningText ?? AppStatusColor.warning)
+                .help(hasReadyModel
+                      ? "当前回复为本地演示。已有可用模型，会自动切换；也可点击前往设置选择默认模型。"
+                      : "还没有连接模型：当前回复为本地演示。点击打开连接模型表单，保存并检查通过后自动切换到真实模型。")
             } else {
                 Label { Text(chat.providerLabel) } icon: { MinisIconView(.server, size: 14).foregroundPalette(.tertiary) }
                     .font(typography?.status ?? .system(size: 9))
@@ -3400,9 +3795,8 @@ struct CompanionChatView: View {
             composerContents(maxVisibleLines: 1)
         }
         // 高度候选共用一个预览呈现 owner 和稳定的 AX 根。
-        .dropDestination(for: URL.self) { urls, _ in
-            chat.addAttachments(urls: urls)
-            return true
+        .dropDestination(for: ComposerDropItem.self) { items, _ in
+            chat.addDroppedItems(items)
         } isTargeted: { targeted in
             isDropTargeted = targeted
         }
@@ -3470,6 +3864,7 @@ struct CompanionChatView: View {
             if chat.isEditingMessage {
                 editModeBar
             }
+            atMentionSection
             HStack(spacing: ComposerLayoutMetrics.controlSpacing) {
                 ComposerPolicyControls(chat: chat, modeShortcutBinding: bridge.shortcutStore.binding(for: .composerMode))
                     .layoutPriority(1)
@@ -3540,9 +3935,12 @@ struct CompanionChatView: View {
                 ComposerScrollField(
                     text: $chat.draftText,
                     font: .systemFont(ofSize: typography?.composerBodySize ?? 13),
-                    placeholder: "输入指令或对话…",
+                    placeholder: "@ 引用技能或项目文件",
                     onSend: {
-                        guard canSend else { return }
+                        guard canSend else {
+                            chat.noteComposerSendBlockedByAttachments()
+                            return
+                        }
                         if chat.canSubmitPresentedToolApprovalFromKeyboard {
                             chat.submitComposerFromKeyboard()
                         } else if chat.isActiveSessionGenerating {
@@ -3554,10 +3952,15 @@ struct CompanionChatView: View {
                     onPaste: { PastedTextComposerConsumer.accept($0, in: chat) },
                     onCommandKey: { key in
                         if key == .historySearch { showInputHistorySearch = true; return true }
+                        if handleAtMentionKey(key) { return true }
                         return chat.handleInputHistoryKey(key)
                     },
+                    onCursorChange: { chat.noteComposerCursor($0) },
                     onInterruptAndSend: {
-                        guard canSend else { return }
+                        guard canSend else {
+                            chat.noteComposerSendBlockedByAttachments()
+                            return
+                        }
                         chat.interruptAndSend()
                     },
                     onStop: {
@@ -3571,8 +3974,15 @@ struct CompanionChatView: View {
                     nativeDraft: chat.nativeComposerDraft(),
                     onRememberNativeDraft: chat.rememberFocusedNativeDraft
                 )
-                .help("输入指令或对话（生成中回车排队；⌘⇧⏎ 打断并发送；Esc 停止并将队列退回输入框；⌥⏎ 换行）")
+                .help("输入指令或对话（生成中回车排队；⌘⇧⏎ 打断并发送；Esc 停止并将队列退回输入框；⇧⏎ 或 ⌥⏎ 换行；@ 引用技能或项目文件）")
                 .accessibilityIdentifier("composer.companion.input")
+                .onChange(of: chat.draftText) { _, _ in
+                    chat.updateFileMentionSuggestions()
+                }
+                .onChange(of: chat.activeSessionID) { _, _ in
+                    atMentionSelectedID = nil
+                    atMentionDismissedDraft = nil
+                }
                 .sheet(isPresented: $showInputHistorySearch) {
                     ComposerInputHistorySearch(chat: chat)
                 }
@@ -3636,6 +4046,113 @@ struct CompanionChatView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
+    // MARK: @ 引用（技能 + 当前项目文件）
+
+    private struct AtMentionItem: Identifiable {
+        let id: String
+        let title: String
+        let subtitle: String
+        let skill: PickerCatalogItem?
+        let path: String?
+        var referencesDirectory = false
+    }
+
+    /// 草稿末尾是 @ 词时的候选：先技能（目录里按名称包含匹配，至多 5 个），再项目文件。
+    private var atMentionItems: [AtMentionItem] {
+        let draft = chat.draftText
+        guard !draft.hasPrefix("/"), atMentionDismissedDraft != draft,
+              let query = chat.activeAtMentionQuery else { return [] }
+        let needle = query.lowercased()
+        let skills = chat.pickerCatalog.filter { item in
+            item.isEnabled
+                && !chat.selectedPickerItems.contains(where: { $0.id == item.id })
+                && (needle.isEmpty || item.name.lowercased().contains(needle))
+        }.prefix(5).map {
+            AtMentionItem(id: "skill:\($0.id)", title: "@\($0.name)", subtitle: "技能 · \($0.detail)",
+                          skill: $0, path: nil)
+        }
+        let files = chat.fileMentionSuggestions.flatMap { path -> [AtMentionItem] in
+            let item = AtMentionItem(id: "file:\(path)", title: ChatStore.fileMentionTitle(path),
+                          subtitle: (path.hasSuffix("/") ? "目录（回车进入）· " : "文件 · ") + path, skill: nil, path: path)
+            guard path.hasSuffix("/") else { return [item] }
+            let reference = AtMentionItem(id: "dir-ref:\(path)", title: ChatStore.fileMentionTitle(path),
+                          subtitle: "引用此目录 · " + path, skill: nil, path: path, referencesDirectory: true)
+            return [item, reference]
+        }
+        return Array(skills) + files
+    }
+
+    @ViewBuilder
+    private var atMentionSection: some View {
+        let items = atMentionItems
+        if !items.isEmpty {
+            let selected = items.firstIndex { $0.id == atMentionSelectedID } ?? 0
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        Button { acceptAtMention(item) } label: {
+                            HStack(spacing: 8) {
+                                Text(item.title).font(.system(.body, design: .monospaced)).lineLimit(1)
+                                Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(index == selected ? Color.accentColor.opacity(0.12) : Color.clear)
+                        .accessibilityIdentifier("composer.companion.at-mention.\(index)")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 220)
+            .accessibilityIdentifier("composer.companion.at-mention-completions")
+        }
+    }
+
+    private func acceptAtMention(_ item: AtMentionItem) {
+        atMentionSelectedID = nil
+        if let skill = item.skill {
+            chat.acceptSkillMention(skill)
+        } else if let path = item.path {
+            if item.referencesDirectory {
+                _ = chat.acceptDirectoryMention(path)
+            } else {
+                _ = chat.acceptFileMention(path)
+            }
+        }
+    }
+
+    /// ↑↓ 选择、Tab 或回车确认、Esc 关闭；没有 @ 候选时返回 false，按键照常处理。
+    private func handleAtMentionKey(_ key: ComposerNativeKey) -> Bool {
+        let items = atMentionItems
+        guard !items.isEmpty else { return false }
+        let index = items.firstIndex { $0.id == atMentionSelectedID } ?? 0
+        switch key {
+        case .up:
+            atMentionSelectedID = items[max(0, index - 1)].id
+            return true
+        case .down:
+            atMentionSelectedID = items[min(items.count - 1, index + 1)].id
+            return true
+        case .tab:
+            acceptAtMention(items[index])
+            return true
+        case .returnKey(let option):
+            guard !option, !chat.canSubmitPresentedToolApprovalFromKeyboard else { return false }
+            acceptAtMention(items[index])
+            return true
+        case .escape:
+            atMentionDismissedDraft = chat.draftText
+            return true
+        case .shiftTab, .historySearch:
+            return false
+        }
+    }
+
     /// 有文本或待发送附件时才允许发送
     private var canSend: Bool {
         GlobalComposer.canSend(
@@ -3648,7 +4165,10 @@ struct CompanionChatView: View {
 
     /// 发送：直接走原链路（节点-对话已彻底解绑：不再自动补节点名进草稿）
     private func send() {
-        guard canSend else { return }
+        guard canSend else {
+            chat.noteComposerSendBlockedByAttachments()
+            return
+        }
         chat.submitInteractiveComposer()
     }
 
@@ -3664,11 +4184,13 @@ struct CompanionChatView: View {
         let mediaReadiness = chat.composerMediaReadinessSnapshot
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                ForEach(Array(chat.pendingAttachments.enumerated()), id: \.offset) { _, att in
+                ForEach(chat.pendingAttachments) { att in
                     pendingAttachmentChip(att, mediaReadiness: mediaReadiness)
                 }
             }
         }
+        .onAppear { chat.autoTranscribeAudioDraftsIfNeeded() }
+        .onChange(of: mediaReadiness) { _, _ in chat.autoTranscribeAudioDraftsIfNeeded() }
     }
 
     private func pendingAttachmentChip(
@@ -3727,6 +4249,37 @@ struct CompanionChatView: View {
                 .accessibilityLabel(ComposerAttachmentPresentation.accessibilityValue(
                     for: att, mediaReadiness: mediaReadiness
                 ))
+                if att.fileURL != nil,
+                   ChatStore.canConvertToPathReference(att) {
+                    Button("改为路径引用") {
+                        chat.convertPendingAttachmentToPathReference(id: att.id)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(theme?.statusWarning ?? Color.orange)
+                    .help("不读取内容，只把文件路径发给模型，由模型用 file_read 读取")
+                    .accessibilityIdentifier("composer.companion.attachment.convert-to-reference.\(att.id.uuidString)")
+                }
+                AudioTranscriptionChipControls(chat: chat, attachment: att)
+                // 与主输入框一致：附件就绪后可在右侧面板预览。
+                let canPreview = onPreviewAttachment != nil && GlobalComposer.canRenderPendingAttachmentPreview(
+                    att, expectedSessionID: sourceSessionID, activeSessionID: chat.activeSessionID,
+                    pendingAttachments: chat.pendingAttachments)
+                Button("预览") {
+                    GlobalComposer.previewPendingAttachment(
+                        att, expectedSessionID: sourceSessionID,
+                        activeSessionID: chat.activeSessionID,
+                        pendingAttachments: chat.pendingAttachments,
+                        onUnavailable: { attachment, sessionID in
+                            onPreviewAttachment?(attachment, sessionID)
+                        }
+                    ) { attachment, sessionID in
+                        onPreviewAttachment?(attachment, sessionID)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(!canPreview)
+                .help(canPreview ? "在右侧面板预览 \(att.fileName)" : "附件就绪且文件来源可用后才能预览")
+                .accessibilityIdentifier("composer.companion.attachment.preview.\(att.id.uuidString)")
                 Button {
                     chat.removePendingAttachment(id: att.id)
                 } label: {
@@ -3749,7 +4302,7 @@ struct CompanionChatView: View {
     private func pickFiles() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowedContentTypes = [.item]
         if panel.runModal() == .OK {

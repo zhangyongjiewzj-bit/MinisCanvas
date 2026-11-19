@@ -50,6 +50,30 @@ enum ProjectSessionAppError: Error, Equatable {
     case runUnavailable
     case busy
     case creationNotAuthorized
+
+    /// 用户可读的中文原因 + 下一步（视图层不再直接展示系统英文文案）。
+    var userMessage: String {
+        switch self {
+        case .grantUnavailable:
+            return "目录授权不可用：目录可能受保护或授权已失效。请重新选择项目目录授权后再试。"
+        case .grantChanged:
+            return "项目目录的授权已变化。请重新选择该目录后再试。"
+        case .sourceUnavailable:
+            return "来源会话已不可用。请回到原会话重新发起。"
+        case .conflictingReplay:
+            return "同一请求已用不同内容提交过。请刷新后重新发起。"
+        case .persistenceUncertain:
+            return "无法确认记录是否已写入。请先检查会话列表是否已有新会话，再决定是否重试；若反复出现请检查磁盘空间。"
+        case .targetUnavailable:
+            return "目标会话已不可用。请刷新会话列表后重试。"
+        case .runUnavailable:
+            return "对应的运行记录已不可用。请回到原会话重新发起。"
+        case .busy:
+            return "当前有其他项目会话操作正在进行。请等它结束后再试。"
+        case .creationNotAuthorized:
+            return "没有获得新建项目会话的授权。请在审批卡中批准，或在设置里调整权限后重试。"
+        }
+    }
 }
 
 /// Exact, bounded source material recovered from the current Composer turn.
@@ -202,6 +226,8 @@ final class ProjectSessionGrantRegistry {
         let originalCanonicalPath: String
         let revision: String
         var revoked: Bool
+        /// 本次授权生效的时间；撤销后重新授权或新建时更新，旧数据为空。
+        var authorizedSince: Date? = nil
     }
     struct DirectoryGrant: Codable, Equatable, Sendable, Identifiable {
         let id: UUID
@@ -224,10 +250,13 @@ final class ProjectSessionGrantRegistry {
         var grants: [Grant]
         var directories: [DirectoryGrant]? = nil
         var instructionTrust: [String: InstructionTrust]? = nil
+        var instructionRefusals: [String: InstructionTrust]? = nil
     }
     private var directories: [DirectoryGrant] = []
     private var temporaryDirectories: [DirectoryGrant] = []
     private var instructionTrust: [String: InstructionTrust] = [:]
+    /// 用户在弹窗里选了"不加载（记住）"的指令文件版本，按项目记；只记哈希，文件内容变了才再问。
+    private var instructionRefusals: [String: InstructionTrust] = [:]
 
     private let url: URL
     private var grants: [Grant]
@@ -246,6 +275,7 @@ final class ProjectSessionGrantRegistry {
             grants = decoded.grants
             directories = decoded.directories ?? []
             instructionTrust = decoded.instructionTrust ?? [:]
+            instructionRefusals = decoded.instructionRefusals ?? [:]
         } else {
             grants = []
         }
@@ -261,8 +291,33 @@ final class ProjectSessionGrantRegistry {
             throw ProjectSessionAppError.grantUnavailable
         }
         let bookmark = try selected.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+        // 同一路径重新授权复用原项目（旧会话和项目记忆继续跟着走）：
+        // 原授权已撤销或书签已失效时换新的授权版本，旧的冻结绑定不会随之复活。
+        if let index = grants.firstIndex(where: { $0.originalCanonicalPath == root.path && !$0.revoked })
+            ?? grants.firstIndex(where: { $0.originalCanonicalPath == root.path }) {
+            let previousGrants = grants
+            let previousTrust = instructionTrust
+            let previousDirectories = directories
+            let old = grants[index]
+            let healthy = !old.revoked && (try? resolveURL(old)) != nil
+            grants[index] = Grant(id: old.id, displayName: name, bookmark: bookmark,
+                                  originalCanonicalPath: root.path,
+                                  revision: healthy ? old.revision : UUID().uuidString, revoked: false,
+                                  authorizedSince: healthy ? old.authorizedSince : Date())
+            do {
+                if let trustedInstructions { instructionTrust[old.id] = try instructionRecord(trustedInstructions, projectID: old.id) }
+                try persist()
+            } catch {
+                grants = previousGrants
+                instructionTrust = previousTrust
+                directories = previousDirectories
+                throw error
+            }
+            return old.id
+        }
         let grant = Grant(id: UUID().uuidString, displayName: name, bookmark: bookmark,
-                          originalCanonicalPath: root.path, revision: UUID().uuidString, revoked: false)
+                          originalCanonicalPath: root.path, revision: UUID().uuidString, revoked: false,
+                          authorizedSince: Date())
         grants.append(grant)
         do {
             if let trustedInstructions { instructionTrust[grant.id] = try instructionRecord(trustedInstructions, projectID: grant.id) }
@@ -275,11 +330,48 @@ final class ProjectSessionGrantRegistry {
         return grant.id
     }
 
+    /// 项目当前授权的规范化目录；未授权或已撤销返回 nil。
+    func authorizedPath(id: String) -> String? {
+        grants.first { $0.id == id && !$0.revoked }?.originalCanonicalPath
+    }
+
+    /// 授权生效时间；在它之前生成的产物，授权已换过一轮，不再算当前授权下的产物。
+    func authorizedSince(id: String) -> Date? {
+        grants.first { $0.id == id && !$0.revoked }?.authorizedSince
+    }
+
+    /// 授权是否本来就是有效的（再次选择同一文件夹时不应在失败后误撤销它）。
+    func isActiveGrant(forDirectory url: URL) -> Bool {
+        guard let root = Self.canonicalDirectory(url) else { return false }
+        return grants.contains { $0.originalCanonicalPath == root.path && !$0.revoked && (try? resolveURL($0)) != nil }
+    }
+
+    /// 撤销项目授权：同时撤销该项目追加的目录授权并清掉指令信任，
+    /// 不留下仍可访问的残余入口。
     func revoke(id: String) throws {
         guard let index = grants.firstIndex(where: { $0.id == id }) else { return }
         let old = grants[index]
+        let oldDirectories = directories
+        let oldTrust = instructionTrust
+        let oldRefusals = instructionRefusals
         grants[index].revoked = true
-        do { try persist() } catch { grants[index] = old; throw error }
+        instructionRefusals.removeValue(forKey: id)
+        for position in directories.indices where directories[position].projectID == id && !directories[position].revoked {
+            directories[position].revoked = true
+            directories[position].revision = UUID()
+        }
+        instructionTrust.removeValue(forKey: id)
+        for position in temporaryDirectories.indices where temporaryDirectories[position].projectID == id {
+            temporaryDirectories[position].revoked = true
+            temporaryDirectories[position].revision = UUID()
+        }
+        do { try persist() } catch {
+            grants[index] = old
+            directories = oldDirectories
+            instructionTrust = oldTrust
+            instructionRefusals = oldRefusals
+            throw error
+        }
     }
 
     private func instructionRecord(_ snapshot: TrustedProjectInstructionSnapshot,
@@ -297,21 +389,60 @@ final class ProjectSessionGrantRegistry {
                                 hashes: snapshot.sourceFileSHA256)
     }
 
+    /// 对齐 Claude Code：信任按项目（文件夹）记，首次信任后文件内容变化不再询问；
+    /// 只有目录本身被换成另一个文件夹（目录标识变了）才需要重新信任。
     func hasInstructionTrust(_ snapshot: TrustedProjectInstructionSnapshot, projectID: String) -> Bool {
-        guard let candidate = try? instructionRecord(snapshot, projectID: projectID) else { return false }
-        return instructionTrust[projectID] == candidate
+        guard let record = instructionTrust[projectID],
+              (try? instructionRecord(snapshot, projectID: projectID)) != nil else { return false }
+        return record.rootIdentity == snapshot.rootDirectoryIdentity
     }
 
     func trustInstructions(_ snapshot: TrustedProjectInstructionSnapshot, projectID: String) throws {
         let candidate = try instructionRecord(snapshot, projectID: projectID)
         let previous = instructionTrust[projectID]
+        let previousRefusal = instructionRefusals[projectID]
         instructionTrust[projectID] = candidate
-        do { try persist() } catch { instructionTrust[projectID] = previous; throw error }
+        instructionRefusals.removeValue(forKey: projectID)
+        do { try persist() } catch {
+            instructionTrust[projectID] = previous
+            instructionRefusals[projectID] = previousRefusal
+            throw error
+        }
     }
 
     func revokeInstructionTrust(projectID: String) throws {
         let previous = instructionTrust.removeValue(forKey: projectID)
         do { try persist() } catch { instructionTrust[projectID] = previous; throw error }
+    }
+
+    /// 记住"不加载"：同一份文件内容（哈希完全一致）之后不再询问，内容变了才再问。
+    /// 只会让后续静默不加载，不会导致自动加载。
+    func refuseInstructions(_ snapshot: TrustedProjectInstructionSnapshot, projectID: String) throws {
+        let candidate = try instructionRecord(snapshot, projectID: projectID)
+        let previous = instructionRefusals[projectID]
+        instructionRefusals[projectID] = candidate
+        do { try persist() } catch { instructionRefusals[projectID] = previous; throw error }
+    }
+
+    func hasInstructionRefusal(_ snapshot: TrustedProjectInstructionSnapshot, projectID: String) -> Bool {
+        guard let record = instructionRefusals[projectID] else { return false }
+        return record.rootIdentity == snapshot.rootDirectoryIdentity
+            && record.hashes == snapshot.sourceFileSHA256
+    }
+
+    func revokeInstructionRefusal(projectID: String) throws {
+        let previous = instructionRefusals.removeValue(forKey: projectID)
+        do { try persist() } catch { instructionRefusals[projectID] = previous; throw error }
+    }
+
+    func instructionRefusalRows() -> [(projectID: String, path: String, hash: String)] {
+        instructionRefusals.keys.sorted().flatMap { projectID -> [(projectID: String, path: String, hash: String)] in
+            guard (try? resolve(id: projectID)) != nil, let record = instructionRefusals[projectID] else { return [] }
+            var seen = Set<String>()
+            return record.paths.filter { seen.insert($0).inserted }.compactMap { path in
+                record.hashes[path].map { (projectID: projectID, path: path, hash: $0) }
+            }
+        }
     }
 
     func instructionTrustRows() -> [(projectID: String, path: String, hash: String)] {
@@ -459,7 +590,7 @@ final class ProjectSessionGrantRegistry {
     }
 
     private func persist() throws {
-        let data = try JSONEncoder().encode(Envelope(version: 1, grants: grants, directories: directories, instructionTrust: instructionTrust))
+        let data = try JSONEncoder().encode(Envelope(version: 1, grants: grants, directories: directories, instructionTrust: instructionTrust, instructionRefusals: instructionRefusals))
         guard data.count <= 1024 * 1024 else { throw ProjectSessionAppError.persistenceUncertain }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try ProjectSessionLocalFile.write(data, to: url)
@@ -624,6 +755,8 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
     // The initial combined card may decline the first load before a prompt
     // exists. Preserve only its hash decision, never its instruction text.
     private var initialInstructionRefusals: [String: [String: String]] = [:]
+    /// 本会话里选过"本次不加载"的指令文件版本：文件内容不变就不再每轮询问（旅程测试 11/17：每发一条消息都弹一次）。
+    private var sessionInstructionRefusals: [String: [String: String]] = [:]
     /// Production uses the native alert. Focused source tests can inject an
     /// explicit click fact without displaying a window.
     private let approve: @MainActor (ProjectSessionCreateRequest, String) -> Bool
@@ -939,9 +1072,11 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
     /// "归入项目" path stay unchanged; that path still grants nothing.
     @discardableResult
     func authorizeFolderAndOpenSession(_ url: URL, displayName: String? = nil) throws -> String {
+        let alreadyActive = grants.isActiveGrant(forDirectory: url)
         let projectID = try authorizeFolderFromNativePicker(url)
         // Any later failure revokes the grant just registered, so the user never
-        // sees "授权失败" while a stale grant stays behind.
+        // sees "授权失败" while a stale grant stays behind. A grant that was already
+        // active before this call (same folder selected again) is left untouched.
         let directory: URL
         do {
             let project = try grants.resolve(id: projectID)
@@ -951,14 +1086,14 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
                 throw ProjectSessionAppError.grantUnavailable
             }
         } catch {
-            try? grants.revoke(id: projectID)
+            if !alreadyActive { try? grants.revoke(id: projectID) }
             throw error
         }
         chat.newSession(projectID: projectID,
                         projectName: displayName ?? url.lastPathComponent,
                         workingDirectory: directory.path)
         guard chat.sessions.first(where: { $0.id == chat.activeSessionID })?.projectID == projectID else {
-            try? grants.revoke(id: projectID)
+            if !alreadyActive { try? grants.revoke(id: projectID) }
             throw ProjectSessionAppError.grantUnavailable
         }
         return projectID
@@ -972,25 +1107,56 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
               let session = chat.sessions.first(where: { $0.id.uuidString == scope.sessionID && $0.projectID == scope.projectID }),
               let directory = session.workingDirectory,
               isTaskFileProjectAuthorized(projectID: scope.projectID, workingDirectory: directory) else { return false }
+        if sessionInstructionRefusals[scope.sessionID] == snapshot.sourceFileSHA256 { return false }
         if let declinedHashes = initialInstructionRefusals.removeValue(forKey: scope.sessionID),
-           declinedHashes == snapshot.sourceFileSHA256 { return false }
+           declinedHashes == snapshot.sourceFileSHA256 {
+            sessionInstructionRefusals[scope.sessionID] = declinedHashes
+            return false
+        }
         if grants.hasInstructionTrust(snapshot, projectID: scope.projectID) { return isCurrent() }
+        // 之前选过"不加载（记住）"且文件内容没变：静默不加载，不再询问。
+        if grants.hasInstructionRefusal(snapshot, projectID: scope.projectID) { return false }
         guard allowPrompt, NSApp?.isActive == true else { return false }
         let alert = NSAlert()
         alert.messageText = "加载项目指令？"
-        alert.informativeText = "这些文件会作为项目指令发送给模型。仅信任所列哈希；文件变化后会再次询问。\n"
+        alert.informativeText = "这些文件会作为项目指令发送给模型。信任按项目记录，之后文件有改动不会再询问；选“不加载（记住）”则同一份文件内容不再询问，文件有改动才再问。两种选择都可随时在设置里撤销。\n"
             + snapshot.loadedRelativePaths.map { ContentSecretRedactor.redact($0) + "\nSHA-256: " + (snapshot.sourceFileSHA256[$0] ?? "") }.joined(separator: "\n")
         alert.addButton(withTitle: "信任并加载")
-        alert.addButton(withTitle: "本次不加载")
+        alert.addButton(withTitle: "不加载（记住）")
         guard modalPhase?(true) != false else { return false }
         let choice = alert.runModal()
-        guard modalPhase?(false) != false,
+        var refuseWriteFailed = false
+        if choice != .alertFirstButtonReturn {
+            sessionInstructionRefusals[scope.sessionID] = snapshot.sourceFileSHA256
+            do { try grants.refuseInstructions(snapshot, projectID: scope.projectID) }
+            catch { refuseWriteFailed = true }
+        }
+        let modalPhaseEnded = modalPhase?(false) != false
+        if refuseWriteFailed {
+            Self.showInstructionRecordWriteFailure(
+                "没能保存“不加载”的选择。本次仍不会加载这些项目指令，但下次打开可能会再次询问。")
+        }
+        guard modalPhaseEnded,
               choice == .alertFirstButtonReturn,
               isCurrent(), productionBindingActive,
               chat.sessions.contains(where: { $0.id.uuidString == scope.sessionID && $0.projectID == scope.projectID && $0.workingDirectory == directory }),
               isTaskFileProjectAuthorized(projectID: scope.projectID, workingDirectory: directory) else { return false }
         do { try grants.trustInstructions(snapshot, projectID: scope.projectID); return true }
-        catch { return false }
+        catch {
+            // 写盘失败保持安全侧：不加载；同时告诉用户原因，免得静默无反应。
+            Self.showInstructionRecordWriteFailure(
+                "没能保存对这些项目指令的信任记录，本次没有加载。请检查磁盘空间和应用数据目录的写入权限后重试。")
+            return false
+        }
+    }
+
+    private static func showInstructionRecordWriteFailure(_ message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "项目指令记录保存失败"
+        alert.informativeText = message
+        alert.addButton(withTitle: "知道了")
+        alert.runModal()
     }
 
     /// The OS picker remains separate. This one App card combines directory
@@ -1020,6 +1186,7 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
         guard productionBindingActive, chat.activeSessionID == originalSession,
               try ProjectSessionGrantRegistry.directoryIdentity(url) == selectedIdentity else { throw ProjectSessionAppError.grantChanged }
         _ = try fileAccessExecutor.validatedProjectAuthorizationDirectory(url.resolvingSymlinksInPath().standardizedFileURL.path)
+        let alreadyActive = grants.isActiveGrant(forDirectory: url)
         let projectID = try grants.registerNativeSelection(url, displayName: url.lastPathComponent,
             trustedInstructions: choice == .alertFirstButtonReturn ? candidate : nil)
         do {
@@ -1032,10 +1199,17 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
                 chat.noteProjectInstructionsNotLoaded()
             }
             return true
-        } catch { try? grants.revoke(id: projectID); throw error }
+        } catch { if !alreadyActive { try? grants.revoke(id: projectID) }; throw error }
     }
 
-    func revokeProject(id: String) throws { try grants.revoke(id: id) }
+    /// 撤销项目授权（含该项目追加的目录授权和指令信任）。返回被撤销项目的文件夹路径，
+    /// 供侧栏同时把它从可访问目录里移除。
+    @discardableResult
+    func revokeProject(id: String) throws -> String? {
+        let path = grants.authorizedPath(id: id)
+        try grants.revoke(id: id)
+        return path
+    }
     func isProjectAvailable(id: String) -> Bool {
         guard productionBindingActive,
               let project = try? grants.resolve(id: id),
@@ -1051,6 +1225,12 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
               let directory = try? grants.directory(for: project),
               directory.path == workingDirectory else { return false }
         return isWithinExecutionRoots(directory)
+    }
+
+    /// 产物生成时间不早于当前授权生效时间（授权撤销重授后，旧产物解绑）。
+    func isTaskFileGrantCurrent(projectID: String, producedAt: Date) -> Bool {
+        guard let since = grants.authorizedSince(id: projectID) else { return true }
+        return producedAt >= since
     }
 
     /// Resolve only a current native grant for the frozen physical directory.
@@ -1177,6 +1357,28 @@ final class ProjectSessionAppHandler: ProjectSessionProductionHandler {
 /// 项目授权时可自动加入可访问目录的路径判定（2026-11-15 用户批准）。
 /// 原生选择框里选中即是明确授权；根目录、主目录本身和系统目录不自动加入。
 enum ProjectFolderAutoMount {
+    /// Why a folder picked for a new project could not be added to the agent's
+    /// accessible folders. Each case has its own message so the user knows what to do.
+    enum Failure: Error, Equatable, CaseIterable {
+        case ineligibleFolder
+        case mountLimitReached
+        case mountFailed
+        case stillOutsideAfterMount
+
+        var message: String {
+            switch self {
+            case .ineligibleFolder:
+                return "根目录、主目录和系统目录不能作为项目目录，请选择其中的某个子文件夹。"
+            case .mountLimitReached:
+                return "可访问目录已达上限（\(PrivacySettings.maxMountedFolders) 个）。请在设置 → 隐私中移除不再使用的目录后重试。"
+            case .mountFailed:
+                return "未能把该文件夹加入 Agent 可访问目录。请重试；若仍失败，请在设置 → 隐私中检查。"
+            case .stillOutsideAfterMount:
+                return "该文件夹仍不在 Agent 可访问范围内（可能位于拒绝目录中）。请在设置 → 隐私中检查后重试。"
+            }
+        }
+    }
+
     static let systemPrefixes = ["/System", "/Library", "/usr", "/bin", "/sbin", "/etc", "/private/etc",
                                  "/private/var/db", "/Applications", "/cores", "/dev", "/opt"]
 

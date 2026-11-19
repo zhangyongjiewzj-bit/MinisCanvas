@@ -8,8 +8,11 @@ struct ChatToolLifecycleView: View {
     let readEvents: () -> [MinisCore.ConversationEvent]
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            let events = readEvents().filter { $0.kind == .tool }
+        // 外层读一次：投影里的观察信号变化时重算；没有未结束的事件时时钟暂停，空闲不再每 0.5 秒重算。
+        let current = readEvents()
+        let needsClock = current.contains { !$0.status.isTerminal }
+        TimelineView(.animation(minimumInterval: 0.5, paused: !needsClock)) { _ in
+            let events = (needsClock ? readEvents() : current).filter { $0.kind == .tool }
             if !events.isEmpty {
                 Text("工具 \(events.count) · 失败 \(events.filter { $0.status == .failed }.count)")
                     .font(.caption)

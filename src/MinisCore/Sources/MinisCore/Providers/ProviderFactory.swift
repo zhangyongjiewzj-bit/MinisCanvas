@@ -162,6 +162,7 @@ public final class ProviderFactory: @unchecked Sendable {
         case noCredentials(String)
         case providerDisabled(String)
         case invalidBaseURL(String)
+        case invalidProxy(String)
         case auditReceiptDenied
         case auditReceiptReplayed
         case auditReceiptConflict
@@ -180,6 +181,8 @@ public final class ProviderFactory: @unchecked Sendable {
                 return "Provider \"\(label)\" is disabled"
             case .invalidBaseURL(let label):
                 return "Provider \"\(label)\" has an invalid base URL"
+            case .invalidProxy(let label):
+                return "Provider \"\(label)\" has an invalid proxy address"
             case .auditReceiptDenied:
                 return "Provider route audit receipt was denied"
             case .auditReceiptReplayed:
@@ -340,6 +343,17 @@ public final class ProviderFactory: @unchecked Sendable {
         return provider
     }
 
+    /// 供应商代理设置对应的会话；跟随系统时为 nil（各 Provider 用自己的默认会话）。
+    /// 自定义代理地址不合法时直接失败，不退回直连。
+    private static func networkSession(_ config: ProviderConfig) throws -> URLSession? {
+        do { return try ProviderNetworkOptionsPolicy.makeSession(for: config.networkOptions.proxy) }
+        catch { throw FactoryError.invalidProxy(config.label) }
+    }
+
+    private static func customHeaders(_ config: ProviderConfig) -> [String: String] {
+        ProviderNetworkOptionsPolicy.resolvedHeaders(config.networkOptions.headers)
+    }
+
     private static func exactIdentifierMatch(_ lhs: String, _ rhs: String) -> Bool {
         lhs.utf8.elementsEqual(rhs.utf8)
     }
@@ -370,16 +384,19 @@ public final class ProviderFactory: @unchecked Sendable {
         // OpenAI — official or any OpenAI-compatible /v1/chat/completions endpoint.
         register(.openAI) { config in
             let runtimeID = config.runtimeProviderID ?? config.providerType.runtimeProviderID
+            let proxied = try ProviderFactory.networkSession(config)
             let provider = OpenAICompatibleProvider(
                 apiKey: config.effectiveAPIKey() ?? "",
                 model: .gpt4oMini,
                 customBaseURL: config.effectiveCustomBaseURL,
                 appendV1Suffix: config.appendV1Suffix,
                 session: config.controlledFieldLoopbackOnly
-                    ? ControlledFieldLoopbackSession.make() : nil,
+                    ? ControlledFieldLoopbackSession.make() : proxied,
                 controlledFieldLoopbackOnly: config.controlledFieldLoopbackOnly,
                 providerName: runtimeID
             )
+            let custom = ProviderFactory.customHeaders(config)
+            if !custom.isEmpty { provider.extraHeaders = custom }
             provider.model = LLMModel(
                 id: provider.model.id,
                 displayName: provider.model.displayName,
@@ -390,14 +407,15 @@ public final class ProviderFactory: @unchecked Sendable {
         // Anthropic — Messages API (custom base = Anthropic-compat proxy).
         register(.anthropic) { config in
             let runtimeID = config.runtimeProviderID ?? config.providerType.runtimeProviderID
-            return FactoryRuntimeIdentityProvider(
-                base: AnthropicProvider(
-                    apiKey: config.effectiveAPIKey() ?? "",
-                    model: .claudeSonnet46,
-                    basePath: config.effectiveCustomBaseURL
-                ),
-                runtimeProviderID: runtimeID
+            let anthropic = AnthropicProvider(
+                apiKey: config.effectiveAPIKey() ?? "",
+                model: .claudeSonnet46,
+                basePath: config.effectiveCustomBaseURL,
+                session: try ProviderFactory.networkSession(config)
             )
+            let custom = ProviderFactory.customHeaders(config)
+            if !custom.isEmpty { anthropic.extraHeaders = custom }
+            return FactoryRuntimeIdentityProvider(base: anthropic, runtimeProviderID: runtimeID)
         }
         // OpenRouter — OpenAI-compatible with attribution headers.
         register(.openRouter) { config in
@@ -407,11 +425,11 @@ public final class ProviderFactory: @unchecked Sendable {
                 model: .orClaudeSonnet4,
                 customBaseURL: config.effectiveCustomBaseURL ?? "https://openrouter.ai/api",
                 appendV1Suffix: config.effectiveCustomBaseURL == nil,
+                session: try ProviderFactory.networkSession(config),
                 providerName: runtimeID
             )
-            provider.extraHeaders = [
-                "X-Title": "MinisCanvas",
-            ]
+            provider.extraHeaders = ["X-Title": "MinisCanvas"]
+                .merging(ProviderFactory.customHeaders(config)) { _, custom in custom }
             provider.useOpenRouterCompat = true
             provider.model = LLMModel(
                 id: provider.model.id,
@@ -429,10 +447,12 @@ public final class ProviderFactory: @unchecked Sendable {
                 model: .gpt4oMini,
                 customBaseURL: config.effectiveCustomBaseURL,
                 appendV1Suffix: config.appendV1Suffix,
-                session: nil,
+                session: try ProviderFactory.networkSession(config),
                 providerName: runtimeID,
                 attemptCheckpointDirectory: config.attemptCheckpointDirectory
             )
+            let custom = ProviderFactory.customHeaders(config)
+            if !custom.isEmpty { provider.extraHeaders = custom }
             provider.model = LLMModel(
                 id: provider.model.id,
                 displayName: provider.model.displayName,
@@ -450,8 +470,11 @@ public final class ProviderFactory: @unchecked Sendable {
                 apiKey: config.effectiveAPIKey() ?? "",
                 model: LLMModel(id: "qwen2.5", displayName: "Qwen 2.5 (Local)", provider: "Local"),
                 customBaseURL: base,
-                appendV1Suffix: config.appendV1Suffix
+                appendV1Suffix: config.appendV1Suffix,
+                session: try ProviderFactory.networkSession(config)
             )
+            let custom = ProviderFactory.customHeaders(config)
+            if !custom.isEmpty { provider.extraHeaders = custom }
             return LocalOpenAIProvider(wrapping: provider, baseURL: baseURL)
         }
         // DashScope（阿里云百炼）— OpenAI 兼容模式；key 按 BAILIAN_TOKEN_PLAN_API_KEY

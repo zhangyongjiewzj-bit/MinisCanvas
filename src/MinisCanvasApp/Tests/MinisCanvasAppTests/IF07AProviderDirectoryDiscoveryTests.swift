@@ -210,8 +210,9 @@ struct IF07AProviderDirectoryDiscoveryTests {
 
         for contract in [
             "settings.provider.fetchModels",
-            "Button(\"应用目录\")",
-            "applyDiscoveredModels(modelIDs)",
+            // 目录现在先勾选再点“应用所选”，仍是显式应用后才进入保存 draft。
+            "settings.provider.fetchModels.apply",
+            "applyDiscoveredModels(modelIDs.filter",
             "ProviderDraftModelMerger.merge(",
             "modelNames: draft.modelNames"
         ] {

@@ -85,6 +85,131 @@ struct SteerTests {
         #expect(!chat.isStreaming)
     }
 
+    /// S-03：排队消息在会话生成结束时只会给当时的活动会话自动发；用户切走期间正常结束的，切回来时必须补发；
+    /// 用户按过停止的队列仍保持暂停。
+    @Test func queuedMessageLeftBehindWhileAwayIsSentOnSwitchBackUnlessStopped() async throws {
+        let chat = ChatStore()
+        defer { chat.stopAllStreamingForSafety() }
+        let engine = CapturingChatEngine()
+        chat.agentEngine = engine
+        chat.streamingProviderOverride = MockProvider()
+        let sessionA = try #require(chat.activeSessionID)
+        chat.draftText = "第一个问题"
+        chat.sendDraft()
+        try await Task.sleep(for: .milliseconds(50))
+        try #require(chat.isStreaming && engine.calls.count == 1)
+        chat.draftText = "切走期间排的队"
+        try #require(chat.enqueueComposer())
+        try #require(chat.activeQueuedComposerMessages.count == 1)
+        chat.newSession()
+        let sessionB = try #require(chat.activeSessionID)
+        try #require(sessionB != sessionA)
+
+        // A 的回合在后台正常结束：排队消息不动（活动会话是 B）。
+        try await waitForStreamEnd(chat)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(engine.calls.count == 1)
+        #expect(chat.queuedComposerMessages.filter { $0.sessionID == sessionA }.count == 1)
+
+        // 切回 A：补发队首。
+        chat.switchSession(id: sessionA)
+        var waited: TimeInterval = 0
+        while engine.calls.count < 2 && waited < 10 {
+            try await Task.sleep(for: .milliseconds(20))
+            waited += 0.02
+        }
+        try await waitForStreamEnd(chat)
+        #expect(engine.calls.count == 2)
+        #expect(engine.calls.last?.history.last?.content == "切走期间排的队")
+        #expect(chat.queuedComposerMessages.filter { $0.sessionID == sessionA }.isEmpty)
+
+        // 用户按过停止：队列暂停，切走再切回也不自动发。
+        chat.draftText = "第三个问题"
+        chat.sendDraft()
+        try await Task.sleep(for: .milliseconds(50))
+        try #require(chat.isStreaming && engine.calls.count == 3)
+        chat.draftText = "停止后留着的队"
+        try #require(chat.enqueueComposer())
+        chat.stopStreaming()
+        chat.switchSession(id: sessionB)
+        chat.switchSession(id: sessionA)
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(engine.calls.count == 3)
+        #expect(chat.activeQueuedComposerMessages.count == 1)
+    }
+
+    /// F-06 情况一：甲手动压缩时排了消息，用户切到乙；压缩在甲不在前台时结束，排队消息不能丢，
+    /// 要登记成“切回时补发”（同 S-03），切回甲时补发队首。
+    @Test func queuedMessageOfASessionWhoseManualCompactionEndsWhileAwayIsSentOnSwitchBack() async throws {
+        let chat = ChatStore()
+        defer { chat.stopAllStreamingForSafety() }
+        let engine = CapturingChatEngine()
+        chat.agentEngine = engine
+        chat.streamingProviderOverride = MockProvider()
+        let sessionA = try #require(chat.activeSessionID)
+        let requestID = chat.beginCompactionPresentation(sessionID: sessionA)
+        #expect(chat.isActiveSessionManualCompacting)
+        chat.draftText = "压缩期间排的队"
+        try #require(chat.enqueueComposer())
+        try #require(chat.activeQueuedComposerMessages.count == 1)
+        chat.newSession()
+        let sessionB = try #require(chat.activeSessionID)
+        try #require(sessionB != sessionA)
+
+        // 甲的压缩在后台结束：乙在前台，排队消息不动。
+        chat.finishCompactionPresentation(requestID: requestID, sessionID: sessionA, state: .succeeded)
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(engine.calls.isEmpty)
+        #expect(chat.queuedComposerMessages.filter { $0.sessionID == sessionA }.count == 1)
+
+        // 切回甲：补发队首。
+        chat.switchSession(id: sessionA)
+        var waited: TimeInterval = 0
+        while engine.calls.isEmpty && waited < 10 {
+            try await Task.sleep(for: .milliseconds(20))
+            waited += 0.02
+        }
+        try await waitForStreamEnd(chat)
+        #expect(engine.calls.count == 1)
+        #expect(engine.calls.last?.history.last?.content == "压缩期间排的队")
+        #expect(chat.queuedComposerMessages.filter { $0.sessionID == sessionA }.isEmpty)
+    }
+
+    /// F-06 情况二：甲手动压缩时用户切到乙也点了压缩，界面上那一个状态槽被乙占用；
+    /// 切回甲时甲仍在压缩，发消息要排队，不能直接发出让甲的压缩结果作废。
+    @Test func aSessionStillCompactingStaysCompactingAfterAnotherSessionTookThePresentationSlot() async throws {
+        let chat = ChatStore()
+        defer { chat.stopAllStreamingForSafety() }
+        let engine = CapturingChatEngine()
+        chat.agentEngine = engine
+        chat.streamingProviderOverride = MockProvider()
+        let sessionA = try #require(chat.activeSessionID)
+        let requestA = chat.beginCompactionPresentation(sessionID: sessionA)
+        chat.newSession()
+        let sessionB = try #require(chat.activeSessionID)
+        let requestB = chat.beginCompactionPresentation(sessionID: sessionB)
+        #expect(chat.compactionPresentation?.sessionID == sessionB)
+        chat.switchSession(id: sessionA)
+        #expect(chat.isActiveSessionManualCompacting)
+
+        chat.draftText = "甲压缩时发的消息"
+        chat.sendDraft()
+        #expect(engine.calls.isEmpty)
+        #expect(chat.activeQueuedComposerMessages.map(\.text) == ["甲压缩时发的消息"])
+
+        // 甲的压缩结束（前台）：队首随即发出。
+        chat.finishCompactionPresentation(requestID: requestA, sessionID: sessionA, state: .succeeded)
+        #expect(!chat.isActiveSessionManualCompacting)
+        var waited: TimeInterval = 0
+        while engine.calls.isEmpty && waited < 10 {
+            try await Task.sleep(for: .milliseconds(20))
+            waited += 0.02
+        }
+        try await waitForStreamEnd(chat)
+        #expect(engine.calls.count == 1)
+        chat.finishCompactionPresentation(requestID: requestB, sessionID: sessionB, state: .succeeded)
+    }
+
     @Test func enterDuringStreamingQueuesDurablyAndAutoSendsWithoutCancelling() async throws {
         try await B1TaskOriginalFixtureSupport.withRoot("o06-single-queue") { root async throws -> Void in
             let suite = "o06-single-" + UUID().uuidString

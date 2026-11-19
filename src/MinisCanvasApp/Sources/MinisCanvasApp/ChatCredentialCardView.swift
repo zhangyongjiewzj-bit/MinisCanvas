@@ -3,6 +3,7 @@ import MinisCore
 
 /// SecureField state is local to this sheet and is cleared on every exit.
 struct ChatCredentialCardView: View {
+    @Environment(\.themeTokens) private var theme
     @Bindable var chat: ChatStore
     @State private var providerID = ""
     @State private var baseURL = ""
@@ -32,7 +33,17 @@ struct ChatCredentialCardView: View {
             TextField("模型名称（逗号分隔）", text: $models)
             SecureField("API Key（留空使用刚才本地捕获的值）", text: $secureValue)
                 .accessibilityIdentifier("credential.local.secure-input")
-            Toggle("我已核实供应商地址，同意保存并探测", isOn: $riskConfirmed)
+            if ProviderEndpointPolicy.isPlainHTTPToPublicHost(baseURL) {
+                Text("该地址使用 http，Key 会在网络上明文传输，有被截获的风险；仅在你信任该网络和服务时继续。")
+                    .font(.caption)
+                    .foregroundStyle(theme?.statusWarningText ?? AppStatusColor.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("credential.local.plainHTTP")
+            }
+            Toggle(ProviderEndpointPolicy.isPlainHTTPToPublicHost(baseURL)
+                   ? "我已了解明文传输的风险，仍同意保存并探测"
+                   : "我已核实供应商地址，同意保存并探测", isOn: $riskConfirmed)
+            .onChange(of: baseURL) { _, _ in riskConfirmed = false }
             HStack {
                 Button("取消") {
                     secureValue = ""

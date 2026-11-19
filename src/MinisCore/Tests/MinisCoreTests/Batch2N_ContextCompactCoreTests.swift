@@ -103,7 +103,10 @@ struct Batch2N_ContextCompactCoreTests {
             LLMMessage(role: .tool, content: bulkyText("旧检索结果"), toolCallID: "historical-search"),
             LLMMessage(role: .user, content: bulkyText("旧问题2"))
         ]
-        var loop = AgentLoop(maxIterations: 5, loopDetector: nil, requestBudget: tracker,
+        // web_search 默认要问（11/19）；这里测的是压缩，检索工具显式设为自动通过。
+        var loop = AgentLoop(maxIterations: 5,
+                             approvalGate: ApprovalGate(policyByTool: ["web_search": .autoApprove]),
+                             loopDetector: nil, requestBudget: tracker,
                              compactor: Compactor(keepRecentMessages: 1),
                              toolExecutionFactLedger: try minisCoreToolContractLedger(at: root))
         loop.automaticCompaction = batch2CanonicalCompaction(source: source, provider: provider)

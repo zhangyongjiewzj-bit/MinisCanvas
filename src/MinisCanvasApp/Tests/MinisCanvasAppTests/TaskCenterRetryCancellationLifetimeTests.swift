@@ -22,6 +22,11 @@ struct TaskCenterRetryCancellationLifetimeTests {
             runner: Task05RetryCancelRunner(), retainSettingsOwner: { settingsOwner = $0 })
         try #require(settingsOwner != nil && SettingsCenter.active === settingsOwner)
         let chat = bridge.chat
+        // R3-P-04：停止重试只能按这次重试自己的回合身份取消审批卡，不得走不带身份的回调（会拒绝别的会话的审批卡）。
+        var unscopedStopCount = 0
+        var scopedStopIdentities: [AgentExecutionIdentity] = []
+        chat.onStreamingStopped = { unscopedStopCount += 1 }
+        chat.onTurnStreamingStopped = { scopedStopIdentities.append($0) }
         chat.draftText = "owned task05 first request"
         chat.submitComposer()
         let firstDeadline = Date().addingTimeInterval(5)
@@ -59,7 +64,11 @@ struct TaskCenterRetryCancellationLifetimeTests {
         #expect(newBinding.parent.taskID != row.parentID)
         #expect(newBinding.child.parentTaskID == newBinding.parent.taskID)
         try #require(chat.isStreaming)
+        unscopedStopCount = 0
+        scopedStopIdentities.removeAll()
         chat.stopStreaming()
+        #expect(unscopedStopCount == 0)
+        #expect(scopedStopIdentities.count == 1)
         let cancelledDeadline = Date().addingTimeInterval(2)
         while Date() < cancelledDeadline && !provider.sawCancellation { try await Task.sleep(for: .milliseconds(5)) }
         #expect(provider.sawCancellation)

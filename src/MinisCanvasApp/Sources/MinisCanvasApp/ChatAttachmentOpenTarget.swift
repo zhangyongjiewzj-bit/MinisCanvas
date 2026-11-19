@@ -45,7 +45,7 @@ enum ChatAttachmentSourceState: Equatable, Sendable {
         case .sourceAvailable:
             return "原文件可用"
         case .missingSourceMaterializable:
-            return "原文件缺失，将从已保存数据恢复"
+            return "原文件缺失，将从已保存数据恢复（文档类附件打开的是提取出的文字，保存为 .txt）"
         case .unavailable:
             return "原文件缺失且没有可恢复数据"
         }
@@ -100,7 +100,12 @@ struct ChatAttachmentOpenTarget {
             .appendingPathComponent("MinisCanvas", isDirectory: true)
             .appendingPathComponent("ChatAttachments", isDirectory: true)
             .appendingPathComponent(attachment.id.uuidString, isDirectory: true)
-        let fileName = Self.safeFileName(attachment.fileName, fallback: attachment.id.uuidString)
+        var fileName = Self.safeFileName(attachment.fileName, fallback: attachment.id.uuidString)
+        if Self.holdsExtractedTextOnly(attachment) {
+            // 保存的只是提取出的文字：用 .txt 打开，避免系统把文字当成 PDF/Word 解析而失败。
+            fileName = (fileName as NSString).deletingPathExtension + ".txt"
+            if fileName == ".txt" { fileName = attachment.id.uuidString + ".txt" }
+        }
         let destination = directory.appendingPathComponent(fileName, isDirectory: false)
 
         do {
@@ -110,6 +115,13 @@ struct ChatAttachmentOpenTarget {
         } catch {
             throw ChatAttachmentOpenError.materializationFailed
         }
+    }
+
+    /// PDF / docx 等附件在会话里保存的是提取后的纯文本，不是原文件字节。
+    static func holdsExtractedTextOnly(_ attachment: ChatAttachment) -> Bool {
+        guard attachment.kind == .text else { return false }
+        let mime = attachment.mimeType?.lowercased()
+        return mime == "application/pdf" || mime == ChatStore.extractedDocumentMimeType
     }
 
     /// 路径格式契约 seam：保留 file://、~ 和普通绝对路径的统一解析。

@@ -217,7 +217,7 @@ enum SettingsProviderConfigurationState: String, Codable, Equatable, Sendable {
         case .missingBaseURL:
             return "尚未配置 Base URL；请填写供应商 API 地址后再检查就绪状态。"
         case .invalidBaseURL:
-            return "Base URL 无效；请使用不含用户名、密码或查询密钥的 HTTPS 地址（本机 loopback 可用 HTTP）。"
+            return "Base URL 无效；请使用 https:// 或 http:// 开头、不含用户名、密码或查询密钥的地址。"
         case .unsupportedProtocol:
             return "当前协议没有真实 ProviderFactory/chat consumer；请选择 OpenAI 兼容或 Anthropic。"
         case .factoryUnavailable:
@@ -515,7 +515,7 @@ enum SettingsStateClassification {
             owner: "SettingsCenter",
             priority: 100,
             scope: "app/appearance",
-            defaultValue: "GeneralSettings.default.themePreset (.system via nearest 映射)",
+            defaultValue: "GeneralSettings.default.themePreset (.light 产品主题；旧文件里的 .system 经一次性迁移改为产品主题)",
             reset: "SettingsCenter.resetToDefaults()",
             persistence: "SettingsStore.settings.json",
             restart: "immediate; ThemeTokenProvider/Theme re-project from settingsMirror",
@@ -523,6 +523,20 @@ enum SettingsStateClassification {
             consumer: "ThemeTokenProvider + Theme.colorSchemePreference + SettingsView Picker(主题预设)",
             settingsKey: "general.themePreset",
             effectiveSource: "SettingsCenter.themePreset"
+        ),
+        PersistentStateDescriptor(
+            stateClass: .canonicalSetting,
+            owner: "SettingsCenter",
+            priority: 100,
+            scope: "app/appearance",
+            defaultValue: "GeneralSettings.default.appearance (.system 跟随系统；旧文件里使用产品主题的用户一次性迁移为 .light)",
+            reset: "SettingsCenter.resetToDefaults()",
+            persistence: "SettingsStore.settings.json general.appearance",
+            restart: "immediate; Theme.colorSchemePreference 与主题令牌按浅色/深色/跟随系统重新投影",
+            validation: "Appearance 枚举（浅色/深色/跟随系统）；与配色预设相互独立，换配色不改明暗",
+            consumer: "Theme.colorSchemePreference + SettingsView Picker(明暗)",
+            settingsKey: "general.appearance",
+            effectiveSource: "SettingsCenter.appearance"
         ),
         PersistentStateDescriptor(
             stateClass: .canonicalSetting,
@@ -705,6 +719,35 @@ enum SettingsStateClassification {
             scope: "app/agent user-only control",
             defaultValue: "true",
             reset: "SettingsCenter.resetToDefaults()",
+            persistence: "SettingsStore.settings.json agent.approvalInlineEnabled",
+            restart: "applied when production services are attached",
+            validation: "User-only Bool; not exposed as a model-mutable setting; presentation only, never changes what needs approval",
+            consumer: "BridgeStore.commitProductionServices -> ApprovalPromptCenter.applyPersistedPresentation(inline:)",
+            settingsKey: "agent.approvalInlineEnabled",
+            effectiveSource: "SettingsCenter.approvalInlineEnabledSetting"
+        ),
+        PersistentStateDescriptor(
+            stateClass: .canonicalSetting,
+            owner: "SettingsCenter",
+            priority: 100,
+            scope: "app/agent user-only control",
+            defaultValue: "0 (wait for the user, never auto-deny)",
+            reset: "SettingsCenter.resetToDefaults()",
+            persistence: "SettingsStore.settings.json agent.approvalTimeoutSeconds",
+            restart: "applied when production services are attached",
+            validation: "User-only finite number clamped to 0...3600 seconds; presentation only",
+            consumer: "BridgeStore.commitProductionServices -> ApprovalPromptCenter.applyPersistedPresentation(expiration:)",
+            settingsKey: "agent.approvalTimeoutSeconds",
+            effectiveSource: "SettingsCenter.approvalTimeoutSecondsSetting",
+            uiBindings: ["expirationInterval"]
+        ),
+        PersistentStateDescriptor(
+            stateClass: .canonicalSetting,
+            owner: "SettingsCenter",
+            priority: 100,
+            scope: "app/agent user-only control",
+            defaultValue: "true",
+            reset: "SettingsCenter.resetToDefaults()",
             persistence: "SettingsStore.settings.json agent.browserWriteEnabled",
             restart: "next admitted browser action",
             validation: "Bool; backup import forces false; every action still needs approval including bypass",
@@ -869,6 +912,21 @@ enum SettingsStateClassification {
             settingsKey: "agent.fileCheckpointsEnabled",
             effectiveSource: "SettingsCenter.fileCheckpointsEnabled",
             uiBindings: ["fileCheckpointsEnabled"]
+        ),
+        PersistentStateDescriptor(
+            stateClass: .canonicalSetting,
+            owner: "SettingsCenter",
+            priority: 100,
+            scope: "app/agent user-only control",
+            defaultValue: "true",
+            reset: "SettingsCenter.resetToDefaults()",
+            persistence: "SettingsStore.settings.json agent.backgroundAutoContinueEnabled",
+            restart: "immediate; read each time a background task completion is considered",
+            validation: "Bool; missing legacy value defaults to true; user UI only, no model mutation key; consecutive auto-continuations are capped per session and never bypass budget, permission mode or approval",
+            consumer: "ChatStore backgroundAutoContinueEnabledProvider (background command/child completion auto-continue gate)",
+            settingsKey: "agent.backgroundAutoContinueEnabled",
+            effectiveSource: "SettingsCenter.backgroundAutoContinueEnabled",
+            uiBindings: ["backgroundAutoContinueEnabled"]
         ),
         PersistentStateDescriptor(
             stateClass: .canonicalSetting,
@@ -1139,7 +1197,7 @@ enum SettingsStateClassification {
             persistence: "SettingsStore.settings.json privacy.redactEnvValues",
             restart: "no behavioural application at this head (EnvVarRedactor runs unconditionally)",
             validation: "Bool",
-            consumer: "SettingsView privacy toggle + BL6SettingsCenterProjection 'privacy.redact-env-values'",
+            consumer: "BL6SettingsCenterProjection 'privacy.redact-env-values'（11/18 设置页开关已移除：功能未启用，不展示）",
             settingsKey: "privacy.redactEnvValues",
             effectiveSource: "SettingsCenter.redactEnvValues"
         ),
@@ -1153,7 +1211,7 @@ enum SettingsStateClassification {
             persistence: "SettingsStore.settings.json privacy.collectAnalytics",
             restart: "no behavioural application at this head (no analytics pipeline exists)",
             validation: "Bool",
-            consumer: "SettingsView privacy toggle + BL6SettingsCenterProjection 'privacy.collect-analytics'",
+            consumer: "BL6SettingsCenterProjection 'privacy.collect-analytics'（11/18 设置页开关已移除：功能未启用，不展示）",
             settingsKey: "privacy.collectAnalytics",
             effectiveSource: "SettingsCenter.collectAnalytics"
         ),
@@ -1393,9 +1451,34 @@ enum ProviderStatusTextProjection {
         // contain an obvious credential marker.
         guard let category else { return nil }
         if let httpStatus = httpStatus(in: line) {
-            return "\(category)（HTTP \(httpStatus)）"
+            return "\(category)（HTTP \(httpStatus)）\(httpHint(category: category, status: httpStatus))"
         }
         return category == line ? line : category
+    }
+
+    /// 应用自己写死的完整提示（保存失败原因、获取模型列表的具体原因）。不含用户或
+    /// 服务端内容，原样显示，不再被裁成笼统的类别或兜底文案（11/16 现场 F1、F3）。
+    static let appAuthoredMessages: [String] = ProviderSaveFailureCategory.allMessages + [
+        "获取模型列表失败：API Key 不能为空",
+        "获取模型列表失败：Base URL 不能为空",
+        "获取模型列表失败：当前运行配置不允许联网",
+        "获取模型列表失败：连接超时，请检查 Base URL 或网络",
+        "获取模型列表失败：无法连接服务器，请检查 Base URL 或网络",
+        "获取模型列表失败：该服务没有 /models 接口，请手动填写模型名称",
+        "获取模型列表失败：返回的模型列表格式无法识别，请手动填写模型名称",
+    ] + CustomProviderURL.Failure.allFixedMessages.map { "获取模型列表失败：" + $0 }
+
+    /// HTTP 状态码对应的一句话原因和下一步，只用固定文字。
+    private static func httpHint(category: String, status: Int) -> String {
+        let actionable = ["获取模型列表失败", "最小请求失败", "鉴权失败", "模型发现失败"]
+        guard actionable.contains(category) else { return "" }
+        switch status {
+        case 401, 403: return "：API Key 无效或没有权限，请检查或直接替换 API Key"
+        case 404: return "：地址或模型不存在，请检查 Base URL 和模型名称"
+        case 429: return "：请求过多或额度不足，请稍后重试"
+        case 500...599: return "：服务端出错，请稍后重试"
+        default: return ""
+        }
     }
 
     private static func hiddenSummary(category: String?, httpStatus: Int?) -> String {
@@ -1444,6 +1527,9 @@ enum ProviderStatusTextProjection {
     }
 
     private static func safeCategory(in line: String) -> String? {
+        if let message = appAuthoredMessages.first(where: { line == $0 || line == $0 + "。" }) {
+            return line == message ? message : message + "。"
+        }
         let categories = [
             "无法从钥匙串读取当前 API Key：访问被拒绝",
             "无法从钥匙串读取当前 API Key：读取失败",

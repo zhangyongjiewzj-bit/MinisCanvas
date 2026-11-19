@@ -439,9 +439,10 @@ struct AttachmentStoreTests {
         #expect(chat.pendingAttachments.isEmpty)
     }
 
-    @Test func oversizedTextAttachmentIsCapped() async throws {
+    @Test func oversizedTextAttachmentKeepsHeadAndTail() async throws {
         let chat = ChatStore()
-        let long = String(repeating: "a", count: 10_000)
+        let long = String(repeating: "H", count: 48_000) + String(repeating: "m", count: 20_000)
+            + String(repeating: "T", count: 12_000)
         let txtURL = try makeTempFile(name: "long.txt", data: Data(long.utf8))
         defer { try? FileManager.default.removeItem(at: txtURL.deletingLastPathComponent()) }
 
@@ -454,8 +455,13 @@ struct AttachmentStoreTests {
         }
         let att = try #require(chat.pendingAttachments.first)
         #expect(att.kind == .text)
-        let body = try #require(att.data)
-        #expect(body.count <= ChatStore.maxTextAttachmentChars)
+        let body = try #require(att.data.flatMap { String(data: $0, encoding: .utf8) })
+        #expect(ChatStore.maxTextAttachmentChars == 60_000)
+        #expect(body.hasPrefix(String(repeating: "H", count: 48_000)))
+        #expect(body.hasSuffix(String(repeating: "T", count: 12_000)))
+        #expect(body.contains("中间省略 20000 字"))
+        #expect(body.contains("file_read"))
+        #expect(att.originalTextCharacterCount == 80_000)
     }
 
     @Test func composeUserContentCombinesTextAndAttachments() async throws {
@@ -488,6 +494,20 @@ struct AttachmentStoreTests {
                                     mimeType: "image/png", data: e11PngData)
         let imgContent = ChatStore.composeUserContent(text: "", attachments: [imgAtt])
         #expect(imgContent.contains("我上传了图片 cat.png"))
+        #expect(!imgContent.contains("来源路径"))
+
+        // M-07：图片有来源路径时写进说明，较早的图片被省略后模型仍能用 file_read 重看
+        let pathImg = ChatAttachment(kind: .image, fileName: "dog.png", fileType: .image,
+                                     mimeType: "image/png", data: e11PngData, fileURL: "/tmp/pics/dog.png")
+        let pathContent = ChatStore.composeUserContent(text: "", attachments: [pathImg])
+        #expect(pathContent.contains("来源路径：/tmp/pics/dog.png"))
+
+        // MC4-020：音频同样写来源路径，较早的音频被预算省略后能定位要请用户重新添加的是哪一段
+        let pathAudio = ChatAttachment(kind: .audio, fileName: "memo.wav", fileType: .audio,
+                                       mimeType: "audio/wav", data: Data(count: 16), fileURL: "/tmp/voice/memo.wav")
+        let audioContent = ChatStore.composeUserContent(text: "", attachments: [pathAudio])
+        #expect(audioContent.contains("我上传了音频 memo.wav"))
+        #expect(audioContent.contains("来源路径：/tmp/voice/memo.wav"))
     }
 
     @Test func sendDraftWithAttachmentOnlySends() async throws {

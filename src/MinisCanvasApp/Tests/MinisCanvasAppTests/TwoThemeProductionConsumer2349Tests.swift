@@ -68,7 +68,9 @@ struct TwoThemeProductionConsumer2349Tests {
         let reopened = SettingsStore(directory: directory)
         #expect(reopened.settings.general.themePreset == .light)
         #expect(reopened.settings.general.legacyThemePresetRawValue == raw)
-        #expect(reopened.settings.general.appearance == .light)
+        // F-1 起明暗（浅 / 深 / 跟随系统）是独立选择：带迁移标记的文件按存储值读取，
+        // 旧配色词只收敛配色预设，不再抹掉明暗。
+        #expect(reopened.settings.general.appearance == .dark)
         #expect(reopened.settings.general.accentTheme == .pseudo)
         #expect(ThemePreset(rawValue: raw)?.current == .system)
     }
@@ -84,9 +86,12 @@ struct TwoThemeProductionConsumer2349Tests {
                 let data = try JSONSerialization.data(withJSONObject: raw)
                 try data.write(to: directory.appendingPathComponent(SettingsStore.fileName))
                 let loaded = SettingsStore(directory: directory)
-                let expected: ThemePreset = appearance == .light ? .light : .system
+                // 无迁移标记的旧文件：旧「浅色」直接是产品主题；旧「深色/跟随系统」先收敛为跟随系统，
+                // 再被一次性迁移改为产品主题。所以 18 种旧组合重新打开后都是产品主题。
+                let expected: ThemePreset = .light
                 #expect(loaded.settings.general.themePreset == expected)
-                #expect(loaded.settings.general.appearance == expected.appearanceProjection)
+                // F-1：旧「固定浅色」迁移后仍是浅色；其余旧组合跟随系统。
+                #expect(loaded.settings.general.appearance == (appearance == .light ? .light : .system))
                 let first = loaded.settings.general
                 let write = loaded.update(\.general) { $0.setThemePreset(expected) }
                 if case .failure(let error) = write { Issue.record("synthetic persist failed: \(error)") }
@@ -109,7 +114,7 @@ struct TwoThemeProductionConsumer2349Tests {
         #expect(reopened.settings.general.themePreset == .system)
         #expect(reopened.settings.general.legacyThemePresetRawValue == "highContrast")
         center.themePreset = .light
-        #expect(center.colorSchemePreference == .light)
+        #expect(center.colorSchemePreference == nil)   // 产品主题带深色版，明暗跟随系统
         #expect(center.themePreset == .light)
     }
 
@@ -121,22 +126,24 @@ struct TwoThemeProductionConsumer2349Tests {
             let appearance = try #require(NSAppearance(named: name))
             provider.updateSystemAppearance(appearance)
             var nativeBackground: ThemeColor?
-            var nativeAccent: ThemeColor?
             appearance.performAsCurrentDrawingAppearance {
                 if let rgb = NSColor.windowBackgroundColor.usingColorSpace(.sRGB) {
                     nativeBackground = ThemeColor(r: Double(rgb.redComponent), g: Double(rgb.greenComponent), b: Double(rgb.blueComponent))
                 }
-                if let rgb = NSColor.controlAccentColor.usingColorSpace(.sRGB) {
-                    nativeAccent = ThemeColor(r: Double(rgb.redComponent), g: Double(rgb.greenComponent), b: Double(rgb.blueComponent))
-                }
             }
+            // 跟随系统主题的强调色统一为陶土橙，不取系统强调色。
+            let terracotta = ThemeTokenProvider.systemThemeAccent(for: provider.mode)
+            let productAccent = ThemeColor(rgb: provider.mode == .dark
+                ? ThemePreset.canonicalAccentTheme.darkAccentRGB
+                : ThemePreset.canonicalAccentTheme.accentRGB)
+            #expect(terracotta == productAccent)
             #expect(provider.tokens.background == nativeBackground)
             #expect(provider.aj38.backgroundPrimary == provider.tokens.background)
             #expect(provider.aj38.backgroundSecondary == provider.tokens.sidebarBackground)
-            #expect(provider.aj38.accent == nativeAccent)
-            #expect(provider.aj38.accentHover == nativeAccent)
-            #expect(provider.accentColor == Color(nsColor: .controlAccentColor))
-            #expect(center.effectiveThemeAccentColor == Color(nsColor: .controlAccentColor))
+            #expect(provider.aj38.accent == productAccent)
+            #expect(provider.aj38.accentHover == productAccent)
+            #expect(provider.accentColor == ThemePreset.light.accentColor)
+            #expect(center.effectiveThemeAccentColor == ThemePreset.light.accentColor)
             #expect(center.colorSchemePreference == nil)
             for surface in [provider.tokens.background, provider.tokens.sidebarBackground, provider.tokens.surfaceRaised] {
                 #expect(ThemeContrast.violations(tokens: provider.tokens, background: surface).isEmpty)
@@ -146,11 +153,13 @@ struct TwoThemeProductionConsumer2349Tests {
         let product = provider.tokens
         let overlay = provider.aj38
         #expect(product == ThemePreset.light.semanticTokens(systemIsDark: false))
-        #expect(overlay == Aj38Palette.readableLight.withAccent(AccentTheme.pseudo.accentRGB))
+        #expect(overlay == Aj38Palette.readableLight)
+        // 产品主题带深色版：系统切到深色，tokens 与覆盖色板随之换成深色那套。
         provider.updateSystemAppearance(NSAppearance(named: .darkAqua))
-        #expect(provider.tokens == product)
-        #expect(provider.aj38 == overlay)
-        #expect(provider.mode == .light)
-        #expect(center.colorSchemePreference == .light)
+        #expect(provider.tokens == ThemePreset.light.semanticTokens(systemIsDark: true))
+        #expect(provider.tokens != product)
+        #expect(provider.aj38 == Aj38Palette.readableDark)
+        #expect(provider.mode == .dark)
+        #expect(center.colorSchemePreference == nil)
     }
 }

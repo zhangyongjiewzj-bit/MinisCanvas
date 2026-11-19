@@ -84,6 +84,20 @@ struct SessionCompactProjectionTests {
         #expect(projection.state == .blocked)
         #expect(projection.checkpointID == nil)
     }
+    /// MC4-044：存储已装配但会话还没落盘，与“存储服务没装配”显示不同。
+    @Test
+    func unsavedSessionIsDistinctFromUnassembledStore() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = SessionStore(directory: directory)
+        let notSaved = SessionCompactProjection(sessionID: UUID().uuidString, store: store)
+        #expect(notSaved.state == .sessionNotSaved)
+        #expect(notSaved.stateLabel != "持久化未装配")
+        let noStore = SessionCompactProjection(sessionID: UUID().uuidString, store: nil)
+        #expect(noStore.state == .unavailable)
+        #expect(noStore.stateLabel == "持久化未装配")
+    }
+
     @Test
     func ordinaryRevisionChangesWithoutCheckpointDoNotProjectCorruption() throws {
         let directory = try makeDirectory()

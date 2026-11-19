@@ -180,6 +180,30 @@ struct AJ52OutputModeTests {
         #expect(replies[0].content == "ok")
         #expect(!replies[0].content.contains("⏳ 生成中"))
     }
+
+    /// 11/19 旅途：极简模式中途停止后，回答一直显示「生成中…」转圈。
+    @Test func conciseModeStopLeavesNoPlaceholderInReply() async throws {
+        let chat = ChatStore()
+        chat.agentEngine = InterruptRecordingEngine()
+        chat.outputMode = .concise
+
+        chat.draftText = "极简模式中途停止"
+        chat.sendDraft()
+        let reply = try #require(chat.messages.last)
+        #expect(reply.role == .assistant)
+        var waited: TimeInterval = 0
+        while chat.messages.last?.turnTiming?.firstTokenAt == nil && waited < 5 {
+            try await Task.sleep(for: .milliseconds(20))
+            waited += 0.02
+        }
+
+        chat.stopStreaming()
+
+        let stopped = try #require(chat.messages.first { $0.id == reply.id })
+        #expect(!stopped.isStreaming)
+        #expect(stopped.wasInterrupted)
+        #expect(!stopped.content.contains("生成中"))
+    }
 }
 
 // MARK: - 模式持久化（AppSettings / SettingsCenter）
@@ -294,5 +318,17 @@ struct TurnEnvironmentPromptTests {
         #expect(full.contains("当前会话目标：整理本周报告"))
         let bare = ChatStore.turnEnvironmentPrompt(now: date, goalObjective: nil, projectDirectory: nil, timeZone: utc)
         #expect(bare == "当前日期：2026-11-15（星期日）")
+    }
+}
+
+// 2026-11-16 现场 F5：新建项目自动挂载失败时，按实际原因分别提示，不再混成一句。
+@Suite("Project folder auto mount failure messages")
+struct ProjectFolderAutoMountFailureMessageTests {
+    @Test func eachFailureHasItsOwnMessage() {
+        let messages = ProjectFolderAutoMount.Failure.allCases.map(\.message)
+        #expect(Set(messages).count == messages.count)
+        #expect(ProjectFolderAutoMount.Failure.ineligibleFolder.message.contains("子文件夹"))
+        #expect(ProjectFolderAutoMount.Failure.mountLimitReached.message.contains("\(PrivacySettings.maxMountedFolders)"))
+        #expect(!messages.contains { $0.contains("或已达挂载上限") })
     }
 }

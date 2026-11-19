@@ -7,6 +7,11 @@ private final class WorkflowToolProvider: LLMProvider, @unchecked Sendable {
     var model = LLMModel(id: "workflow-model", displayName: "Workflow Model", provider: "workflow-provider")
     var capabilities: Set<ProviderCapability> { [] }
     private var responseIndex = 0
+    private let toolName: String
+
+    init(toolName: String = "web_search") {
+        self.toolName = toolName
+    }
 
     func sendMessage(
         messages: [LLMMessage],
@@ -22,7 +27,7 @@ private final class WorkflowToolProvider: LLMProvider, @unchecked Sendable {
                 usage: nil,
                 toolCalls: [LLMToolCall(
                     id: "call-workflow-1",
-                    name: "web_search",
+                    name: toolName,
                     rawArguments: "{\"query\":\"MinisCanvas\"}",
                     arguments: ["query": "MinisCanvas"]
                 )]
@@ -67,6 +72,14 @@ private func workflowToolCatalog() -> [AgentToolDefinition] {
             description: "Search the configured web provider.",
             parameters: [
                 "query": AgentToolParam(type: .string, description: "Search query"),
+            ],
+            required: ["query"]
+        ),
+        AgentToolDefinition(
+            name: "speech",
+            description: "Synthetic low-risk tool.",
+            parameters: [
+                "query": AgentToolParam(type: .string, description: "Synthetic input"),
             ],
             required: ["query"]
         ),
@@ -151,6 +164,11 @@ private final class FailingWorkflowProvider: LLMProvider, @unchecked Sendable {
     var capabilities: Set<ProviderCapability> { [] }
     private(set) var sendCount = 0
     private var responseIndex = 0
+    private let toolName: String
+
+    init(toolName: String = "web_search") {
+        self.toolName = toolName
+    }
 
     func sendMessage(
         messages: [LLMMessage],
@@ -167,7 +185,7 @@ private final class FailingWorkflowProvider: LLMProvider, @unchecked Sendable {
                 usage: nil,
                 toolCalls: [LLMToolCall(
                     id: "call-failing-1",
-                    name: "web_search",
+                    name: toolName,
                     rawArguments: "{\"query\":\"failure\"}",
                     arguments: ["query": "failure"]
                 )]
@@ -261,7 +279,7 @@ private final class CancellationWorkflowProvider: LLMProvider, @unchecked Sendab
 
 private struct WorkflowToolExecutor: ToolExecutor {
     func execute(name: String, input: [String: Any]) async throws -> String {
-        #expect(name == "web_search")
+        #expect(name == "web_search" || name == "speech")
         return "search-result"
     }
 }
@@ -374,7 +392,9 @@ struct ChatSessionToolCallWorkflowTests {
 
         let sessions = SessionStore(directory: root)
         let session = try sessions.createSession(id: "failed-retry-session", projectID: "failed-retry-project")
-        let provider = FailingWorkflowProvider()
+        // 运行时用默认审批门且没有审批人；web_search 现在默认要问（11/19），
+        // 这里换成默认免审批的低风险工具，测的仍是失败后冻结重试信封。
+        let provider = FailingWorkflowProvider(toolName: "speech")
         let runtime = try makeWorkflowRuntime(
             root: root,
             sessions: sessions,
@@ -899,10 +919,12 @@ struct ChatSessionToolCallWorkflowTests {
 
         let sessions = SessionStore(directory: root)
         let session = try sessions.createSession(id: "workflow-session", projectID: "workflow-project")
+        // 运行时用默认审批门且没有审批人；web_search 现在默认要问（11/19），
+        // 这里换成默认免审批的 speech，测的仍是原生工具调用历史跨重启保留。
         let runtime = try makeWorkflowRuntime(
             root: root,
             sessions: sessions,
-            provider: WorkflowToolProvider()
+            provider: WorkflowToolProvider(toolName: "speech")
         )
         let context = try await runtime.makeContext(sessionID: session.id)
 

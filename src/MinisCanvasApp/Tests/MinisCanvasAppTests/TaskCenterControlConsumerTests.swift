@@ -178,7 +178,7 @@ struct TaskCenterControlConsumerTests {
         let recoveryTitle = try #require(TaskCenterRecoveryRowText.visibleTitle(for: row))
         #expect(recoveryTitle.contains("子任务 child-task"))
         #expect(recoveryTitle.contains("父任务 parent-task"))
-        #expect(recoveryTitle.contains("Run child-run"))
+        #expect(recoveryTitle.contains("运行 child-run"))
         #expect(recoveryTitle.contains("真实终态未记录"))
         #expect(row.accessibilityLabel.contains("父任务 parent-task"))
         #expect(!row.cancelAvailable && !row.retryAvailable)

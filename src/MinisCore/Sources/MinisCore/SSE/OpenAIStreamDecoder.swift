@@ -134,6 +134,8 @@ public enum OpenAIStreamDecoder {
             public var id: String?
             public var name: String?
             public var arguments: String = ""
+            /// 参数累计超过边界上限后置位：丢弃已累计的参数、不再继续累加（V-6）。
+            public var argumentsOversized = false
 
             public init(id: String? = nil, name: String? = nil, arguments: String = "") {
                 self.id = id
@@ -158,8 +160,16 @@ public enum OpenAIStreamDecoder {
             var call = calls[delta.index] ?? Call()
             if let id = delta.id { call.id = id }
             if let name = delta.name { call.name = name }
-            if let args = delta.arguments { call.arguments += args }
+            if let args = delta.arguments, !call.argumentsOversized { call.arguments += args }
             calls[delta.index] = call
+        }
+
+        /// 这个槽位的参数已超限：清掉已累计的参数，后续增量不再累加。
+        public mutating func markArgumentsOversized(index: Int) {
+            guard var call = calls[index] else { return }
+            call.arguments = ""
+            call.argumentsOversized = true
+            calls[index] = call
         }
 
         /// Completed calls in index order (only those with a name).

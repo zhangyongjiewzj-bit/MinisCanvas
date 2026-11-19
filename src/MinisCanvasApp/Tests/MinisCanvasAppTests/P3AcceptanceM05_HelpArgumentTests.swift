@@ -25,7 +25,7 @@ struct P3AcceptanceM05HelpArgumentTests {
         #expect(text.contains(metadata?.zhSummary ?? "missing Chinese summary"))
         #expect(text.contains(metadata?.enSummary ?? "missing English summary"))
         #expect(text.contains(metadata?.parameterSummary ?? "missing parameter summary"))
-        #expect(text.contains("当前阻断：暂不可用，请在设置→智能体调整自主权上限。"))
+        #expect(text.contains("当前阻断：暂不可用，请在设置→智能体调整最高模式。"))
         #expect(!text.contains("/canvas.run"))
         #expect(center.pendingAdjudication == nil)
     }
@@ -42,7 +42,7 @@ struct P3AcceptanceM05HelpArgumentTests {
         let center = ComposerCommandAdjudicationCenter()
 
         #expect(center.evaluate(request: request, snapshot: snapshot, facts: facts) == .execute)
-        #expect(center.projection?.text.contains("未知 Composer 命令：no.such.command") == true)
+        #expect(center.projection?.text.contains("未知命令：no.such.command") == true)
         #expect(center.pendingAdjudication == nil)
     }
 

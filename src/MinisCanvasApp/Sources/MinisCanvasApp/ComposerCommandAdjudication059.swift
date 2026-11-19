@@ -237,7 +237,7 @@ final class ComposerCommandAdjudicationCenter {
     /// invokes this only after current lease/policy and availability checks.
     var desktopCommandAction: ((PendingCommandRequest, ComposerSubmissionSnapshot) throws -> String)?
     static let desktopCommandIDs: Set<String> = [
-        "model", "permissions", "memory", "mcp", "context", "clear", "rewind",
+        "model", "permissions", "memory", "mcp", "context", "clear", "rewind", "undo", "diff",
         "doctor", "usage", "export", "rename", "resume", "plan", "skills", "shortcuts",
         // N2: same entries as the Stop button, failed-row Retry and approval-card Deny.
         "stop", "retry", "reject",
@@ -296,7 +296,7 @@ final class ComposerCommandAdjudicationCenter {
     /// Registration and a Policy/Approval bit do not imply that approval can
     /// execute a command. The Composer menu may project this concrete blocker
     /// while keeping the command discoverable.
-    private static let boundarySettingsReason = "暂不可用，请在设置→智能体调整自主权上限。"
+    private static let boundarySettingsReason = "暂不可用，请在设置→智能体调整最高模式。"
 
     static func missingExecutorReason(for commandID: String) -> String? {
         let id = CommandDefinition.canonicalID(commandID)
@@ -497,7 +497,7 @@ final class ComposerCommandAdjudicationCenter {
             projection = AcknowledgedProjection(
                 id: request.id,
                 commandID: request.commandID,
-                text: "命令 /\(request.commandID) 已批准，正通过规范 Composer 路径执行。",
+                text: "命令 /\(request.commandID) 已批准，正通过规范路径执行。",
                 emittedAt: now
             )
             if request.commandID == "compact" {
@@ -533,7 +533,11 @@ final class ComposerCommandAdjudicationCenter {
         if request.requiresPolicyApproval {
             supersedeUnanswered(now: now)
             approvalToken = nil
-            if hasNativeAuthorization, request.commandID == "compact" {
+            // 2026-11-16 用户决定：用户自己提交的 /compact 在所有档位直接执行、不弹卡
+            // （与 Claude Code 一致；模型调用的压缩工具此前已定为免卡）。
+            let isUsersOwnCompact = request.commandID == "compact"
+                && ChatStore.userComposerCommandRequestID == request.id
+            if (hasNativeAuthorization || isUsersOwnCompact), request.commandID == "compact" {
                 return .execute
             }
             let submitted = PendingAdjudication(
@@ -643,7 +647,7 @@ final class ComposerCommandAdjudicationCenter {
                 setProjection(
                     id: pending.id,
                     commandID: pending.commandID,
-                    text: "Composer 规范重放入口未接线，命令未获批准（fail-closed）。",
+                    text: "规范重放入口未接线，命令未获批准（fail-closed）。",
                     now: now
                 )
                 return false
@@ -946,12 +950,18 @@ final class ComposerCommandAdjudicationCenter {
             let registry = commandRegistry
             let requestedID = request.args["command_id"]?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if CommandDefinition.canonicalID(requestedID) == "goal", registry.command(id: "goal") != nil {
+                return "/goal · 会话目标 / Conversation Goal\n"
+                    + "/goal 目标内容：设定目标；/goal：查看当前目标。\n"
+                    + "/goal pause 暂停，/goal resume 恢复，/goal clear 清除当前目标。\n"
+                    + "风险：低；只管理当前会话的目标，不执行其他命令。"
+            }
             if !requestedID.isEmpty {
                 guard let command = registry.command(id: requestedID),
                       CommandRegistry.composerCommandIDs.contains(command.id),
                       let metadata = CommandRegistry.composerMetadata(for: command.id)
                 else {
-                    return "未知 Composer 命令：\(requestedID)。输入 /help 查看当前注册表。"
+                    return "未知命令：\(requestedID)。输入 /help 查看当前注册表。"
                 }
                 var lines = [
                     "/\(command.id) · \(command.title) / \(metadata.enTitle)",
@@ -968,10 +978,10 @@ final class ComposerCommandAdjudicationCenter {
                 return lines.joined(separator: "\n")
             }
             let vocabulary = registry.allCommands()
-                .filter { CommandRegistry.composerCommandIDs.contains($0.id) }
+                .filter { CommandRegistry.composerCommandIDs.contains($0.id) || $0.id == "goal" }
                 .map(commandListRow)
                 .joined(separator: "\n")
-            return "Composer 命令一览（斜杠输入，需批准的命令会显示裁决卡）：\n\(vocabulary)"
+            return "命令一览（斜杠输入，需批准的命令会显示裁决卡）：\n\(vocabulary)"
         case "commands":
             let registered = commandRegistry.allCommands()
                 .filter { CommandRegistry.composerCommandIDs.contains($0.id) }
@@ -993,10 +1003,10 @@ final class ComposerCommandAdjudicationCenter {
                 registered.filter { $0.category.rawValue == selected.rawValue }
             } ?? registered
             guard !displayed.isEmpty else {
-                return "当前注册表在该分类下没有可列出的 Composer 命令。"
+                return "当前注册表在该分类下没有可列出的命令。"
             }
             let rows = displayed.map(commandListRow).joined(separator: "\n")
-            let heading = category.map { "\($0.displayName)命令" } ?? "Composer 命令"
+            let heading = category.map { "\($0.displayName)命令" } ?? "命令"
             return "\(heading)（\(displayed.count) 条，来自当前注册表）：\n\(rows)"
         case "status":
             let runtime = statusProjection?(snapshot) ?? ""
@@ -1008,17 +1018,17 @@ final class ComposerCommandAdjudicationCenter {
             let value = boundaryProjection?(snapshot)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return value.isEmpty
-                ? "当前安全边界事实未知；本命令未执行任何副作用。"
+                ? "暂时读不到当前的安全边界设置；本命令没有改动任何设置。"
                 : value
         case "provider":
             let value = providerProjection?(snapshot)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return value.isEmpty
-                ? "当前 Provider/Model 已应用事实未知；本命令未执行任何副作用。"
+                ? "还没有选定可用的模型；本命令没有改动任何设置。"
                 : value
         default:
             // 未来注册表新增的非批准命令：仍然可见地消费，不静默吞掉。
-            return "命令 /\(request.commandID) 已被 Composer 策略层消费；尚无专属结果视图，未执行任何副作用。"
+            return "命令 /\(request.commandID) 已被策略层消费；尚无专属结果视图，未执行任何副作用。"
         }
     }
 
@@ -1100,9 +1110,9 @@ struct ComposerCommandAdjudicationCard: View {
     private var adjudicationSection: some View {
         if let pending = activeAdjudication {
             HStack(spacing: 8) {
-                MinisIconView(.warning, size: 20, accessibilityLabel: "Composer 命令待批准")
+                MinisIconView(.warning, size: 20, accessibilityLabel: "命令待批准")
                     .foregroundPalette(theme?.statusWarning ?? .orange)
-                Text("Composer 命令待批准")
+                Text("命令待批准")
                     .font(.headline)
                 Spacer()
                 Text("/\(pending.commandID)")

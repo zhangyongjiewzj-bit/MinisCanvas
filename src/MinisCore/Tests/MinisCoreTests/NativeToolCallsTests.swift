@@ -532,7 +532,7 @@ struct NativeToolCallsTests {
         #expect(persistedFacts == result.toolExecutionFacts)
         if knownCapability {
             #expect(observer.executedNames == ["file_read"])
-            #expect(feedback.content == String(decoding: originalBytes, as: UTF8.self))
+            #expect(feedback.content == "     1\tTOOL1006 real owned reader positive\n     2\t完整正文")
             #expect(result.toolCallsExecuted == 1)
             #expect(result.toolExecutionFacts.count == 1)
             let fact = try #require(result.toolExecutionFacts.first)
@@ -555,5 +555,78 @@ struct NativeToolCallsTests {
             #expect(result.toolCallsExecuted == 0)
             #expect(result.toolExecutionFacts.isEmpty)
         }
+    }
+}
+
+// MARK: - 第三轮：V-6 超限调用回固定工具错误；B-8 思考文本留在本轮的助手消息上
+
+extension NativeToolCallsTests {
+    private func runLoop(_ fixture: NativeToolFixture, _ mock: NativeToolMockProvider) async throws -> AgentLoopResult {
+        try await fixture.makeLoop().run(
+            messages: [LLMMessage(role: .user, content: "跑一下")],
+            systemPrompt: "test",
+            provider: mock,
+            toolExecutor: fixture.executor,
+            tools: AgentToolCatalog.makeTools(),
+            currentConversationID: fixture.identity.turn.sessionID,
+            parentIdentitySeed: ParentRuntimeIdentitySeed(
+                sessionID: fixture.identity.turn.sessionID,
+                conversationID: fixture.identity.turn.sessionID,
+                taskID: "task:native-tool-calls",
+                actorID: "test"
+            ),
+            executionIdentity: fixture.identity
+        )
+    }
+
+    @Test func oversizedArgumentsCallGetsFixedToolErrorAndIsNeverExecuted() async throws {
+        let fixture = NativeToolFixture()
+        var oversized = LLMToolCall(id: "call_big", name: "shell_execute", rawArguments: "{}", arguments: [:])
+        oversized.argumentsExceedLimit = true
+        let mock = NativeToolMockProvider(responses: [
+            LLMResponse(text: "一次写完", stopReason: "tool_calls", usage: nil, toolCalls: [oversized]),
+            LLMResponse(text: "改为分段", stopReason: nil, usage: nil),
+        ])
+        let result = try await runLoop(fixture, mock)
+        #expect(result.toolCallsExecuted == 0)
+        #expect(result.messages.last?.content == "改为分段")
+        let toolMessage = try #require(mock.receivedHistory[1].first { $0.role == .tool })
+        #expect(toolMessage.toolCallID == "call_big")
+        #expect(toolMessage.content.contains(ProviderToolCallBoundary.oversizedArgumentsToolResult))
+    }
+
+    @Test func oversizedCallDoesNotBlockTheOrdinaryCallInTheSameResponse() async throws {
+        let fixture = NativeToolFixture()
+        var oversized = LLMToolCall(id: "call_big", name: "shell_execute", rawArguments: "{}", arguments: [:])
+        oversized.argumentsExceedLimit = true
+        let ordinary = LLMToolCall(id: "call_ok", name: "shell_execute",
+                                   rawArguments: "{\"command\":\"echo still-runs\"}",
+                                   arguments: ["command": "echo still-runs"])
+        let mock = NativeToolMockProvider(responses: [
+            LLMResponse(text: "两个调用", stopReason: "tool_calls", usage: nil, toolCalls: [oversized, ordinary]),
+            LLMResponse(text: "完成", stopReason: nil, usage: nil),
+        ])
+        let result = try await runLoop(fixture, mock)
+        #expect(result.toolCallsExecuted == 1)
+        let toolMessages = mock.receivedHistory[1].filter { $0.role == .tool }
+        #expect(toolMessages.count == 2)
+        #expect(toolMessages.first { $0.toolCallID == "call_big" }?.content
+            .contains(ProviderToolCallBoundary.oversizedArgumentsToolResult) == true)
+        #expect(toolMessages.first { $0.toolCallID == "call_ok" }?.content.contains("still-runs") == true)
+    }
+
+    @Test func reasoningContentStaysOnThisTurnsAssistantMessageForTheNextRequest() async throws {
+        let fixture = NativeToolFixture()
+        var call = LLMToolCall(id: "call_1", name: "shell_execute",
+                               rawArguments: "{\"command\":\"echo native-ok\"}",
+                               arguments: ["command": "echo native-ok"])
+        call.reasoningContent = "先跑命令再回答"
+        let mock = NativeToolMockProvider(responses: [
+            LLMResponse(text: "", stopReason: "tool_calls", usage: nil, toolCalls: [call]),
+            LLMResponse(text: "最终结果", stopReason: nil, usage: nil),
+        ])
+        _ = try await runLoop(fixture, mock)
+        let assistant = try #require(mock.receivedHistory[1].first { $0.role == .assistant && !$0.toolCalls.isEmpty })
+        #expect(assistant.toolCalls.first?.reasoningContent == "先跑命令再回答")
     }
 }

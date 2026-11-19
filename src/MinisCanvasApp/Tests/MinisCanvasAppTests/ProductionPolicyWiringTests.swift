@@ -226,7 +226,7 @@ struct ProductionPolicyWiringTests {
         #expect(!bridge.chat.isStreaming)
         #expect(bridge.chat.lastComposerSubmissionSnapshot?.autonomyCeiling == .l1)
         let aboveAssistant = try #require(bridge.chat.messages.last(where: { $0.role == .assistant }))
-        #expect(aboveAssistant.content.contains("需要自主权上限 L2，而你的上限是 L1"))
+        #expect(aboveAssistant.content.contains("当前模式超出了你设置的运行安全上限"))
         #expect(!aboveAssistant.content.contains("收到：auto edit above L1"))
         let aboveSnapshot = try #require(bridge.chat.lastComposerSubmissionSnapshot)
         let aboveController = ComposerAuthorizationController(
@@ -345,7 +345,7 @@ struct ProductionPolicyWiringTests {
         let loweredSnapshot = try #require(bridge.chat.lastComposerSubmissionSnapshot)
         #expect(loweredSnapshot.autonomyCeiling == .l0)
         let loweredAssistant = try #require(bridge.chat.messages.last(where: { $0.role == .assistant }))
-        #expect(loweredAssistant.content.contains("需要自主权上限 L1，而你的上限是 L0"))
+        #expect(loweredAssistant.content.contains("当前模式超出了你设置的运行安全上限"))
         #expect(!loweredAssistant.content.contains("收到：manual above lowered L0"))
         let loweredController = ComposerAuthorizationController(
             snapshot: loweredSnapshot, facts: bridge.chat.composerPolicyFacts
@@ -748,7 +748,7 @@ struct ProductionPolicyWiringTests {
         #expect(frozen.autonomyCeiling == .l0)
         #expect(frozen.effort == .high)
         let assistant = try #require(bridge.chat.messages.last(where: { $0.role == .assistant }))
-        #expect(assistant.content.contains("需要自主权上限 L1，而你的上限是 L0"))
+        #expect(assistant.content.contains("当前模式超出了你设置的运行安全上限"))
         #expect(!assistant.content.contains("收到：blocked by user L0 ceiling"))
         #expect(nextPolicy.acceptedExecutionCount == 0)
 

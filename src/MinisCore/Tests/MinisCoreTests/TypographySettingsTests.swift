@@ -127,7 +127,7 @@ struct TypographySettingsTests {
         #expect(result.migrated)
         #expect(result.settings.settingsVersion == AppSettings.currentVersion)
         #expect(result.settings.typography.uiBaseFontSize == 14)
-        #expect(result.settings.general.themePreset == .system)
+        #expect(result.settings.general.themePreset == .light)   // 一次性迁到产品主题
         #expect(result.settings.general.appearance == .system)
         #expect(result.settings.general.legacyThemePresetRawValue == "dark|pseudo")
         #expect(result.settings.agent.maxLoopIterations == 5)

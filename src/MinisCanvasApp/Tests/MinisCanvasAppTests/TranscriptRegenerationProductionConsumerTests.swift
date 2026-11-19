@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import MinisCore
 import Testing
@@ -28,6 +29,79 @@ struct TranscriptRegenerationProductionConsumerTests {
         #expect(f.chat.composerPolicySelection == selection && f.chat.composerPolicyFacts == facts)
         #expect(f.provider.catalogs.last == [])
         #expect(f.transport.calls == 0)
+    }
+
+    @Test func interruptedAnswerCanBeRegeneratedLikeAnyOtherAnswer() async throws {
+        let f = try await fixture(attack: false)
+        defer { f.chat.stopAllStreamingForSafety(); f.registry.disconnectAll(); try? f.profile.cleanupDisposableRoots() }
+        try await send("original question", chat: f.chat, provider: f.provider)
+        let session = try #require(f.chat.activeSessionID)
+        let answer = try #require(f.chat.messages.last(where: { $0.role == .assistant }))
+        var edited = f.chat.messages
+        let row = try #require(edited.firstIndex(where: { $0.id == answer.id }))
+        edited[row].wasInterrupted = true
+        f.chat.messages = edited
+        // 与停止按钮一致：中断标记随会话落盘后才去重新生成。
+        f.chat.touchSession(session)
+        f.chat.flushPendingSessionPersistence()
+        #expect(f.chat.regenerationDisabledReason(messageID: answer.id) == nil)
+        let revision = try #require(f.chat.transcriptRevision(forSession: session))
+        let userCountBefore = f.chat.messages.filter { $0.role == .user }.count
+        #expect(await f.chat.regenerateAnswer(sessionID: session, messageID: answer.id, expectedRevision: revision))
+        await finish(f.chat, session: session)
+        // 被中断的回答是被替换而不是追加：半截回答不在了，没有新增提示用户消息，新回答出现。
+        #expect(!f.chat.messages.contains(where: { $0.id == answer.id }))
+        #expect(f.chat.messages.filter { $0.role == .user }.count == userCountBefore)
+        #expect(!f.chat.messages.contains(where: { $0.content.contains("请基于已有上下文重新回答") }))
+        let replacement = try #require(f.chat.messages.last(where: { $0.role == .assistant }))
+        #expect(replacement.id != answer.id && replacement.content == "已完成的合成回答" && !replacement.wasInterrupted)
+        let lastUser = try #require(f.chat.messages.lastIndex(where: { $0.role == .user }))
+        #expect(f.chat.messages[(lastUser + 1)...].filter { $0.role == .assistant }.count == 1)
+    }
+
+    /// 11/19 旅途：简洁模式在出字前停止，回答正文为空，"重新生成"却被置灰。
+    @Test func interruptedAnswerWithoutTextCanBeRegenerated() async throws {
+        let f = try await fixture(attack: false)
+        defer { f.chat.stopAllStreamingForSafety(); f.registry.disconnectAll(); try? f.profile.cleanupDisposableRoots() }
+        try await send("original question", chat: f.chat, provider: f.provider)
+        let answer = try #require(f.chat.messages.last(where: { $0.role == .assistant }))
+        var edited = f.chat.messages
+        let row = try #require(edited.firstIndex(where: { $0.id == answer.id }))
+        edited[row].replaceContent("")
+        f.chat.messages = edited
+        #expect(f.chat.regenerationDisabledReason(messageID: answer.id) != nil)
+        edited[row].wasInterrupted = true
+        f.chat.messages = edited
+        let session = try #require(f.chat.activeSessionID)
+        // 与停止按钮一致：中断标记随会话落盘后才去重新生成。
+        f.chat.touchSession(session)
+        f.chat.flushPendingSessionPersistence()
+        #expect(f.chat.regenerationDisabledReason(messageID: answer.id) == nil)
+        let userCountBefore = f.chat.messages.filter { $0.role == .user }.count
+        let revision = try #require(f.chat.transcriptRevision(forSession: session))
+        #expect(await f.chat.regenerateAnswer(sessionID: session, messageID: answer.id, expectedRevision: revision))
+        await finish(f.chat, session: session)
+        #expect(!f.chat.messages.contains(where: { $0.id == answer.id }))
+        #expect(f.chat.messages.filter { $0.role == .user }.count == userCountBefore)
+        #expect(f.chat.messages.last(where: { $0.role == .assistant })?.content == "已完成的合成回答")
+    }
+
+    /// 后台完成通知：仍是用户角色、正文不变（发给模型的内容不变），但显示成灰色系统提示，不画用户气泡。
+    @Test func backgroundCompletionNoticeRendersAsGraySystemLineNotUserBubble() {
+        let notice = ChatMessageUI(role: .user, content: ChatStore.backgroundCompletionContinuationPrompt)
+        let ordinary = ChatMessageUI(role: .user, content: "普通用户消息")
+        #expect(notice.isBackgroundCompletionNotice && !ordinary.isBackgroundCompletionNotice)
+        #expect(notice.role == .user && notice.content == ChatStore.backgroundCompletionContinuationPrompt)
+        let shown = ChatTranscriptFormatter.formattedMessage(notice, baseSize: 14, redactor: nil)
+        #expect(shown.length > 0)
+        let style = shown.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        #expect(style?.textBlocks.contains(where: { $0 is UserBubbleTextBlock }) != true)
+        #expect(style?.alignment == .center)
+        #expect(shown.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor == NSColor.secondaryLabelColor)
+        #expect(!shown.string.contains("【系统通知】"))
+        let bubble = ChatTranscriptFormatter.formattedMessage(ordinary, baseSize: 14, redactor: nil)
+        let bubbleStyle = bubble.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        #expect(bubbleStyle?.textBlocks.contains(where: { $0 is UserBubbleTextBlock }) == true)
     }
 
     @Test(arguments: [ComposerTaskMode.manual, .bypassPermission])

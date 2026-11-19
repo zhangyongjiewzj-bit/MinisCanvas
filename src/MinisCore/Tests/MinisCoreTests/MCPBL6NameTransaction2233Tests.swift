@@ -75,7 +75,7 @@ struct MCPBL6NameTransaction2233Tests {
         _ = try manager.authorizeServer(id: "synthetic")
         let proposal = try record(manager: manager, profileID: profileID, requestID: "mcp2233-revoked")
         _ = try manager.revokeServer(id: "synthetic")
-        #expect(manager.authorization(serverID: "synthetic") == nil)
+        #expect(manager.authorization(serverID: "synthetic")?.serverAuthorized == false) // 11/16：撤销服务器授权保留记录
         #expect(manager.commitBL6NameReplay(proposal, profileID: profileID) == .failure(.staleRevision))
         #expect(manager.server(id: "synthetic")?.name == "Before")
         #expect(try manager.bl6NameReplayRecord(

@@ -46,6 +46,23 @@ import Testing
         #expect(try Data(contentsOf: root.appendingPathComponent(id + ".log")) == Data(complete.stdout.utf8))
     }
 
+    @Test func oneCorruptRecordDoesNotBlockRecoveryOfTheOthers() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let persistence = BackgroundShellPersistence(root: root)
+        let good = BackgroundShellSnapshot(
+            id: "bg-good0001", sessionID: "owner", commandPreview: "echo ok", state: .exited,
+            exitCode: 0, processID: 1, startedAt: Date(), endedAt: Date(), timeoutSeconds: 30,
+            stdoutBytes: 0, stderrBytes: 0, endNote: nil)
+        try persistence.write(.init(snapshot: good, processStart: nil))
+        let bad = root.appendingPathComponent("bg-bad00001.json")
+        try Data("{not json".utf8).write(to: bad)
+        let records = try persistence.records()
+        #expect(records.map(\.snapshot.id) == ["bg-good0001"])
+        // 损坏文件原样保留，不被删除。
+        #expect(FileManager.default.fileExists(atPath: bad.path))
+    }
+
     @Test func persistedOutputPagesPreserveUTF8AcrossTheReadLimit() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

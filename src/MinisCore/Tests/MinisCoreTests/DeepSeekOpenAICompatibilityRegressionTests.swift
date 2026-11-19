@@ -86,7 +86,8 @@ struct DeepSeekOpenAICompatibilityRegressionTests {
             modelID: nil,
             apiKey: fixtureKey
         )
-        #expect(customPathRequest.url?.path == "/api/models")
+        // 与对话请求同一规则：路径里没有版本段才补 /v1（对话一直是 /api/v1/chat/completions）。
+        #expect(customPathRequest.url?.path == "/api/v1/models")
     }
 
     @Test("V4 Flash generation uses the same route and maps HTTP failures without leaking credentials")

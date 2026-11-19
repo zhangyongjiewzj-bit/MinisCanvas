@@ -158,6 +158,10 @@ struct BacklinkUnavailable0400Tests {
             mcpManager: MCPServerManager(fileURL: root.appendingPathComponent("mcps.json")),
             skillStore: SkillStore(skillsRoot: root.appendingPathComponent("skills")),
             canvasRuntimeState: .disabled)
+        // R3-10：源会话的回合在“退出”时仍在运行，冷启动会把它最后一条助手回复标成已中断并落盘一次；
+        // 之后点卡片、走复制链接都不得再改动源会话文件。
+        #expect(try Data(contentsOf: sourceFile) != sourceBeforeCold)
+        let sourceAfterRecovery = try Data(contentsOf: sourceFile)
         #expect(reopenedBridge.chat.applySwitchSession(id: sourceID))
         let coldCard = try #require(reopenedBridge.chat.sessions.first(where: { $0.id == sourceID })?
             .messages.compactMap(\.sessionReferenceCard).first { $0.id == originalCard.id })
@@ -174,7 +178,7 @@ struct BacklinkUnavailable0400Tests {
         #expect(!reopenedBridge.chat.canOpenSourceCard(coldCard))
         #expect(!reopenedBridge.chat.openSourceCard(coldCard))
         #expect(reopenedBridge.chat.activeSessionID == sourceID)
-        #expect(try Data(contentsOf: sourceFile) == sourceBeforeCold)
+        #expect(try Data(contentsOf: sourceFile) == sourceAfterRecovery)
         DeepLinkHandler(bridge: reopenedBridge).handle(try #require(DeepLinkRouter.parse(url: copiedLink)))
         #expect(reopenedBridge.chat.activeSessionID == sourceID)
         #expect(reopenedBridge.chat.sessions.first(where: { $0.id == sourceID })?

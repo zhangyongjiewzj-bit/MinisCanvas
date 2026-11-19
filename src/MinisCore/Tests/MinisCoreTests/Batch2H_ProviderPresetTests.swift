@@ -18,10 +18,14 @@ struct Batch2HProviderPresetTests {
         #expect(Set(ids).count == ids.count)
         for preset in ProviderPreset.all {
             #expect(!preset.displayName.isEmpty)
-            #expect(preset.baseURL.hasPrefix("https://"))
+            #expect(preset.baseURL.hasPrefix("https://") || ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: preset.baseURL))
             #expect(!preset.credentialName.isEmpty)
             #expect(preset.credentialName == EnvVarStore.canonicalName(preset.credentialName))
-            #expect(!preset.modelNames.isEmpty)
+            // 本机预设的模型名取决于本机已下载的模型，允许留空。
+            // Gemini / Kimi / 智谱 / 硅基流动只补地址，模型名用“获取模型列表”选择。
+            let addressOnly: Set<String> = ["gemini", "kimi", "zhipu", "siliconflow"]
+            #expect(!preset.modelNames.isEmpty || addressOnly.contains(preset.id)
+                || ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: preset.baseURL))
         }
     }
 
@@ -41,9 +45,24 @@ struct Batch2HProviderPresetTests {
         #expect(preset.credentialName == "DASHSCOPE_API_KEY")
     }
 
-    @Test("每个预设的 Base URL / 协议 / 模型 = providerSuggestion(for: 凭据名)，不另抄一份")
+    @Test("预设含 Anthropic、OpenAI、OpenRouter 与本机的 Ollama、LM Studio，本机预设不要 Key")
+    func presetsIncludeMainstreamAndLocalServices() throws {
+        let ids = Set(ProviderPreset.all.map(\.id))
+        #expect(ids.isSuperset(of: ["anthropic", "openai", "openrouter", "ollama", "lmstudio"]))
+        let ollama = try #require(ProviderPreset.all.first { $0.id == "ollama" })
+        #expect(ollama.baseURL == "http://localhost:11434/v1")
+        let lmStudio = try #require(ProviderPreset.all.first { $0.id == "lmstudio" })
+        #expect(lmStudio.baseURL == "http://localhost:1234/v1")
+        #expect(ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: ollama.baseURL))
+        #expect(ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: "http://192.168.1.8:3000/v1"))
+        #expect(!ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: "https://api.openai.com/v1"))
+        #expect(ProviderPreset.defaultBaseURL(forCredentialName: "openai_api_key") == "https://api.openai.com/v1")
+        #expect(ProviderPreset.defaultBaseURL(forCredentialName: "MY_RELAY_KEY") == nil)
+    }
+
+    @Test("原有三个预设的 Base URL / 协议 / 模型 = providerSuggestion(for: 凭据名)，不另抄一份")
     func presetsAgreeWithExistingSuggestionTable() throws {
-        for preset in ProviderPreset.all {
+        for preset in ProviderPreset.all where ["deepseek", "dashscope", "newapi"].contains(preset.id) {
             let suggestion = try #require(EnvVarStore.providerSuggestion(for: preset.credentialName))
             #expect(suggestion.baseURL == preset.baseURL, "\(preset.id)")
             #expect(suggestion.modelNames == preset.modelNames, "\(preset.id)")

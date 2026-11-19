@@ -333,8 +333,19 @@ public struct AgentOrchestrator: Sendable {
     public static let hardMaxConcurrentChildren = ChildConcurrencySelection.hardMaximum
     public static let hardMaxIterationsPerTask = 100
     public static let hardMaxChildDepth = 3
-    public static let hardMaxChildBudgetRequests = 16
-    public static let hardMaxChildTimeout: TimeInterval = 300
+    /// 对齐 Claude Code：子任务不再有 16 次请求、300 秒的硬上限。
+    /// 实际约束来自父会话的请求预算与迭代上限；墙钟只留 2 小时的安全网。
+    public static let hardMaxChildBudgetRequests = 1000
+    public static let hardMaxChildTimeout: TimeInterval = 7200
+    /// 子循环里单次模型请求的时限，沿用主对话（`AgentLoopChatEngine.mainChatExecutionTimeout`）。
+    /// 2 小时只管整个子任务（由截止时间负责），不当成单次请求的时限。
+    public static let childRequestTimeout: TimeInterval = 900
+    /// 子循环里非命令行、非浏览器工具的时限，沿用主对话默认的"工具超时"（300 秒）。
+    public static let childOtherToolTimeout: TimeInterval = 300
+    /// 子循环的单次请求与普通工具时限：各自沿用主对话的值，且都不超过子任务自己剩余的时间。
+    static func childLoopTimeouts(taskTimeout: TimeInterval) -> (request: TimeInterval, otherTool: TimeInterval) {
+        (min(childRequestTimeout, taskTimeout), min(childOtherToolTimeout, taskTimeout))
+    }
 
     /// 并行策略的默认并发上限（Hermes delegation 概念参考：max_concurrent_children=5，
     /// legacy callers 默认 4；production child selection 可将上限提升到 40。
@@ -426,6 +437,8 @@ public struct AgentOrchestrator: Sendable {
     private var trustedProjectInstructions: TrustedProjectInstructionSnapshot?
     private let parentComposerSnapshot: ComposerSubmissionSnapshot?
     private let parentComposerFacts: ComposerPolicyFactSource?
+    /// 父会话的持久规则库；子任务只读引用（规则与本对话规则都对子任务有效，子任务自己不新增规则）。
+    private let parentPersistentRules: PersistentApprovalRuleStore?
     private let parentAuthorityCheck: (@Sendable () async -> Bool)?
     private let concreteBuiltinOwner: ConcreteBuiltinOwnerBox?
     /// Secure composition roots require every builtin child executor to carry
@@ -1046,7 +1059,7 @@ public struct AgentOrchestrator: Sendable {
     public init(
         defaultMaxConcurrent: Int? = nil,
         childConcurrencySelection: ChildConcurrencySelection = .default,
-        maxIterationsPerTask: Int = 50,
+        maxIterationsPerTask: Int = AgentOrchestrator.hardMaxIterationsPerTask,
         provider: (any LLMProvider)? = nil,
         toolExecutor: (any ToolExecutor)? = nil,
         externalRunners: [String: any ExternalAgentRunner] = [:],
@@ -1081,6 +1094,7 @@ public struct AgentOrchestrator: Sendable {
         trustedProjectInstructions: TrustedProjectInstructionSnapshot? = nil,
         parentComposerSnapshot: ComposerSubmissionSnapshot? = nil,
         parentComposerFacts: ComposerPolicyFactSource? = nil,
+        parentPersistentRules: PersistentApprovalRuleStore? = nil,
         parentAuthorityCheck: (@Sendable () async -> Bool)? = nil,
         concreteBuiltinToolExecutorOwner: BuiltinToolExecutor? = nil,
         childDepth: Int = 0,
@@ -1145,6 +1159,7 @@ public struct AgentOrchestrator: Sendable {
         self.trustedProjectInstructions = trustedProjectInstructions
         self.parentComposerSnapshot = parentComposerSnapshot
         self.parentComposerFacts = parentComposerFacts
+        self.parentPersistentRules = parentPersistentRules
         self.parentAuthorityCheck = parentAuthorityCheck
         self.concreteBuiltinOwner = (concreteBuiltinToolExecutorOwner
             ?? (toolExecutor as? BuiltinToolExecutor)).map(ConcreteBuiltinOwnerBox.init)
@@ -1203,6 +1218,7 @@ public struct AgentOrchestrator: Sendable {
             trustedProjectInstructions: trustedProjectInstructions,
             parentComposerSnapshot: parentComposerSnapshot,
             parentComposerFacts: parentComposerFacts,
+            parentPersistentRules: parentPersistentRules,
             parentAuthorityCheck: parentAuthorityCheck,
             concreteBuiltinToolExecutorOwner: concreteBuiltinOwner?.executor,
             childDepth: childDepth,
@@ -1259,6 +1275,7 @@ public struct AgentOrchestrator: Sendable {
             trustedProjectInstructions: trustedProjectInstructions,
             parentComposerSnapshot: parentComposerSnapshot,
             parentComposerFacts: parentComposerFacts,
+            parentPersistentRules: parentPersistentRules,
             parentAuthorityCheck: parentAuthorityCheck,
             // A replacement wrapper has no verified relationship to the old
             // concrete owner. A direct replacement can derive its own owner.
@@ -1313,6 +1330,7 @@ public struct AgentOrchestrator: Sendable {
             trustedProjectInstructions: trustedProjectInstructions,
             parentComposerSnapshot: parentComposerSnapshot,
             parentComposerFacts: parentComposerFacts,
+            parentPersistentRules: parentPersistentRules,
             parentAuthorityCheck: parentAuthorityCheck,
             concreteBuiltinToolExecutorOwner: concreteBuiltinOwner?.executor,
             childDepth: childDepth,
@@ -1372,6 +1390,7 @@ public struct AgentOrchestrator: Sendable {
             trustedProjectInstructions: trustedProjectInstructions,
             parentComposerSnapshot: parentComposerSnapshot,
             parentComposerFacts: parentComposerFacts,
+            parentPersistentRules: parentPersistentRules,
             parentAuthorityCheck: parentAuthorityCheck,
             concreteBuiltinToolExecutorOwner: concreteBuiltinOwner?.executor,
             childDepth: childDepth,
@@ -1422,6 +1441,7 @@ public struct AgentOrchestrator: Sendable {
             trustedProjectInstructions: trustedProjectInstructions,
             parentComposerSnapshot: parentComposerSnapshot,
             parentComposerFacts: parentComposerFacts,
+            parentPersistentRules: parentPersistentRules,
             parentAuthorityCheck: parentAuthorityCheck,
             concreteBuiltinToolExecutorOwner: concreteBuiltinOwner?.executor,
             childDepth: childDepth,
@@ -1862,11 +1882,14 @@ public struct AgentOrchestrator: Sendable {
                       !(await isParentTurnCancelled()), await parentAuthorityCheck?() != false else {
                     throw CancellationError()
                 }
-                report = await ChildWorktreeExecutionContext.$current.withValue(scope) {
+                let isolated = await ChildWorktreeExecutionContext.$current.withValue(scope) {
                     await runChildWithActivity(task: executionTask, systemPrompt: systemPrompt,
                         launchIntentID: launchIntentID, cancelledBeforeAdmission: cancelledBeforeAdmission,
                         controlledRetry: nil, preparedExecutionTask: executionTask)
                 }
+                // 回报带上隔离工作区的路径和分支，父会话与任务中心才能找到子任务的改动。
+                report = isolated.withWorkspace(path: scope.allocation.workingDirectory,
+                                                branch: scope.allocation.branch)
             } catch {
                 report = makeReport(task: task, start: Date(),
                     result: .failed(error: "WORKTREE_ISOLATION_UNAVAILABLE: " + error.localizedDescription))
@@ -2423,6 +2446,9 @@ public struct AgentOrchestrator: Sendable {
         let providerSnapshot = try childProviderSnapshot(for: task, conversationID: conversationID)
         let available = availableCapabilities(for: task) ?? []
         let policyCapabilities = capabilityPolicy?.allowedCapabilities ?? Set(ProviderCapability.allCases)
+        let childWorkingDirectory = validatedResourceScope(for: task).scope?.workingDirectory
+            ?? ChildWorktreeExecutionContext.current?.allocation.workingDirectory ?? parentWorkingDirectory ?? concreteBuiltinOwner?.executor.allowedRoot.path
+            ?? FileManager.default.currentDirectoryPath
         return try ChildRuntimeIdentity.derive(
             parent: parent,
             childSessionID: "\(sessionID):child:\(executionIdentity)",
@@ -2433,9 +2459,7 @@ public struct AgentOrchestrator: Sendable {
             policyCapabilities: policyCapabilities,
             providerSnapshot: providerSnapshot,
             memoryScopeID: "memory:\(sessionID):\(executionIdentity)",
-            workingDirectory: validatedResourceScope(for: task).scope?.workingDirectory
-                ?? ChildWorktreeExecutionContext.current?.allocation.workingDirectory ?? parentWorkingDirectory ?? concreteBuiltinOwner?.executor.allowedRoot.path
-                ?? FileManager.default.currentDirectoryPath,
+            workingDirectory: childWorkingDirectory,
             cancelGeneration: parentTurnHandle.turnID,
             evidenceRoot: "evidence:\(taskID):\(executionIdentity)",
             parentTurnHandle: parentTurnHandle,
@@ -2901,8 +2925,10 @@ public struct AgentOrchestrator: Sendable {
                   explicitDeniedRoots: $0.owner.explicitDeniedRoots) }) ?? parentFileAccessCeiling else { return (nil, invalid) }
         var builtinNames = Set(AgentToolCatalog.makeTools().map(\.name))
         if owner.webFetchAvailable { builtinNames.insert(WebFetchToolContract.toolName) }
+        if owner.webSearchAvailable { builtinNames.insert(WebSearchToolContract.toolName) }
         let forbidden: Set<String> = [BL6SettingsToolApproval.toolName, "session_create", "ask_user", "orchestrate",
-                                      ExternalSessionToolNames.read, ExternalSessionToolNames.send]
+                                      ExternalSessionToolNames.read, ExternalSessionToolNames.send,
+                                      SessionMessagingTool.toolName]
         let inheritedNames = policy.allowedToolNames.union(policy.allowedMCPToolNames)
             .intersection(builtinNames.union(policy.allowedMCPToolNames)).subtracting(forbidden)
         let request = task.resourceRequest
@@ -3051,6 +3077,11 @@ public struct AgentOrchestrator: Sendable {
            capabilityPolicy.allowsTool(WebFetchToolContract.toolName) {
             definitions.append(WebFetchToolContract.definition(for: owner))
         }
+        if let owner = (executor as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner,
+           owner.webSearchAvailable, owner.registeredToolNames.contains(WebSearchToolContract.toolName),
+           capabilityPolicy.allowsTool(WebSearchToolContract.toolName) {
+            definitions.append(WebSearchToolContract.definition)
+        }
         if !capabilityPolicy.allowedMCPToolNames.isEmpty,
            let builtinExecutor = (executor as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner,
            let bridge = builtinExecutor.mcpBridge {
@@ -3107,6 +3138,11 @@ public struct AgentOrchestrator: Sendable {
             overBudgetPolicy: .pause
         )), false)
     }
+
+    /// Window admission of a built-in child: reduce old tool results from 80% of the window.
+    static let childAdmissionTriggerFraction = 0.8
+    /// The child loop's request `max_tokens`: 4096 by default, up to 1.5x at high effort.
+    static let childAdmissionOutputReserveTokens = 6_144
 
     /// Existing child implementation kept separate so lifecycle policy cannot change
     /// the established sibling-isolation/reporting behavior.
@@ -3296,22 +3332,32 @@ public struct AgentOrchestrator: Sendable {
                     return AgentChildToolRuntimeBinding(parent: parentRuntimeIdentity,
                         boundary: childBoundary, locator: locator)
                 }()
+                // 2 小时只管整个子任务（截止时间）；单次请求和普通工具沿用主对话的时限。
+                let childLoopTimeouts = Self.childLoopTimeouts(taskTimeout: effectiveChildTimeout)
                 var loop = AgentLoop(
                     maxIterations: maxIterationsPerTask,
                     approvalGate: observedApprovalGate,
                     turnController: legacyTurnController ?? turnController,
                     loopDetector: makeLoopDetector(),
                     requestBudget: childBoundary?.budget ?? childBudget.tracker,
-                    timeout: effectiveChildTimeout,
+                    timeout: childLoopTimeouts.request,
                     taskStore: taskStore,
                     parentBinding: childBinding,
                     childBoundary: childBoundary,
                     childToolRuntimeBinding: taskRuntime,
                     toolExecutionFactLedger: toolExecutionFactLedger
                 )
+                loop.otherToolTimeout = childLoopTimeouts.otherTool
                 if childBudget.consumesResponseAtCap {
                     loop.childBudgetConsumingResponseAtRequestCap = childBoundary?.budget
                 }
+                // 子智能体没有会话存档，不做摘要压缩：只在接近窗口时缩减旧工具结果，
+                // 超窗报错后缩减重发一次，仍超才失败。
+                loop.contextAdmission = ContextAdmissionConfig(
+                    windowTokens: provider.model.contextWindowTokens,
+                    triggerFraction: Self.childAdmissionTriggerFraction,
+                    outputReserveTokens: Self.childAdmissionOutputReserveTokens,
+                    allowsCompaction: false, appliesReductionInLoop: true)
                 if let approvalObservation, let taskRuntime {
                     let projectionChanged = childTaskProjectionChanged
                     loop.onToolExecutionPhase = { fact in
@@ -3401,11 +3447,21 @@ public struct AgentOrchestrator: Sendable {
                         workspaceID: inherited.workspaceID, createdAt: inherited.createdAt,
                         policyRevision: inherited.policyRevision, grantEpoch: inherited.grantEpoch,
                         bypassModeConfirmed: inherited.bypassModeConfirmed,
-                        autonomyCeiling: inherited.autonomyCeiling)
+                        autonomyCeiling: inherited.autonomyCeiling,
+                        // 子任务继承用户在输入框里明确选的自动编辑/自动档：自动编辑免卡对子任务开放，
+                        // 范围限子任务自己的写根（ComposerPolicyEnforcedToolExecutor 里再核对），底线不变。
+                        explicitlySelectedInteractiveAutoMode: inherited.explicitlySelectedInteractiveAutoMode)
                     childComposer = snapshot
+                    // 子任务共享父会话的持久规则库（只读引用）：规则按父会话的项目键查，本对话规则
+                    // 映射到父会话 ID，路径检查用子任务自己的授权根和工作目录；子任务不新增规则。
+                    let childGrants = parentPersistentRules.map {
+                        ComposerApprovalGrantStore(persistentRules: PersistentApprovalRuleStore(
+                            readOnlyUpstream: $0, parentSessionID: inherited.sessionID,
+                            parentProjectRoots: parentComposerFacts?.allowedWriteRoots ?? facts.allowedWriteRoots))
+                    } ?? ComposerApprovalGrantStore()
                     effectiveExecutor = ComposerPolicyEnforcedToolExecutor(
                         base: childExecutor,
-                        controller: ComposerAuthorizationController(snapshot: snapshot, facts: facts),
+                        controller: ComposerAuthorizationController(snapshot: snapshot, facts: facts, grants: childGrants),
                         approvalGate: observedApprovalGate)
                 } else {
                     // Legacy library callers retain their existing explicit ApprovalGate.
@@ -3524,6 +3580,10 @@ public struct AgentOrchestrator: Sendable {
                     outcome = .failed
                 } else if let clarification = terminalError as? AskUserQuestionTool.NeedsClarification {
                     message = clarification.result
+                    outcome = .failed
+                } else if case .contextWindowFull? = terminalError as? AgentLoopError {
+                    // 子任务没有“压缩后重试”按钮，也不能新开会话继续：告诉主智能体该怎么办。
+                    message = AgentLoopError.contextWindowFullDelegatedDescription(subagent: true)
                     outcome = .failed
                 } else {
                     message = terminalError.localizedDescription

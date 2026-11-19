@@ -154,6 +154,8 @@ public enum MediaVideoExtractionFailure: Error, Equatable, Sendable {
 /// this result as a viewed video until a separately gated consumer uses it.
 public enum MediaVideoExtraction {
     private static let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47]
+    /// The shrink-and-retry ladder for an over-budget frame stops here.
+    private static let minShrinkPixelSize = 192
 
     public static func extractFrames(
         from source: any MediaVideoFrameSource,
@@ -191,21 +193,31 @@ public enum MediaVideoExtraction {
             var remainingBytes = limits.maxOutputBytes
             var previousActual: Double?
 
-            for requested in requestedTimes {
+            for (index, requested) in requestedTimes.enumerated() {
                 try Task.checkCancellation()
-                let sample = try await source.pngFrame(
+                var sample = try await source.pngFrame(
                     at: requested, maxPixelSize: limits.maxPixelSize
                 )
                 try Task.checkCancellation()
+                // A frame over its fair share of the remaining budget is
+                // re-requested at a smaller size instead of failing the whole
+                // video; unused budget carries to later frames.
+                let share = remainingBytes / (requestedTimes.count - index)
+                var shrunkenSize = limits.maxPixelSize
+                while sample.pngData.count > share, shrunkenSize > minShrinkPixelSize {
+                    shrunkenSize = max(minShrinkPixelSize, shrunkenSize * 7 / 10)
+                    sample = try await source.pngFrame(at: requested, maxPixelSize: shrunkenSize)
+                    try Task.checkCancellation()
+                }
                 guard sample.actualSeconds.isFinite,
                       sample.actualSeconds >= 0,
                       sample.actualSeconds <= duration else {
                     return .failure(.invalidTime)
                 }
                 if let previousActual {
-                    if sample.actualSeconds == previousActual {
-                        return .failure(.duplicateTime)
-                    }
+                    // 画面不动的视频（例如系统录屏）相邻取样时刻会落在同一帧上：这一帧已经取过，
+                    // 跳过而不是让整段视频失败；它占的份额留给后面的帧。
+                    if sample.actualSeconds == previousActual { continue }
                     guard sample.actualSeconds > previousActual else {
                         return .failure(.invalidTime)
                     }
@@ -280,7 +292,12 @@ public actor AVFoundationVideoFrameSource: MediaVideoFrameSource {
             // different languages/channels or silently select one of them.
             if audioTracks.count == 1 {
                 do {
-                    audio = try readAudio(audioTracks[0], duration: duration, maxBytes: remaining)
+                    // Cap long soundtracks at 16 kHz mono so they fit the byte
+                    // budget; a track already at or below that stays as is.
+                    let nativeRate = (try? await audioTracks[0].load(.formatDescriptions))?.first
+                        .flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee.mSampleRate } ?? 0
+                    let outputRate = nativeRate > 0 ? min(nativeRate, 16_000) : 16_000
+                    audio = try readAudio(audioTracks[0], duration: duration, maxBytes: remaining, sampleRate: outputRate)
                     remaining -= audio?.byteCount ?? 0; audioState = .extracted
                 } catch { audio = nil }
             }
@@ -300,11 +317,14 @@ public actor AVFoundationVideoFrameSource: MediaVideoFrameSource {
         } catch { return nil }
     }
 
-    private func readAudio(_ track: AVAssetTrack, duration: Double, maxBytes: Int) throws -> MediaVideoAudioTrack {
+    private func readAudio(_ track: AVAssetTrack, duration: Double, maxBytes: Int, sampleRate targetRate: Double) throws -> MediaVideoAudioTrack {
         guard maxBytes > 44 else { throw MediaVideoExtractionFailure.limitExceeded }
         let reader = try AVAssetReader(asset: asset)
+        // Mono and at most 16 kHz keep a long soundtrack inside the byte
+        // budget (about 32 KB per second) instead of dropping it.
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMBitDepthKey: 16,
+            AVSampleRateKey: targetRate, AVNumberOfChannelsKey: 1,
             AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false,
             AVLinearPCMIsNonInterleaved: false
         ])

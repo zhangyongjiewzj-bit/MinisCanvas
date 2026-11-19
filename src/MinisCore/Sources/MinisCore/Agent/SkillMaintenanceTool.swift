@@ -60,12 +60,29 @@ public final class SkillMaintenanceTool: @unchecked Sendable {
         guard let id = input["skillID"] as? String, SkillStore.isSafeSkillID(id),
               Set(input.keys).isSubset(of: ["skillID"]) else { throw SkillError.invalidContent }
         guard let raw = store.rawContent(id) else { throw SkillError.skillNotFound(id) }
+        // 用户在设置里停用（或被隔离）的技能等于“别用它”：不返回全文，模型也就没法照着做。
+        // 技能列表里查不到的（磁盘上有文件但还没被技能库收录）同样不返回，只放行列表里明确启用的。
+        guard store.allSkills().first(where: { $0.id == id })?.isEnabled == true else {
+            throw SkillError.importFailed(reason: "技能「\(id)」已停用或不在技能列表里，不能读取。需要时请让用户先在设置里启用它。")
+        }
         guard ContentSecretRedactor.redact(raw, knownSecrets: knownSecrets()) == raw else {
             throw SkillError.importFailed(reason: "skill content contains credential-like text and cannot be returned")
         }
         let payload: [String: String] = ["skillID": id, "sha256": SkillManifest.hash(raw), "content": raw]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         return String(decoding: data, as: UTF8.self)
+    }
+
+    /// App 技能库里没有这个 id 时，再按名字找用户已确认的外部技能（~/.claude/skills 等），
+    /// 只读，正文脱敏并限长，不返回可用于 skill_update 的哈希之外的任何写入能力。
+    public func readIncludingExternal(input: [String: Any]) async throws -> String {
+        if let id = input["skillID"] as? String, Set(input.keys).isSubset(of: ["skillID"]),
+           !(SkillStore.isSafeSkillID(id) && store.rawContent(id) != nil),
+           let external = await ExternalSkillReader.read(
+            name: id, sessionID: AgentExecutionContext.current?.currentConversationID) {
+            return external
+        }
+        return try read(input: input)
     }
 
     func prepare(name: String, input: ComposerToolInput) throws -> Review {
@@ -217,8 +234,8 @@ public final class SkillMaintenanceTool: @unchecked Sendable {
 
     public static func definitions() -> [AgentToolDefinition] {
         [AgentToolDefinition(name: readName,
-            description: "Read an App skill's current SKILL.md and its SHA-256. Read-only, no approval card. Call it before skill_update or skill_delete and pass the returned sha256 as expectedContentHash; also use it when the user asks what a skill says. Skills live in the App's own store, not in the project: never search the file system for SKILL.md. Unknown id fails; check Settings → Skills for the slug.",
-            parameters: ["skillID": AgentToolParam(type: .string, description: "Canonical App skill id (slug), e.g. writing-summary; never a file path.")],
+            description: "Read an App skill's current SKILL.md and its SHA-256. Read-only, no approval card. Call it before skill_update or skill_delete and pass the returned sha256 as expectedContentHash; also use it when the user asks what a skill says, and to load the full text of any skill listed in the skill catalog or whose injected text says it was truncated (\"full text is long\"). Skills live in the App's own store, not in the project: never search the file system for SKILL.md. Unknown id fails; use the name shown in the skill catalog or the slug in Settings → Skills. External skills (from ~/.claude/skills and similar, confirmed by the user and listed in the catalog as external) can also be read by their name: the result is marked external, read-only, redacted and length-limited, and cannot be changed with skill_update.",
+            parameters: ["skillID": AgentToolParam(type: .string, description: "Canonical App skill id (slug), e.g. writing-summary, or the name of a confirmed external skill from the catalog; never a file path.")],
             required: ["skillID"])]
         + names.sorted().map { name in
             var properties: [String: AgentToolParam] = [

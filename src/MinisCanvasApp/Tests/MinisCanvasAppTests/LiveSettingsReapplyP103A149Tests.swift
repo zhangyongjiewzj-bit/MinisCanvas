@@ -383,11 +383,11 @@ struct LiveSettingsReapplyP103A149Tests {
         let initial = try #require(bridge.lastAgentSettingsReapplyReceipt)
         #expect(initial.source == .initialAttach)
         // AgentSettings.default：maxLoopIterations = 50、toolTimeoutSeconds = 300、
-        // concurrentToolLimit = 4、fallbackEnabled = true。
+        // concurrentToolLimit = 4、fallbackEnabled = false（跨供应商自动回退默认关闭，2026-11-16）。
         #expect(initial.maxLoopIterations == 50)
         #expect(initial.toolTimeoutSeconds == 300)
         #expect(initial.concurrentToolLimit == 4)
-        #expect(initial.fallbackEnabled)
+        #expect(!initial.fallbackEnabled)
 
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 42,
@@ -415,7 +415,7 @@ struct LiveSettingsReapplyP103A149Tests {
         let final = try #require(bridge.lastAgentSettingsReapplyReceipt)
         #expect(final.generation == reattached.generation + 1)
         #expect(final.source == .runtimeRefresh)
-        #expect(final.fallbackEnabled)
+        #expect(!final.fallbackEnabled)
     }
 
     // MARK: - 7. 正向存续护栏（149B）：childGovernor 注入与 Kill Switch 调和缝在重施后仍存续

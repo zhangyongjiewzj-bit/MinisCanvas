@@ -836,7 +836,12 @@ public struct AgentContext {
                     identity: childBoundary.identity,
                     attemptID: childBoundary.identity.generationID ?? childBoundary.identity.childTaskID,
                     outcome: outcome,
-                    detail: error.localizedDescription
+                    detail: {
+                        if case .contextWindowFull? = error as? AgentLoopError {
+                            return AgentLoopError.contextWindowFullDelegatedDescription(subagent: true)
+                        }
+                        return error.localizedDescription
+                    }()
                 )
             }
             throw error

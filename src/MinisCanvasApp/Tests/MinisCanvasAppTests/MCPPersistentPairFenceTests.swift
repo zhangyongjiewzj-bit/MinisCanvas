@@ -449,7 +449,8 @@ struct MCPPersistentPairFenceTests {
             #expect(try bytes(owner.authorizationFileURL) == authBefore)
             // This succeeds only if the same owner's auth-only baseline refreshed.
             try owner.updateServer(server("A", name: "after revoke"))
-            #expect(manager(owner.fileURL, backing).authorization(serverID: "A") == nil)
+            // 11/16：撤销服务器授权改为保留工具名单、只把服务器授权置为关闭，撤销仍然生效。
+            #expect(manager(owner.fileURL, backing).authorization(serverID: "A")?.serverAuthorized != true)
         }
     }
 

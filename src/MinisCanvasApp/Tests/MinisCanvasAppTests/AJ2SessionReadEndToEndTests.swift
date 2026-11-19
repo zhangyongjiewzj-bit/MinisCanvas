@@ -1130,7 +1130,7 @@ private actor AJ2ExactSyntheticApproval: ApprovalDelegate {
 
     init(target: String, scope: String, expectedSummary: String,
          expectedRiskLevel: ApprovalRiskLevel = .high,
-         expectedSecondConfirmation: Bool = true, allow: Bool,
+         expectedSecondConfirmation: Bool = false, allow: Bool,
          onDecision: @escaping @Sendable (String) -> Void) {
         self.target = target; self.scope = scope; self.expectedSummary = expectedSummary
         self.expectedRiskLevel = expectedRiskLevel
@@ -2034,9 +2034,9 @@ extension AJ2SessionReadEndToEndTests {
                 try #require(provider.toolOutputs.count == 1)
                 let rawOutput = try #require(provider.toolOutputs.first)
                 #expect(body == MCPOutputLimiter.project(rawOutput))
-                #expect(body.utf8.count <= MCPOutputLimiter.defaultMaximumCharacters)
+                #expect(body.count <= MCPOutputLimiter.defaultMaximumCharacters)
                 let modelProjection = try #require(JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any])
-                if rawOutput.utf8.count > MCPOutputLimiter.defaultMaximumCharacters {
+                if rawOutput.count > MCPOutputLimiter.defaultMaximumCharacters {
                     #expect(modelProjection["truncated"] as? Bool == true)
                     #expect(modelProjection["preview"] is String)
                 } else {

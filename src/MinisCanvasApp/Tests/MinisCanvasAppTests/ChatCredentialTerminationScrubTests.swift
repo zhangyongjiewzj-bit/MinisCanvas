@@ -51,8 +51,11 @@ struct ChatCredentialTerminationScrubTests {
             messageID: messageID, current: masked, append: " next chunk")
         #expect(!after.contains(secret))
         // Continuity of the protected surface is preserved (tightening only).
-        #expect(after.contains("next chunk"))
+        // The stream withholds its last word until the turn settles.
         #expect(after.hasPrefix(masked))
+        let settled = broker.finalizeStream(messageID: messageID, current: after)?.text ?? after
+        #expect(settled.contains("next chunk"))
+        #expect(!settled.contains(secret))
     }
 
     @Test func sessionScopedCancellationScrubsInFlightStreamBuffers() {
@@ -136,5 +139,97 @@ struct ChatCredentialTerminationScrubTests {
         let continued = broker.projectStream(
             messageID: messageID, current: projected, append: " and sk-synthetic-nextchunk5678 end")
         #expect(!continued.contains("sk-synthetic-nextchunk5678"))
+    }
+
+    /// 停止（身份已退役、不再有后续片段）：已渲染的文字，包括流式中被扣住的末尾词，
+    /// 以脱敏后的完整形态保留，与旧行为（每片段整条脱敏）一致。
+    @Test func stopKeepsRenderedTailExactlyAsFullRedaction() {
+        let broker = ChatCredentialBroker()
+        let messageID = UUID()
+        let raw = "第一句。 Second sentence with sk-synthetic-stoptail9999 and last word"
+        var shown = broker.projectStream(messageID: messageID, current: "", append: String(raw.prefix(30)))
+        shown = broker.projectStream(messageID: messageID, current: shown, append: String(raw.dropFirst(30)))
+        #expect(!shown.contains("sk-synthetic-stoptail9999"))
+        #expect(!shown.hasSuffix("word"))
+        let stopped = broker.finalizeStream(messageID: messageID, current: shown)
+        #expect(stopped?.text == broker.protect(raw))
+        #expect(stopped?.text.hasSuffix("last word") == true)
+        // 终态后不再有流状态：同一条消息再没有可取回的内容。
+        #expect(broker.finalizeStream(messageID: messageID, current: stopped?.text ?? "") == nil)
+    }
+
+    /// 托管撤销发生在尾部被扣住时：尾部按撤销前的已知密钥脱敏后保留，不丢文字、不复活明文。
+    @Test func cancelWhileTailIsWithheldKeepsMaskedTailAndNeverResurfacesSecret() {
+        let broker = ChatCredentialBroker()
+        let session = UUID()
+        let secret = Self.opaqueSecret("withheld-tail")
+        #expect(broker.captureSecureField(secret, sessionID: session) != nil)
+        let messageID = UUID()
+        let shown = broker.projectStream(messageID: messageID, current: "", append: "已发送 " + secret)
+        #expect(shown == "已发送 ")
+        broker.cancel()
+        let settled = broker.finalizeStream(messageID: messageID, current: shown)
+        #expect(settled?.text == shown + String(repeating: "*", count: secret.count))
+        #expect(settled?.extendsPrevious == true)
+    }
+
+    /// 工具调用边界：先放开被扣住的尾部，行内锚点才不会落在尚未显示的词之前。
+    @Test func settleReleasesWithheldTailBeforeToolAnchor() {
+        let broker = ChatCredentialBroker()
+        let messageID = UUID()
+        let shown = broker.projectStream(messageID: messageID, current: "", append: "我先运行 build")
+        #expect(shown == "我先运行 ")
+        let settled = broker.settleStream(messageID: messageID)
+        #expect(settled?.text == "我先运行 build")
+        #expect(settled?.extendsPrevious == true)
+    }
+
+    /// 工具边界上尾部仍像密钥前缀：保持扣住，已显示文字不含前缀。
+    @Test func settleKeepsPartialTokenWithheldAtToolBoundary() {
+        let broker = ChatCredentialBroker()
+        let messageID = UUID()
+        _ = broker.projectStream(messageID: messageID, current: "", append: "请使用 ghp_aB3dE6gH9kaB3dE6")
+        let settled = broker.settleStream(messageID: messageID)
+        #expect(settled?.text.contains("ghp_aB3d") == false)
+        #expect(settled?.text.hasPrefix("请使用") == true)
+    }
+
+    /// 终止（停止/出错/安全锁）时被扣住的残缺令牌被遮蔽，普通文字照常放出。
+    @Test func terminationMasksPartialTokenTailButKeepsPlainTail() {
+        let broker = ChatCredentialBroker()
+        let tokenMessage = UUID()
+        let shown = broker.projectStream(messageID: tokenMessage, current: "", append: "说明 ghp_aB3dE6gH9kaB3dE6")
+        let closed = broker.finalizeStream(messageID: tokenMessage, current: shown)
+        #expect(closed?.text.contains("ghp_aB3d") == false)
+        #expect(closed?.text.hasPrefix("说明 ") == true)
+
+        let plainMessage = UUID()
+        let plainShown = broker.projectStream(messageID: plainMessage, current: "", append: "先说 hello wor")
+        #expect(broker.finalizeStream(messageID: plainMessage, current: plainShown)?.text == "先说 hello wor")
+    }
+
+    /// 托管撤销时被扣住的残缺令牌同样遮蔽。
+    @Test func cancelMasksPartialTokenTail() {
+        let broker = ChatCredentialBroker()
+        let messageID = UUID()
+        let shown = broker.projectStream(messageID: messageID, current: "", append: "说明 ghp_aB3dE6gH9kaB3dE6")
+        broker.cancel()
+        let closed = broker.finalizeStream(messageID: messageID, current: shown)
+        #expect(closed?.text.contains("ghp_aB3d") == false)
+    }
+
+    /// 思考文字显示前同样经过增量脱敏；终态放开普通尾部、遮蔽疑似密钥。
+    @Test func thinkingChannelIsRedactedIncrementally() {
+        let broker = ChatCredentialBroker()
+        let messageID = UUID()
+        var shown = broker.projectThinking(messageID: messageID, current: "", append: "想到 sk-abcdef")
+        #expect(!shown.contains("sk-abc"))
+        shown = broker.projectThinking(messageID: messageID, current: shown, append: "ghijklmnop ")
+        #expect(!shown.contains("sk-abc"))
+        #expect(broker.finalizeThinking(messageID: messageID, current: shown)?.contains("sk-abc") == false)
+
+        let plain = UUID()
+        let plainShown = broker.projectThinking(messageID: plain, current: "", append: "想想 hello wor")
+        #expect(broker.finalizeThinking(messageID: plain, current: plainShown) == "想想 hello wor")
     }
 }

@@ -6,7 +6,10 @@ struct TurnFileChangesView: View {
     let onSendComment: (String) async -> Bool
     let onReviewRecovery: (String) -> Void
     var onReviewChildRecovery: ((String, String) -> Void)? = nil
+    /// 会话工作目录；提供时多出只读的“工作区改动”页（git status + git diff HEAD）。
+    var workspaceDirectory: String? = nil
     @State private var selectedTurn: Int?
+    @State private var showsWorkspace = false
     @Environment(\.typographyTokens) private var typography
 
     private var turns: [Int] { Array(Set(changes.map(\.turnID))).sorted() }
@@ -15,14 +18,39 @@ struct TurnFileChangesView: View {
     }
 
     var body: some View {
+        if showsWorkspace && workspaceDirectory != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                pagePicker
+                WorkspaceChangesView(directory: workspaceDirectory)
+            }
+            .padding(10)
+        } else {
+            turnChangesBody
+        }
+    }
+
+    @ViewBuilder
+    private var pagePicker: some View {
+        if workspaceDirectory != nil {
+            Picker("改动来源", selection: $showsWorkspace) {
+                Text("本会话文件工具").tag(false)
+                Text("工作区改动").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .accessibilityIdentifier("changes.page-picker")
+        }
+    }
+
+    private var turnChangesBody: some View {
         VStack(alignment: .leading, spacing: 10) {
+            pagePicker
             Picker("回合", selection: Binding(get: { effectiveTurn }, set: { selectedTurn = $0 })) {
                 ForEach(turns, id: \.self) { turn in
                     Text("T\(turn)").tag(Optional(turn))
                 }
             }
             .accessibilityIdentifier("changes.turn-picker")
-            Text("仅包含成功文件工具的账本记录；shell 命令造成的改动不在此面板。账本保留范围外的历史不显示；源载荷已截断的内容无法展开恢复。成功事实仅来自当前 engine 内存，重启后缺少匹配事实的旧记录不显示。")
+            Text("本页仅包含成功文件工具的账本记录；shell 命令造成的改动请看“工作区改动”页。账本保留范围外的历史不显示；源载荷已截断的内容无法展开恢复。成功事实仅来自当前 engine 内存，重启后缺少匹配事实的旧记录不显示。")
                 .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
             if !canSendComment {
                 Text("评论会通过普通输入框发送；请先处理输入草稿、附件或编辑中的消息。")

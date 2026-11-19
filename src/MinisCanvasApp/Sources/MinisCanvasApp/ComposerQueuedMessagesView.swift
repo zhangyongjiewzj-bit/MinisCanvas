@@ -11,7 +11,7 @@ struct ComposerQueuedMessagesView: View {
                 Text("排队消息 \(chat.activeQueuedComposerMessages.count) 条")
                 Spacer(minLength: 4)
                 Button("发送下一条") { _ = chat.sendNextQueuedComposer() }
-                    .disabled(chat.isActiveSessionGenerating || !chat.draftText.isEmpty
+                    .disabled(chat.isActiveSessionGenerating || chat.hasDraft
                         || !chat.pendingAttachments.isEmpty || !chat.activePastedTextDrafts.isEmpty)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
@@ -19,7 +19,7 @@ struct ComposerQueuedMessagesView: View {
             DisclosureGroup("管理排队消息") {
                 ComposerQueueManagementList(
                     items: chat.activeQueuedComposerMessages,
-                    canEdit: !chat.isEditingMessage && chat.draftText.isEmpty
+                    canEdit: !chat.isEditingMessage && !chat.hasDraft
                         && chat.pendingAttachments.isEmpty && chat.activePastedTextDrafts.isEmpty,
                     edit: { _ = chat.editQueuedComposer(id: $0) },
                     delete: { _ = chat.deleteQueuedComposer(id: $0) }
@@ -37,8 +37,12 @@ struct ComposerQueuedMessagesView: View {
 struct ComposerContextNoticeView: View {
     @Bindable var chat: ChatStore
     let bridge: BridgeStore
+    @State private var permissionRulesNoticeDismissed = false
     @State private var presentsCheckpoints = false
     @State private var presentsContextSources = false
+    @State private var compactionHint = ""
+    @State private var pendingBudgetReset: SessionBudgetResetTarget?
+    @Environment(\.minisOpenSettingsPage) private var openSettingsPage
     @Environment(\.typographyTokens) private var typography
     @Environment(\.themeTokens) private var theme
     var body: some View {
@@ -84,13 +88,48 @@ struct ComposerContextNoticeView: View {
                     Text(reason)
                     Button("新会话继续") { chat.continueAfterContextLimit() }
                         .disabled(!chat.canContinueAfterContextLimit)
+                    if chat.sessionBudgetResetTarget != nil {
+                        Button("去设置调高上限") { openSettingsPage(SettingsPage.agent.rawValue) }
+                            .accessibilityIdentifier("composer.context-limit.open-settings")
+                    }
+                    if let target = chat.sessionBudgetResetTarget {
+                        Button("重置预算") { pendingBudgetReset = target }
+                            .disabled(chat.sessionBudgetResetBlockedReason != nil
+                                || bridge.approvalCenter.pendingRequest != nil)
+                            .help(chat.sessionBudgetResetBlockedReason ?? "清零本会话的累计用量计数后继续")
+                            .accessibilityIdentifier("composer.context-limit.budget-reset")
+                    }
+                }
+                .sessionBudgetResetConfirmation($pendingBudgetReset) { target in
+                    Task { @MainActor in
+                        await chat.resetConfirmedSessionBudget(target) {
+                            bridge.approvalCenter.pendingRequest != nil
+                        }
+                    }
                 }
                 .accessibilityIdentifier("composer.context-limit")
             }
-            Button("恢复文件检查点…") { presentsCheckpoints = true }
-                .disabled(chat.isActiveSessionGenerating || chat.fileCheckpoints.isEmpty)
-                .help(FileCheckpointStore.scopeDisclosure)
-                .accessibilityIdentifier("composer.file-checkpoints")
+            MemoryProposalInlineCards(chat: chat)
+            // A-4：权限规则文件损坏、版本不符或写入失败时，对话页给出可见提示（原来只记日志，
+            // 用户看不到，以为“始终允许”还在生效）。只读内存里的诊断列表，无文件读写。
+            if !permissionRulesNoticeDismissed,
+               bridge.approvalCenter.persistentRules?.diagnostics().contains(where: { $0.hasPrefix("规则文件") }) == true {
+                HStack(spacing: 8) {
+                    Text("权限规则文件出了问题，部分“始终允许”规则可能没有生效；拒绝和每次询问规则仍然有效。")
+                    Button("查看详情") { openSettingsPage(SettingsPage.permissions.rawValue) }
+                        .accessibilityIdentifier("composer.permission-rules-notice.open")
+                    Button("知道了") { permissionRulesNoticeDismissed = true }
+                        .accessibilityIdentifier("composer.permission-rules-notice.dismiss")
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("composer.permission-rules-notice")
+            }
+            if !chat.fileCheckpoints.isEmpty {
+                Button("恢复文件检查点…") { presentsCheckpoints = true }
+                    .disabled(chat.isActiveSessionGenerating)
+                    .help(FileCheckpointStore.scopeDisclosure)
+                    .accessibilityIdentifier("composer.file-checkpoints")
+            }
         }
         .font(typography?.caption ?? .caption)
         .foregroundStyle(.secondary)
@@ -106,8 +145,10 @@ struct ComposerContextNoticeView: View {
     }
     private var contextOccupancyColor: Color {
         guard let fraction = chat.contextOccupancy?.fraction else { return .secondary }
-        if fraction > 0.9 { return theme?.statusDangerText ?? .red }
-        if fraction >= 0.7 { return theme?.statusWarningText ?? .orange }
+        // 颜色跟随自动压缩阈值：到阈值变黄（未设阈值按 70%），到 95%（发送被拒的线）变红。
+        let warn = chat.configuredAutoCompactThreshold ?? 0.7
+        if fraction >= ContextWindowPolicy.hardBlockFraction { return theme?.statusDangerText ?? .red }
+        if fraction >= min(warn, ContextWindowPolicy.hardBlockFraction) { return theme?.statusWarningText ?? .orange }
         return .secondary
     }
 
@@ -138,13 +179,22 @@ struct ComposerContextNoticeView: View {
             }
             .frame(maxHeight: 280)
 
+            TextField("压缩指引（可选），例如：保留关于数据库迁移的决定", text: $compactionHint)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("composer.compaction-hint")
             Button("压缩上下文") {
                 guard let sessionID, chat.activeSessionID == sessionID,
                       let command = AppCommandMenuBuilder.command(
                         id: "ui.chat.compact", registry: bridge.commandRegistry, display: bridge.paletteDisplay
                       ), command.isEnabled else { return }
                 presentsContextSources = false
-                bridge.runCommand(id: command.id)
+                let hint = compactionHint.trimmingCharacters(in: .whitespacesAndNewlines)
+                compactionHint = ""
+                if hint.isEmpty {
+                    bridge.runCommand(id: command.id)
+                } else {
+                    chat.compactContext(hint: hint)
+                }
             }
             .disabled(sessionID == nil || compact?.isEnabled != true)
         }
@@ -155,6 +205,69 @@ struct ComposerContextNoticeView: View {
 
 /// Shared by the main and companion composer toolbars; reads the same
 /// session-scoped injection result as the former context-notice disclosure.
+/// 模型自己提议的记忆：在对话里给批准卡，用户点“批准并记住”才写入。
+/// 只列本会话范围内、来自对话提议的待审项；其余来源的待审项仍在 设置 › 记忆。
+@MainActor
+struct MemoryProposalInlineCards: View {
+    @Bindable var chat: ChatStore
+    @State private var proposals: [MemoryProposalEnvelope] = []
+    @State private var message: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(proposals, id: \.proposal.proposalID) { proposal in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("模型提议记住：" + proposal.text)
+                        .textSelection(.enabled)
+                    HStack(spacing: 8) {
+                        Button("批准并记住") { approve(proposal) }
+                            .accessibilityIdentifier("composer.memory-proposal.approve")
+                        Button("拒绝") { reject(proposal) }
+                            .accessibilityIdentifier("composer.memory-proposal.reject")
+                    }
+                    .controlSize(.small)
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            }
+            if let message {
+                Text(message).foregroundStyle(.secondary)
+            }
+        }
+        .accessibilityIdentifier("composer.memory-proposals")
+        .task(id: chat.activeSessionID) { refresh() }
+        .onChange(of: chat.isActiveSessionGenerating) { _, generating in
+            if !generating { refresh() }
+        }
+    }
+
+    private func refresh() {
+        let pending = (try? SettingsCenter.active?.pendingMemoryProposals()) ?? []
+        proposals = pending.filter { $0.sourceID == MemoryProposalConsumer.chatProjectSourceID }
+    }
+
+    private func approve(_ proposal: MemoryProposalEnvelope) {
+        do {
+            try SettingsCenter.active?.approveDisplayedMemoryProposal(proposal)
+            message = "已记住。"
+        } catch {
+            message = "没能记住这条，请到 设置 › 记忆 重新检查。"
+        }
+        refresh()
+    }
+
+    private func reject(_ proposal: MemoryProposalEnvelope) {
+        do {
+            try SettingsCenter.active?.rejectDisplayedMemoryProposal(proposal)
+            message = "已拒绝，未写入记忆。"
+        } catch {
+            message = "没能拒绝这条，请到 设置 › 记忆 处理。"
+        }
+        refresh()
+    }
+}
+
 @MainActor
 struct ComposerMemoryToolbarButton: View {
     @Bindable var chat: ChatStore

@@ -159,7 +159,7 @@ struct P3AcceptanceM01BrowserSessionRebindTests {
             _ = try await BrowserRebindRouteProbe.execute(route, context: staleContext)
             Issue.record("old conversation must not reach the replacement browser")
         } catch let error as ToolExecutorError {
-            #expect(error == .resourceScopeInvalid)
+            #expect(error == .browserSessionUnavailable)
         }
 
         let currentContext = AgentExecutionContextSnapshot(

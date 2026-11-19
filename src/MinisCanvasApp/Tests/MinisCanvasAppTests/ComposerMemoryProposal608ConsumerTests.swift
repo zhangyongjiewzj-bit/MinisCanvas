@@ -440,8 +440,8 @@ struct ComposerMemoryProposal608ConsumerTests {
     private func targetContext1056(_ f: Fixture, tool: String, target: URL,
                                    sessionID: String? = nil) throws -> ApprovalAuthorizationContext {
         let session = try #require(f.bridge.chat.activeSessionID)
-        let input: [String: Any] = tool == "file_read"
-            ? ["path": target.path] : ["path": target.path, "content": "owned1056-output"]
+        let input: [String: Any] = tool == "file_write"
+            ? ["path": target.path, "content": "owned1056-output"] : ["path": target.path]
         let digest = try #require(ApprovalAuthorizationContext.payloadDigest(for: input))
         let facts = f.bridge.chat.composerPolicyFacts
         let unique = UUID().uuidString
@@ -483,8 +483,8 @@ struct ComposerMemoryProposal608ConsumerTests {
         center: ApprovalPromptCenter, root: URL, target: URL, tool: String,
         context: ApprovalAuthorizationContext, probe: PresentedApproval1056Probe, observation: String?
     ) async throws -> String {
-        let input: [String: Any] = tool == "file_read"
-            ? ["path": target.path] : ["path": target.path, "content": "owned1056-output"]
+        let input: [String: Any] = tool == "file_write"
+            ? ["path": target.path, "content": "owned1056-output"] : ["path": target.path]
         let gate = ApprovalGate(policyByTool: [tool: .alwaysAsk],
             delegate: ApprovalPromptDelegate(center: center),
             onApprovalReceipt: { receipt in await MainActor.run { probe.receipts.append(receipt) } })
@@ -502,11 +502,17 @@ struct ComposerMemoryProposal608ConsumerTests {
             concurrencyLimit: 1, autonomyLevel: .l2, creatorID: context.actorID, createdAt: now)
         let lease = AutonomyLease(goalID: goal.goalID, scopeID: goal.scopeID,
             issuedAt: now, expiresAt: goal.deadline)
+        // file_delete 在执行器里必须有文件改动台账和会话身份，缺一个就在删除前失败
+        // （runFileDelete："File change ledger unavailable for deletion"），所以这里接上真实台账。
+        let executor = BuiltinToolExecutor(allowedRoot: root)
+        executor.fileChangeLedger = FileChangeLedger(workspaceRoot: root.resolvingSymlinksInPath().path)
+        executor.fileChangeSessionID = context.sessionID
         return try await PolicyRuntimeBinding(goal: goal, lease: lease)
-            .wrap(BuiltinToolExecutor(allowedRoot: root)).execute(name: tool, input: input)
+            .wrap(executor).execute(name: tool, input: input)
     }
 
-    @Test(arguments: ["file_read", "file_write"])
+    // 只有不可逆操作才有第二次确认（2026-11-16），所以两步用例改用 file_delete；file_write 已是一次点击。
+    @Test(arguments: ["file_read", "file_delete"])
     func approveConsumesTheOriginalGateWithIndependentL3Steps1056(tool: String) async throws {
         try await withFixture { f in
         bindPresentedApproval1056(f)
@@ -514,7 +520,7 @@ struct ComposerMemoryProposal608ConsumerTests {
         let before = try #require(f.sessions.loadSession(id: owner.uuidString))
         let beforeChat = f.bridge.chat.messages
         let target = f.root.appendingPathComponent("target1056.txt")
-        if tool == "file_read" { try Data("owned1056-source".utf8).write(to: target) }
+        try Data("owned1056-source".utf8).write(to: target)
         let context = try targetContext1056(f, tool: tool, target: target)
         let probe = PresentedApproval1056Probe()
         let task = beginTarget1056(f, target: target, tool: tool, context: context, probe: probe)
@@ -522,7 +528,7 @@ struct ComposerMemoryProposal608ConsumerTests {
         #expect(await observePresentedApproval1056 { f.bridge.approvalCenter.pendingRequest != nil })
         let original = try #require(f.bridge.approvalCenter.pendingRequest)
         #expect(original.binding?.identityDigest == context.identityDigest)
-        #expect(original.requiresSecondConfirmation == (tool == "file_write"))
+        #expect(original.requiresSecondConfirmation == (tool == "file_delete"))
         #expect(f.bridge.composerCommandReadinessObservation(for: "approve") == .noKnownBlocker)
         let first = try submitPresentedApproval1056(f)
         #expect(f.bridge.approvalCenter.pendingRequest == original) // The command card never re-presents a target.
@@ -536,11 +542,11 @@ struct ComposerMemoryProposal608ConsumerTests {
         #expect(f.center.projection?.id == first.requestID)
         #expect(f.bridge.chat.lastComposerCommandReceipt == first)
         #expect(!f.center.approveCurrentAdjudication())
-        if tool == "file_write" {
+        if tool == "file_delete" {
             #expect(f.bridge.approvalCenter.pendingRequest == original)
             #expect(f.bridge.approvalCenter.awaitingConfirmation && !probe.finished)
             #expect(probe.executions == 0 && probe.receipts.isEmpty)
-            #expect(!FileManager.default.fileExists(atPath: target.path))
+            #expect(FileManager.default.fileExists(atPath: target.path))
             #expect(f.center.projection?.text.contains("尚未允许工具执行") == true)
             let second = try submitPresentedApproval1056(f)
             #expect(second.requestID != first.requestID)
@@ -559,7 +565,11 @@ struct ComposerMemoryProposal608ConsumerTests {
         if tool == "file_read" { #expect(probe.result?.contains("owned1056-source") == true) }
         #expect(f.bridge.approvalCenter.pendingRequest == nil)
         #expect(probe.receipts.count == 1 && probe.receipts.first?.identityDigest == context.identityDigest)
-        #expect(try Data(contentsOf: target) == Data((tool == "file_write" ? "owned1056-output" : "owned1056-source").utf8))
+        if tool == "file_delete" {
+            #expect(!FileManager.default.fileExists(atPath: target.path))
+        } else {
+            #expect(try Data(contentsOf: target) == Data("owned1056-source".utf8))
+        }
         #expect(f.bridge.chat.messages == beforeChat)
         let expectedCommandReceipt = try #require(f.bridge.chat.lastComposerCommandReceipt)
         #expect(f.center.projection?.id == expectedCommandReceipt.requestID)

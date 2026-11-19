@@ -185,8 +185,8 @@ struct TaskSummaryView: View {
 
     private func statusColor(_ status: AgentTaskStatus) -> Color {
         switch status {
-        case .queued: return .blue
-        case .running: return .orange
+        case .queued: return theme?.statusInfo ?? AppStatusColor.info
+        case .running: return theme?.statusWarning ?? AppStatusColor.warning
         case .succeeded: return theme?.statusSuccess ?? .green
         case .failed: return theme?.aj38.danger.swiftUIColor ?? .red
         case .cancelled: return .secondary
@@ -195,8 +195,8 @@ struct TaskSummaryView: View {
 
     private func statusColor(_ status: TaskCenterReceiptState) -> Color {
         switch status {
-        case .queued, .inputRequired: return .blue
-        case .running, .approvalRequired, .retrying: return .orange
+        case .queued, .inputRequired: return theme?.statusInfo ?? AppStatusColor.info
+        case .running, .approvalRequired, .retrying: return theme?.statusWarning ?? AppStatusColor.warning
         case .completed: return theme?.statusSuccess ?? .green
         case .failed: return theme?.aj38.danger.swiftUIColor ?? .red
         case .cancelled: return .secondary

@@ -141,4 +141,42 @@ struct CCFinishRoleAndArtifactTests {
         }
     }
 
+    @Test func savedMCPImageCanBeReadByItsOwnSessionOnly() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = ToolOutputArtifactStore(sessionStorageRoot: root, sessionID: UUID())
+        let second = ToolOutputArtifactStore(sessionStorageRoot: root, sessionID: UUID())
+        let imageURL = try first.persistImage(Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3]), fileExtension: "png")
+        #expect(try first.resolveArtifactPath(imageURL.path) == imageURL)
+        #expect(throws: ToolExecutorError.self) { try second.resolveArtifactPath(imageURL.path) }
+        // 清单随图片一起写入会话输出目录（重启后凭内容哈希恢复读取资格）。
+        let manifest = imageURL.deletingLastPathComponent().appendingPathComponent("manifest.json")
+        #expect(FileManager.default.fileExists(atPath: manifest.path))
+    }
+
+    @Test func sessionOutputDirectoryOverQuotaDropsOldestFilesFirst() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ToolOutputArtifactStore(sessionStorageRoot: root, sessionID: UUID())
+        let bytes = Data(repeating: 7, count: 100)
+        let oldest = try store.persistImage(bytes, fileExtension: "png")
+        let middle = try store.persistImage(bytes, fileExtension: "png")
+        let newest = try store.persistImage(bytes, fileExtension: "png")
+        let directory = oldest.deletingLastPathComponent()
+        let now = Date()
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-30)], ofItemAtPath: oldest.path)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-20)], ofItemAtPath: middle.path)
+        try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-10)], ofItemAtPath: newest.path)
+
+        // 上限 250 字节：三张 100 字节的图要删掉最旧的一张；刚写入的文件始终保留。
+        ToolOutputArtifactStore.enforceSessionQuota(
+            directory: directory, keeping: newest.lastPathComponent, limit: 250)
+        #expect(!FileManager.default.fileExists(atPath: oldest.path))
+        #expect(FileManager.default.fileExists(atPath: middle.path))
+        #expect(FileManager.default.fileExists(atPath: newest.path))
+        // 被清理的文件不能再按路径读取。
+        #expect(throws: ToolExecutorError.self) { try store.resolveArtifactPath(oldest.path) }
+        #expect(try store.resolveArtifactPath(newest.path) == newest)
+    }
+
 }

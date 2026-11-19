@@ -35,7 +35,7 @@ import Testing
         let parts = try #require(JSONSerialization.jsonObject(with: Data(returned.content.utf8)) as? [[String: Any]])
         let part = try #require(parts.first)
         let content = try #require(part["content"] as? String)
-        #expect(content.utf8.count <= MCPOutputLimiter.defaultMaximumCharacters)
+        #expect(content.count <= MCPOutputLimiter.defaultMaximumCharacters)
         #expect(part["is_error"] as? Bool == fails)
         #expect(ledger.facts.count == 1)
         #expect(ledger.pendingReceipts.isEmpty)
@@ -97,7 +97,7 @@ import Testing
         let executor = BuiltinToolExecutor(allowedRoot: root, deniedRoots: [])
         let visible = try await modelVisibleFile(at: file, root: root, executor: executor)
         let mask = String(repeating: "*", count: secret.count)
-        try #require(visible == "OPENAI_API_KEY=\(mask)\nPORT=3000\n")
+        try #require(visible == "     1\tOPENAI_API_KEY=\(mask)\n     2\tPORT=3000")
 
         let wholeFile = visible.replacingOccurrences(of: "PORT=3000", with: "PORT=4000")
         try await expectMaskedWriteRefusal(wholeFile, at: file, executor: executor)
@@ -157,6 +157,7 @@ import Testing
         executor.fileCheckpointsEnabled = checkpoints
         executor.fileCheckpointStore = store
         executor.fileChangeSessionID = "file-mask-mutation"
+        executor.markFileRead(path: file.path) // 覆盖已有文件要求先读
 
         await #expect(throws: ToolExecutorError.self) {
             _ = try await executor.execute(name: "file_write", input: [
@@ -282,8 +283,11 @@ import Testing
         try Data(source.utf8).write(to: file)
         let executor = BuiltinToolExecutor(allowedRoot: root, deniedRoots: [])
         let visible = try await modelVisibleFile(at: file, root: root, executor: executor)
-        #expect(Data(visible.utf8) == Data(source.replacingOccurrences(
-            of: "opaque-synthetic-value", with: "[REDACTED]").utf8))
+        // file_read 每行带 cat -n 行号前缀；去掉前缀后，除密钥值外应与源文件逐字节一致。
+        let numberedExpected = source.replacingOccurrences(of: "opaque-synthetic-value", with: "[REDACTED]")
+            .split(separator: "\n", omittingEmptySubsequences: false).dropLast()
+            .enumerated().map { "     \($0.offset + 1)\t\($0.element)" }.joined(separator: "\n")
+        #expect(Data(visible.utf8) == Data(numberedExpected.utf8))
         #expect(try Data(contentsOf: file) == Data(source.utf8))
     }
 
@@ -305,7 +309,7 @@ import Testing
             let fileRead = MCPOutputLimiter.projectFileRead(item.source, to: item.limit)
             #expect(!legacy.contains(item.secret))
             #expect(!fileRead.contains(item.secret))
-            #expect(fileRead.utf8.count <= item.limit)
+            #expect(fileRead.count <= item.limit)
         }
 
         let escapedCredential = #"{"note":"\u0073k-syntheticMaskCheck0123456789"}"#

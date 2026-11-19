@@ -29,7 +29,7 @@ struct ExternalSessionHumanResolutionCard: View {
                 .font(.caption)
             if let original = snapshot?.unconfirmedControl {
                 Text("来源 \(original.sourceID.rawValue) · 配置 \(original.profileID.rawValue)")
-                Text("会话 \(original.threadID.rawValue) · 回合 \(original.turnID?.rawValue ?? "无回合 ID") · 原操作 \(original.operation.rawValue)")
+                Text("会话 \(original.threadID.rawValue) · 回合 \(original.turnID?.rawValue ?? "无回合 ID") · 原操作 \(original.operation.humanLabel)")
                 Text("原授权 \(original.controlAuthorizationID.rawValue) · epoch \(original.controlRevocationEpoch) · generation \(original.connectionGeneration) · owner \(original.connectionOwnerID)")
                 Text("原请求 \(original.requestIdentity?.localOperationID ?? "旧记录未提供") · 状态观察 \(original.observedTurnStatus?.rawValue ?? "未观察")（不是操作回执）")
                 Button("检查原目标并准备人工确认") { Task { await inspect() } }
@@ -43,7 +43,7 @@ struct ExternalSessionHumanResolutionCard: View {
                 Picker("独立补偿操作", selection: $operation) {
                     ForEach([ExternalSessionControlOperationV1.resume, .fork, .steer].filter {
                         controlGrant?.operations.contains($0) == true
-                    }, id: \.rawValue) { Text($0.rawValue).tag($0) }
+                    }, id: \.rawValue) { Text($0.humanLabel).tag($0) }
                 }
                 if operation == .steer { TextField("本次独立补偿指令", text: $input) }
                 Button("单独授权并发送一次独立补偿…") { confirmCompensation = true }
@@ -54,7 +54,7 @@ struct ExternalSessionHumanResolutionCard: View {
                 ForEach(snapshot.humanResolutionHistory ?? [], id: \.decisionID) { receipt in
                     VStack(alignment: .leading, spacing: 3) {
                         Text("人工记录 \(receipt.decisionID) · \(receipt.decision.rawValue)")
-                        Text("原操作 \(receipt.original.operation.rawValue) 的结果仍未知；\(receipt.outcome.rawValue)")
+                        Text("原操作 \(receipt.original.operation.humanLabel) 的结果仍未知；\(receipt.outcome.rawValue)")
                         Text("来源 \(receipt.decisionSource.rawValue) · 决定者 \(receipt.actor.rawValue) · \(receipt.redactedNote) · \(receipt.redactedSourceReference)")
                     }
                     .accessibilityIdentifier("external-session-human-history")
@@ -87,7 +87,7 @@ struct ExternalSessionHumanResolutionCard: View {
             Button("取消", role: .cancel) {}
             Button("仅授权这次独立补偿") { Task { await submit(.authorizeOneIndependentCompensation) } }
         } message: {
-            Text("原操作结果仍未知。本次是新请求，只生成新请求的回执，不记录已在外部处理。\n目标：\(preview?.original.threadID.rawValue ?? "未检查") / \(preview?.original.turnID?.rawValue ?? "无回合 ID")\n操作：\(operation.rawValue)\n指令：\(operation == .steer ? input : "无")\n说明：\(note)\n依据：\(reference)")
+            Text("原操作结果仍未知。本次是新请求，只生成新请求的回执，不记录已在外部处理。\n目标：\(preview?.original.threadID.rawValue ?? "未检查") / \(preview?.original.turnID?.rawValue ?? "无回合 ID")\n操作：\(operation.humanLabel)\n指令：\(operation == .steer ? input : "无")\n说明：\(note)\n依据：\(reference)")
         }
     }
 
@@ -145,5 +145,20 @@ struct ExternalSessionHumanResolutionCard: View {
                 readGrant: readGrant, controlGrant: controlGrant)
             message = "已建立新连接；只允许当前授权下的新请求，旧操作历史仍 UNKNOWN。"
         } catch { message = "新连接失败：\(error)" }
+    }
+}
+
+private extension ExternalSessionControlOperationV1 {
+    /// 界面显示用的中文名；不改变存储或协议里的 rawValue。
+    var humanLabel: String {
+        switch self {
+        case .resume: "继续会话"
+        case .fork: "分叉会话"
+        case .steer: "追加指令"
+        case .interrupt: "中断"
+        case .approve: "批准"
+        case .reject: "拒绝"
+        case .provideInput: "提供输入"
+        }
     }
 }

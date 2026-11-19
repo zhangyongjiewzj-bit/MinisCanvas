@@ -33,6 +33,22 @@ struct ApprovalEditPreviewMissTests {
         }
     }
 
+    /// E-01 PR1b：原文只差空白时给出“重新 file_read”的可操作提示；回退提示逻辑会红。
+    @Test func whitespaceOnlyMissSuggestsReReading() async throws {
+        let (root, target) = try makeFile("func demo() {\n    return 1\n}\n")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let owner = BuiltinToolExecutor(allowedRoot: root)
+        let input = try ComposerToolInput(["path": target.path, "old_string": "func demo() {\n  return 1\n}", "new_string": "x"])
+        do {
+            _ = try await owner.prepareFileApprovalPreview(tool: "file_edit", input: input)
+            Issue.record("expected editFailed")
+        } catch {
+            let detail = try #require(editFailedDetail(error))
+            #expect(detail.hasPrefix("old_string not found in "))
+            #expect(detail.contains("file_read"))
+        }
+    }
+
     @Test func multiMatchWithoutReplaceAllKeepsAmbiguityMessage() async throws {
         let (root, target) = try makeFile("dup\ndup\n")
         defer { try? FileManager.default.removeItem(at: root) }

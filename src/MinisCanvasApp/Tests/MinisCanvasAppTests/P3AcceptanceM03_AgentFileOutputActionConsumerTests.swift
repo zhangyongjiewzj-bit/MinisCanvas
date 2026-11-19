@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import MinisCore
 @testable import MinisCanvasApp
 
 @Suite("D-OUTPUT-03/04 ordinary Agent file output actions")
@@ -190,7 +191,8 @@ struct P3AcceptanceM03_AgentFileOutputActionConsumerTests {
             )
             #expect(imageResult == .completed)
 
-            let pdf = root.appendingPathComponent("report.pdf")
+            // PDF 现已支持只读预览；这里改用仍不支持预览的二进制类型验证拒绝路径。
+            let pdf = root.appendingPathComponent("report.bin")
             try Data("synthetic report".utf8).write(to: pdf)
             let pdfOutput = change(pdf.path)
             let pdfResult = AgentFileOutputActionConsumer.perform(
@@ -233,6 +235,30 @@ struct P3AcceptanceM03_AgentFileOutputActionConsumerTests {
             #expect(escaped.text == nil)
             #expect(escaped.error == AgentFileOutputFailure.outOfBounds.message)
             #expect(!(escaped.error ?? "").contains("outside-canary"))
+        }
+    }
+
+    @Test("Ledger artifact action returns stale when the file bytes no longer match the recorded hash")
+    func ledgerArtifactStaleWhenHashDiffers() throws {
+        try withSyntheticRoot { root, file in
+            let sha = String(repeating: "a", count: 64)
+            let record = FileChangeRecord(
+                changeID: "c1", path: "report.txt", kind: .created, diffID: "d1",
+                insertions: 1, deletions: 0, timestamp: Date(timeIntervalSince1970: 1),
+                sessionID: "session-A", outputSHA256: sha, workspaceRoot: root.path)
+            let artifact = ProducedFileArtifactEvidence(
+                diffID: "d1", path: "report.txt", outputSHA256: sha, producerReceiptID: "r",
+                producerAttemptID: "a", producerToolCallID: "t", producerToolName: "file_write",
+                status: .succeeded, nextStep: .reviewDiff)
+            var opened = false
+            let outcome = AgentFileOutputActionConsumer.performLedgerArtifact(
+                artifact: artifact, ledgerRecord: record, fallbackRoot: nil, viewerSessionID: "session-A",
+                intent: .systemOpen, preview: { _ in false },
+                probe: AgentFileOutputActionConsumer.fileSystemProbe,
+                digest: { _ in String(repeating: "b", count: 64) },
+                open: { _ in opened = true; return true }, reveal: { _ in true }, copy: { _ in true })
+            #expect(outcome == .failed(.stale))
+            #expect(!opened)
         }
     }
 

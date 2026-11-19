@@ -134,6 +134,20 @@ public struct ProducedFileArtifactEvidence: Sendable, Equatable {
     public let producerToolName: String
     public let status: ToolExecutionStatus
     public let nextStep: NextStep
+
+    public init(diffID: String, path: String, outputSHA256: String, producerReceiptID: String,
+                producerAttemptID: String, producerToolCallID: String, producerToolName: String,
+                status: ToolExecutionStatus, nextStep: NextStep) {
+        self.diffID = diffID
+        self.path = path
+        self.outputSHA256 = outputSHA256
+        self.producerReceiptID = producerReceiptID
+        self.producerAttemptID = producerAttemptID
+        self.producerToolCallID = producerToolCallID
+        self.producerToolName = producerToolName
+        self.status = status
+        self.nextStep = nextStep
+    }
 }
 
 /// 同一 `diffID` 下的逐文件差异正文。正文复用现有 `DiffRenderer` 的
@@ -850,5 +864,127 @@ public final class FileChangeLedger: @unchecked Sendable {
         for (idx, slot) in slots.enumerated() {
             indexByID[Self.key(sessionID: slot.record.sessionID, diffID: slot.record.diffID)] = idx
         }
+    }
+}
+
+// MARK: - 命令生成的产物（未经写入验证）
+
+/// shell 命令结束后，只检查命令文本里出现的、带常见产物扩展名的路径：文件存在且修改时间
+/// 不早于命令开始时才算“命令生成”。它不是写入证明（命令可能只是读取或触碰了该文件），
+/// 因此与台账里“已证实写入”的记录分开显示。除命令文本外，只有界扫描工作目录第一层。
+public enum CommandGeneratedArtifacts {
+    public static let statusLabel = "命令生成（未经写入验证）"
+    public static let maximumCount = 20
+
+    static let artifactExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "webp", "heic", "svg", "pdf", "html", "htm", "md", "txt",
+        "csv", "tsv", "json", "xlsx", "xls", "docx", "doc", "pptx", "ppt", "zip", "tar", "gz",
+        "mp4", "mov", "m4v", "mkv", "webm", "mp3", "wav", "m4a", "log", "xml", "yaml", "yml"
+    ]
+
+    private static let unquoted = try? NSRegularExpression(
+        pattern: #"(?:^|[\s=<>(])([^\s"'`<>|;&()]+\.[A-Za-z0-9]{1,5})(?=$|[\s"'`<>|;&)])"#)
+    private static let quoted = try? NSRegularExpression(
+        pattern: #"["']([^"'\n]+\.[A-Za-z0-9]{1,5})["']"#)
+
+    /// 返回命令文本中出现、存在且 mtime 不早于 `startedAt` 的路径（标准化的绝对路径，去重，最多 `maximumCount` 个）。
+    public static func detect(command: String, workingDirectory: URL, startedAt: Date,
+                              homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> [String] {
+        let ns = command as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        var tokens: [String] = []
+        for expression in [quoted, unquoted] {
+            guard let expression else { continue }
+            for match in expression.matches(in: command, range: full) where match.numberOfRanges > 1 {
+                let range = match.range(at: 1)
+                if range.location != NSNotFound { tokens.append(ns.substring(with: range)) }
+            }
+        }
+        var seen = Set<String>()
+        var result: [String] = []
+        // 文件系统时间戳可能只到秒级，留 1 秒容差。
+        let threshold = startedAt.addingTimeInterval(-1)
+        // `cd 子目录 && …` 之后命令里的相对路径按该目录解析。
+        let baseDirectory = leadingCDTarget(command: command, workingDirectory: workingDirectory,
+                                            homeDirectory: homeDirectory) ?? workingDirectory
+        func admit(_ url: URL) {
+            guard result.count < maximumCount,
+                  !seen.contains(url.path), !SensitiveFilePolicy.contains(url.path) else { return }
+            var info = stat()
+            guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return }
+            let modified = Date(timeIntervalSince1970: TimeInterval(info.st_mtimespec.tv_sec)
+                + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+            guard modified >= threshold else { return }
+            seen.insert(url.path)
+            result.append(url.path)
+        }
+        for token in tokens {
+            guard result.count < maximumCount else { break }
+            let ext = (token as NSString).pathExtension.lowercased()
+            guard artifactExtensions.contains(ext), !token.contains("$"), !token.contains("*") else { continue }
+            let path: String
+            if token.hasPrefix("/") { path = token }
+            else if token.hasPrefix("~/") { path = homeDirectory.appendingPathComponent(String(token.dropFirst(2))).path }
+            else { path = baseDirectory.appendingPathComponent(token).path }
+            admit(URL(fileURLWithPath: path).standardizedFileURL)
+        }
+        // 脚本（如 python3 plot.py）生成的文件不会出现在命令文本里：
+        // 再有界扫描工作目录第一层（至多 200 项、跳过隐藏项、只认产物扩展名）。
+        var scanned = 0
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            at: workingDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        for entry in entries {
+            scanned += 1
+            if scanned > scanLimit || result.count >= maximumCount { break }
+            let ext = entry.pathExtension.lowercased()
+            guard ext != "log", artifactExtensions.contains(ext) else { continue }
+            admit(entry.standardizedFileURL)
+        }
+        return result
+    }
+
+    static let scanLimit = 200
+
+    private static let leadingCD = try? NSRegularExpression(
+        pattern: #"^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))\s*(?:&&|;)"#)
+
+    /// 命令开头的 `cd 目录 &&`（或 `;`）的目标目录；含变量或通配时不解析。
+    private static func leadingCDTarget(command: String, workingDirectory: URL, homeDirectory: URL) -> URL? {
+        guard let expression = leadingCD else { return nil }
+        let ns = command as NSString
+        guard let match = expression.firstMatch(in: command, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        var target: String?
+        for index in 1...3 {
+            let range = match.range(at: index)
+            if range.location != NSNotFound { target = ns.substring(with: range); break }
+        }
+        guard let target, !target.contains("$"), !target.contains("*"), !target.contains("`") else { return nil }
+        let path: String
+        if target.hasPrefix("/") { path = target }
+        else if target == "~" { path = homeDirectory.path }
+        else if target.hasPrefix("~/") { path = homeDirectory.appendingPathComponent(String(target.dropFirst(2))).path }
+        else { path = workingDirectory.appendingPathComponent(target).path }
+        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+    }
+}
+
+/// 按会话保存“命令生成”的产物路径，供界面与子任务汇总读取；只在内存里，不是授权依据。
+public final class CommandGeneratedArtifactLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bySession: [String: [String]] = [:]
+    public init() {}
+
+    public func record(sessionID: String, paths: [String]) {
+        guard !paths.isEmpty else { return }
+        lock.lock(); defer { lock.unlock() }
+        var list = bySession[sessionID, default: []]
+        for path in paths where !list.contains(path) { list.append(path) }
+        if list.count > 200 { list.removeFirst(list.count - 200) }
+        bySession[sessionID] = list
+    }
+
+    public func paths(sessionID: String) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return bySession[sessionID] ?? []
     }
 }

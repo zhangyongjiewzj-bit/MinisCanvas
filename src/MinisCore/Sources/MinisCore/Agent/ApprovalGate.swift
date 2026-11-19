@@ -247,8 +247,11 @@ public struct ApprovalGate: Sendable {
 
     /// Default per-tool policy (E1 spec):
     /// - File mutations always ask; shell input risk asks except finite read-only Git forms.
-    /// - `file_read` / `browser` / `speech` → `autoApprove` (low risk); `session_read` always asks
-    /// - `web_search` reads the network but not the filesystem → auto.
+    /// - `file_read` / `browser` / `speech` → `autoApprove` (low risk); `session_read` asks, except that
+    ///   the Composer lets the current session read its own messages/metadata without a card.
+    /// - Only irreversible operations (`isIrreversibleOperation`) need a second confirmation; every
+    ///   other card is a single click, whatever its risk level.
+    /// - `web_search` sends the query to a third party → asks every time, like `web_fetch`.
     /// - `orchestrate` (P3-AGENT-01): the opt-in tool ships with MinisCore
     ///   (`OrchestrationToolExecutor.makeDefinition`), so every default-shaped
     ///   gate — including the `ApprovalGate(delegate:)` instances built by
@@ -276,13 +279,18 @@ public struct ApprovalGate: Sendable {
         "browser": .autoApprove,
         "browser_use": .autoApprove,
         "speech": .autoApprove,
-        "web_search": .autoApprove,
+        // 用户 2026-11-19：联网搜索默认每次询问，和 web_fetch 一样（搜索词会发给第三方搜索服务）。
+        "web_search": .alwaysAsk,
         "web_fetch": .alwaysAsk,
         "session_read": .alwaysAsk,
         // Read is authorized by the mounted sessions directory; send is an
         // outbound, irrevocable message and is asked on every call.
         ExternalSessionToolNames.read: .autoApprove,
         ExternalSessionToolNames.send: .alwaysAsk,
+        // 会话之间的协作（用户 2026-11-16）：给本应用其它会话发消息按目标会话审批
+        // （可对此目标“本对话内/以后都允许”）；共享任务看板只改本地 JSON，不弹卡。
+        SessionMessagingTool.toolName: .alwaysAsk,
+        TaskBoardTool.toolName: .autoApprove,
         // 只读技能内容（第七版）：给 skill_update/skill_delete 取当前哈希。
         SkillMaintenanceTool.readName: .autoApprove,
         OrchestrationToolExecutor.resultToolName: .autoApprove,
@@ -315,6 +323,8 @@ public struct ApprovalGate: Sendable {
         ExternalSessionToolNames.read: .low,
         SkillMaintenanceTool.readName: .low,
         ExternalSessionToolNames.send: .high,
+        SessionMessagingTool.toolName: .medium,
+        TaskBoardTool.toolName: .low,
         OrchestrationToolExecutor.resultToolName: .low,
         OrchestrationToolExecutor.toolName: .medium,
         BL6SettingsToolApproval.catalogToolName: .low,
@@ -324,6 +334,10 @@ public struct ApprovalGate: Sendable {
     /// Read-only file tools that never need a card under the default "ask every time"
     /// policy (user decision 2026-11-16, aligned with Claude Code). Input risk still applies.
     public static let readOnlyFileToolNames: Set<String> = ["file_read", "file_grep", "file_glob"]
+
+    /// 只读辅助工具：查看后台输出、停止后台命令、浏览器（只读动作）。默认“每次询问”下也不弹卡；
+    /// 浏览器的副作用动作不在此列，仍按输入风险询问。
+    public static let approvalFreeHelperToolNames: Set<String> = ["shell_output", "shell_stop", "browser", "browser_use"]
 
     /// Expand one user-facing policy into the explicit per-tool table used by
     /// the gate. Unknown tools remain fail-closed regardless of this table.
@@ -340,7 +354,11 @@ public struct ApprovalGate: Sendable {
                     || name == ExternalSessionToolNames.read
                     || name == AskUserQuestionTool.toolName
                     || name == SkillMaintenanceTool.readName
+                    || name == TaskBoardTool.toolName
                     || Self.readOnlyFileToolNames.contains(name)
+                    // 用户 2026-11-16 决定：查看后台输出、停止后台命令、浏览器只读动作不弹卡
+                    // （浏览器的点击/输入/下载等副作用仍由 inputRiskLevel 判高风险而询问）。
+                    || Self.approvalFreeHelperToolNames.contains(name)
                     || name == ContextCompactTool.toolName ? .autoApprove : .alwaysAsk
             }
         case .autoApprove:
@@ -348,7 +366,8 @@ public struct ApprovalGate: Sendable {
                 result[name] = name == BL6SettingsToolApproval.toolName
                     || name == BL6SettingsToolApproval.catalogToolName
                     || name == "file_delete"
-                    || name == ExternalSessionToolNames.send ? .alwaysAsk : .autoApprove
+                    || name == ExternalSessionToolNames.send
+                    || name == SessionMessagingTool.toolName ? .alwaysAsk : .autoApprove
             }
         case .riskOnlyAsk:
             return defaultPolicies.keys.reduce(into: [:]) { result, name in
@@ -423,8 +442,16 @@ public struct ApprovalGate: Sendable {
             return .high
         }
 
+        // 网页搜索的 query 是搜索词，不是网址：带冒号的搜索词（如 site:…）不按网址判定，
+        // 只有 query 本身以 http:// 或 https:// 开头才按网址检查。
+        let urlLikeText: String? = tool == "web_search"
+            ? (input["query"] as? String).flatMap { query -> String? in
+                let lowered = query.trimmingCharacters(in: .whitespaces).lowercased()
+                return lowered.hasPrefix("http://") || lowered.hasPrefix("https://") ? query : nil
+            }
+            : ((input["url"] as? String) ?? (input["query"] as? String))
         if tool == "browser" || tool == "browser_use" || tool == "web_search",
-           let urlString = (input["url"] as? String) ?? (input["query"] as? String),
+           let urlString = urlLikeText,
            urlString.contains(":") {
             guard let url = URL(string: urlString),
                   let scheme = url.scheme?.lowercased(),
@@ -446,6 +473,28 @@ public struct ApprovalGate: Sendable {
             return .high
         }
         return .low
+    }
+
+    /// 用户 2026-11-16 决定（对齐 Claude Code）：只有不可逆操作才需要第二次确认，其余一次点击即可。
+    /// 不可逆：file_delete、不可逆删除命令（rm、git clean -f、git reset --hard、git push --force 等）、
+    /// skill_delete、向外部会话发送消息、MCP 服务器与定时任务的增删。
+    public static func isIrreversibleOperation(tool: String, input: [String: Any]) -> Bool {
+        let tool = tool.lowercased()
+        switch tool {
+        case "file_delete", "skill_delete", ExternalSessionToolNames.send:
+            return true
+        case "shell_execute", "shell":
+            guard let command = input["command"] as? String else { return false }
+            return BypassSystemFloor.requiresIrreversibleDeletionApproval(command: command)
+        case BL6SettingsToolApproval.toolName:
+            guard let changes = input["changes"] as? [String: Any] else { return false }
+            return changes.keys.contains {
+                $0 == "mcp.servers.add" || $0 == "mcp.servers.remove"
+                    || $0 == "scheduler.tasks.add" || $0 == "scheduler.tasks.remove"
+            }
+        default:
+            return false
+        }
     }
 
     /// User-entered confirmation names override finite read-only shell shortcuts.
@@ -539,6 +588,16 @@ public struct ApprovalGate: Sendable {
               let request = try? OrchestrateRequestV1.decode(input: normalized,
                     maxTasks: OrchestrationToolExecutor.maxTasks) else { return [] }
         return request.tasks.filter { $0.agent?.hasPrefix("external:") == true }
+    }
+
+    /// 只给审批卡展示的子任务标题：脱敏、单行、每个最多 40 字；任务正文不进来。
+    /// 解码失败返回空数组，卡片回退到原来的通用写法；执行器仍照常校验。
+    static func orchestrationDisplayTitles(_ input: [String: Any]) -> [String] {
+        guard let normalized = normalizedOrchestrationInput(input),
+              let request = try? OrchestrateRequestV1.decode(input: normalized,
+                    maxTasks: OrchestrationToolExecutor.maxTasks) else { return [] }
+        return request.tasks.map { externalOrchestrationDisplayText($0.title, limit: 40) }
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     }
 
     private static func externalOrchestrationDisplayName(_ agent: String?) -> String? {
@@ -639,6 +698,14 @@ public struct ApprovalGate: Sendable {
         if let add = fields("mcp.servers.add") {
             let args = ((add["args"] as? [String: Any])?["list"] as? [String]) ?? []
             let envNames = (((add["env"] as? [String: Any])?["object"] as? [String: Any]) ?? [:]).keys.sorted()
+            let remoteURL = text(add, "url")
+            if !remoteURL.isEmpty {
+                let headerNames = (((add["headers"] as? [String: Any])?["object"] as? [String: Any]) ?? [:]).keys.sorted()
+                return "新增远程 MCP 服务器（新增后仍需在设置页授权才会连接）：\n"
+                    + "名称：\(safe(text(add, "name")))\n"
+                    + "地址：\(safe(remoteURL))\n"
+                    + "请求头名：\(headerNames.isEmpty ? "无" : headerNames.joined(separator: ", "))（值不显示）"
+            }
             return "新增 MCP 服务器（批准后将授权本机以下命令；新增后仍需在设置页授权才会连接）：\n"
                 + "名称：\(safe(text(add, "name")))\n"
                 + "命令：\(safe(text(add, "command")))\n"
@@ -779,6 +846,16 @@ public struct ApprovalGate: Sendable {
         } else if tool == BL6SettingsToolApproval.toolName,
                   let sessionSummary = sessionManagementSummary(input) {
             inputSummary = sessionSummary
+        } else if tool == SessionMessagingTool.toolName {
+            let mode = (input["mode"] as? String) == "run" ? "发送并让对方开始运行" : "只投递（不触发运行）"
+            let message = ContentSecretRedactor.redact(
+                input["message"] as? String ?? "", knownSecrets: ModelShellEnvironment.knownCredentialValues())
+            let attachmentPaths: [String] = ((input["files"] as? [Any]) ?? []).compactMap { $0 as? String }
+            let attachmentLines: String = attachmentPaths.prefix(3)
+                .map { "\n附件文件（内容会附在消息后）：" + ContentSecretRedactor.redact($0) }.joined()
+            inputSummary = "向本应用的另一个会话发送消息\n目标：\(input["target"] as? String ?? "")\n方式：\(mode)\n"
+                + "对方按它自己的模式、权限与审批处理，不继承本会话的权限；这条消息在对方会话里标注为“其它会话的请求”。\n"
+                + "消息全文：\n" + String(message.prefix(3000)) + attachmentLines
         } else {
             inputSummary = tool == "file_delete"
                 ? Self.fileDeleteInputSummary(input) : Self.makeInputSummary(input)
@@ -790,7 +867,7 @@ public struct ApprovalGate: Sendable {
             riskLevel: effectiveRisk,
             requiresApproval: shouldAsk(tool: tool, input: input),
             inputRiskLevel: inputRisk,
-            requiresSecondConfirmation: effectiveRisk == .high && tool != BL6SettingsToolApproval.toolName,
+            requiresSecondConfirmation: Self.isIrreversibleOperation(tool: tool, input: input),
             inputDigest: approvalInputDigest,
             identityDigest: browserIdentityDigest,
             filePreview: ApprovalFilePreview.capture(tool: tool, input: input)
@@ -802,6 +879,9 @@ public struct ApprovalGate: Sendable {
                 : String(safe.prefix(40)) + "…" + String(safe.suffix(79))
         }
         request.terminalPolicyDisposition = terminalDisposition
+        if tool == "orchestrate" {
+            request.displayTaskTitles = Self.orchestrationDisplayTitles(input)
+        }
         if BrowserSideEffectPolicy.browserToolNames.contains(tool.lowercased()),
            (input["action"] as? String) == "navigate",
            let raw = input["url"] as? String, let url = URL(string: raw),
@@ -840,6 +920,7 @@ public struct ApprovalGate: Sendable {
             filePreview: base.filePreview, webFetchAuthority: base.webFetchAuthority,
             displayTargetPath: base.displayTargetPath
         )
+        request.displayTaskTitles = base.displayTaskTitles
         request.terminalPolicyDisposition = base.terminalPolicyDisposition
         request.browserNavigationDestination = base.browserNavigationDestination
         request.browserInteractionInput = base.browserInteractionInput

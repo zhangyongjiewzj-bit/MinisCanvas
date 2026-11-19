@@ -371,10 +371,7 @@ struct ProviderReadinessURLSessionTransportTests {
             await center.checkProviderReadiness(forProviderName: "R35_LUNA_API_KEY")
         )
         #expect(report.state == .live)
-        #expect(report.modelChecks.map(\.modelID) == [
-            "gpt-5.6-luna",
-            "gpt-5.6-luna-mini"
-        ])
+        #expect(report.modelChecks.map(\.modelID) == ["gpt-5.6-luna"])
         #expect(report.modelChecks.allSatisfy {
             $0.status == .passed
                 && $0.readiness?.state == .live
@@ -465,7 +462,7 @@ struct ProviderReadinessURLSessionTransportTests {
         #expect(report.authentication.status == .passed)
         #expect(report.modelDiscovery.status == .passed)
         #expect(report.discoveredModelIDs == ["gpt-5.6-luna", "gpt-5.6-luna-mini"])
-        #expect(report.modelChecks.map(\.modelID) == ["gpt-5.6-luna", "gpt-5.6-luna-mini"])
+        #expect(report.modelChecks.map(\.modelID) == ["gpt-5.6-luna"])
         #expect(report.modelChecks.allSatisfy { $0.status == .passed })
         #expect(report.state == .unverified)
         #expect(report.modelChecks.allSatisfy {
@@ -502,12 +499,11 @@ struct ProviderReadinessURLSessionTransportTests {
         #expect(activeProvider.name == "Mock")
 
         let requests = ReadinessURLProtocol.requests()
-        #expect(requests.count == 5)
+        #expect(requests.count == 4)
         #expect(requests.map { "\($0.httpMethod ?? "") \($0.url?.path ?? "")" } == [
             "GET /v1",
             "GET /v1/models",
             "GET /v1/models",
-            "POST /v1/chat/completions",
             "POST /v1/chat/completions"
         ])
         #expect(requests.allSatisfy {
@@ -658,7 +654,7 @@ struct ProviderReadinessURLSessionTransportTests {
         })
         let body = try #require(ReadinessURLProtocol.bodyData(from: requests[1]))
         let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
-        #expect(object["max_tokens"] as? Int == 1)
+        #expect(object["max_tokens"] as? Int == 16)
         #expect(object["model"] as? String == "claude-test")
     }
 
@@ -912,7 +908,7 @@ struct ProviderReadinessURLSessionTransportTests {
         let unsafeRequest = ProviderReadinessTransportRequest(
             operation: .reachability,
             providerID: "URLSESSION_HTTP",
-            baseURL: URL(string: "http://provider.example/v1")!,
+            baseURL: URL(string: "ftp://provider.example/v1")!,
             apiKey: "sk-http-secret-1234",
             modelID: nil,
             protocolType: .openaiCompatible
@@ -923,12 +919,13 @@ struct ProviderReadinessURLSessionTransportTests {
         #expect(ReadinessURLProtocol.requests().isEmpty)
     }
 
-    @Test("unknown model catalog fields are rejected without forwarding credentials")
-    func unknownCatalogFieldsFailClosed() async throws {
+    @Test("模型目录根上多出未知键时照常解析，且不转发凭据")
+    func unknownCatalogRootKeysAreIgnored() async throws {
         let secret = "sk-unknown-catalog-secret-1234"
         ReadinessURLProtocol.reset { _ in
             .json(status: 200, object: [
-                "data": [["id": "gpt-5.6-luna"]],
+                "data": [["id": "gpt-5.6-luna"], ["id": "gpt-5.6-luna"]],
+                "success": true,
                 "echo": secret
             ])
         }
@@ -943,8 +940,8 @@ struct ProviderReadinessURLSessionTransportTests {
             modelID: nil,
             protocolType: .openaiCompatible
         ))
-        #expect(response.errorCategory == .malformedResponse)
-        #expect(response.modelIDs.isEmpty)
+        #expect(response.errorCategory == nil)
+        #expect(response.modelIDs == ["gpt-5.6-luna"])
         #expect(response.body.isEmpty)
         #expect(ReadinessURLProtocol.requests().count == 1)
     }

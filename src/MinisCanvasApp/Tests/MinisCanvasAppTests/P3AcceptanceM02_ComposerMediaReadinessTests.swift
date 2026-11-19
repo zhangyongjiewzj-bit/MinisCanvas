@@ -113,6 +113,27 @@ struct P3AcceptanceM02_ComposerMediaReadinessTests {
         #expect(chat.canSubmitComposerAttachments)
     }
 
+    @Test("M-10: audio over the 25 MB direct-send cap is transcribable even when the model accepts audio")
+    func oversizedAudioFallsBackToTranscriptionForAudioModels() throws {
+        let chat = makeChat()
+        defer { chat.stopAllStreamingForSafety() }
+        chat.streamingProviderOverride = M02ReadinessProvider(modalities: [.textInput, .textOutput, .audioInput])
+        var bytes = Data([0x52, 0x49, 0x46, 0x46])
+        bytes.append(Data(count: MediaPayloadValidation.maxInputBytes + 1024))
+        let audio = ChatAttachment(
+            kind: .audio, fileName: "meeting.wav", fileType: .audio, mimeType: "audio/wav", data: bytes)
+        chat.addComposerDraftAttachment(audio)
+        defer { chat.cancelAudioTranscription(id: audio.id) }
+        let item = try #require(chat.composerMediaReadinessSnapshot.attachment(id: audio.id))
+        #expect(item.readiness == .unsupported)
+        #expect(item.audioTranscribable)
+        // 不超限的音频仍原样发送（模型收音频时不触发转写）。
+        #expect(ChatStore.audioNativelyDeliverable(
+            supported: [.audioInput], wire: nil, byteCount: MediaPayloadValidation.maxInputBytes))
+        #expect(!ChatStore.audioNativelyDeliverable(
+            supported: [.audioInput], wire: nil, byteCount: MediaPayloadValidation.maxInputBytes + 1))
+    }
+
     @Test("sampled video uses PNG capability while extracted PDF stays a text reference")
     func sampledVideoAndExtractedPDFUseTheirActualInputRepresentation() async throws {
         let chat = makeChat()
@@ -139,9 +160,10 @@ struct P3AcceptanceM02_ComposerMediaReadinessTests {
 
         chat.streamingProviderOverride = M02ReadinessProvider(modalities: .textOnly)
         let textOnly = chat.composerMediaReadinessSnapshot
-        #expect(textOnly.attachment(id: video.id)?.readiness == .unsupported)
+        // 2026-11-16：不支持图片的模型不再拦下视频，改为按路径引用交给模型。
+        #expect(textOnly.attachment(id: video.id)?.readiness == .referenceOnly)
         #expect(textOnly.attachment(id: extractedPDF.id)?.readiness == .referenceOnly)
-        #expect(!textOnly.canSubmitAttachments)
+        #expect(textOnly.canSubmitAttachments)
         chat.removePendingAttachment(id: video.id)
         #expect(chat.canSubmitComposerAttachments)
     }

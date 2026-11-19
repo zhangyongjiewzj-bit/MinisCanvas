@@ -92,13 +92,13 @@ struct ErrorMessageTests {
         let isChinese = Locale.current.language.languageCode?.identifier.lowercased().hasPrefix("zh") ?? false
         let cases: [(error: any Error, expected: String)] = [
             (AgentLoopError.maxIterationsExceeded(5), isChinese
-                ? "已达到最大迭代次数（5），请简化任务或拆分步骤后重试"
+                ? "本回合的工具调用已达上限（5 次），已先停下。点「继续」可接着做，也可以把任务拆小后再试"
                 : "Max iterations exceeded (5) — please simplify the task or split it into steps"),
             (AgentLoopError.outputTokenCeilingExhausted, isChinese
                 ? "当前上下文没有剩余输出额度，请增大上下文长度或缩短输入后重试"
                 : "No output tokens remain in this context — increase the context length or shorten the input"),
             (ComposerAuthorizationError.modeExceedsAutonomyCeiling(required: .l2, maximum: .l1),
-                "当前模式需要自主权上限 L2，而你的上限是 L1。请把输入框齿轮里的模式改为手动审批，或到 设置 → 智能体运行 → 运行安全上限 调高上限。"),
+                "当前模式超出了你设置的运行安全上限。请把输入框齿轮里的模式改为手动审批，或到 设置 → 智能体运行 → 运行安全上限 调高上限。"),
             (AgentLoopChatEngine.ContextManifestConsumptionError.contextLengthExceeded,
                 "当前上下文已超过设置的长度上限，本次请求未执行。请缩短输入或在新会话继续。")
         ]
@@ -133,7 +133,8 @@ struct ErrorMessageTests {
             try #require(!chat.isStreaming)
             let assistant = try #require(chat.messages.last(where: { $0.role == .assistant }))
             #expect(assistant.content == content)
-            #expect(content.contains("操作未完成（CHAT-UNKNOWN）。请重试；若重复出现，请输入 /doctor 打开环境诊断，导出诊断包并附上此错误信息。"))
+            #expect(content.contains(ChatStore.unknownErrorMessage(.internalFailure)))
+            #expect(content.contains("（CHAT-UNKNOWN:internal）"))
             #expect(!content.contains(privatePayload))
             #expect(!content.contains("SYNTHETIC-PRIVATE-BODY"))
             #expect(!content.contains("/synthetic/private/path"))
@@ -294,5 +295,68 @@ struct ErrorMessageTests {
             #expect(!message.contains("/private/tmp"))
             #expect(!message.contains("evidence"))
         }
+    }
+}
+
+// MARK: - 八组：面向用户的错误说明（G-08 / G-14 / U-10 / T2-1）
+
+@Suite("用户可见错误说明收口")
+@MainActor
+struct UserFacingErrorTextTests {
+    @Test func englishInternalTagsAreRemovedButHTTPCodesStay() {
+        let network = LLMError.networkError(underlying: URLError(.timedOut))
+        let shown = UserFacingErrorText.stripEnglishTag(network.friendlyMessage(locale: Locale(identifier: "zh_CN")))
+        #expect(!shown.contains("network"))
+        #expect(shown.contains("请求超时"))
+        let http = LLMError.httpStatus(code: 429, detail: "rate limit").friendlyMessage(locale: Locale(identifier: "zh_CN"))
+        #expect(UserFacingErrorText.stripEnglishTag(http) == http)
+        #expect(http.contains("429"))
+        let provider = ChatStore.userErrorMessage(LLMError.providerError(message: "x"))
+        #expect(!provider.contains("（provider）"))
+    }
+
+    @Test func systemEnglishDescriptionNeverReachesTheUser() {
+        let path = "/Users/someone/secret-folder/a.txt"
+        let cocoa = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError,
+            userInfo: [NSLocalizedDescriptionKey: "The file \(path) couldn’t be opened."])
+        let shown = UserFacingErrorText.describe(cocoa)
+        #expect(!shown.contains(path))
+        #expect(!shown.contains("couldn’t"))
+        #expect(UserFacingErrorText.containsChinese(shown))
+        let owned = NSError(domain: "owned", code: 1, userInfo: [NSLocalizedDescriptionKey: "目标会话已被移走"])
+        #expect(UserFacingErrorText.describe(owned) == "目标会话已被移走")
+        let english = NSError(domain: "owned", code: 2, userInfo: [NSLocalizedDescriptionKey: "Boom token=abc"])
+        #expect(!UserFacingErrorText.describe(english).contains("token=abc"))
+    }
+
+    /// 为什么必须扫描源码：约 90 处展示点分散在各个视图和控制器里，行为测试无法逐一触达；
+    /// 新增一处把 `.localizedDescription` 直接拼进用户文字的写法，只有源码扫描能立刻发现。
+    /// 白名单列的是确实安全的位置：固定中文文案的类型化错误、只进日志或生命周期记录的原因、
+    /// 画布冻结范围内的文件。数字是该文件允许出现的最大次数，新增请改走 UserFacingErrorText.describe。
+    @Test func viewLayerDoesNotInterpolateRawLocalizedDescription() throws {
+        let allowed: [String: Int] = [
+            "UserFacingErrorText.swift": 3,
+            // 固定中文文案的类型化错误
+            "ChatStore.swift": 12, "MCPManagerView.swift": 2, "ChatGPTAccountCard.swift": 2,
+            "PackageFeatureManifest.swift": 4, "ContextPanelView.swift": 2,
+            // 只进生命周期记录或已脱敏的摘要，不上屏
+            "ChatAgentEngine.swift": 4, "SessionDrafts.swift": 2, "SettingsCenter.swift": 5,
+            // 画布、视频节点、分镜相关（画布冻结，本轮不动）
+            "BridgeStore.swift": 6, "CanvasStore.swift": 3, "CanvasMutationCoordinator.swift": 1,
+            "AssetPanelView.swift": 1, "StoryboardWorkbenchView.swift": 1, "StoryboardExporter.swift": 2,
+            "NodeChatStore.swift": 2, "NodeTextInspectorView.swift": 1, "VideoTaskExecutor.swift": 3,
+        ]
+        let dir = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MinisCanvasApp")
+        let files = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasSuffix(".swift") }
+        #expect(!files.isEmpty)
+        var offenders: [String] = []
+        for name in files {
+            let text = try String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)
+            let count = text.components(separatedBy: "localizedDescription").count - 1
+            if count > (allowed[name] ?? 0) { offenders.append("\(name): \(count) > \(allowed[name] ?? 0)") }
+        }
+        #expect(offenders.isEmpty, "新增了直接展示 localizedDescription 的写法：\(offenders)")
     }
 }

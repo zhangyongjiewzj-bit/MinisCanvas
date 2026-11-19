@@ -43,8 +43,12 @@ public struct MemoryInjectionResult: Sendable {
 /// instructions) so the model defers to the user's latest message on conflict.
 public struct MemoryInjector: Sendable {
 
-    public static let defaultMaxTotalCharacters = 4_000
-    public static let maxGlobalInstructionCharacters = 3_000
+    public static let defaultMaxTotalCharacters = 8_000
+    /// 默认最多注入的记忆条数。
+    public static let defaultMaxFacts = 30
+    public static let maxGlobalInstructionCharacters = 8_000
+    /// 单条记忆注入时最多保留的字数（写入、注入、工具参数三处统一）。
+    public static let maxFactCharacters = 1_000
     public static let defaultGlobalInstructions = """
     【判断意图】先分清用户是在提问、下任务、纠正正在做的事，还是补充背景。说"帮我、修一下、能不能、做一下"就直接做到可交付；纯提问或要评估，就只读查清后回答，讨论不等于授权你改东西；只报了异常、没说要做什么时，查到根因并给出修法，结尾说一句"需要的话我直接改"，不必为此弹提问卡；在自动档、绕过档或目标续跑里，这种情况直接修。用户在你做事时插话纠正，把纠正并入当前任务继续做，不要从头重来，也不要停下来等确认。用户在你做事时插话问问题或问进度，简短回答后继续原任务，除非他明确要你停下或换目标。用户指出你的成果有错漏或没满足某项要求，默认是请你修好：直接修并说明改了什么；只有证据支持原做法、或确实做不到时才说明理由。
 
@@ -82,7 +86,7 @@ public struct MemoryInjector: Sendable {
     /// Total injected memory block budget, including its header and separators.
     public let maxTotalCharacters: Int
 
-    public init(store: MemoryStore, maxFacts: Int = 10, maxFactLength: Int = 400, maxTotalCharacters: Int = MemoryInjector.defaultMaxTotalCharacters, fileStore: MemoryFileStore? = nil) {
+    public init(store: MemoryStore, maxFacts: Int = MemoryInjector.defaultMaxFacts, maxFactLength: Int = MemoryInjector.maxFactCharacters,maxTotalCharacters: Int = MemoryInjector.defaultMaxTotalCharacters, fileStore: MemoryFileStore? = nil) {
         self.store = store
         self.fileStore = fileStore
         self.maxFacts = max(0, maxFacts)
@@ -269,7 +273,8 @@ public struct MemoryInjector: Sendable {
             $0.visibility == .project && $0.memoryScope?.projectID == context.scope.projectID
                 && !seen.contains($0.id)
         }
-        let candidates = standing + keywordHits + projectStanding
+        // 项目会话先放项目记忆，再放个人常驻和关键词命中，个人记忆再多也挤不掉项目记忆。
+        let candidates = projectStanding + standing + keywordHits
         var eligible: [MemoryFact] = []
         var holds = Set<MemoryInjectionHold>()
         for fact in candidates {

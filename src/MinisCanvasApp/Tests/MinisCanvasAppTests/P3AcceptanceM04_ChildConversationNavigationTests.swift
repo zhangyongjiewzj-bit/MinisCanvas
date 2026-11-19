@@ -126,6 +126,15 @@ struct P3AcceptanceM04_ChildConversationNavigationTests {
         try sessions.saveMessage(
             LLMMessage(role: .assistant, content: "子任务结果"), sessionID: child.id
         )
+        // T1-3：工具调用和结果在记录里已被概括/省略，任务中心要显示工具名，而不只是“已省略”。
+        try sessions.saveMessage(
+            LLMMessage(role: .assistant, content: "[工具调用参数已省略]\n工具：file_read <path>",
+                       toolCalls: [LLMToolCall(id: "call-1", name: "file_read", rawArguments: "{}", arguments: [:])]),
+            sessionID: child.id
+        )
+        try sessions.saveMessage(
+            LLMMessage(role: .tool, content: "[工具结果内容已省略]", toolCallID: "call-1"), sessionID: child.id
+        )
         let locator = ChildTranscriptLocator(
             childSessionID: child.id, parentSessionID: parent.id,
             taskID: task.taskID, parentID: task.parentID,
@@ -154,8 +163,12 @@ struct P3AcceptanceM04_ChildConversationNavigationTests {
         #expect(navigation.parentSessionID == parent.id)
         #expect(navigation.childSessionID == child.id)
         let first = try #require(consumer.childTranscript(navigation: navigation))
-        #expect(first.messages.map(\.roleTitle) == ["任务输入", "子代理"])
-        #expect(first.messages.map(\.content) == ["子任务输入", "子任务结果"])
+        #expect(first.messages.map(\.roleTitle) == ["任务输入", "子代理", "子代理", "工具结果"])
+        #expect(first.messages.map(\.content) == [
+            "子任务输入", "子任务结果",
+            "[工具调用参数已省略]\n工具：file_read <path>",
+            "[工具结果内容已省略] 工具：file_read",
+        ])
 
         let reopenedSessions = SessionStore(directory: sessionsURL)
         let reopenedTasks = try AgentTaskStore(persistenceURL: ledgerURL)

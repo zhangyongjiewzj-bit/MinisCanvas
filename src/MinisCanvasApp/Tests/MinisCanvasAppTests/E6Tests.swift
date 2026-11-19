@@ -315,16 +315,9 @@ struct ApprovalUIBridgingTests {
         // Production rendered actions require 0.5s at each approval stage.
         try await Task.sleep(for: .milliseconds(550))
         let first = center.actionsForPresentedRequest()
+        // 2026-11-16 起 file_write 只需一次点击；重复点击同一张卡仍只能产生一次效果。
         first.approve()
         first.approve()
-        #expect(center.awaitingConfirmation)
-        #expect(!FileManager.default.fileExists(atPath: file.path))
-        #expect(facts.facts.isEmpty && facts.pendingReceipts.isEmpty)
-        #expect(await receipts.values.isEmpty)
-        try await Task.sleep(for: .milliseconds(550))
-        let confirmed = center.actionsForPresentedRequest()
-        confirmed.approve()
-        confirmed.approve()
         try await consume.value
 
         #expect(try Data(contentsOf: file) == Data(marker.utf8))
@@ -358,7 +351,7 @@ struct ApprovalUIBridgingTests {
         #expect(terminal.status == .completed && terminal.terminalTruth?.outcome == .succeeded)
 
         first.approve()
-        confirmed.approve()
+        first.approve()
         #expect(center.pendingRequest == nil)
         #expect(try Data(contentsOf: file) == Data(marker.utf8))
         #expect(await receipts.values == accepted)
@@ -744,12 +737,11 @@ struct ApprovalCancellationCaller346Tests {
         }
         #expect(fixture.center.pendingRequest?.sessionID == sessionB.uuidString)
         #expect(fixture.center.pendingRequest?.callID == "caller346-fresh")
-        #expect(fixture.center.pendingRequest?.requiresSecondConfirmation == true)
-        fixture.center.approvePending()
-        #expect(fixture.center.awaitingConfirmation)
+        // file_write 不是不可逆操作：一次点击即执行（2026-11-16）。
+        #expect(fixture.center.pendingRequest?.requiresSecondConfirmation == false)
         #expect(fixture.executor.executedNames.isEmpty)
         #expect(fixture.recorder.withLock { $0.approvedReceipts } == 0)
-        fixture.center.confirmPending()
+        fixture.center.approvePending()
         #expect(await observe { !chat.isActiveSessionStreaming })
         #expect(fixture.executor.executedNames == ["file_write"],
                 "synthetic provider tool results: \(freshProvider.lastReceivedMessages.map(\.content))")
@@ -794,10 +786,8 @@ struct ApprovalCancellationCaller346Tests {
             return
         }
         let oldIdentity = try #require(chat.activeExecutionIdentity(for: session))
-        fixture.center.approvePending()
-        #expect(fixture.center.awaitingConfirmation)
         #expect(fixture.executor.executedNames.isEmpty)
-        fixture.center.confirmPending()
+        fixture.center.approvePending()
         #expect(await observe { !chat.isActiveSessionStreaming })
         #expect(fixture.executor.executedNames == ["file_write"])
         #expect(fixture.recorder.withLock { $0.approvedReceipts } == 1)
@@ -882,10 +872,8 @@ struct ApprovalCancellationCaller346Tests {
                 await cleanUp(fixture)
                 return
             }
-            fixture.center.approvePending()
-            #expect(fixture.center.awaitingConfirmation)
             #expect(fixture.executor.executedNames.isEmpty)
-            fixture.center.confirmPending()
+            fixture.center.approvePending()
             #expect(await observe { !chat.isActiveSessionStreaming })
             #expect(fixture.executor.executedNames == ["file_write"])
             #expect(fixture.recorder.withLock { $0.approvedReceipts } == 1)

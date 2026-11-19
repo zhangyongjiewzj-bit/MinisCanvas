@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 
 /// Durable ownership and redacted output for background commands, bounded per job.
 struct BackgroundShellPersistence {
@@ -57,10 +58,19 @@ struct BackgroundShellPersistence {
     }
     func records() throws -> [Ownership] {
         try prepare()
+        // 逐条解析：一条记录损坏只跳过它并记日志，其余照常恢复；损坏文件原样保留。
         return try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
-            .map { try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: $0)) }
+            .compactMap { url -> Ownership? in
+                do {
+                    return try JSONDecoder().decode(Ownership.self, from: Data(contentsOf: url))
+                } catch {
+                    Self.log.error("后台命令记录损坏，已跳过：\(url.lastPathComponent, privacy: .public)")
+                    return nil
+                }
+            }
     }
+    private static let log = Logger(subsystem: "com.miniscanvas.core", category: "BackgroundShellPersistence")
     func discardLog(id: String) throws {
         let url = outputURL(id)
         if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }

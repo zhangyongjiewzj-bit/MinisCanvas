@@ -14,6 +14,11 @@ private func mcpUTF8Prefix(_ text: String, maxBytes: Int) -> String {
     return result
 }
 
+private func mcpCharPrefix(_ text: String, maxChars: Int) -> String {
+    guard maxChars > 0 else { return "" }
+    return String(text.prefix(maxChars))
+}
+
 /// The bounded terminal reason shared by tool output, request budgets, and
 /// loop protection.  A terminal reason is deliberately machine-readable and
 /// fail-closed so consumers never have to infer safety from display text.
@@ -42,9 +47,9 @@ public struct ToolTerminalReason: Codable, Equatable, Sendable {
     public static func outputTruncated(maximumCharacters: Int) -> Self {
         Self(
             code: .outputTruncated,
-            message: "MCP output exceeded the "
+            message: "Tool output exceeded the "
                 + String(max(0, maximumCharacters))
-                + "-byte bound"
+                + "-character bound"
         )
     }
 
@@ -76,16 +81,35 @@ public struct BoundedToolOutput: Codable, Equatable, Sendable {
     public let terminalReason: ToolTerminalReason?
 
     public init(text: String, terminalReason: ToolTerminalReason? = nil) {
-        self.text = mcpUTF8Prefix(text, maxBytes: MCPOutputLimiter.defaultMaximumCharacters)
+        self.text = mcpCharPrefix(text, maxChars: MCPOutputLimiter.defaultMaximumCharacters)
         self.terminalReason = terminalReason
     }
 }
 
-/// Deterministic UTF-8 byte bound for text returned by an MCP tool.
+/// Deterministic character bound (not bytes, so Chinese text is not cut three
+/// times earlier than ASCII) for text returned to the model by any tool.
 public enum MCPOutputLimiter {
-    public static let defaultMaximumCharacters = 32_000
+    public static let defaultMaximumCharacters = 100_000
     public static let truncationMarker = "...[truncated]"
     private static let streamedRedactionCarryBytes = 1_024
+    /// Room reserved for the human-readable truncation explanation.
+    private static let truncationNoteReserve = 120
+    private static let truncationNoteMinimumBound = 400
+
+    /// Prefix + explanation of how much was kept + the stable marker. The
+    /// explanation tells the model the total length so it can narrow its request.
+    private static func truncatedText(_ text: String, maximum: Int, totalCharacters: Int? = nil,
+                                      atLeast: Bool = false) -> String {
+        let marker = truncationMarker
+        guard maximum > marker.count else { return mcpCharPrefix("truncated", maxChars: maximum) }
+        guard maximum >= truncationNoteMinimumBound else {
+            return mcpCharPrefix(text, maxChars: maximum - marker.count) + marker
+        }
+        let kept = maximum - marker.count - truncationNoteReserve
+        let total = totalCharacters ?? text.count
+        let note = "\n[输出过长：共\(atLeast ? "超过 " : " ")\(total) 字符，此处只保留前 \(kept) 字符，其余未显示；请缩小范围或分段获取]"
+        return mcpCharPrefix(text, maxChars: kept) + note + marker
+    }
 
     /// Joins streamed MCP text parts without first materializing an
     /// unbounded intermediate string. A bounded carry lets redaction see
@@ -94,8 +118,8 @@ public enum MCPOutputLimiter {
     public static func limit<S: Sequence>(_ segments: S, to maximumCharacters: Int) -> String where S.Element == String {
         let maximum = max(0, maximumCharacters)
         guard maximum > 0 else { return "" }
-        guard maximum > truncationMarker.utf8.count else {
-            return mcpUTF8Prefix("truncated", maxBytes: maximum)
+        guard maximum > truncationMarker.count else {
+            return mcpCharPrefix("truncated", maxChars: maximum)
         }
 
         let sourceBudget = maximum + streamedRedactionCarryBytes
@@ -109,10 +133,10 @@ public enum MCPOutputLimiter {
                 sourceWasTruncated = true
                 break
             }
-            let segment = mcpUTF8Prefix(rawSegment, maxBytes: remaining)
+            let segment = mcpCharPrefix(rawSegment, maxChars: remaining)
             buffered.append(segment)
-            bufferedBytes += segment.utf8.count
-            if segment.utf8.count < rawSegment.utf8.count {
+            bufferedBytes += segment.count
+            if segment.count < rawSegment.count {
                 sourceWasTruncated = true
                 break
             }
@@ -121,24 +145,25 @@ public enum MCPOutputLimiter {
         let joined = buffered.joined()
         let joinedIsJSONShaped = looksLikeJSONDocument(joined)
         let rendered = redactStreamSegments(buffered, joined: joined)
-        let contentLimit = maximum - truncationMarker.utf8.count
-        if sourceWasTruncated, joinedIsJSONShaped {
-            return minimalValidJSON(maxBytes: maximum)
-        }
+        let contentLimit = maximum - truncationMarker.count
         if sourceWasTruncated {
             // The unread suffix could complete a credential that begins in
-            // the bounded carry. Do not publish a prefix whose safety cannot
-            // be proven; the terminal marker is the fail-closed projection.
-            return truncationMarker
+            // the bounded carry. Redact what was read, then publish only the
+            // part that ends well before the carry region, so a credential
+            // straddling the cut is never exposed. The model still gets the
+            // beginning of the output and is told it was cut.
+            var visible = joinedIsJSONShaped ? redactSensitiveJSONPairs(rendered) : rendered
+            visible = String(visible.prefix(max(0, visible.count - streamedRedactionCarryBytes)))
+            return truncatedText(visible, maximum: maximum, totalCharacters: sourceBudget, atLeast: true)
         }
         if let structured = redactSensitiveJSON(joined) {
-            return limitJSON(MCPServerSecretPolicy.redactText(structured), to: maximum)
+            return limitJSON(MCPServerSecretPolicy.redactText(structured), to: maximum, originalCharacters: joined.count)
         }
         if joinedIsJSONShaped {
             return minimalValidJSON(maxBytes: maximum)
         }
-        guard rendered.utf8.count <= contentLimit else {
-            return mcpUTF8Prefix(rendered, maxBytes: contentLimit) + truncationMarker
+        guard rendered.count <= contentLimit else {
+            return truncatedText(rendered, maximum: maximum)
         }
         return rendered
     }
@@ -180,13 +205,10 @@ public enum MCPOutputLimiter {
             preservingSettingsCatalogMetadata: preservingSettingsCatalogMetadata)
         let redacted = MCPServerSecretPolicy.redactText(structuredJSON ?? text)
         if structuredJSON != nil {
-            return limitJSON(redacted, to: maximum)
+            return limitJSON(redacted, to: maximum, originalCharacters: text.count)
         }
-        guard redacted.utf8.count > maximum else { return redacted }
-        guard maximum > truncationMarker.utf8.count else {
-            return mcpUTF8Prefix("truncated", maxBytes: maximum)
-        }
-        return mcpUTF8Prefix(redacted, maxBytes: maximum - truncationMarker.utf8.count) + truncationMarker
+        guard redacted.count > maximum else { return redacted }
+        return truncatedText(redacted, maximum: maximum)
     }
 
     /// Project JSON-shaped remote output before applying the UTF-8 byte bound.
@@ -199,17 +221,55 @@ public enum MCPOutputLimiter {
     /// The built-in file reader preserves source bytes around redacted values.
     /// Other tools retain the established structured MCP projection.
     public static func projectFileRead(_ text: String, to maximumCharacters: Int = defaultMaximumCharacters) -> String {
+        // file_read 的正文每行带 cat -n 行号前缀，整段不再是合法 JSON：先剥掉前缀，按正文做脱敏
+        // （JSON 里的密钥值才会被识别），再把前缀按行接回；行数对不上时宁可不带行号也不带密钥。
+        if let numbered = splitLineNumberedFileRead(text) {
+            let projected = projectFileReadBody(numbered.body, to: maximumCharacters)
+            let lines = projected.components(separatedBy: "\n")
+            let rebuilt: String
+            if lines.count == numbered.prefixes.count {
+                rebuilt = zip(numbered.prefixes, lines).map { $0 + $1 }.joined(separator: "\n") + numbered.trailer
+            } else {
+                rebuilt = projected + numbered.trailer
+            }
+            guard maximumCharacters > 0 else { return "" }
+            return rebuilt.count > maximumCharacters ? truncatedText(rebuilt, maximum: maximumCharacters) : rebuilt
+        }
+        return projectFileReadBody(text, to: maximumCharacters)
+    }
+
+    /// 把 `"   12\t内容"` 形式的逐行输出拆成（前缀数组, 正文, 末尾说明）。
+    /// 只有开头连续的编号行算正文；其后的截断提示等行原样作为末尾说明。没有编号行时返回 nil。
+    private static func splitLineNumberedFileRead(_ text: String) -> (prefixes: [String], body: String, trailer: String)? {
+        let lines = text.components(separatedBy: "\n")
+        var prefixes: [String] = []
+        var bodyLines: [String] = []
+        for line in lines {
+            let scalars = Array(line.unicodeScalars)
+            var index = 0
+            while index < scalars.count, scalars[index] == " " { index += 1 }
+            let digitsStart = index
+            while index < scalars.count, scalars[index].value >= 48, scalars[index].value <= 57 { index += 1 }
+            guard index > digitsStart, index < scalars.count, scalars[index] == "\t" else { break }
+            prefixes.append(String(String.UnicodeScalarView(scalars[...index])))
+            bodyLines.append(String(String.UnicodeScalarView(scalars[(index + 1)...])))
+        }
+        guard !prefixes.isEmpty else { return nil }
+        let trailerLines = lines.dropFirst(prefixes.count)
+        // 末尾说明本应只有截断提示；万一是未编号的正文，也要过一遍通用脱敏。
+        let trailer = trailerLines.isEmpty ? "" : "\n" + MCPServerSecretPolicy.redactText(trailerLines.joined(separator: "\n"))
+        return (prefixes, bodyLines.joined(separator: "\n"), trailer)
+    }
+
+    private static func projectFileReadBody(_ text: String, to maximumCharacters: Int) -> String {
         guard let structured = FileReadJSONProjection.redact(text, sensitiveKey: isSensitiveKey) else {
             return project(text, to: maximumCharacters)
         }
         let maximum = max(0, maximumCharacters)
         guard maximum > 0 else { return "" }
         let redacted = MCPServerSecretPolicy.redactText(structured)
-        guard redacted.utf8.count > maximum else { return redacted }
-        guard maximum > truncationMarker.utf8.count else {
-            return mcpUTF8Prefix("truncated", maxBytes: maximum)
-        }
-        return mcpUTF8Prefix(redacted, maxBytes: maximum - truncationMarker.utf8.count) + truncationMarker
+        guard redacted.count > maximum else { return redacted }
+        return truncatedText(redacted, maximum: maximum)
     }
 
     /// Only the registered built-in settings_catalog result may use this
@@ -231,7 +291,7 @@ public enum MCPOutputLimiter {
     ) -> BoundedToolOutput {
         let projected = limit(text, to: maximumCharacters)
         let redacted = redactSensitiveJSON(text) ?? text
-        let wasTruncated = redacted.utf8.count > max(0, maximumCharacters)
+        let wasTruncated = redacted.count > max(0, maximumCharacters)
         return BoundedToolOutput(
             text: projected,
             terminalReason: wasTruncated
@@ -293,35 +353,50 @@ public enum MCPOutputLimiter {
     }
 
     /// Keep JSON structurally valid when the redacted representation exceeds
-    /// the byte budget. A raw prefix would cut through a string/object and
-    /// publish malformed JSON to the bridge consumer.
-    private static func limitJSON(_ redactedJSON: String, to maximumBytes: Int) -> String {
-        guard redactedJSON.utf8.count > maximumBytes else { return redactedJSON }
-        guard maximumBytes > truncationMarker.utf8.count else { return minimalValidJSON(maxBytes: maximumBytes) }
+    /// the budget. A raw prefix would cut through a string/object and publish
+    /// malformed JSON to the bridge consumer. The wrapper keeps the beginning
+    /// of the document and states the total length.
+    /// `total_characters` reports the original full text length (before redaction
+    /// and re-serialization), so the model knows how much the tool really returned.
+    private static func limitJSON(_ redactedJSON: String, to maximum: Int, originalCharacters: Int? = nil) -> String {
+        guard redactedJSON.count > maximum else { return redactedJSON }
+        let total = originalCharacters ?? redactedJSON.count
+        guard maximum > truncationMarker.count else { return minimalValidJSON(maxBytes: maximum) }
 
-        let base: [String: Any] = ["truncated": true, "preview": ""]
-        guard let baseData = try? JSONSerialization.data(withJSONObject: base, options: [.sortedKeys]) else {
-            return minimalValidJSON(maxBytes: maximumBytes)
+        func render(_ length: Int) -> String? {
+            let candidate: [String: Any] = [
+                "truncated": true, "total_characters": total,
+                "preview": String(redactedJSON.prefix(length))
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: candidate, options: [.sortedKeys]) else {
+                return nil
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            return text.count <= maximum ? text : nil
         }
-        if baseData.count > maximumBytes {
+        guard var best = render(0) else {
             let markerJSON = "\"\(truncationMarker)\""
-            return markerJSON.utf8.count <= maximumBytes
-                ? markerJSON
-                : minimalValidJSON(maxBytes: maximumBytes)
+            return markerJSON.count <= maximum ? markerJSON : minimalValidJSON(maxBytes: maximum)
         }
+        var low = 0, high = min(redactedJSON.count, maximum)
+        while low < high {
+            let mid = (low + high + 1) / 2
+            if let rendered = render(mid) { best = rendered; low = mid } else { high = mid - 1 }
+        }
+        return best
+    }
 
-        var preview = mcpUTF8Prefix(redactedJSON, maxBytes: maximumBytes - baseData.count)
-        while true {
-            let candidate: [String: Any] = ["truncated": true, "preview": preview]
-            if let data = try? JSONSerialization.data(withJSONObject: candidate, options: [.sortedKeys]),
-               data.count <= maximumBytes {
-                return String(decoding: data, as: UTF8.self)
-            }
-            guard !preview.isEmpty else {
-                return String(decoding: baseData, as: UTF8.self)
-            }
-            preview.removeLast()
-        }
+    /// Text-level redaction of `"sensitive_key": value` pairs, for JSON that is
+    /// too large or too cut-off to parse. Values become "[REDACTED]".
+    private static let sensitiveJSONPairExpression: NSRegularExpression? = try? NSRegularExpression(
+        pattern: #"("(?:[^"\\]|\\.)*(?:token|secret|password|authorization|credential|api[_-]?key|access[_-]?key|private[_-]?key|cookie)(?:[^"\\]|\\.)*"\s*:\s*)("(?:[^"\\]|\\.)*"?|[^,}\]\s]+)"#,
+        options: [.caseInsensitive])
+
+    private static func redactSensitiveJSONPairs(_ text: String) -> String {
+        guard let expression = sensitiveJSONPairExpression else { return text }
+        let range = NSRange(text.startIndex..., in: text)
+        return expression.stringByReplacingMatches(
+            in: text, options: [], range: range, withTemplate: "$1\"[REDACTED]\"")
     }
 
     private static func minimalValidJSON(maxBytes: Int) -> String {

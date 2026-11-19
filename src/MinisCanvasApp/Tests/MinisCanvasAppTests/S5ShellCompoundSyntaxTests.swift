@@ -43,7 +43,7 @@ struct S5ShellCompoundSyntaxTests {
     }
 
     @Test func compoundContainingDeniedExecutableIsDenied() {
-        #expect(TerminalGuard.classify("ls && sudo rm -rf /").kind == .denied)
+        #expect(TerminalGuard.classify("ls && halt rm -rf /").kind == .denied)
     }
 
     /// 副作用判据（store 层）：自动提交复合命令不得执行、必须进确认条。
@@ -106,9 +106,9 @@ struct S5AgentShellExecuteCompoundLockTests {
         let theSnapshot = TerminalPolicySnapshot.default
 
         // 判据先于行为：同一条命令在终端与 Agent 共用的唯一 snapshot 上就是
-        // .denied（内嵌 sudo / 内嵌 dd 均由整行 policyWords 捕获）。
+        // .denied（内嵌 halt / 内嵌 dd 均由整行 policyWords 捕获）。
         let battery = [
-            "echo PWN > \(marker(in: root).path); sudo true",
+            "echo PWN > \(marker(in: root).path); halt true",
             "printf seed > \(marker(in: root).path) && dd if=/dev/zero of=\(marker(in: root).path)",
         ]
         for command in battery {
@@ -147,7 +147,7 @@ struct S5AgentShellExecuteCompoundLockTests {
                     "non-denied danger syntax is the confirmation class: \(command)")
         }
         // 内嵌硬拒名则整体 denied，绝不因语法被拒而降格成确认类。
-        #expect(theSnapshot.classify(command: "ls && sudo touch /tmp/s5-marker") == .denied)
+        #expect(theSnapshot.classify(command: "ls && halt touch /tmp/s5-marker") == .denied)
     }
 
     // MARK: 3. 确认类必须逐条落到 per-call approval，gate 不可跳过（重定向锁的后继：审批层）
@@ -243,9 +243,9 @@ struct S5AgentShellExecuteCompoundLockTests {
         let unknownEnvelope = try #require(try JSONSerialization.jsonObject(with: Data(unknownResult.utf8)) as? [String: Any])
         #expect((unknownEnvelope["exit_code"] as? Int) == 127)
 
-        #expect(theSnapshot.classify(command: "sudo ls") == .denied)
+        #expect(theSnapshot.classify(command: "halt ls") == .denied)
         await #expect(throws: ToolExecutorError.shellRejected("command denied by terminal policy")) {
-            _ = try await executor.execute(name: "shell_execute", input: ["command": "sudo ls"])
+            _ = try await executor.execute(name: "shell_execute", input: ["command": "halt ls"])
         }
         // fail-closed throw 不得留下任何执行痕迹。
         #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).isEmpty,

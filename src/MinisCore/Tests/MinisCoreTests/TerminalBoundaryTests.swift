@@ -121,7 +121,7 @@ struct TerminalBoundaryTests {
         #expect(approval.error == TerminalBoundaryError.approvalRequired.rawValue)
         #expect(runner.invocationCount == 0)
 
-        let denied = await boundary.execute(request(command: "sudo ls", context: context(workdir: root)))
+        let denied = await boundary.execute(request(command: "shutdown now", context: context(workdir: root)))
         #expect(denied.error == TerminalBoundaryError.denied.rawValue)
         let unknown = await boundary.execute(request(command: "foobar", context: context(workdir: root)))
         #expect(unknown.error == TerminalBoundaryError.approvalRequired.rawValue)
@@ -139,7 +139,7 @@ struct TerminalBoundaryTests {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let policySnapshot = TerminalPolicySnapshot(settings: TerminalPolicySettings(
-            automaticAllowCommands: ["echo", "sudo"],
+            automaticAllowCommands: ["echo", "halt"],
             confirmationCommands: [],
             userDeniedCommands: ["echo"]
         ).editingConfirmationCommands(["git"]))
@@ -154,7 +154,7 @@ struct TerminalBoundaryTests {
             context: context(workdir: root)
         ))
         let hardDenied = await boundary.execute(request(
-            command: "sudo ls",
+            command: "halt ls",
             context: context(workdir: root)
         ))
         let confirmation = await boundary.execute(request(
@@ -173,15 +173,15 @@ struct TerminalBoundaryTests {
         let root = try makeRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let snapshot = TerminalPolicySnapshot(settings: TerminalPolicySettings(
-            automaticAllowCommands: ["env", "nice", "echo", "open", "printf"],
+            automaticAllowCommands: ["env", "nice", "echo", "reboot", "printf"],
             confirmationCommands: [],
             userDeniedCommands: ["printf"]
         ))
         let runner = CountingTerminalRunner()
         let boundary = TerminalBoundary(policy: policy(root: root, snapshot: snapshot), runner: runner)
         let deniedCommands = [
-            "env open Synthetic.app",
-            "nice -n 2 open Synthetic.app",
+            "env reboot Synthetic.app",
+            "nice -n 2 reboot Synthetic.app",
             "env nice -- printf synthetic",
         ]
         for command in deniedCommands {
@@ -585,6 +585,20 @@ struct TerminalBoundaryTests {
         #expect(configured["PATH"] == "/synthetic-explicit-toolchain:/usr/bin:/bin")
         #expect(configured["BAD=NAME"] == nil)
         #expect(configured["MCP_NUL"] == nil)
+    }
+
+    @Test("local MCP search path keeps login-shell and common toolchain directories without duplicates")
+    func mcpSearchPathMergesLoginPathAndCommonToolDirectories() {
+        let path = ChildProcessEnvironment.mcpSearchPath(
+            loginPath: "/Users/x/.nvm/versions/node/v22/bin:/usr/bin:relative/bin:/opt/homebrew/bin",
+            home: "/Users/x")
+        let entries = path.split(separator: ":").map(String.init)
+        #expect(entries.first == "/Users/x/.nvm/versions/node/v22/bin")
+        #expect(entries.contains("/Users/x/.cargo/bin"))
+        #expect(entries.contains("/Users/x/.volta/bin"))
+        #expect(entries.contains("/Users/x/.local/bin"))
+        #expect(!entries.contains("relative/bin"))
+        #expect(entries.count == Set(entries).count)
     }
 
     @Test("ordinary locale and terminal identifiers survive without importing aliases or startup hooks")
@@ -1114,14 +1128,14 @@ struct ExplicitTerminalConfirmationProvenanceTests {
         #expect(try JSONDecoder().decode(TerminalPolicySnapshot.self,
             from: JSONEncoder().encode(explicit)) == explicit)
         #expect(frozen.classify(command: "git status") == .allowed)
-        #expect(explicit.classify(command: "git status && sudo ls") == .denied)
+        #expect(explicit.classify(command: "git status && halt ls") == .denied)
         var denied = edited
         denied.userDeniedCommands = ["git"]
         #expect(denied.normalized().explicitConfirmationCommands.isEmpty)
         #expect(TerminalPolicySnapshot(settings: denied).classify(command: "git status") == .denied)
-        let hard = edited.editingConfirmationCommands(edited.confirmationCommands + ["sudo"])
-        #expect(!hard.explicitConfirmationCommands.contains("sudo"))
-        #expect(TerminalPolicySnapshot(settings: hard).classify(command: "sudo ls") == .denied)
+        let hard = edited.editingConfirmationCommands(edited.confirmationCommands + ["halt"])
+        #expect(!hard.explicitConfirmationCommands.contains("halt"))
+        #expect(TerminalPolicySnapshot(settings: hard).classify(command: "halt ls") == .denied)
         let removed = edited.editingConfirmationCommands(edited.confirmationCommands.filter { $0 != "git" })
         var allowed = removed
         allowed.automaticAllowCommands.append("git")

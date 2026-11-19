@@ -74,7 +74,9 @@ struct ContextBoundary0715Tests {
         #expect(summaryMessage.content.hasPrefix("<context-summary>"))
         #expect(summaryMessage.content.contains(Provider.summaryConstraint))
         #expect(Array(projection.suffix(3)) == recent)
-        #expect(projection.contains { $0.content.contains(facts[0].receiptID) })
+        // 压缩后只留摘要和最近消息：已成功的回执不再带进上下文。
+        #expect(!projection.contains { $0.content.contains(facts[0].receiptID) })
+        #expect(checkpoint.retentionFacts?.contains { $0.source?.effect != nil } == false)
 
         let next = "Continue the comparison after the right-panel action; keep the original title and do not write files."
         chat.draftText = next
@@ -90,7 +92,7 @@ struct ContextBoundary0715Tests {
         #expect(sent == projection + [LLMMessage(role: .user, content: next)])
         #expect(sent.filter { $0.role == .user && $0.content == next }.count == 1)
         #expect(Array(sent.dropLast().suffix(3)) == recent)
-        #expect(ledger.facts == facts, "retained completed receipt is context, not an instruction to redispatch")
+        #expect(ledger.facts == facts, "the ledger keeps its completed receipt untouched; compaction neither redispatches nor rewrites it")
         let canonical = try #require(fixture.settings.sessionStore.loadSession(id: source.id))
         #expect(canonical.messages.starts(with: source.messages))
         #expect(canonical.messages.filter { $0.role == .user && $0.content == next }.count == 1)

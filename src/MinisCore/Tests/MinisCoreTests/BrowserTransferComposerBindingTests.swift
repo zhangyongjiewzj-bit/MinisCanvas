@@ -32,9 +32,15 @@ struct BrowserTransferComposerBindingTests {
         let allowed = try await wrapped("/synthetic/project/output.txt")
             .execute(callID: "allowed", name: "browser", input: ["action": "screenshot"])
         #expect(allowed == "checked")
-        await #expect(throws: ComposerAuthorizationError.pathOutsideAllowedRoots("/synthetic/other/output.txt")) {
-            _ = try await wrapped("/synthetic/other/output.txt")
-                .execute(callID: "outside", name: "browser", input: ["action": "screenshot"])
+        // 授权根外的普通位置：不再直接拒绝，交给浏览器动作自己的审批卡（卡上显示最终目标路径）。
+        let outside = try await wrapped("/synthetic/other/output.txt")
+            .execute(callID: "outside", name: "browser", input: ["action": "screenshot"])
+        #expect(outside == "checked")
+        // 底线不变：凭据与密钥位置仍直接拒绝。
+        let credential = NSHomeDirectory() + "/.ssh/id_ed25519"
+        await #expect(throws: ComposerAuthorizationError.pathOutsideAllowedRoots(credential)) {
+            _ = try await wrapped(credential)
+                .execute(callID: "credential", name: "browser", input: ["action": "screenshot"])
         }
         #expect(BrowserTransferFileAccessContext.current == nil)
     }

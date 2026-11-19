@@ -237,16 +237,18 @@ struct AnthropicMediaGateConsumerTests {
     }
 
     @Test func toolRoleEnvelopeUnchangedUnderGating() {
-        // Pin: the tool_result fast path (which ignores images exactly as it
-        // always did — agent tool-result images are stripped upstream at the
-        // AgentProvider edge lane 128 wired) is not perturbed by this lane.
+        // 第八版起工具结果可以带图片（对齐 Claude Code：读图片、MCP 截图交给模型）。
+        // 能力闸门照样生效：SVG 不作为图片块发送，tool_result 里保留正文并说明被拒原因。
         var msg = LLMMessage(role: .tool, content: "result text")
         msg.toolCallID = "call_42"
         msg.images = [LLMMessage.ImageAttachment(mimeType: "image/svg+xml", data: svgBytes)]
         let gated = AnthropicProvider.anthropicMessageDict(
             msg, mediaCapabilities: claudeVisionModel.capabilities)
-        let legacy = AnthropicProvider.anthropicMessageDict(msg)
-        #expect(jsonSerialized(gated) == jsonSerialized(legacy))
+        let json = jsonSerialized(gated)
+        #expect(json.contains("\"tool_use_id\":\"call_42\""))
+        #expect(json.contains("result text"))
+        #expect(json.contains("[media-gate]"))
+        #expect(!json.contains("\"type\":\"image\""))
     }
 
     @Test func decisionIsStatelessAcrossModelSwitch() {

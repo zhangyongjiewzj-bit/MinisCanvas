@@ -174,7 +174,7 @@ struct ComposerSlashCommandMenuStateTests {
         #expect(state("help") == .available)
         #expect(state("status") == .available)
         #expect(state("tasks") == .available)
-        #expect(state("compact") == .requiresApproval)
+        #expect(state("compact") == .available) // 手动压缩不弹审批卡，菜单显示可用
         #expect(state("model") == .available) // N05 opens a picker; applying a selection keeps its own gate.
         // Registered under the neutral session: stop needs an in-flight
         // generation, approve needs a pending request, so both stay 阻断 — now
@@ -191,9 +191,9 @@ struct ComposerSlashCommandMenuStateTests {
             sessionState: .init(unavailableReasonsByCommandID:
                 GlobalComposer.missingExecutorReasons(registry: registry)))
         let boundary = try #require(entries.first { $0.id == "boundary.set" })
-        #expect(boundary.state == .blocked(reason: "暂不可用，请在设置→智能体调整自主权上限。"))
+        #expect(boundary.state == .blocked(reason: "暂不可用，请在设置→智能体调整最高模式。"))
         #expect(!boundary.shouldSendOnAccept)
-        #expect(entries.first { $0.id == "compact" }?.state == .requiresApproval)
+        #expect(entries.first { $0.id == "compact" }?.state == .available)
         #expect(entries.first { $0.id == "model" }?.state == .available)
     }
 
@@ -422,7 +422,7 @@ struct ComposerSlashVocabularyDerivationTests {
         #expect(rows.count == SlashRegistryExpectations.canonicalComposerIDs().count)
         for metadata in CommandRegistry.composerCommandMetadata {
             let state = rows[metadata.id]?.state
-            if metadata.requiresPolicyApproval {
+            if metadata.requiresPolicyApproval && metadata.id != "compact" {
                 #expect(state == .requiresApproval,
                         "/\(metadata.id) 的审批态未由注册表投影")
             } else {
@@ -477,5 +477,70 @@ struct ComposerSlashVocabularyDerivationTests {
         #expect(!source.contains("\"memory.propose\""))
         #expect(!source.contains("\"provider.use\""))
         #expect(!source.contains("\"boundary.set\""))
+    }
+}
+
+// 自定义斜杠命令（含 /init）接入斜杠菜单与发送。
+@Suite("自定义斜杠命令菜单")
+struct CustomSlashCommandMenuTests {
+    private func sample() -> CustomSlashCommand {
+        CustomSlashCommand(name: "lint", description: "审查改动", argumentHint: "[文件]",
+                           source: .project, template: "请审查 $ARGUMENTS")
+    }
+
+    @Test @MainActor func customCommandsAppearAfterBuiltInRowsWithSourceAndHint() throws {
+        let registry = SlashRegistryExpectations.routedComposerRegistry()
+        let commands = CustomSlashCommandLoader.builtinPromptCommands + [sample()]
+        let rows = ComposerSlashCommandMenu.entries(
+            matching: "/", registry: registry, customCommands: commands)
+        let review = try #require(rows.first { $0.id == "lint" })
+        #expect(review.customCommand?.source == .project)
+        #expect(review.descriptor.argumentSummary == "[文件]")
+        #expect(review.state == .available)
+        #expect(rows.contains { $0.id == "init" })
+        let builtinCount = ComposerSlashCommandMenu.entries(matching: "/", registry: registry).count
+        #expect(rows.prefix(builtinCount).allSatisfy { $0.customCommand == nil })
+    }
+
+    @Test @MainActor func acceptingCustomRowSendsOnlyWithoutArgumentHintAndKeepsTypedArguments() throws {
+        let registry = SlashRegistryExpectations.routedComposerRegistry()
+        let rows = ComposerSlashCommandMenu.entries(
+            matching: "/", registry: registry,
+            customCommands: CustomSlashCommandLoader.builtinPromptCommands + [sample()])
+        let initRow = try #require(rows.first { $0.id == "init" })
+        let reviewRow = try #require(rows.first { $0.id == "lint" })
+        let initAccepted = GlobalComposer.acceptedSlashDraft(current: "/in", entry: initRow, registry: registry)
+        #expect(initAccepted.text == "/init" && initAccepted.shouldSend)
+        let bare = GlobalComposer.acceptedSlashDraft(current: "/lin", entry: reviewRow, registry: registry)
+        #expect(bare.text == "/lint " && !bare.shouldSend)
+        let typed = GlobalComposer.acceptedSlashDraft(current: "/lint a.swift", entry: reviewRow, registry: registry)
+        #expect(typed.text == "/lint a.swift" && typed.shouldSend)
+    }
+
+    @Test @MainActor func customCommandWithArgumentPlaceholderOnlyCompletesWithTrailingSpace() throws {
+        let registry = SlashRegistryExpectations.routedComposerRegistry()
+        let command = CustomSlashCommand(name: "fixit", description: "修复", source: .user, template: "修复 $1")
+        let rows = ComposerSlashCommandMenu.entries(matching: "/fix", registry: registry, customCommands: [command])
+        let row = try #require(rows.first { $0.id == "fixit" })
+        let accepted = GlobalComposer.acceptedSlashDraft(current: "/fix", entry: row, registry: registry)
+        #expect(accepted.text == "/fixit " && !accepted.shouldSend)
+    }
+
+    @Test func customCommandExpandsArgumentsIntoTheMessage() {
+        #expect(sample().expand(arguments: "a.swift") == "请审查 a.swift")
+    }
+
+    @Test @MainActor func slashCommandDirectoryIsScannedInTheBackgroundAndSubmitUsesTheResult() async {
+        let chat = ChatStore()
+        await chat.reloadCustomSlashCommandsInBackground()
+        #expect(chat.customSlashCommands.contains { $0.name == "init" })
+        #expect(chat.expandedCustomSlashCommand(for: "/init") == CustomSlashCommandLoader.initPrompt)
+    }
+
+    @Test @MainActor func initCommandExpandsToItsPromptAndBuiltInCommandsStayUntouched() {
+        let chat = ChatStore()
+        #expect(chat.expandedCustomSlashCommand(for: "/init") == CustomSlashCommandLoader.initPrompt)
+        #expect(chat.expandedCustomSlashCommand(for: "/help") == nil)
+        #expect(chat.expandedCustomSlashCommand(for: "普通消息") == nil)
     }
 }

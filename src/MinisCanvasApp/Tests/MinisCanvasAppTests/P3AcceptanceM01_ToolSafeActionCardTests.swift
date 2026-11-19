@@ -139,4 +139,14 @@ struct P3AcceptanceM01_ToolSafeActionCardTests {
         #expect(hidden.summary == "目标未记录")
         #expect(!hidden.accessibilityLabel.contains("SECRET_VALUE"))
     }
+
+    @Test func toolTargetShowsFullCommandPathAndSearchPattern() {
+        #expect(ToolTargetDisplayStore.display(tool: "shell_execute", input: ["command": "git log --oneline -n 5 | head"])
+            == "git log --oneline -n 5 | head")
+        #expect(ToolTargetDisplayStore.display(tool: "file_read", input: ["path": "/Users/me/work/src/a.swift"])
+            == "src/a.swift")
+        #expect(ToolTargetDisplayStore.display(tool: "file_grep", input: ["pattern": "TODO", "path": "/Users/me/work"])
+            == "TODO · me/work")
+        #expect(ToolTargetDisplayStore.display(tool: "file_glob", input: ["pattern": "*.swift"]) == "*.swift")
+    }
 }

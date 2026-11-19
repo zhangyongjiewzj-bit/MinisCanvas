@@ -145,6 +145,8 @@ final class AppLifecycleGuard {
         bridge?.stopProductionSpeechOutput()
         // Chat owns the shared DraftStore in the packaged Phase 3 lane;
         // reading `bridge.canvas` here would construct or require Canvas on exit.
+        // 会话写盘在后台串行队列；退出前等它写完，避免丢最后一次变更。
+        bridge?.chat.flushPendingSessionPersistence()
         let didFlushLongDrafts = bridge?.chat.flushPendingDraftForTermination() ?? true
         let didFlush = (bridge?.chat.draftStore?.flushAll() ?? true) && didFlushLongDrafts
         if didFlush {
@@ -286,7 +288,7 @@ enum ProductionOrchestrationDefaults {
         guard !profile.isDisposable || isolatedDeletionSettingsAreOwned(settings, profile: profile) else { return }
         settings.onFileAccessSettingsChanged = { [weak bridge, weak settings] in
             guard let bridge, let settings else { return }
-            attachCurrentProductionConfiguration(
+            settings.pendingFileAccessAttachment = attachCurrentProductionConfiguration(
                 to: bridge,
                 settings: settings,
                 profile: profile,
@@ -429,6 +431,8 @@ enum ProductionOrchestrationDefaults {
         bridge.webFetchNetworkConfigurationProvider = { @MainActor [settings] expected in
             settings.networkDomainConfigurationSnapshot(expectedDefaults: expected)
         }
+        bridge.p03CleanupAppController.enablePersistence(
+            at: profile.rootDirectory.appendingPathComponent("child-worktree-residuals-v1.json"))
         bridge.childWorktreeRootProvider = {
             let root = try GitChildWorktreeRoot.appManaged(
                 profile: P03RuntimeWorktreeProfile(profile: profile)
@@ -607,6 +611,9 @@ final class MinisCanvasAppDelegate: NSObject, NSApplicationDelegate {
     var onUserQuit: (@MainActor () -> Void)?
     var onSystemTermination: (@MainActor () -> Void)?
     var prepareToolTermination: (@MainActor () -> Task<Void, Never>?)?
+    /// 正在进行的工作项数量（回复、后台命令、运行中的定时任务）；大于 0 时退出前先确认。
+    var activeWorkCount: (@MainActor () -> Int)?
+    private var systemQuitInProgress = false
     private let toolTerminationDrain = AppToolTerminationDrain()
     private var quitAppleEventRouter: AppQuitAppleEventRouter?
 
@@ -617,12 +624,15 @@ final class MinisCanvasAppDelegate: NSObject, NSApplicationDelegate {
                 else { NSApplication.shared.terminate(nil) }
             },
             onSystemQuit: { [weak self] in
+                self?.systemQuitInProgress = true
                 self?.onSystemTermination?()
                 NSApplication.shared.terminate(nil)
             }
         )
         quitAppleEventRouter = router
         router.install()
+        // 上次转写时退出或崩溃留下的音频临时目录（里面是用户音频原文）。
+        Task.detached(priority: .utility) { AudioTranscriber.removeLeftoverTemporaryDirectories() }
     }
     /// 正常退出回调（willTerminate 恒在主线程投递，调用侧经 assumeIsolated 回 MainActor）
     var onWillTerminate: (@MainActor () -> Void)?
@@ -636,6 +646,16 @@ final class MinisCanvasAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if toolTerminationDrain.isWaiting { return .terminateLater }
+        // 对齐 Claude Code：有进行中的工作时，退出前确认；关机、注销等系统退出不拦。
+        if !systemQuitInProgress, let count = activeWorkCount?(), count > 0 {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "有 \(count) 项正在进行，确定退出吗？"
+            alert.informativeText = "退出会中止正在进行的回复、后台命令和定时任务。取消后可等它们结束再退出。"
+            alert.addButton(withTitle: "退出")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
         guard let work = prepareToolTermination?() else { return .terminateNow }
         toolTerminationDrain.request(start: { completed in
             Task { await work.value; completed() }
@@ -651,6 +671,7 @@ final class MinisCanvasAppDelegate: NSObject, NSApplicationDelegate {
         onUserQuit = nil
         onSystemTermination = nil
         prepareToolTermination = nil
+        activeWorkCount = nil
         MainActor.assumeIsolated {
             onWillTerminate?()
         }
@@ -1129,6 +1150,9 @@ struct MinisCanvasAppMain: App {
     @Environment(\.openWindow) private var openWindow
     @State private var bridge: BridgeStore
     @State private var settingsCenter: SettingsCenter
+    /// 流畅度第四轮：主题 token 提供者只建一次（原先根视图每次求值都新建，
+    /// 环境值身份变化会让所有读主题的视图重算，且每次构造都注册系统外观观察）。
+    @State private var themeProvider: ThemeTokenProvider
     /// AJ-57：共享快捷键 Store（Canvas 与设置窗口用同一实例，避免内存不同步）。
     @State private var shortcutStore: ShortcutStore
     /// 波4：技能管理 Store（设置窗口「技能」分区数据源）。
@@ -1338,6 +1362,9 @@ struct MinisCanvasAppMain: App {
         let keychain = deepSeekFieldComposition?.keychain ?? (bootstrapFailure == nil && profile.mode == .production
             ? profile.makeProductionKeychainStore()
             : profile.makeKeychainStore())
+        // ChatGPT account sign-in shares the app's Keychain; the provider and readiness
+        // probes fetch the live access token from this session.
+        ChatGPTAccountSessions.install(ChatGPTAccountSession(keychain: keychain))
         let logManager = profile.makeLogManager()
         // Explicit disposable field fixture only, before sharing this logger with any consumer.
         // Existing file bytes are established by a normal append; synthetic severity samples
@@ -1383,7 +1410,7 @@ struct MinisCanvasAppMain: App {
                     arguments: CommandLine.arguments
                 )
             } catch {
-                sessionFieldPreparationError = error.localizedDescription
+                sessionFieldPreparationError = UserFacingErrorText.describe(error)
             }
         }
         let journeyReadinessTransport = DeepSeekEnvironmentPackageFieldBootstrap.journeyReadinessTransport(
@@ -1423,6 +1450,7 @@ struct MinisCanvasAppMain: App {
             }
         }
         _settingsCenter = State(initialValue: settings)
+        _themeProvider = State(initialValue: ThemeTokenProvider(center: settings))
         _shortcutStore = State(initialValue: store)
         let skillsStore = SkillsStore(
 
@@ -1587,6 +1615,19 @@ struct MinisCanvasAppMain: App {
                 store: schedulerStore, bridge: bridge, settings: settings
             )
         )
+        // 新建定时任务时从列表选会话：会话列表与当前会话由这里注入，回合号自动取最新。
+        SchedulerTaskPrefillInbox.shared.sessionOptions = { [weak bridge] in
+            guard let chat = bridge?.chat else { return [] }
+            return chat.sessions.map { session in
+                let scope = session.projectID.map { MemoryScope(sessionID: session.id.uuidString, projectID: $0) }
+                return SchedulerSessionOption(
+                    id: session.id, title: session.title, projectID: session.projectID,
+                    projectName: session.projectName,
+                    userTurnCount: session.messages.filter { $0.role == .user }.count,
+                    projectRoot: scope.flatMap { $0.isValid ? chat.trustedProjectRootProvider?($0) : nil })
+            }
+        }
+        SchedulerTaskPrefillInbox.shared.currentSessionID = { [weak bridge] in bridge?.chat.activeSessionID }
         // The same readiness store remains the sole chat readiness fact source.
         bridge.chat.onProviderLaunchSnapshotChanged = { [weak settings] snapshot in
             settings?.updateProviderLaunchSnapshot(snapshot)
@@ -1811,7 +1852,7 @@ struct MinisCanvasAppMain: App {
                 productionBootstrapStarted = false
                 return
             } catch {
-                asynchronousFieldError = error.localizedDescription
+                asynchronousFieldError = UserFacingErrorText.describe(error)
                 return
             }
         }
@@ -1832,7 +1873,15 @@ struct MinisCanvasAppMain: App {
         }
         schedulerRuntime.start()
         ResidentLifecycleController.shared.start(openMainWindow: {
-            openWindow(id: "miniscanvas.main")
+            // 菜单栏“打开 MinisCanvas”：已有主窗口就激活它，不再多开一个窗口。
+            if let window = NSApplication.shared.windows.first(where: {
+                $0.identifier?.rawValue.hasPrefix("miniscanvas.main") == true
+            }) {
+                if window.isMiniaturized { window.deminiaturize(nil) }
+                window.makeKeyAndOrderFront(nil)
+            } else {
+                openWindow(id: "miniscanvas.main")
+            }
             NSApplication.shared.activate(ignoringOtherApps: true)
         }, onWake: {
             schedulerRuntime.resumeAfterWake()
@@ -1960,6 +2009,13 @@ struct MinisCanvasAppMain: App {
         let personaChat = bridge.chat
         settingsCenter.onPersonaSettingsChanged = { [weak personaChat] persona, enabled in
             personaChat?.restorePersona(persona, enabled: enabled)
+        }
+        // F1-01 / F1-09：供应商改名迁移会话绑定；删除前列出仍在使用它的会话。
+        settingsCenter.onProviderRenamed = { [weak personaChat] oldName, newName in
+            personaChat?.migrateSessionProviderBindings(fromProviderName: oldName, to: newName)
+        }
+        settingsCenter.providerDependentSessionTitles = { [weak personaChat] name in
+            personaChat?.sessionTitlesBound(toProviderName: name) ?? []
         }
         // Saved Composer defaults come from SettingsCenter. The active
         // Composer selection is temporary.
@@ -2147,6 +2203,7 @@ struct MinisCanvasAppMain: App {
         bridge.chat.memoryInjector = MemoryInjector(store: settingsCenter.memoryStore, fileStore: settingsCenter.memoryFileStore)
         bridge.chat.memoryEnabledProvider = { settingsCenter.memoryEnabled }
         bridge.chat.globalInstructionsEnabledProvider = { settingsCenter.globalInstructionsEnabled }
+        bridge.chat.backgroundAutoContinueEnabledProvider = { settingsCenter.backgroundAutoContinueEnabled }
         let processMemoryPrincipal = ProcessUIDMemoryPrincipalSource.production
         bridge.chat.memoryTrustedPrincipalProvider = {
             processMemoryPrincipal.trustedPrincipal()
@@ -2201,7 +2258,7 @@ struct MinisCanvasAppMain: App {
         if let idx = args.firstIndex(of: "--open-url"),
            args.indices.contains(idx + 1),
            let url = URL(string: args[idx + 1]) {
-            DeepLinkRouter.shared.handle(url: url)
+            bridge.deepLinkHandler.handleExternal(url: url)
         }
         if chatScrollFieldFixture {
             await ChatScrollAsyncFieldFixture.run(profile: runtimeProfile, chat: bridge.chat)
@@ -2227,7 +2284,7 @@ struct MinisCanvasAppMain: App {
             } catch is CancellationError {
                 return
             } catch {
-                asynchronousFieldError = error.localizedDescription
+                asynchronousFieldError = UserFacingErrorText.describe(error)
             }
         }
         if outputFieldFixture {
@@ -2245,7 +2302,7 @@ struct MinisCanvasAppMain: App {
             } catch is CancellationError {
                 return
             } catch {
-                asynchronousFieldError = error.localizedDescription
+                asynchronousFieldError = UserFacingErrorText.describe(error)
             }
         }
     }
@@ -2357,14 +2414,16 @@ struct MinisCanvasAppMain: App {
                 .tint(settingsCenter.effectiveThemeAccentColor)
                 // C3-2：两层主题 token（palette → semantic）注入；Provider 无状态，
                 // 直接读 settingsCenter 的 @Observable 属性，改主题/外观即刷新。
-                .environment(\.themeTokens, ThemeTokenProvider(center: settingsCenter))
+                .environment(\.themeTokens, themeProvider)
                 .environment(\.typographyTokens, TypographyTokenProvider(center: settingsCenter))
                 // FONTPARITY-012：机制级字号比例随 token 一起注入，布局预留宽度
                 // 通过该环境值消费，不在各表面重复推导 base/14。
                 .environment(\.typographyContentScale, TypographyTokenProvider(center: settingsCenter).contentScale)
                 // E9：应用已运行时收到 miniscanvas:// URL
                 .onOpenURL { url in
-                    DeepLinkRouter.shared.handle(url: url)
+                    Task { @MainActor in
+                        bridge.deepLinkHandler.handleExternal(url: url)
+                    }
                 }
                 // AJ-61：设置中心改 .sheet 呈现（替代独立设置窗口：全屏空间下不再退全屏；
                 // 工具栏齿轮 / ⌘, / 深链 settings 三入口统一触发同一 isSettingsPresented state）。
@@ -2385,12 +2444,16 @@ struct MinisCanvasAppMain: App {
                 }) {
                     SettingsView(center: settingsCenter, shortcutStore: shortcutStore, skillsStore: skillsStore, schedulerStore: schedulerStore, schedulerRuntime: schedulerRuntime, initialPageID: settingsInitialPageID, chatStore: bridge.chat, approvalCenter: bridge.approvalCenter)
                         .observingMinisIconRenders(using: iconRenderTelemetry, scene: .settingsSheet)
+                        // F3-01：命令超时只在设置里改；改了立即作用于执行器（下一次命令起生效），不用重启。
+                        .onChange(of: settingsCenter.shellCommandTimeoutSeconds) { _, _ in
+                            bridge.refreshProductionAgentSettings(settingsCenter.settings.agent)
+                        }
                         .environment(\.externalSessionAuthorizationComposition, externalSessionAuthorization)
                         .environment(shortcutStore)
                         .font(TypographyTokenProvider(center: settingsCenter).body)
                         .environment(settingsCenter)
                         // C3-2：设置面板同样注入 token provider（主题 Picker 预览等可引用）。
-                        .environment(\.themeTokens, ThemeTokenProvider(center: settingsCenter))
+                        .environment(\.themeTokens, themeProvider)
                         .environment(\.typographyTokens, TypographyTokenProvider(center: settingsCenter))
                         .environment(\.typographyContentScale, TypographyTokenProvider(center: settingsCenter).contentScale)
                         // D-SETTINGS-17（可调整尺寸）：设置入口呈现不得用固定宽高钉死
@@ -2476,6 +2539,10 @@ struct MinisCanvasAppMain: App {
                         general: settingsCenter.settings.general
                     )
                 }
+                // 连接检查通过后，演示模式自动切到第一个已就绪的模型。
+                .onChange(of: bridge.chat.hasReadyChatModel) { _, ready in
+                    if ready { _ = bridge.chat.adoptFirstReadyChatModelIfDemo() }
+                }
             }
           }
           .task(id: settingsCenter.systemNotifications?.canDeliverGoalReminders == true
@@ -2500,11 +2567,50 @@ struct MinisCanvasAppMain: App {
                   _ = settingsCenter.systemNotifications?.cancelForApplicationExit()
                   terminationRequest.cancelForSystemTermination()
               }
+              // 自定义子智能体（.claude/agents）：按当前会话已信任的项目目录读取。
+              let subagentChat = bridge.chat
+              if subagentChat.externalSkillCatalog == nil {
+                  // 外部技能根（~/.claude/skills 等）：只读；确认记录放在 App 技能库目录的旁边。
+                  subagentChat.externalSkillCatalog = MinisCore.ExternalSkillCatalog(
+                      confirmationsURL: MinisCore.SkillStore.defaultSkillsRoot()
+                          .deletingLastPathComponent()
+                          .appendingPathComponent("external-skill-confirmations.json"))
+              }
+              if subagentChat.customSubagentConfirmations == nil {
+                  // 项目 .claude/agents 里的子智能体：内容经用户确认后才可用，记录放在技能库目录旁边。
+                  subagentChat.customSubagentConfirmations = MinisCore.CustomSubagentConfirmationStore(
+                      url: MinisCore.SkillStore.defaultSkillsRoot()
+                          .deletingLastPathComponent()
+                          .appendingPathComponent("custom-subagent-confirmations.json"))
+              }
+              // 项目 .mcp.json 的批准记录文件：启动时就建常驻实例，让它从一开始受保护。
+              _ = MinisCore.MCPProjectConfigStore.resident(
+                  directory: settingsCenter.mcpManager.fileURL.deletingLastPathComponent())
+              MinisCore.ExternalSkillReader.install { sessionID in
+                  await MainActor.run { subagentChat.externalSkillReadContext(forSession: sessionID) }
+              }
+              MinisCore.CustomSubagentCatalog.install {
+                  // 按发起派发的会话找项目，不看界面上当前打开的会话。
+                  let sessionID = MinisCore.AgentExecutionContext.current?.currentConversationID
+                  return await MainActor.run { subagentChat.customSubagentDefinitions(forSession: sessionID) }
+              }
+              appDelegate.activeWorkCount = {
+                  var count = 0
+                  if bridge.chat.hasStreamingTasksForSafety { count += 1 }
+                  if bridge.hasActiveChildExecutions { count += 1 }
+                  count += BackgroundShellRegistry.shared.runningCount
+                  if ResidentLifecycleController.shared.isSchedulerExecuting { count += 1 }
+                  return count
+              }
               appDelegate.prepareToolTermination = {
                   let notificationDrain = settingsCenter.systemNotifications?.cancelForApplicationExit()
                   let toolDrain = bridge.prepareProductionToolsForApplicationExit()
-                  guard notificationDrain != nil || toolDrain != nil || BackgroundShellRegistry.shared.hasRunning else { return nil }
+                  let hookRuntime = MinisCore.HookRuntime.installed
+                  guard notificationDrain != nil || toolDrain != nil || BackgroundShellRegistry.shared.hasRunning
+                        || hookRuntime?.knownSessionIDs().isEmpty == false else { return nil }
                   return Task {
+                      // 对齐 Claude Code：退出时同步等待 SessionEnd 钩子，最多约 5 秒。
+                      await hookRuntime?.fireSessionEndAtExit(timeout: 5)
                       _ = await notificationDrain?.value
                       _ = await toolDrain?.value
                       _ = await BackgroundShellRegistry.shared.terminateAll(reason: .applicationExit, waitSeconds: 3)
@@ -2695,7 +2801,7 @@ private struct SessionCommands: Commands {
                 Button("发送消息", action: handleSessionCommandTap)
                     .disabled(
                         bootstrapFailure != nil
-                            || bridge.chat.draftText.trimmingCharacters(in: .whitespaces).isEmpty
+                            || !bridge.chat.hasNonBlankDraft
                     )
             }
         }

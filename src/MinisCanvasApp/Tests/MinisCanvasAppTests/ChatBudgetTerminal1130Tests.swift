@@ -311,6 +311,8 @@ struct ChatBudgetTerminal1130Tests {
                 in: window, exactText: "预算已超限"))
             try #require(NativeConsumerOwnedAX.role(overviewStatus) == .staticText)
             let resetByIdentifier = NativeConsumerOwnedAX.find(in: window, identifier: "chat-inspector.budget-reset")
+            _ = resetByIdentifier
+            // 输入区上限提示条的按钮叫"重置预算"，与检查器的"重置本会话预算"不同名，按标签唯一定位。
             let reset = try #require(NativeConsumerOwnedAX.find(
                 in: window, label: "重置本会话预算", pressable: true))
             try #require(NativeConsumerOwnedAX.role(reset) == .button

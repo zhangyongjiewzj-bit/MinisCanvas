@@ -1227,4 +1227,36 @@ struct O16ProviderDisplayNameTests {
         #expect(roundTrip.providerDisplayName == "中文 Provider")
         #expect(roundTrip.id == original.id && roundTrip.name == original.name)
     }
+
+    /// F1-02：文件存在但读不出来时不当空表，后续保存不得覆盖原文件。
+    @Test func unreadableMetadataIsNotTreatedAsEmptyAndIsNeverOverwritten() throws {
+        let dir = try makeTempDir("unreadable-metadata")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent(EnvVarStore.fileName)
+        let damaged = Data("[{\"name\": \"KEEP_ME\", \"value\": ".utf8)
+        try damaged.write(to: fileURL)
+        let defaults = makeIsolatedDefaults("unreadable-metadata")
+        let store = EnvVarStore(
+            directory: dir,
+            keychain: KeychainStore(backing: KeychainStoreInMemoryBacking()),
+            privacyStore: EnvVarPrivacyStore(defaults: defaults)
+        )
+        #expect(store.metadataUnreadable)
+        #expect(!store.setEnvVar(name: "NEW_VALUE", value: "x", isSecret: false))
+        #expect(store.lastPersistenceError == .metadataWriteFailed)
+        #expect(try Data(contentsOf: fileURL) == damaged)
+    }
+
+    @Test func missingMetadataFileIsAnOrdinaryEmptyStore() throws {
+        let dir = try makeTempDir("missing-metadata")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let defaults = makeIsolatedDefaults("missing-metadata")
+        let store = EnvVarStore(
+            directory: dir,
+            keychain: KeychainStore(backing: KeychainStoreInMemoryBacking()),
+            privacyStore: EnvVarPrivacyStore(defaults: defaults)
+        )
+        #expect(!store.metadataUnreadable)
+        #expect(store.setEnvVar(name: "NEW_VALUE", value: "x", isSecret: false))
+    }
 }

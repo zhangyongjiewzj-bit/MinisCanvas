@@ -57,7 +57,7 @@ private final class NativeActionOrderingFixture: NSObject {
         styleMask: [.titled], backing: .buffered, defer: false)
     let button = ComposerPolicyIdentityButton(frame: NSRect(x: 20, y: 20, width: 160, height: 30),
         pullsDown: false)
-    let menu = ComposerPolicyChoiceMenu(title: "Composer 工作量")
+    let menu = ComposerPolicyChoiceMenu(title: "工作量")
     private(set) var itemActions = 0
     private(set) var forwardedActions = 0
     private(set) var capturedIndex: Int?

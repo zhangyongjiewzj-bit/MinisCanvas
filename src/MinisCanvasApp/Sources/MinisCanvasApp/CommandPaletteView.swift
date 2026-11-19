@@ -172,16 +172,19 @@ struct CommandPaletteView: View {
     /// 都由 `MinisCore.CommandParser` 提取参数，命中则「命令 + 参数」一起下发；
     /// 解析未命中（纯过滤词）才回落到当前 top-1 结果（无参数）。
     /// 抽成纯静态函数便于无 SwiftUI 宿主的单测（F22CommandArgTests）。
+    /// `category` 给出时（侧栏选了分类），解析出的命令必须属于这个分类才采用；否则（例如在“日志”
+    /// 分类里输入“设置日志”被解析成“设置环境变量 + 参数”）回车执行列表里看得到的第一项。
     static func resolveSubmission(
         query: String,
         registry: CommandRegistry,
-        fallbackID: String?
+        fallbackID: String?,
+        category: CommandCategory? = nil
     ) -> PaletteSubmission? {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             // 显式限定 MinisCore.CommandParser —— App 模块内另有同名画布指令解析器
             let parsed = MinisCore.CommandParser().parse(trimmed, registry: registry)
-            if let command = parsed.command {
+            if let command = parsed.command, category.map({ $0 == command.category }) ?? true {
                 return PaletteSubmission(id: command.id, args: parsed.args)
             }
         }
@@ -201,10 +204,13 @@ struct CommandPaletteView: View {
     }
 
     private func runSubmittedQuery() {
+        // 回车前先同步重算：防抖还没到时，别用上一次的结果当 top-1。
+        model.refresh()
         guard let submission = Self.resolveSubmission(
             query: model.query,
             registry: model.registry,
-            fallbackID: firstResult?.id
+            fallbackID: firstResult?.id,
+            category: model.selectedCategory
         ) else { return }
         bridge.runCommand(id: submission.id, args: submission.args)
     }
@@ -257,7 +263,7 @@ struct CommandPaletteView: View {
                 // Favorite state uses the star/star.fill pair, which has no stable MinisIcon case.
                 Image(systemName: command.isFavorite ? "star.fill" : "star")
                     .font(.system(size: 11))
-                    .foregroundStyle(command.isFavorite ? Color.yellow : Color.secondary.opacity(0.5))
+                    .foregroundStyle(command.isFavorite ? (theme?.aj38.accent.swiftUIColor ?? Color.yellow) : Color.secondary.opacity(0.5))
                     .frame(width: 18)
             }
             .buttonStyle(.plain)

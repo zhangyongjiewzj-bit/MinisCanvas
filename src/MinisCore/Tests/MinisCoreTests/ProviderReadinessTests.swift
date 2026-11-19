@@ -8,7 +8,8 @@ struct ProviderReadinessTests {
         let secretLikeText = "Authorization: Bearer fixture-secret"
         let cases: [(ProviderReadinessFailureCategory, String, String)] = [
             (.unauthorized, "认证", "Authentication"),
-            (.permissionDenied, "认证", "Authentication"),
+            // S1-07：403 可能是权限，也可能是余额/额度不足，文案合并说明。
+            (.permissionDenied, "访问权限", "permission"),
             (.notFound, "端点", "endpoint"),
             (.timeout, "超时", "timed out"),
             (.rateLimited, "限流", "rate limited"),

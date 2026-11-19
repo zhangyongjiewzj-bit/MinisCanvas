@@ -4,10 +4,12 @@ import MinisCore
 /// Wire support remains owned by the provider; this projection uses only the
 /// public catalog's declared bound and never copies a model mapping table.
 enum ComposerThinkingSelection {
+    /// 选项从请求映射表推导：只列映射表会写入请求体的档位；
+    /// 没有映射的模型只给“模型默认”，不再列选了也无效的 7 档。
     static func options(modelID: String?) -> [ThinkingLevel?] {
-        [nil] + ThinkingLevel.allCases.filter { level in
-            guard let modelID,
-                  let maximum = ThinkingLevelCatalog.declaredMaxLevel(for: modelID) else { return true }
+        guard let modelID else { return [nil] }
+        return [nil] + ThinkingLevelCatalog.requestableLevels(for: modelID).filter { level in
+            guard let maximum = ThinkingLevelCatalog.declaredMaxLevel(for: modelID) else { return true }
             return level <= maximum
         }.map(Optional.some)
     }
@@ -18,9 +20,9 @@ enum ComposerThinkingSelection {
         return min(requested, maximum)
     }
 
-    static func title(_ level: ThinkingLevel?) -> String {
-        guard let level else { return "思考：模型默认" }
-        let label: String = switch level {
+    /// 档位的中文名（输入框菜单、设置页、帮助文案共用）。
+    static func label(_ level: ThinkingLevel) -> String {
+        switch level {
         case .off: "关闭"
         case .low: "低"
         case .medium: "中"
@@ -29,7 +31,11 @@ enum ComposerThinkingSelection {
         case .max: "最高"
         case .ultra: "极高"
         }
-        return "思考：\(label)"
+    }
+
+    static func title(_ level: ThinkingLevel?) -> String {
+        guard let level else { return "思考：模型默认" }
+        return "思考：\(label(level))"
     }
 
     static func help(modelID: String?) -> String {
@@ -38,6 +44,6 @@ enum ComposerThinkingSelection {
               let maximum = ThinkingLevelCatalog.declaredMaxLevel(for: modelID) else {
             return common + " 当前模型未声明目录上限。"
         }
-        return common + " 当前目录上限：\(maximum.displayName)；切换模型时超过上限的请求按此上限捕获。"
+        return common + " 当前目录上限：\(label(maximum))；切换模型时超过上限的请求按此上限捕获。"
     }
 }

@@ -43,7 +43,7 @@ struct PromptOnlyUsageOccupancy_R6_Tests {
         chat.draftText = text
         chat.submitComposer()
         try #require(await waitUntil {
-            chat.messages.last?.isStreaming == true && chat.messages.last?.content == "CURRENT_REPLY_2669"
+            chat.messages.last?.isStreaming == true && chat.messages.last?.content.hasPrefix("CURRENT_REPLY_2669 ") == true
         }, "the turn must reach its streamed reply")
         dialogue.releaseReplyCompletion()
         try #require(await waitUntil { !chat.hasStreamingTasksForSafety })
@@ -52,7 +52,7 @@ struct PromptOnlyUsageOccupancy_R6_Tests {
     @Test func modelWithoutExplicitWindowShowsOccupancyAgainst128kAfterPromptOnlyUsage() async throws {
         let modelID = "synthetic-r6-unknown-model"
         let fixture = try Fixture(initialHistory: [])
-        let dialogue = Dialogue(replyUsage: promptOnlyUsage(32_000))
+        let dialogue = Dialogue(replyText: "CURRENT_REPLY_2669 streamed.", replyUsage: promptOnlyUsage(32_000))
         dialogue.model = LLMModel(id: modelID, displayName: "R6 owned", provider: Dialogue.providerID,
                                   contextWindow: nil)
         let chat = fixture.bridge.chat
@@ -74,7 +74,7 @@ struct PromptOnlyUsageOccupancy_R6_Tests {
 
     @Test func catalogModelWithoutExplicitWindowUsesCatalogWindowAfterPromptOnlyUsage() async throws {
         let fixture = try Fixture(initialHistory: [])
-        let dialogue = Dialogue(replyUsage: promptOnlyUsage(32_000))
+        let dialogue = Dialogue(replyText: "CURRENT_REPLY_2669 streamed.", replyUsage: promptOnlyUsage(32_000))
         dialogue.model = LLMModel(id: "gpt-4.1", displayName: "R6 catalog", provider: Dialogue.providerID,
                                   contextWindow: nil)
         let chat = fixture.bridge.chat
@@ -98,7 +98,7 @@ struct PromptOnlyUsageOccupancy_R6_Tests {
         let modelID = "synthetic-r6-unknown-model"
         let fixture = try Fixture()
         let summary = HeldSummary(lateFailure: false)
-        let dialogue = Dialogue(replyUsage: promptOnlyUsage(104_960))
+        let dialogue = Dialogue(replyText: "CURRENT_REPLY_2669 streamed.", replyUsage: promptOnlyUsage(104_960))
         dialogue.model = LLMModel(id: modelID, displayName: "R6 owned", provider: Dialogue.providerID,
                                   contextWindow: nil)
         let chat = fixture.bridge.chat

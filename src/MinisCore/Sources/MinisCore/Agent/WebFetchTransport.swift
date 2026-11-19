@@ -14,10 +14,44 @@ public enum WebFetchError: Error, Equatable, Sendable {
 }
 
 extension WebFetchError: LocalizedError {
+    /// 模型收到的失败原因：每种情况都说清楚发生了什么、下一步怎么办，状态码不丢。
     public var errorDescription: String? {
-        guard case .policyDenied(let denial) = self,
-              denial == .domainNotAuthorized || denial == .crossOriginNotAuthorized else { return nil }
-        return "网页抓取的目标域名不在允许列表内。\(BrowserNavigationPolicy.allowedWebsitesSettingsGuidance)"
+        switch self {
+        case .policyDenied(let denial):
+            if denial == .domainNotAuthorized || denial == .crossOriginNotAuthorized {
+                return "网页抓取的目标域名不在允许列表内。\(BrowserNavigationPolicy.allowedWebsitesSettingsGuidance)"
+            }
+            return "网页抓取被拒绝：\(denial.message)。"
+        case .invalidResponse:
+            return "网页抓取失败：服务器返回的响应无法识别。"
+        case .unexpectedRedirect:
+            return "网页抓取失败：服务器响应的地址与请求的地址不一致，已放弃。"
+        case .redirectLimit:
+            return "网页抓取失败：重定向超过 \(WebFetchTransport.maximumRedirects) 次，已放弃。"
+        case .redirectLoop:
+            return "网页抓取失败：重定向形成了循环，已放弃。"
+        case .missingRedirectLocation:
+            return "网页抓取失败：服务器要求重定向，但没有给出目标地址。"
+        case .httpStatus(let status):
+            switch status {
+            case 404, 410:
+                return "网页抓取失败：服务器返回 HTTP \(status)，页面不存在。请核对链接是否正确。"
+            case 401, 403:
+                return "网页抓取失败：服务器返回 HTTP \(status)，需要登录或没有访问权限。可改用浏览器工具，或请用户提供页面内容。"
+            case 429:
+                return "网页抓取失败：服务器返回 HTTP 429，请求过于频繁。请稍后再试。"
+            case 500...599:
+                return "网页抓取失败：服务器返回 HTTP \(status)，对方服务器出错。可稍后重试。"
+            default:
+                return "网页抓取失败：服务器返回 HTTP \(status)。"
+            }
+        case .responseTooLarge:
+            return "网页抓取失败：页面超过 \(WebFetchTransport.maximumBytes / 1024 / 1024) MB 上限。请改用浏览器工具查看，或换一个更小的页面。"
+        case .unsupportedContentType:
+            return "网页抓取失败：这个地址返回的不是网页或纯文本（例如 PDF、图片、压缩包）。需要时请改用浏览器工具，或请用户下载后提供文件路径。"
+        case .unsupportedEncoding:
+            return "网页抓取失败：页面文字编码无法识别。"
+        }
     }
 }
 
@@ -134,7 +168,7 @@ public struct WebFetchTransport: Sendable {
         defer { session.invalidateAndCancel() }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.httpMethod = "GET"
-        request.setValue("text/html, application/xhtml+xml, text/plain", forHTTPHeaderField: "Accept")
+        request.setValue("text/html, application/xhtml+xml, text/plain, application/json, application/xml, application/rss+xml, application/atom+xml, text/markdown, text/csv;q=0.9, */*;q=0.5", forHTTPHeaderField: "Accept")
         let (bytes, rawResponse) = try await session.bytes(for: request, delegate: WebFetchNoRedirect())
         guard let response = rawResponse as? HTTPURLResponse else { throw WebFetchError.invalidResponse }
         if response.expectedContentLength > Int64(maximumBytes) { throw WebFetchError.responseTooLarge }

@@ -675,7 +675,7 @@ struct SettingsAtomicConversation3169Tests {
         #expect(center.settingsStore.settings.general.language == "zh-Hans")
         #expect(center.settingsStore.settings.agent.fallbackEnabled == originalFallback)
         #expect(TerminalPolicySnapshot(settings: center.settingsStore.settings.agent.terminalPolicy)
-            .classify(command: "sudo echo synthetic") == .denied)
+            .classify(command: "halt echo synthetic") == .denied)
         #expect(SettingsStore(directory: center.settingsStore.directory).settings == center.settingsStore.settings)
         let thirdReadback = SettingsStore(directory: center.settingsStore.directory).settings
         #expect(thirdReadback.general.language == "zh-Hans")

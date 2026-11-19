@@ -151,7 +151,7 @@ struct ToolApprovalGatePolicyTests {
         #expect(!internalRequest.requiresSecondConfirmation)
         #expect(mixedRequest.riskLevel == .high)
         #expect(mixedRequest.requiresApproval)
-        #expect(mixedRequest.requiresSecondConfirmation)
+        #expect(!mixedRequest.requiresSecondConfirmation)
         #expect(mixedRequest.persistentAllowOffer == nil)
         let warning = "外部程序以你的用户身份在本机运行，可以读写你有权限访问的文件，不受本应用的文件范围、Hooks 和审批约束。"
         #expect(mixedRequest.inputSummary.contains("启动外部程序：claude"))

@@ -23,7 +23,7 @@ struct P3AcceptanceM07DeniedWithinAllowedRootTests {
         let normalRead = try await executor.execute(
             name: "file_read", input: ["path": normalFile.path]
         )
-        #expect(normalRead == "allowed")
+        #expect(normalRead == "     1\tallowed")
         await #expect(throws: ToolExecutorError.pathViolation(excludedFile.path)) {
             _ = try await executor.execute(name: "file_read", input: ["path": excludedFile.path])
         }

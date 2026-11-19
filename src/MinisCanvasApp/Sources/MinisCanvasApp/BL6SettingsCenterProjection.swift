@@ -258,12 +258,12 @@ extension SettingsCenter {
                   admittedNames.insert(entry.name.lowercased()).inserted,
                   let projection = chatProviderSettingsProjection(providerID: entry.name),
                   projection.providerID == entry.name else {
-                throw ConversationSettingsToolError.ownerUnavailable
+                throw ConversationSettingsToolError.unavailable(.providerRowInvalid)
             }
             let identity = SHA256.hash(data: Data(entry.id.utf8))
                 .map { String(format: "%02x", $0) }.joined()
             let id = "provider.record." + identity
-            guard values[id] == nil else { throw ConversationSettingsToolError.ownerUnavailable }
+            guard values[id] == nil else { throw ConversationSettingsToolError.unavailable(.providerRowInvalid) }
             let revision = SHA256.hash(data: Data(projection.metadataRevision.utf8))
                 .map { String(format: "%02x", $0) }.joined()
             values[id] = .object([

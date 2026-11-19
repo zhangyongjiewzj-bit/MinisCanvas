@@ -158,7 +158,7 @@ struct BB7TaskCenterRuntimePresentationTests {
                 let initialLabel = NativeConsumerOwnedAX.label(summary)
                 fixture.observeGoalAttributes(summary, initialLabel: initialLabel)
                 let label = try #require(initialLabel)
-                #expect(label == "Goal 授权有效")
+                #expect(label == "任务授权有效")
                 #expect(!label.contains(scope))
                 #expect(!label.contains(goalID.uuidString))
                 let frame = try #require(NativeConsumerOwnedAX.frame(summary))
@@ -213,16 +213,16 @@ struct BB7TaskCenterRuntimePresentationTests {
                 #expect(NativeConsumerOwnedAX.press(expand))
                 fixture.pump(window)
                 let expanded = try #require(NativeConsumerOwnedAX.textSnapshot(in: window, identifier: rowID))
-                #expect(expanded.texts.contains("Goal 授权有效"))
-                #expect(expanded.texts.contains("Goal scope：" + scope))
+                #expect(expanded.texts.contains("任务授权有效"))
+                #expect(expanded.texts.contains("授权范围：" + scope))
                 #expect(expanded.texts.contains("子能力摘要（具体操作仍受审批/安全策略约束）"))
                 #expect(expanded.texts.contains("子能力：未知（未记录子能力边界）"))
-                #expect(expanded.texts.contains("父 Goal 仅表示父级目标与上限，不等于子任务全部有效权限"))
+                #expect(expanded.texts.contains("父任务授权仅表示父级目标与上限，不等于子任务全部有效权限"))
                 let summaryLabels = try #require(expanded.labelsByIdentifier[
                     "task-center-lease-state-" + goalID.uuidString])
                 try #require(summaryLabels.count == 1)
                 let summaryLabel = try #require(summaryLabels.first)
-                #expect(summaryLabel == "Goal 授权有效")
+                #expect(summaryLabel == "任务授权有效")
                 #expect(!summaryLabel.localizedCaseInsensitiveContains("scope"))
                 #expect(!summaryLabel.contains(goalID.uuidString))
                 let row = try #require(NativeConsumerOwnedAX.find(in: window, identifier: rowID))
@@ -247,7 +247,7 @@ struct BB7TaskCenterRuntimePresentationTests {
                 // opened. Its combined children need not expose a separate ID.
                 let group = try #require(NativeConsumerOwnedAX.textSnapshot(in: window,
                     identifier: "task-center-goal-" + goalID.uuidString))
-                #expect(group.texts.contains { $0.contains("Goal 授权有效") })
+                #expect(group.texts.contains { $0.contains("任务授权有效") })
                 #expect(group.texts.contains { $0.contains(scope) })
                 // The contract does not require a Goal UUID text in advanced content.
 
@@ -285,7 +285,7 @@ struct BB7TaskCenterRuntimePresentationTests {
                 try fixture.requireHealthyWindow(window, phase: "failure-after-expand")
                 let safeCode = try #require(NativeConsumerOwnedAX.find(in: window,
                     identifier: "task-center-failure-code-" + task.taskID))
-                #expect(NativeConsumerOwnedAX.label(safeCode) == "失败代码：execution-failed")
+                #expect(NativeConsumerOwnedAX.label(safeCode) == "失败原因：执行失败")
             }
             #expect(fixture.tasks.taskCenterSnapshots() == before)
         }

@@ -9,14 +9,14 @@ public protocol WorkflowProvider: Sendable {
     func generate(prompt: String, step: WorkflowStep) async throws -> String
 }
 
-/// 桥接 `LLMProvider` 的默认实现：单轮 user 消息，maxTokens 4096 / temperature 0.7。
+/// 桥接 `LLMProvider` 的默认实现：单轮 user 消息，maxTokens 4096，不传温度（用各模型自己的默认值）。
 /// LLMProvider 非 Sendable，沿用代码库惯例用 `@unchecked Sendable` 包装。
 public final class LLMWorkflowProvider: WorkflowProvider, @unchecked Sendable {
     public let provider: any LLMProvider
     public let maxTokens: Int
     public let temperature: Double?
 
-    public init(provider: any LLMProvider, maxTokens: Int = 4096, temperature: Double? = 0.7) {
+    public init(provider: any LLMProvider, maxTokens: Int = 4096, temperature: Double? = nil) {
         self.provider = provider
         self.maxTokens = maxTokens
         self.temperature = temperature

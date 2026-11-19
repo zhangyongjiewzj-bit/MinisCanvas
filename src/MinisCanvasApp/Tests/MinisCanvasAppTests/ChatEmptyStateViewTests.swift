@@ -57,7 +57,7 @@ struct ChatEmptyStateViewTests {
         let content = ChatEmptyStateView.content(for: sessionID)
 
         #expect(content.identity == "chat.emptyState.\(sessionID.uuidString)")
-        #expect(content.accessibilityLabel == "空会话，\(sessionID.uuidString)")
+        #expect(content.accessibilityLabel == "空会话")
         #expect(ChatEmptyStateView.accessibilityIdentifier == "chat.emptyState")
     }
 

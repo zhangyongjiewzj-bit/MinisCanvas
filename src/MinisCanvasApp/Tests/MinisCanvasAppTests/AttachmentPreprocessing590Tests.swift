@@ -140,7 +140,7 @@ struct AttachmentPreprocessing590Tests {
     }
 
     @Test("recognized payload publishes before metadata and preserves resolved bytes",
-          arguments: ["txt", "rtf"])
+          arguments: ["txt", "go"])
     func placeholderPrecedesFileMetadata(ext: String) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("perf590-attachment-\(UUID())")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

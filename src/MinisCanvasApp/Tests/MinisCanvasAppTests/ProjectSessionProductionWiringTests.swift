@@ -135,7 +135,8 @@ struct ProjectSessionProductionWiringTests {
         #expect(reopened.hasInstructionTrust(frozen, projectID: projectID))
         try Data("changed instruction".utf8).write(to: physicalRoot.appendingPathComponent("AGENTS.md"))
         let changed = try #require(try TrustedProjectInstructions.loadSnapshot(atTrustedRoot: physicalRoot))
-        #expect(!reopened.hasInstructionTrust(changed, projectID: projectID))
+        // 信任按项目记：首次信任后文件内容变化不再重新询问。
+        #expect(reopened.hasInstructionTrust(changed, projectID: projectID))
         #expect(reopened.hasInstructionTrust(frozen, projectID: projectID))
         #expect(frozen.systemPromptPrefix.contains("owned instruction"))
         try reopened.revokeInstructionTrust(projectID: projectID)
@@ -143,6 +144,32 @@ struct ProjectSessionProductionWiringTests {
         #expect(try reopened.resolve(id: projectID).projectID == projectID)
         let cold = try ProjectSessionGrantRegistry(directory: root)
         #expect(cold.instructionTrustRows().isEmpty)
+    }
+    @Test func rememberedInstructionRefusalPersistsUntilFileChangesOrRevoked() throws {
+        let root = try temporaryRoot().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registry = try ProjectSessionGrantRegistry(directory: root)
+        let physicalRoot = URL(fileURLWithPath: try DarwinSystemPathResolver.resolve(root), isDirectory: true)
+        try Data("refused instruction".utf8).write(to: physicalRoot.appendingPathComponent("AGENTS.md"))
+        let frozen = try #require(try TrustedProjectInstructions.loadSnapshot(atTrustedRoot: physicalRoot))
+        let projectID = try registry.registerNativeSelection(root, displayName: "Refusal project")
+        #expect(!registry.hasInstructionRefusal(frozen, projectID: projectID))
+        try registry.refuseInstructions(frozen, projectID: projectID)
+        let reopened = try ProjectSessionGrantRegistry(directory: root)
+        #expect(reopened.hasInstructionRefusal(frozen, projectID: projectID))
+        // 拒绝只会静默不加载，绝不等于信任。
+        #expect(!reopened.hasInstructionTrust(frozen, projectID: projectID))
+        #expect(reopened.instructionRefusalRows().count == 1)
+        // 文件内容变了才再问。
+        try Data("changed instruction".utf8).write(to: physicalRoot.appendingPathComponent("AGENTS.md"))
+        let changed = try #require(try TrustedProjectInstructions.loadSnapshot(atTrustedRoot: physicalRoot))
+        #expect(!reopened.hasInstructionRefusal(changed, projectID: projectID))
+        // 撤销后恢复询问；信任会清掉拒绝记录。
+        try reopened.revokeInstructionRefusal(projectID: projectID)
+        #expect(!reopened.hasInstructionRefusal(frozen, projectID: projectID))
+        try reopened.refuseInstructions(frozen, projectID: projectID)
+        try reopened.trustInstructions(frozen, projectID: projectID)
+        #expect(!reopened.hasInstructionRefusal(frozen, projectID: projectID))
     }
     @Test func projectDirectoriesPersistWhileSessionDirectoriesRemainEphemeral() throws {
         let root = try temporaryRoot().resolvingSymlinksInPath()
@@ -174,6 +201,29 @@ struct ProjectSessionProductionWiringTests {
         #expect(throws: ProjectSessionAppError.self) { _ = try reopened.validatedDirectory(revoked) }
         registry.retainDirectorySessions([])
         #expect(!registry.directoryGrants().contains { $0.sessionID == "session-b" })
+    }
+
+    @Test func sameFolderReauthorizationReusesProjectAndRevokeClearsExtraDirectories() throws {
+        let root = try temporaryRoot().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let project = root.appendingPathComponent("project")
+        let extra = root.appendingPathComponent("extra")
+        for url in [project, extra] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+        let registry = try ProjectSessionGrantRegistry(directory: root)
+        let first = try registry.registerNativeSelection(project, displayName: "项目")
+        // 同一文件夹再授权：复用原项目，不产生第二个。
+        #expect(try registry.registerNativeSelection(project, displayName: "项目") == first)
+        #expect(registry.list().count == 1)
+        let identity = try ProjectSessionGrantRegistry.directoryIdentity(extra)
+        try registry.approveDirectory(extra, identity: identity, sessionID: "s", projectID: first,
+            workingDirectory: project.path, persistForProject: true)
+        try registry.revoke(id: first)
+        #expect(registry.list().isEmpty)
+        let revokedGrants = registry.directoryGrants().map { $0.revoked }
+        #expect(revokedGrants.allSatisfy { $0 })
+        // 撤销后重新授权同一文件夹：回到原项目。
+        #expect(try registry.registerNativeSelection(project, displayName: "项目") == first)
+        #expect(registry.list().map(\.projectID) == [first])
     }
 
 }

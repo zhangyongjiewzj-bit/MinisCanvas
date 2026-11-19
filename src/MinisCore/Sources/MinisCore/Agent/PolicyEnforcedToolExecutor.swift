@@ -43,7 +43,35 @@ extension PolicyEnforcedToolExecutorError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .policyViolation(let violation):
-            return "Policy violation: \(violation.rawValue)"
+            return "策略不允许本次操作，未执行：\(violation.userFacingReason)"
+        }
+    }
+}
+
+extension PolicyViolation {
+    /// 面向用户和模型的中文原因；不带内部枚举名，也不含路径或密钥。
+    public var userFacingReason: String {
+        switch self {
+        case .emptyScope, .scopeMismatch, .invalidLease, .leaseGoalMismatch:
+            return "本次任务的授权范围无效或与当前任务不符"
+        case .capabilityNotAllowed, .invalidCapability:
+            return "这个工具不在当前授权范围内"
+        case .fileRootNotAllowed, .invalidFileRoot:
+            return "目标路径不在授权的文件夹内"
+        case .networkDomainNotAllowed, .invalidNetworkDomain:
+            return "目标网址不在允许访问的范围内"
+        case .budgetExceeded, .invalidBudget, .invalidRequestCost:
+            return "本次任务的用量预算已用完或无效"
+        case .deadlineExceeded, .requestDeadlineExceeded:
+            return "已超过本次任务的时限"
+        case .leaseExpired:
+            return "本次授权已过期，请重新发送请求"
+        case .leaseRevoked:
+            return "本次授权已被撤销"
+        case .autonomyLevelExceeded:
+            return "这个操作超出了当前的自主权上限"
+        case .concurrencyExceeded, .invalidConcurrency, .invalidActiveTasks:
+            return "同时进行的任务过多，请稍后再试"
         }
     }
 }
@@ -140,7 +168,8 @@ public final class PolicyEnforcedToolExecutor: BrowserDestinationPolicyChecking,
         }
         return PolicyRequest(
             capabilityID: name,
-            filePath: input["path"] as? String,
+            // 11/16：MCP 工具的 path 由 MCP 服务器自己的访问边界决定，不当作本机文件路径检查。
+            filePath: name.hasPrefix("mcp_") ? nil : input["path"] as? String,
             networkDomain: domain,
             estimatedCost: 1
         )
@@ -151,7 +180,8 @@ public final class PolicyEnforcedToolExecutor: BrowserDestinationPolicyChecking,
     public static let defaultRequestBuilder: @Sendable (String, [String: Any]) -> PolicyRequest = { name, input in
         PolicyRequest(
             capabilityID: name,
-            filePath: input["path"] as? String,
+            // 11/16：MCP 工具的 path 由 MCP 服务器自己的访问边界决定，不当作本机文件路径检查。
+            filePath: name.hasPrefix("mcp_") ? nil : input["path"] as? String,
             estimatedCost: 1
         )
     }
@@ -252,6 +282,7 @@ public final class PolicyEnforcedToolExecutor: BrowserDestinationPolicyChecking,
         // 系统底线与凭据保护在 Composer 授权与 BuiltinToolExecutor 里判断。
         let approvedOutsideRead = builtRequest.filePath.map {
             ApprovedFileReadScope.permits(tool: name, path: $0)
+                || ApprovedFileWriteScope.permits(tool: name, path: $0)
         } ?? false
         let ownedArtifactRead: Bool
         if name == "file_read", let path = builtRequest.filePath {

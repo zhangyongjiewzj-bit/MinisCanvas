@@ -1,16 +1,23 @@
 import SwiftUI
+import MinisCore
 import Observation
 
 /// Presentation only: the store remains the sole confirmation/authorization gate.
 enum SchedulerConfirmationFeedback {
-    static func failureMessage(previewExpiresAt: Date, hasValidTarget: Bool, now: Date = Date()) -> String {
+    static let storageUnavailableAdvice = "定时任务存储写入失败。请检查磁盘空间后重新打开应用。"
+
+    static func failureMessage(previewExpiresAt: Date, hasValidTarget: Bool,
+                               storageUnavailable: Bool = false, now: Date = Date()) -> String {
+        if storageUnavailable {
+            return "确认失败：" + storageUnavailableAdvice
+        }
         if previewExpiresAt <= now {
             return "确认失败：预览已过期。请重新预览后再授权。"
         }
         if !hasValidTarget {
             return "确认失败：目标会话、项目或来源轮次不完整。请补全目标后重新预览。"
         }
-        return "确认失败：任务版本或授权条件已变化，或当前存储不可用。请刷新后重新预览。"
+        return "确认失败：任务版本或授权条件已变化。请刷新后重新预览。"
     }
 }
 
@@ -212,7 +219,7 @@ struct SchedulerControlProductionProjection: Equatable, Sendable {
                 modelID: nil,
                 credentialVersion: nil,
                 status: nil,
-                detail: "Provider/model/credential readiness unavailable"
+                detail: "服务商、模型与凭据的可用性暂时无法确认"
             )
         }
         source = Source(
@@ -284,7 +291,8 @@ struct SchedulerControlSettingsView: View {
     @State private var selectedTaskID: UUID?
     @State private var preview: SchedulerTaskPreview?
     @State private var sourceAnchorConfirmed = false
-    @State private var actorID = ""
+    /// 授权主体默认取当前系统用户，不需要手输；仍可改。
+    @State private var actorID = NSUserName().isEmpty ? "本机用户" : NSUserName()
     @State private var feedback: String?
     private struct EditorPresentation: Identifiable {
         let id = UUID()
@@ -297,6 +305,7 @@ struct SchedulerControlSettingsView: View {
     /// Transient observations are keyed to the clicked occurrence, never the
     /// selected/current task. They do not replace any durable receipt.
     @State private var targetDeliveryObservations: [UUID: SchedulerTargetDeliveryObservation] = [:]
+    @State private var rerunFeedback: String?
 
     init(store: SchedulerTaskStore, runtime: SchedulerTaskRuntime? = nil) {
         self.store = store
@@ -411,7 +420,7 @@ struct SchedulerControlSettingsView: View {
                     Spacer()
                     Text(task.isAuthorized && task.sourceAnchorDigest != nil ? "已授权" : "待绑定授权")
                         .font(typography?.caption2 ?? .caption2)
-                        .foregroundStyle(task.isAuthorized ? .green : .secondary)
+                        .foregroundStyle(task.isAuthorized ? (theme?.statusSuccess ?? AppStatusColor.success) : Color.secondary)
                 }
                 Text(task.cronExpression)
                     .font(typography?.monospaced ?? .system(.caption, design: .monospaced))
@@ -612,7 +621,7 @@ struct SchedulerControlSettingsView: View {
             keyValue("目标会话", preview.targetSessionID?.uuidString ?? "未绑定")
             keyValue("来源用户轮次（从 1 开始）", preview.targetTurnID.map(String.init) ?? "未绑定")
             if let providerPreflight = preview.providerPreflight {
-                keyValue("选定 Provider", providerPreflight.providerID ?? "未解析")
+                keyValue("选定服务商", providerPreflight.providerID ?? "未解析")
                 keyValue("选定模型", providerPreflight.modelID ?? "未解析")
                 keyValue("凭据与模型前置", providerPreflight.status.displayLabel)
                 if !providerPreflight.isReadyForExecution {
@@ -622,7 +631,7 @@ struct SchedulerControlSettingsView: View {
                 }
             } else {
                 keyValue("凭据与模型前置", "未装配")
-                Text("当前 Provider/model 前置无法复核，请刷新预览。")
+                Text("当前服务商和模型的前置条件无法复核，请刷新预览。")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(theme?.statusDanger ?? .red)
             }
@@ -650,7 +659,7 @@ struct SchedulerControlSettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("显式授权")
                 .font(typography?.headline ?? .headline)
-            TextField("授权主体（必填）", text: $actorID)
+            TextField("授权主体（默认当前用户）", text: $actorID)
                 .textFieldStyle(.roundedBorder)
             keyValue("授权项目", preview.targetProjectID ?? "未绑定")
             Text(preview.observedPolicyRevision == nil ? "当前策略不可用，请刷新后重试。" : "将使用当前有效策略授权")
@@ -721,7 +730,7 @@ struct SchedulerControlSettingsView: View {
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
             }
-            Text(occurrence.command.isEmpty ? "（旧 ledger 未携带 command）" : occurrence.command)
+            Text(occurrence.command.isEmpty ? "（旧记录没有保存命令内容）" : occurrence.command)
                 .font(typography?.monospaced ?? .system(.caption, design: .monospaced))
                 .lineLimit(2)
             keyValue("来源用户轮次", occurrence.targetTurnID.map(String.init) ?? "未绑定")
@@ -737,7 +746,7 @@ struct SchedulerControlSettingsView: View {
             }
             if let preflight = runtime?.providerPreflight(taskID: occurrence.taskID),
                !preflight.isReadyForExecution {
-                Text("Provider 前置：\(preflight.detail)")
+                Text("模型服务未就绪：\(preflight.detail)")
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(theme?.statusDanger ?? .red)
             }
@@ -748,6 +757,15 @@ struct SchedulerControlSettingsView: View {
                         targetDeliveryObservations[occurrence.id] = runtime.queryTargetDelivery(id: occurrence.id)
                     }
                     .accessibilityIdentifier("scheduler.occurrence.query-target-fact.\(occurrence.id.uuidString)")
+                }
+                if occurrence.state == .failed, let runtime {
+                    Button("重新执行") {
+                        if !runtime.rerunFailedOccurrence(id: occurrence.id) {
+                            rerunFeedback = "没有重新执行：任务已停用或删除，或这一分钟已有记录。请稍后再试。"
+                        }
+                    }
+                    .help("失败的定时任务不会自动重试；点这里按任务当前版本再执行一次")
+                    .accessibilityIdentifier("scheduler.occurrence.rerun.\(occurrence.id.uuidString)")
                 }
                 if occurrence.state == .unknown, let runtime {
                     Button("先对账") {
@@ -765,7 +783,7 @@ struct SchedulerControlSettingsView: View {
                         )
                     }
                     .disabled(!canRetry)
-                    .help(canRetry ? "使用当前任务版本显式重试" : "任务版本或 Provider 凭据已失效，不能产生新的 dispatch intent")
+                    .help(canRetry ? "使用当前任务版本显式重试" : "任务版本或服务商凭据已失效，不能再次执行")
                     Button("终止") {
                         _ = runtime.abortReconciledOccurrence(
                             id: occurrence.id,
@@ -779,6 +797,11 @@ struct SchedulerControlSettingsView: View {
                         cancel(occurrence, using: runtime)
                     }
                 }
+            }
+            if let rerunFeedback, occurrence.state == .failed {
+                Text(rerunFeedback)
+                    .font(typography?.caption ?? .caption)
+                    .foregroundStyle(.secondary)
             }
             if let observation = targetDeliveryObservations[occurrence.id] {
                 Text("目标事实观测（仅查询）：\(targetDeliveryObservationText(observation))")
@@ -823,7 +846,7 @@ struct SchedulerControlSettingsView: View {
                 "下一次触发",
                 projection.nextOccurrence?.formatted(date: .abbreviated, time: .shortened) ?? "无下一次触发"
             )
-            let provider = projection.credential.providerID ?? "未选 Provider"
+            let provider = projection.credential.providerID ?? "未选服务商"
             let model = projection.credential.modelID ?? "未选模型"
             let credentialRevision = projection.credential.credentialVersion ?? "未装配"
             keyValue("凭据来源", "\(provider) / \(model) · \(credentialRevision)")
@@ -834,8 +857,8 @@ struct SchedulerControlSettingsView: View {
             keyValue("任务版本", "任务 v\(projection.pinnedVersion.taskVersion) · occurrence \(projection.pinnedVersion.occurrenceVersions.map(String.init).joined(separator: ", ").isEmpty ? "无" : projection.pinnedVersion.occurrenceVersions.map(String.init).joined(separator: ", "))")
             keyValue("授权状态", projection.authorizationState.rawValue)
             Text(projection.canProduceDispatchIntent
-                ? "当前投影允许进入 dispatch intent。"
-                : "当前投影不会产生 dispatch intent：请修复触发、来源、目标、授权或凭据前置。")
+                ? "当前设置满足条件，可以执行。"
+                : "当前设置不会触发执行：请修复触发、来源、目标、授权或凭据前置。")
                 .font(typography?.caption ?? .caption)
                 .foregroundStyle(projection.canProduceDispatchIntent
                     ? (theme?.statusSuccess ?? .green)
@@ -847,16 +870,19 @@ struct SchedulerControlSettingsView: View {
     }
 
     private func setEnabled(_ task: SchedulerTask, enabled: Bool) {
-        guard store.persistenceError == nil,
-              SchedulerControlTaskRevisionFence.matches(store.task(id: task.id), expectedVersion: task.version) else {
-            feedback = "启用状态未改变：任务版本已变化或存储不可用，请重新预览。"
+        guard store.persistenceError == nil else {
+            feedback = "启用状态未改变：" + SchedulerConfirmationFeedback.storageUnavailableAdvice
+            return
+        }
+        guard SchedulerControlTaskRevisionFence.matches(store.task(id: task.id), expectedVersion: task.version) else {
+            feedback = "启用状态未改变：任务已被修改。请刷新后重新预览。"
             return
         }
         guard store.setEnabled(task.id, enabled: enabled, expectedVersion: task.version,
                                expectedEnablementRevision: task.enablementRevision) else {
             feedback = store.persistenceError == nil
                 ? "启用状态未改变：任务或控制版本已变化，请重新预览。"
-                : "启用状态未改变：持久化失败，请处理存储错误后重试。"
+                : "启用状态未改变：" + SchedulerConfirmationFeedback.storageUnavailableAdvice
             return
         }
         if selectedTaskID == task.id {
@@ -882,12 +908,15 @@ struct SchedulerControlSettingsView: View {
     }
 
     private func cancel(_ occurrence: SchedulerOccurrence, using runtime: SchedulerTaskRuntime) {
-        guard store.persistenceError == nil,
-              SchedulerControlTaskRevisionFence.matches(
+        guard store.persistenceError == nil else {
+            feedback = "取消未执行：" + SchedulerConfirmationFeedback.storageUnavailableAdvice
+            return
+        }
+        guard SchedulerControlTaskRevisionFence.matches(
                   store.task(id: occurrence.taskID),
                   expectedVersion: occurrence.taskVersion
               ) else {
-            feedback = "取消未执行：任务版本已变化或存储不可用，请重新预览。"
+            feedback = "取消未执行：任务已被修改。请刷新后重新预览。"
             return
         }
         guard runtime.cancelOccurrence(
@@ -897,7 +926,7 @@ struct SchedulerControlSettingsView: View {
             owner: occurrence.leaseOwner,
             token: occurrence.leaseToken
         ) else {
-            feedback = "取消未执行：occurrence 版本或 lease 已变化，请重新加载。"
+            feedback = "取消未执行：这次执行记录的版本或占用状态已变化，请重新加载。"
             return
         }
         if preview?.taskID == occurrence.taskID {
@@ -924,7 +953,8 @@ struct SchedulerControlSettingsView: View {
         ) else {
             feedback = SchedulerConfirmationFeedback.failureMessage(
                 previewExpiresAt: preview.expiresAt,
-                hasValidTarget: preview.hasValidTarget
+                hasValidTarget: preview.hasValidTarget,
+                storageUnavailable: store.persistenceError != nil
             )
             return
         }
@@ -1006,6 +1036,20 @@ private struct SchedulerControlTaskEditor: View {
     @State private var projectID = ""
     @State private var turnID = ""
     @State private var error: String?
+    @State private var opensNewSession = false
+    @State private var preset: SchedulerCronPreset = .daily
+    @State private var hour = 9
+    @State private var minute = 0
+    @State private var weekday = 1
+    @State private var sessionOptions: [SchedulerSessionOption] = []
+    @State private var selectedSessionID: UUID?
+
+    private static let weekdayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+
+    private var schedulableOptions: [SchedulerSessionOption] { sessionOptions.filter(\.isSchedulable) }
+    private var selectedOption: SchedulerSessionOption? {
+        sessionOptions.first { $0.id == selectedSessionID }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1018,28 +1062,54 @@ private struct SchedulerControlTaskEditor: View {
                 TextField("任务名称", text: $name)
                     .accessibilityIdentifier("scheduler.editor.name")
                     .focused($focusedField, equals: .name)
-                TextField("Cron（分 时 日 月 周）", text: $cron)
-                    .accessibilityIdentifier("scheduler.editor.cron")
-                    .focused($focusedField, equals: .cron)
-                Text("例如：0 9 * * * 表示每天 09:00（使用任务预览所示时区）。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Picker("执行频率", selection: $preset) {
+                    ForEach(SchedulerCronPreset.allCases) { Text($0.title).tag($0) }
+                }
+                .onChange(of: preset) { _, _ in applyPreset() }
+                if preset != .custom {
+                    HStack {
+                        if preset == .weekly {
+                            Picker("星期", selection: $weekday) {
+                                ForEach(0..<7, id: \.self) { Text(Self.weekdayNames[$0]).tag($0) }
+                            }
+                            .onChange(of: weekday) { _, _ in applyPreset() }
+                        }
+                        if preset != .hourly {
+                            Picker("时", selection: $hour) {
+                                ForEach(0..<24, id: \.self) { Text(String(format: "%02d", $0)).tag($0) }
+                            }
+                            .onChange(of: hour) { _, _ in applyPreset() }
+                        }
+                        Picker("分", selection: $minute) {
+                            ForEach(0..<60, id: \.self) { Text(String(format: "%02d", $0)).tag($0) }
+                        }
+                        .onChange(of: minute) { _, _ in applyPreset() }
+                    }
+                    Text("对应 cron：\(cron)（使用任务预览所示时区）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    TextField("Cron（分 时 日 月 周）", text: $cron)
+                        .accessibilityIdentifier("scheduler.editor.cron")
+                        .focused($focusedField, equals: .cron)
+                    Text("例如：0 9 * * * 表示每天 09:00（使用任务预览所示时区）。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 TextField("提示词或支持的斜杠命令", text: $command, axis: .vertical)
                     .accessibilityIdentifier("scheduler.editor.prompt")
                     .lineLimit(2...4)
                     .focused($focusedField, equals: .command)
-                Text("提示词会发送到绑定的目标会话；目前支持 /compact 和 /memory.propose，不是终端命令。执行仍须通过任务授权与当前策略。")
+                Text("提示词会发送到绑定的目标会话；支持 /compact、/memory.propose，以及你在 ~/.claude/commands 里写的自定义命令（保存时展开成完整提示词），不是终端命令。执行仍须通过任务授权与当前策略。失败的任务不会自动重试，可在触发记录里点“重新执行”。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Toggle("启用", isOn: $isEnabled)
-                Section("显式目标范围") {
-                    TextField("目标 Session UUID", text: $sessionID)
-                        .focused($focusedField, equals: .session)
-                    TextField("目标 Project ID", text: $projectID)
-                        .focused($focusedField, equals: .project)
-                    TextField("目标 Turn ID", text: $turnID)
-                        .focused($focusedField, equals: .turn)
-                }
+                Toggle("每次运行开新会话", isOn: $opensNewSession)
+                    .accessibilityIdentifier("scheduler.editor.new-session")
+                Text("开启后，每次触发都会在目标会话所在的项目里新建一个会话（标题含任务名和时间）并在其中运行；目标会话本身不被改动。修改这个选项需要重新授权。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                targetSection
                 if let error {
                     Text(error).modifier(ReadableStatusForeground(status: .danger))
                 }
@@ -1056,27 +1126,116 @@ private struct SchedulerControlTaskEditor: View {
             }
             .padding(14)
         }
-        .frame(width: 500, height: 440)
+        .frame(width: 500, height: 560)
         .onAppear {
             Task { @MainActor in
                 await Task.yield()
                 focusedField = .name
             }
+            sessionOptions = SchedulerTaskPrefillInbox.shared.sessionOptions()
             guard let task else {
+                cron = SchedulerCronPreset.cron(.daily, hour: hour, minute: minute, weekday: weekday) ?? "0 9 * * *"
                 if let prefill {
                     sessionID = prefill.sessionID.uuidString
                     projectID = prefill.projectID
                     turnID = String(prefill.turnID)
+                    selectedSessionID = prefill.sessionID
+                } else if let current = SchedulerTaskPrefillInbox.shared.currentSessionID(),
+                          let option = schedulableOptions.first(where: { $0.id == current }) {
+                    chooseSession(option)
+                } else if let first = schedulableOptions.first {
+                    chooseSession(first)
                 }
                 return
             }
             name = task.name
             cron = task.cronExpression
+            if let parsed = SchedulerCronPreset.parse(task.cronExpression) {
+                preset = parsed.preset
+                hour = parsed.hour
+                minute = parsed.minute
+                weekday = parsed.weekday
+            } else {
+                preset = .custom
+            }
             command = task.command
             isEnabled = task.isEnabled
+            opensNewSession = task.opensNewSessionEachRun
             sessionID = task.targetSessionID?.uuidString ?? ""
             projectID = task.targetProjectID ?? ""
             turnID = task.targetTurnID.map(String.init) ?? ""
+            selectedSessionID = task.targetSessionID
+        }
+    }
+
+    @ViewBuilder private var targetSection: some View {
+        Section("执行位置") {
+            if sessionOptions.isEmpty {
+                TextField("目标 Session UUID", text: $sessionID)
+                    .focused($focusedField, equals: .session)
+                TextField("目标 Project ID", text: $projectID)
+                    .focused($focusedField, equals: .project)
+                TextField("目标 Turn ID", text: $turnID)
+                    .focused($focusedField, equals: .turn)
+            } else {
+                Picker("目标会话", selection: $selectedSessionID) {
+                    Text("请选择会话").tag(UUID?.none)
+                    if let id = selectedSessionID, !schedulableOptions.contains(where: { $0.id == id }) {
+                        Text(selectedOption?.menuTitle ?? "原目标会话（已不在列表）").tag(Optional(id))
+                    }
+                    ForEach(schedulableOptions) { Text($0.menuTitle).tag(Optional($0.id)) }
+                }
+                .onChange(of: selectedSessionID) { _, newValue in
+                    if let newValue, let option = sessionOptions.first(where: { $0.id == newValue }) { chooseSession(option) }
+                }
+                if let option = selectedOption, option.isSchedulable {
+                    Text("所属项目：\(option.projectName ?? option.projectID ?? "")；回合号自动取该会话当前最新一轮（第 \(turnID.isEmpty ? String(option.userTurnCount) : turnID) 轮）。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                let blocked = sessionOptions.count - schedulableOptions.count
+                if blocked > 0 {
+                    Text("另有 \(blocked) 个会话不能选：定时任务需要绑定到项目里、且已发过消息的会话。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    /// "/名称 参数" 命中自定义命令（用户级、所选会话项目的项目级）或内置提示词命令
+    /// （/review、/commit、/init）时返回展开后的提示词；其余原样返回。保存时一次展开并冻结，
+    /// 之后改命令文件不影响这个任务（无人值守的任务不在运行时读可能被改过的文件）。
+    /// 内置命令（/compact、/memory.propose 等）不展开。
+    static func expandingCustomCommand(_ text: String, projectRoot: URL? = nil) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/"), trimmed.count > 1 else { return text }
+        let body = trimmed.dropFirst()
+        let name = String(body.prefix { !$0.isWhitespace })
+        guard !name.isEmpty,
+              !CustomSlashCommandLoader.defaultReservedNames.contains(CommandDefinition.canonicalID(name)),
+              let custom = CustomSlashCommandLoader.command(
+                named: name, in: CustomSlashCommandLoader.load(projectRoot: projectRoot)),
+              custom.source == .user || custom.source == .project || custom.source == .builtinPrompt
+        else { return text }
+        let expanded = custom.expandForSending(
+            arguments: String(body.dropFirst(name.count)), projectRoot: projectRoot, allowedRoots: [])
+        return expanded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? text : expanded
+    }
+
+    private func applyPreset() {
+        if let generated = SchedulerCronPreset.cron(preset, hour: hour, minute: minute, weekday: weekday) {
+            cron = generated
+        }
+    }
+
+    private func chooseSession(_ option: SchedulerSessionOption) {
+        selectedSessionID = option.id
+        sessionID = option.id.uuidString
+        projectID = option.projectID ?? ""
+        // 保留编辑中任务原来的回合号，只在换了会话时自动取最新。
+        if task == nil || task?.targetSessionID != option.id || turnID.isEmpty {
+            turnID = String(option.userTurnCount)
         }
     }
 
@@ -1088,6 +1247,8 @@ private struct SchedulerControlTaskEditor: View {
         let targetSession = UUID(uuidString: sessionID.trimmingCharacters(in: .whitespacesAndNewlines))
         let targetProject = projectID.trimmingCharacters(in: .whitespacesAndNewlines)
         let targetTurn = Int(turnID.trimmingCharacters(in: .whitespacesAndNewlines))
+        // 自定义斜杠命令在保存时就展开成完整提示词：任务摘要、授权预览和之后每次执行用的是同一段文字。
+        let command = Self.expandingCustomCommand(self.command, projectRoot: selectedOption?.projectRoot)
         if var current = task {
             current.name = name
             current.cronExpression = cron.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1096,6 +1257,7 @@ private struct SchedulerControlTaskEditor: View {
             current.targetSessionID = targetSession
             current.targetProjectID = targetProject.isEmpty ? nil : targetProject
             current.targetTurnID = targetTurn
+            current.opensNewSessionEachRun = opensNewSession
             if let error = store.update(current, expectedVersion: task?.version,
                                         expectedEnablementRevision: task?.enablementRevision) {
                 self.error = error
@@ -1108,7 +1270,8 @@ private struct SchedulerControlTaskEditor: View {
             isEnabled: isEnabled,
             targetSessionID: targetSession,
             targetProjectID: targetProject.isEmpty ? nil : targetProject,
-            targetTurnID: targetTurn
+            targetTurnID: targetTurn,
+            opensNewSessionEachRun: opensNewSession
         ) {
             self.error = error
             return

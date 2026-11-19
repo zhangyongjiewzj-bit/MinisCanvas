@@ -66,10 +66,10 @@ enum ComposerPolicyPresentation {
     ]
 
     static let scopeLabels: [(ComposerApprovalScope, String)] = [
-        (.request, "本次请求"),
+        (.request, "仅这一次"),
         (.turn, "本回合"),
-        (.session, "本会话"),
-        (.workspace, "本工作区")
+        (.session, "当前会话"),
+        (.workspace, "当前工作区")
     ]
 
     static let effortLabels: [(ComposerEffort, String)] = [
@@ -95,6 +95,15 @@ enum ComposerPolicyPresentation {
         "权限模式：\(modeLabel(snapshot.mode)) · 工作量：\(effortLabel(snapshot.effort))"
     }
 
+    /// 回合进行中切换了任务模式：在途回合仍按提交时冻结的模式执行，这里说明新模式何时生效。
+    static let modeChangeDeferredText = "新模式从下一轮开始生效；要立即收紧可先停止当前回合"
+
+    static func modeChangeDeferredHint(
+        snapshot: ComposerSubmissionSnapshot, currentMode: ComposerTaskMode, isTurnInFlight: Bool
+    ) -> String? {
+        isTurnInFlight && snapshot.mode != currentMode ? modeChangeDeferredText : nil
+    }
+
     /// A snapshot is displayable only while its session remains active.
     static func activeSnapshot(
         _ snapshot: ComposerSubmissionSnapshot?,
@@ -118,11 +127,11 @@ extension ComposerEngineError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .missingRequiredSnapshot:
-            return "Composer 回合缺少不可变策略快照，已拒绝执行"
+            return "本回合缺少输入策略快照，已拒绝执行"
         case .missingPolicyFacts:
-            return "Composer 生产策略事实源未装配，已拒绝执行"
+            return "输入策略来源未就绪，已拒绝执行"
         case .invalidExecutionIdentity:
-            return "Composer 回合执行身份无效或与快照不匹配，已拒绝执行"
+            return "本回合执行身份无效或与策略快照不匹配，已拒绝执行"
         }
     }
 }

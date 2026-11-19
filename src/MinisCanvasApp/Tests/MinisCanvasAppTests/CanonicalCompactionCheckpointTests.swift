@@ -90,6 +90,25 @@ struct CanonicalCompactionCheckpointTests {
         )
     }
 
+    @Test func literalSummaryMarkerInUserOrAssistantTextDoesNotBlockResume() async throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = SessionStore(directory: directory)
+        let session = try seed(store, id: "literal-marker")
+        let result = try await Compactor(keepRecentMessages: 2).compact(messages: session.messages,
+            safetyMode: .requireVerbatimText)
+        let checkpoint = try #require(
+            try ChatSessionBridge.saveCanonicalCompactionCheckpoint(
+                sessionStore: store, sessionID: session.id, sourceMessages: session.messages,
+                expectedTranscriptRevision: session.transcriptRevision, result: result))
+        try store.saveMessage(LLMMessage(role: .user, content: "<context-summary> 是什么意思？"),
+                              sessionID: session.id)
+        try store.saveMessage(LLMMessage(role: .assistant, content: "源码里写着 <context-summary> 字面量"),
+                              sessionID: session.id)
+        let resumed = try ChatSessionBridge.resumeCanonicalMessages(sessionStore: store, sessionID: session.id)
+        #expect(resumed.count == checkpoint.replacementHistory.count + 2)
+    }
+
     @Test func restartResumeDoesNotDuplicateCanonicalSummary() async throws {
         let directory = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }

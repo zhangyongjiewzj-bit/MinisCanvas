@@ -64,6 +64,19 @@ enum StageStatus: String, Codable, Sendable, Equatable, CaseIterable {
     case stale
 }
 
+extension StageStatus {
+    /// 界面显示名；持久化值（rawValue）不变。
+    var displayName: String {
+        switch self {
+        case .pending: "待执行"
+        case .running: "执行中"
+        case .awaitingReview: "待审核"
+        case .done: "已通过"
+        case .stale: "需重跑"
+        }
+    }
+}
+
 /// Secret-free link between a document stage and its durable result artifact.
 /// The source ID is optional for the first stage; all revisions are opaque
 /// fingerprints and never contain prompt text or provider credentials.
@@ -78,6 +91,17 @@ struct DocumentOutputLineage: Codable, Sendable, Equatable {
 /// Execution is independent from manual review (`StageStatus`). Old documents
 /// have no execution record and remain pending until an explicit user action.
 enum DocumentStageRunState: String, Codable, Sendable { case pending, running, succeeded, failed }
+extension DocumentStageRunState {
+    /// 界面显示名；持久化值（rawValue）不变。
+    var displayName: String {
+        switch self {
+        case .pending: "未运行"
+        case .running: "运行中"
+        case .succeeded: "运行成功"
+        case .failed: "运行失败"
+        }
+    }
+}
 struct DocumentStageRun: Codable, Sendable, Equatable {
     let id: UUID
     let sourceRevision: String

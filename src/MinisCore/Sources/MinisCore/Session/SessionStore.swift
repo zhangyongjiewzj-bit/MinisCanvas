@@ -485,6 +485,9 @@ public final class SessionStore: @unchecked Sendable {
     private static let maxQuarantineBytes: Int64 = 64 * 1024 * 1024
     private static let maxCheckpointChainRecords = 512
     private static let maxCheckpointChainBytes: Int64 = 4 * 1024 * 1024
+    /// 单个会话的已提交链记录超过触发数时，从最老的一端裁到保留数（留足余量，远低于 512 的硬上限）。
+    static let checkpointChainPruneTrigger = 384
+    static let checkpointChainRetainedRecords = 256
     private static let maxCleanupHandoffDepth = 64
 
     private enum QuarantineStage: String, Sendable {
@@ -915,7 +918,7 @@ public final class SessionStore: @unchecked Sendable {
     }
 
     public enum ConversationGoalControl: Sendable {
-        case pause, resume, stop
+        case pause, resume, stop, clearBlockers
     }
 
     public func recordConversationGoalTurn(
@@ -1038,6 +1041,7 @@ public final class SessionStore: @unchecked Sendable {
             case .pause: changed = goal.pause()
             case .resume: changed = goal.resume()
             case .stop: changed = goal.stop()
+            case .clearBlockers: changed = goal.clearBlockers()
             }
             guard changed else { throw ConversationGoalError.invalidTransition }
             return goal
@@ -1273,6 +1277,79 @@ public final class SessionStore: @unchecked Sendable {
                 current.messages = Array(current.messages.prefix(anchor.messageIndex + 1))
                 current.transcriptRevision += 1
                 current.updatedAt = Date()
+                // 回退越过压缩边界时，先让检查点不再参与续接（与“撤销压缩”同一套截止线），
+                // 否则下一回合续接校验会失败。
+                try detachCheckpointProjectionIfInvalidAfterRewindUnlocked(rewound: current)
+                return try commitTranscriptUnlocked(current)
+            }
+        }
+    }
+
+    /// 回退后的会话若与当前选中的压缩检查点边界不再吻合，就写一条截止线，让该检查点
+    /// 不再用于续接（完整对话保持不变）。没有检查点或仍然吻合时什么也不做。
+    /// 调用方已持有会话锁；先写截止线再提交回退，截止线只会让续接改用完整对话，不会丢内容。
+    private func detachCheckpointProjectionIfInvalidAfterRewindUnlocked(rewound: ChatSession) throws {
+        var directoryInfo = stat()
+        guard Darwin.lstat(compactionCheckpointsDirectory.path, &directoryInfo) == 0 else {
+            guard errno == ENOENT else {
+                throw SessionStoreError.invalidCompactionCheckpoint(rewound.id)
+            }
+            return
+        }
+        let sessionID = rewound.id
+        try withCheckpointFileLock(sessionID: sessionID, repair: false, exclusive: true) {
+            guard let checkpoint = try checkpointSelectionUnlocked(session: rewound, repair: false).checkpoint else {
+                return
+            }
+            do {
+                try validateCheckpointForResume(checkpoint, session: rewound)
+                return
+            } catch {}
+            guard checkpoint.retainsCanonicalTranscript else {
+                throw SessionStoreError.sessionSnapshotConflict(sessionID)
+            }
+            let cutoff = CheckpointProjectionCutoff(
+                schemaVersion: 1, sessionID: sessionID, sessionCreatedAt: rewound.createdAt,
+                lineage: rewound.lineageIdentity, checkpointID: checkpoint.checkpointID,
+                resultRevision: checkpoint.resultTranscriptRevision,
+                checkpointDigest: checkpoint.contentDigest
+            )
+            guard let data = canonicalCheckpointIntegrityData(cutoff) else {
+                throw SessionStoreError.invalidCompactionCheckpoint(checkpoint.checkpointID)
+            }
+            guard persistCheckpointSidecarDataUnlocked(
+                data, at: checkpointProjectionCutoffURL(sessionID: sessionID), id: sessionID,
+                atomicRename: true) else {
+                throw SessionStoreError.sessionCommitUncertain(sessionID)
+            }
+        }
+    }
+
+    /// 重试失败回合（对齐 Claude Code / Codex：从这一轮的用户消息重新开始）：只保留到最后一条
+    /// 用户消息为止，去掉其后的半截产出与错误提示。半截产出若留着，会被当成本轮内容再发给模型
+    /// （思考模式缺回传字段、以助手消息结尾，供应商直接拒收）。与 rewindConversation 同一套
+    /// 版本核对：落盘会话必须与调用方看到的完全一致，否则拒绝。
+    @discardableResult
+    public func discardOutputAfterLastUserMessage(expectedSession: ChatSession) throws -> ChatSession {
+        try PersistenceTransactionFence.withWrite([persistenceDomain]) {
+            try lock.withLock {
+                try Task.checkCancellation()
+                let sessionID = expectedSession.id
+                guard var current = try loadUnlocked(id: sessionID) else {
+                    throw SessionStoreError.sessionNotFound(sessionID)
+                }
+                guard current == expectedSession,
+                      current.transcriptRevision < UInt64.max,
+                      !FileManager.default.fileExists(atPath:
+                        sessionsDirectory.appendingPathComponent("_archive/\(sessionID).json").path),
+                      let lastUser = current.messages.lastIndex(where: { $0.role == .user }),
+                      lastUser + 1 < current.messages.count else {
+                    throw SessionStoreError.sessionSnapshotConflict(sessionID)
+                }
+                try validateLineageUnlocked(current)
+                current.messages = Array(current.messages.prefix(lastUser + 1))
+                current.transcriptRevision += 1
+                current.updatedAt = Date()
                 return try commitTranscriptUnlocked(current)
             }
         }
@@ -1413,7 +1490,8 @@ public final class SessionStore: @unchecked Sendable {
                     lastCheckpointChainPayloadMismatch = .notObserved
                     try validateCheckpointShape(checkpoint)
                     lastCheckpointSaveStage = .existingHistory
-                    let previousDigest = try validateCheckpointHistoryBeforeSaveUnlocked(checkpoint)
+                    let savedHistory = try validateCheckpointHistoryBeforeSaveUnlocked(checkpoint)
+                    let previousDigest = savedHistory.previousDigest
                     lastCheckpointSaveStage = .existingCheckpointRead
                     if let existing = try loadCheckpointUnlocked(id: checkpoint.checkpointID) {
                         guard existing == checkpoint else {
@@ -1504,6 +1582,9 @@ public final class SessionStore: @unchecked Sendable {
                         expectedSessionGeneration: checkpoint.resultTranscriptRevision
                     )
                     lastCheckpointSaveStage = .complete
+                    pruneSupersededCheckpointPayloadsUnlocked(
+                        history: savedHistory.history, committed: checkpoint)
+                    pruneOldestCheckpointChainRecordsUnlocked(sessionID: checkpoint.sessionID)
                     return checkpoint
                 }
             }
@@ -2839,6 +2920,17 @@ public final class SessionStore: @unchecked Sendable {
         let checkpointDigest: String
     }
 
+    private struct CheckpointChainPruneAnchor: Codable {
+        let schemaVersion: Int
+        let sessionID: String
+        let allowedOldestPredecessorDigests: [String]
+    }
+
+    private func checkpointChainPruneAnchorURL(sessionID: String) -> URL {
+        let key = SHA256.hash(data: Data(sessionID.utf8)).map { String(format: "%02x", $0) }.joined()
+        return compactionCheckpointsDirectory.appendingPathComponent(".\(key).chain-prune-anchor.json")
+    }
+
     private func checkpointProjectionCutoffURL(sessionID: String) -> URL {
         let key = SHA256.hash(data: Data(sessionID.utf8)).map { String(format: "%02x", $0) }.joined()
         return compactionCheckpointsDirectory.appendingPathComponent(".\(key).projection-cutoff.json")
@@ -3105,9 +3197,77 @@ public final class SessionStore: @unchecked Sendable {
         return record
     }
 
+    /// 新检查点提交成功后，删掉本会话里比“上一份”更早的检查点正文。
+    /// 撤销压缩只读最新一份（它写的是“截止线”文件，不回退到更早的检查点）；上一份留作回退，
+    /// 万一最新一份提交到一半中断，重启时把它隔离后仍可回到上一份。
+    /// 链记录（每份几 KB）全部保留，所以链的校验照旧；只有正文（可达 1MB 以上）被清理。
+    /// 清理是已提交压缩之后的收尾：删不掉不影响这次压缩，旧正文留到下一次保存再清。
+    private func pruneSupersededCheckpointPayloadsUnlocked(
+        history: [CompactionCheckpoint], committed: CompactionCheckpoint
+    ) {
+        let earlier = history.filter {
+            $0.resultTranscriptRevision < committed.resultTranscriptRevision
+        }
+        guard let priorRevision = earlier.map(\.resultTranscriptRevision).max() else { return }
+        for old in earlier where old.resultTranscriptRevision < priorRevision {
+            _ = removeItemIfExists(at: checkpointURL(for: old.checkpointID))
+        }
+    }
+
+    /// MC4-009：链记录只增不减，单会话压缩到约 512 次后新压缩会被拒绝且没有出口。
+    /// 新检查点提交成功后，若本会话已提交链记录超过触发数，就从最老一端连续删除，保留最新 256 条。
+    /// 不删：撤销压缩截止线引用的记录及更新的记录（截止线文件校验要求它仍在链里）、带清理墓碑的记录
+    /// （墓碑校验要求对应链记录存在）。只删连续的最老前缀，遇到不能删的或删失败就停，链仍是一条连续的链。
+    /// 删除前先写裁剪锚点，记下这批被删记录的摘要（以及当前最老记录的前驱摘要）；读链时最老一条的前驱
+    /// 必须落在锚点里，链头被意外删掉或改动仍会被发现，完整性校验不放宽。
+    /// 收尾清理，失败不影响这次已提交的压缩，下一次保存再试。
+    private func pruneOldestCheckpointChainRecordsUnlocked(sessionID: String) {
+        guard let records = try? scanCheckpointChainRecordsUnlocked([], sessionID: sessionID, repair: false),
+              records.count > Self.checkpointChainPruneTrigger else { return }
+        var protectedFloor = UInt64.max
+        let cutoffData: Data?
+        do {
+            cutoffData = try readCheckpointChainDataUnlocked(
+                at: checkpointProjectionCutoffURL(sessionID: sessionID), id: sessionID)
+        } catch { return }
+        if let cutoffData {
+            guard let cutoff = try? JSONDecoder().decode(CheckpointProjectionCutoff.self, from: cutoffData) else { return }
+            protectedFloor = cutoff.resultRevision
+        }
+        let ordered = records.sorted { $0.resultTranscriptRevision < $1.resultTranscriptRevision }
+        var planned: [CheckpointChainRecord] = []
+        for record in ordered.prefix(ordered.count - Self.checkpointChainRetainedRecords) {
+            guard record.resultTranscriptRevision < protectedFloor,
+                  !FileManager.default.fileExists(atPath: compactionCheckpointsDirectory
+                    .appendingPathComponent(".\(record.checkpointID).cleanup.tombstone.json").path) else { break }
+            planned.append(record)
+        }
+        guard !planned.isEmpty else { return }
+        var allowed = planned.map(\.checkpointDigest)
+        if let inherited = planned.first?.previousDigest { allowed.insert(inherited, at: 0) }
+        let anchor = CheckpointChainPruneAnchor(schemaVersion: 1, sessionID: sessionID, allowedOldestPredecessorDigests: allowed)
+        guard let data = canonicalCheckpointIntegrityData(anchor),
+              persistCheckpointSidecarDataUnlocked(data, at: checkpointChainPruneAnchorURL(sessionID: sessionID),
+                                                  id: sessionID, atomicRename: true) else { return }
+        for record in planned {
+            guard removeItemIfExists(at: checkpointChainURL(for: record.checkpointID)) else { return }
+        }
+    }
+
+    /// 读链时最老一条记录允许的前驱摘要；没有锚点文件时为空（最老一条必须没有前驱）。
+    private func checkpointChainPruneAnchorDigestsUnlocked(sessionID: String) throws -> Set<String> {
+        guard let data = try readCheckpointChainDataUnlocked(
+            at: checkpointChainPruneAnchorURL(sessionID: sessionID), id: sessionID) else { return [] }
+        guard let anchor = try? JSONDecoder().decode(CheckpointChainPruneAnchor.self, from: data),
+              anchor.schemaVersion == 1, anchor.sessionID == sessionID else {
+            throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
+        }
+        return Set(anchor.allowedOldestPredecessorDigests)
+    }
+
     private func validateCheckpointHistoryBeforeSaveUnlocked(
         _ checkpoint: CompactionCheckpoint
-    ) throws -> String? {
+    ) throws -> (previousDigest: String?, history: [CompactionCheckpoint]) {
         let history = try scanCheckpointHistoryUnlocked(sessionID: checkpoint.sessionID)
         if history.contains(where: {
             $0.checkpointID == checkpoint.checkpointID
@@ -3129,7 +3289,7 @@ public final class SessionStore: @unchecked Sendable {
         guard previous.count <= 1 else {
             throw SessionStoreError.compactionCheckpointRecoveryRequired(checkpoint.checkpointID)
         }
-        return previous.first?.contentDigest
+        return (previous.first?.contentDigest, history)
     }
 
     private func scanCheckpointHistoryUnlocked(
@@ -3146,9 +3306,9 @@ public final class SessionStore: @unchecked Sendable {
             throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
         }
         let candidates = files.filter { $0.pathExtension == "json" }
-        guard candidates.count <= Self.maxCheckpointChainRecords else {
-            throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
-        }
+        // The count and byte bounds apply to this session's own history. The
+        // directory is shared by every session, so counting other sessions' files
+        // would make every session's compaction fail once the directory filled up.
         var totalBytes: Int64 = 0
         var history: [CompactionCheckpoint] = []
         for url in candidates {
@@ -3156,10 +3316,6 @@ public final class SessionStore: @unchecked Sendable {
             guard Darwin.lstat(url.path, &info) == 0,
                   info.st_size >= 0,
                   info.st_size <= off_t(CompactionCheckpoint.maxPersistedBytes) else {
-                throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
-            }
-            totalBytes += Int64(info.st_size)
-            guard totalBytes <= Self.maxCheckpointChainBytes else {
                 throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
             }
             let checkpointID = url.deletingPathExtension().lastPathComponent
@@ -3171,6 +3327,11 @@ public final class SessionStore: @unchecked Sendable {
                 throw SessionStoreError.compactionCheckpointRecoveryRequired(checkpointID)
             }
             guard identity.sessionID == sessionID else { continue }
+            totalBytes += Int64(info.st_size)
+            guard totalBytes <= Self.maxCheckpointChainBytes,
+                  history.count < Self.maxCheckpointChainRecords else {
+                throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
+            }
             guard let checkpoint = try? decodeDurableCheckpoint(data, id: checkpointID) else {
                 throw SessionStoreError.compactionCheckpointRecoveryRequired(checkpointID)
             }
@@ -3682,10 +3843,9 @@ public final class SessionStore: @unchecked Sendable {
             return name.hasPrefix(".")
                 && (name.hasSuffix(".chain.json") || name.hasSuffix(".chain.prepared.json"))
         }
-        guard chainFiles.count <= Self.maxCheckpointChainRecords else {
-            throw SessionStoreError.compactionCheckpointRecoveryRequired(sessionID)
-        }
+        // Bounds apply to this session's own records, not to every session sharing the directory.
         var totalBytes: Int64 = 0
+        var sessionRecordCount = 0
         var candidatesByID: [String: [CheckpointChainRecord]] = [:]
         for url in chainFiles {
             lastCheckpointReadStage = .canonicalChainEnumerationAndDecode
@@ -3712,15 +3872,19 @@ public final class SessionStore: @unchecked Sendable {
                   info.st_size <= 64 * 1024 else {
                 throw SessionStoreError.compactionCheckpointRecoveryRequired(recordID)
             }
-            totalBytes += Int64(info.st_size)
-            guard totalBytes <= Self.maxCheckpointChainBytes,
-                  let data = try? readCheckpointChainDataUnlocked(at: url, id: recordID),
+            guard let data = try? readCheckpointChainDataUnlocked(at: url, id: recordID),
                   let record = try? decodeCanonicalCheckpointChainRecord(data, checkpointID: recordID),
                   record.phase == phase,
                   record.checkpointID == recordID else {
                 throw SessionStoreError.compactionCheckpointRecoveryRequired(recordID)
             }
             if record.sessionID != sessionID { continue }
+            totalBytes += Int64(info.st_size)
+            sessionRecordCount += 1
+            guard totalBytes <= Self.maxCheckpointChainBytes,
+                  sessionRecordCount <= Self.maxCheckpointChainRecords else {
+                throw SessionStoreError.compactionCheckpointRecoveryRequired(recordID)
+            }
             lastCheckpointReadStage = .recordShapeOrManifest
             guard record.schemaVersion == CheckpointChainRecord.currentSchemaVersion,
                   isCanonicalCheckpointTransactionID(record.transactionID),
@@ -3824,6 +3988,13 @@ public final class SessionStore: @unchecked Sendable {
         let records = try scanCheckpointChainRecordsUnlocked(checkpoints, sessionID: sessionID, repair: repair)
         let activeByID = Dictionary(uniqueKeysWithValues: checkpoints.map { ($0.checkpointID, $0) })
         var generations: [UInt64: CheckpointChainRecord] = [:]
+        // MC4-009：最老端的链记录可能已被裁掉；此时最老的一条的前驱摘要必须是裁剪锚点里记下的。
+        let oldestRevision = records.map(\.resultTranscriptRevision).min()
+        let prunedPredecessors = try checkpointChainPruneAnchorDigestsUnlocked(sessionID: sessionID)
+        func isPrunedOldest(_ record: CheckpointChainRecord) -> Bool {
+            record.resultTranscriptRevision == oldestRevision
+                && record.previousDigest.map(prunedPredecessors.contains) == true
+        }
         for record in records {
             lastCheckpointReadStage = .generationOrPredecessorLinks
             if let previous = generations[record.resultTranscriptRevision],
@@ -3843,7 +4014,7 @@ public final class SessionStore: @unchecked Sendable {
                     throw SessionStoreError.compactionCheckpointRecoveryRequired(record.checkpointID)
                 }
             } else {
-                guard record.previousDigest == nil else {
+                guard record.previousDigest == nil || isPrunedOldest(record) else {
                     throw SessionStoreError.compactionCheckpointRecoveryRequired(record.checkpointID)
                 }
             }
@@ -3851,8 +4022,15 @@ public final class SessionStore: @unchecked Sendable {
                 // A committed chain without an active payload is only
                 // legitimate after the payload was durably quarantined and
                 // its cleanup tombstone was fully validated. A missing
-                // payload without that evidence is incomplete state.
-                guard validatedCleanupTombstoneIDs.contains(record.checkpointID) else {
+                // payload without that evidence is incomplete state, except
+                // for a checkpoint a newer active one has superseded: its
+                // payload was pruned on purpose after that newer checkpoint
+                // committed (`pruneSupersededCheckpointPayloadsUnlocked`).
+                let supersededByActiveCheckpoint = checkpoints.contains {
+                    $0.resultTranscriptRevision > record.resultTranscriptRevision
+                }
+                guard validatedCleanupTombstoneIDs.contains(record.checkpointID)
+                        || supersededByActiveCheckpoint else {
                     throw SessionStoreError.compactionCheckpointRecoveryRequired(
                         record.checkpointID
                     )
@@ -3888,7 +4066,7 @@ public final class SessionStore: @unchecked Sendable {
                     $0.resultTranscriptRevision == checkpoint.sourceTranscriptRevision
                         && $0.checkpointDigest == previousDigest
                 }
-                guard activePrevious || historicalPrevious else {
+                guard activePrevious || historicalPrevious || isPrunedOldest(record) else {
                     throw SessionStoreError.compactionCheckpointRecoveryRequired(record.checkpointID)
                 }
             }

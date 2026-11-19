@@ -154,6 +154,103 @@ struct ConversationRewindConsumerTests {
         #expect(chat.conversationRewindDisplay(for: a, redactor: redactor).preview == nil)
     }
 
+    /// R3-09：两轮对话后才改文件（检查点晚于第二条用户消息），再退出重开。
+    private func r309Prepared() async throws -> (profile: RuntimeIsolationProfile, store: SessionStore,
+                                                   id: UUID, boundary: Int, root: URL, file: URL) {
+        let (profile, chat, store, _) = try fixture()
+        defer { chat.stopAllStreamingForSafety() }
+        let id = try #require(chat.activeSessionID)
+        try await send("R309_FIRST", chat: chat)
+        let boundary = try #require(store.loadSession(id: id.uuidString)).messages.count - 1
+        try await send("R309_SECOND", chat: chat)
+        let root = profile.rootDirectory.appendingPathComponent("r309-files", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let resolvedRoot = root.resolvingSymlinksInPath()
+        let file = resolvedRoot.appendingPathComponent("probe.txt")
+        let checkpoints = try FileCheckpointStore(
+            directory: resolvedRoot.appendingPathComponent("checkpoints", isDirectory: true),
+            allowedRoots: [resolvedRoot])
+        let snapshot = try #require(chat.sessions.first { $0.id == id })
+        let after = Data("written-by-tool".utf8)
+        let checkpointID = try checkpoints.begin(path: file, sessionID: id.uuidString, operation: .write,
+            expectedAfter: after, conversation: try JSONEncoder().encode(snapshot))
+        try after.write(to: file)
+        try checkpoints.commit(checkpointID)
+        return (profile, store, id, boundary, resolvedRoot, file)
+    }
+
+    private func r309ColdStore(_ prepared: (profile: RuntimeIsolationProfile, store: SessionStore,
+                                            id: UUID, boundary: Int, root: URL, file: URL)) throws -> ChatStore {
+        let cold = ChatStore(preferencesDefaults: prepared.profile.makeUserDefaults(),
+                             logManager: prepared.profile.makeLogManager())
+        #expect(cold.attachPersistence(SessionStore(directory: prepared.profile.sessionDirectory)))
+        cold.fileCheckpointStore = try FileCheckpointStore(
+            directory: prepared.root.appendingPathComponent("checkpoints", isDirectory: true),
+            allowedRoots: [prepared.root])
+        cold.configureComposerPolicy(ComposerPolicyFactSource(
+            knownCapabilities: [], grantedCapabilities: [], allowedWriteRoots: [prepared.root.path],
+            workspaceID: cold.composerWorkspaceID, revision: "r309", grantEpoch: "r309",
+            leaseID: "r309", expiresAt: Date().addingTimeInterval(60)))
+        #expect(cold.applySwitchSession(id: prepared.id))
+        return cold
+    }
+
+    @Test("R3-09：重启后回退会话并恢复文件，仍按消息的真实时间找到早于启动时刻的检查点")
+    func restartedRewindRestoresFilesChangedAfterTheAnchor() async throws {
+        let prepared = try await r309Prepared()
+        defer { try? prepared.profile.cleanupDisposableRoots() }
+        let cold = try r309ColdStore(prepared)
+        #expect(cold.fileCheckpoints.count == 1)
+        let anchor = try #require(try cold.conversationRewindAnchors()
+            .first { $0.messageIndex == prepared.boundary })
+        #expect(await cold.restoreConversationAndFiles(anchor))
+        #expect(!FileManager.default.fileExists(atPath: prepared.file.path))
+        #expect(cold.checkpointFeedback?.contains("恢复其后改动的 1 个文件") == true)
+    }
+
+    @Test("MC4-024：文件已恢复但会话回退写盘失败时，提示明确写出文件已恢复、对话没有回退")
+    func fileRestoredButConversationRewindFailureIsStatedInFeedback() async throws {
+        let prepared = try await r309Prepared()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755],
+                ofItemAtPath: prepared.store.sessionsDirectory.path)
+            try? prepared.profile.cleanupDisposableRoots()
+        }
+        let cold = try r309ColdStore(prepared)
+        let anchor = try #require(try cold.conversationRewindAnchors()
+            .first { $0.messageIndex == prepared.boundary })
+        // 会话文件所在目录不可写：文件恢复（在检查点目录和工作区）照常成功，会话回退写盘失败。
+        try FileManager.default.setAttributes([.posixPermissions: 0o555],
+            ofItemAtPath: prepared.store.sessionsDirectory.path)
+        let ok = await cold.restoreConversationAndFiles(anchor)
+        #expect(ok == false)
+        #expect(!FileManager.default.fileExists(atPath: prepared.file.path))
+        #expect(cold.checkpointFeedback?.contains("个文件恢复到该检查点，但对话没有回退") == true)
+    }
+
+    @Test("R3-09：旧数据没有消息时间时，回退会话不谎称没有文件改动，改为提示按检查点逐个恢复")
+    func restartedRewindWithoutSavedTimesDoesNotClaimNoFileChanges() async throws {
+        let prepared = try await r309Prepared()
+        defer { try? prepared.profile.cleanupDisposableRoots() }
+        // 还原成升级前的旧文件：去掉消息时间。
+        let shard = ChatAttachmentPersistence.sessionSidecarURL(for: prepared.id, in: prepared.store.directory)
+        var object = try #require(try JSONSerialization.jsonObject(
+            with: Data(contentsOf: shard)) as? [String: Any])
+        var sessions = try #require(object["sessions"] as? [[String: Any]])
+        for index in sessions.indices { sessions[index].removeValue(forKey: "messageTimes") }
+        object["sessions"] = sessions
+        try JSONSerialization.data(withJSONObject: object).write(to: shard)
+
+        let cold = try r309ColdStore(prepared)
+        let anchor = try #require(try cold.conversationRewindAnchors()
+            .first { $0.messageIndex == prepared.boundary })
+        #expect(await cold.restoreConversationAndFiles(anchor))
+        #expect(FileManager.default.fileExists(atPath: prepared.file.path))
+        #expect(cold.checkpointFeedback?.contains("按检查点逐个恢复") == true)
+        #expect(cold.checkpointFeedback?.contains("没有文件改动") == false)
+        #expect(cold.fileCheckpoints.count == 1)
+    }
+
     private func send(_ text: String, chat: ChatStore) async throws {
         let id = try #require(chat.activeSessionID)
         chat.draftText = text

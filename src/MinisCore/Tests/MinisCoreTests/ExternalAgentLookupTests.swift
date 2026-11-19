@@ -101,13 +101,14 @@ struct LossySummaryUserQuoteTests {
         #expect(lines == ["- 只用中文回答，不要改动 docs 目录", "- 第二个要求： 报告写到 report.md", "- 再加一条：别删测试"])
     }
 
-    @Test func quotesAreBoundedAndKeepTheNewest() {
+    @Test func quotesAreBoundedAndKeepTheEarliestAndTheNewest() {
         let long = String(repeating: "长", count: 3_000)
         let many = (0..<20).map { LLMMessage(role: .user, content: "\($0)-" + long) }
         let quotes = LossySummaryCompaction.userQuotes(messages: many[...])
         #expect(quotes.contains("（更早的"))
         #expect(quotes.contains("- 19-"))
-        #expect(!quotes.contains("- 0-"))
+        #expect(quotes.contains("- 0-"))      // 最早的一条（任务目标）固定保留
+        #expect(!quotes.contains("- 1-"))
         #expect(quotes.count <= LossySummaryCompaction.userQuotesCharacterLimit + 200)
     }
 

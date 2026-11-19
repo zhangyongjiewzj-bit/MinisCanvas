@@ -7,8 +7,10 @@ import MinisCore
 /// the send while the window is below 95%; at or above 95%, when neither request
 /// reduction nor compaction can lower it, the send is refused visibly with no
 /// Provider request. Real `ChatStore` / `AgentLoop` / `Compactor`; Providers are
-/// the external boundary. Conflicts, cancellation and Provider errors are not
-/// refusals and keep failing the turn (see the migrated 2669 suite).
+/// the external boundary. Since C3-05 (11/17) a failed summary request or a
+/// checkpoint that did not validate is handled like a refusal; conflicts and
+/// cancellation are not refusals and keep failing the turn (see the migrated
+/// 2669 suite).
 ///
 /// Depends on C-L2's `AgentLoop.contextAdmission` and `AgentLoopError.contextWindowFull`.
 @Suite("C3 refused compaction still sends below 95%", .serialized)
@@ -65,6 +67,50 @@ struct CompactionRefusedStillSends_C3_Tests {
         // The notice is a UI system row; asPersisted drops system rows, so the canonical
         // transcript still ends with the reply.
         #expect(canonical.messages.last?.content == "CURRENT_REPLY_2669")
+    }
+
+    /// C3-12: a message sent while a manual compaction is still summarizing does not interrupt it and
+    /// does not change the history under the summary: it waits in the queue and goes out afterwards.
+    @Test func messageSentWhileManualCompactionRunsWaitsInTheQueueAndSendsAfterwards() async throws {
+        let fixture = try Fixture()
+        let dialogue = Dialogue()
+        let chat = fixture.bridge.chat
+        defer {
+            chat.stopAllStreamingForSafety()
+            withExtendedLifetime(fixture.settings) {}
+        }
+        await fixture.attach()
+        #expect(chat.applySwitchSession(id: fixture.sessionID))
+        let original = try #require(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString))
+        chat.streamingProviderOverride = dialogue
+        let requestID = chat.beginCompactionPresentation(sessionID: fixture.sessionID)
+        #expect(chat.isActiveSessionManualCompacting)
+
+        let text = "C3_12_SENT_DURING_COMPACTION"
+        chat.draftText = text
+        chat.submitComposer()
+        #expect(chat.activeQueuedComposerMessages.map(\.text) == [text])
+        #expect(chat.draftText.isEmpty)
+        #expect(dialogue.requests.isEmpty)
+        #expect(!chat.isActiveSessionGenerating)
+        let untouched = try #require(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString))
+        #expect(untouched.messages == original.messages, "the history under the summary must not change")
+
+        chat.finishCompactionPresentation(requestID: requestID, sessionID: fixture.sessionID, state: .succeeded)
+        let sent = await waitUntil { dialogue.requests.count == 1 && !chat.hasStreamingTasksForSafety }
+        #expect(sent)
+        #expect(chat.activeQueuedComposerMessages.isEmpty)
+        let canonical = try #require(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString))
+        #expect(canonical.messages.filter { $0.content == text }.count == 1)
+    }
+
+    /// C3-11: one message's images (base64 is a third larger) must stay clear of the 32 MB request
+    /// body limit, and be reachable by the history media budget that already counts the newest message.
+    @Test func composerImageTotalCapLeavesRoomUnderTheRequestBodyLimit() {
+        let cap = ChatStore.maxComposerImageTotalBytes
+        #expect(cap == 18 * 1024 * 1024)
+        #expect(cap * 4 / 3 < 28 * 1024 * 1024)
+        #expect(cap >= HistoryMediaBudget.defaultMaxBytes)
     }
 
     /// 97% of the window and a history that can neither be compacted nor reduced

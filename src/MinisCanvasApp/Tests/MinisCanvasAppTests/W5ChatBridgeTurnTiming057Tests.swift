@@ -265,4 +265,78 @@ struct W5ChatBridgeTurnTiming057Tests {
         #expect(reopened.messages[0].turnProviderName == nil)
         #expect(reopened.messages[0].turnModelID == nil)
     }
+
+    // MARK: 5. R3-09 每条消息的真实时间
+
+    /// 修后复核：回合中现场转换的消息（工具往来、合并后的中间消息）时间可信，不得标成"未核实"，
+    /// 否则跑过工具的回合，"回退会话并恢复文件"会不再自动恢复文件。只有从磁盘读出的消息才标。
+    @Test func liveConvertedMessagesKeepTrustedTimesOnlyDiskLoadsAreUnverified() {
+        let call = LLMToolCall(id: "c1", name: "file_write", rawArguments: "{}", arguments: [:])
+        let live = [LLMMessage(role: .assistant, content: "", toolCalls: [call]),
+                    LLMMessage(role: .tool, content: "ok", toolCallID: "c1")].map { $0.asChatMessageUI() }
+        #expect(live.allSatisfy { !$0.hasUnverifiedTimestamp })
+        let thread = ChatThread(id: UUID(), messages: [ChatMessageUI(role: .user, content: "改文件")])
+        #expect(thread.asPersisted().asThread().messages.allSatisfy { $0.hasUnverifiedTimestamp })
+    }
+
+    @Test("R3-09：普通消息的真实时间跨 save/reopen 保真；改写过的消息与未核实消息不回填、不写假时间")
+    func messageTimestampsSurviveReopen() throws {
+        let root = try makeTempRoot("message-times")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let t0 = Date(timeIntervalSince1970: 1_700_000_000)
+        let thread = ChatThread(id: UUID(), messages: [
+            ChatMessageUI(role: .user, content: "改一个文件", timestamp: t0),
+            ChatMessageUI(role: .assistant, content: "好的", timestamp: t0.addingTimeInterval(5)),
+        ])
+        // 普通消息没有附件/回合元数据，不产生附件记录，但时间照样落盘。
+        #expect(ChatAttachmentPersistence.records(for: thread).messages.isEmpty)
+        try ChatAttachmentPersistence.save(session: thread, to: root)
+        let id = thread.id.uuidString
+        let records = try #require(try ChatAttachmentPersistence.load(forSessionID: id, from: root))
+        let times = try ChatAttachmentPersistence.loadMessageTimes(forSessionID: id, from: root)
+        #expect(times.count == 2)
+
+        let reopened = ChatAttachmentPersistence.restoreAttachments(
+            from: thread.asPersisted(), records: records, messageTimes: times)
+        #expect(reopened.messages.map(\.timestamp) == [t0, t0.addingTimeInterval(5)])
+        #expect(reopened.messages.allSatisfy { !$0.hasUnverifiedTimestamp })
+
+        // 旧数据没有消息时间：保持“时间未核实”，且再次落盘时不把启动时刻写成真实时间。
+        let bare = ChatAttachmentPersistence.restoreAttachments(from: thread.asPersisted(), records: records)
+        #expect(bare.messages.allSatisfy { $0.hasUnverifiedTimestamp })
+        #expect(ChatAttachmentPersistence.records(for: bare).messageTimes == nil)
+
+        // 内容被改写：摘要对不上，不把旧时间挂到别的消息上。
+        var edited = thread.asPersisted()
+        edited.messages[1] = LLMMessage(role: .assistant, content: "改写过")
+        let fenced = ChatAttachmentPersistence.restoreAttachments(
+            from: edited, records: records, messageTimes: times)
+        #expect(fenced.messages[0].timestamp == t0 && !fenced.messages[0].hasUnverifiedTimestamp)
+        #expect(fenced.messages[1].hasUnverifiedTimestamp)
+    }
+
+    @Test("R3-09：旧文件没有 messageTimes 键照常读取；旧档的终态助手回合用回合创建时刻作为可信时间")
+    func legacySidecarWithoutTimesAndTurnStartFallback() throws {
+        let root = try makeTempRoot("message-times-legacy")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = UUID()
+        let shard = ChatAttachmentPersistence.sessionSidecarURL(for: id, in: root)
+        try Data("""
+        {"schemaVersion":5,"sessions":[{"sessionID":"\(id.uuidString)","messages":[]}]}
+        """.utf8).write(to: shard)
+        #expect(try ChatAttachmentPersistence.loadMessageTimes(forSessionID: id.uuidString, from: root).isEmpty)
+
+        let timing = terminalTiming()
+        let thread = ChatThread(id: id, messages: [
+            ChatMessageUI(role: .user, content: "问"),
+            ChatMessageUI(role: .assistant, content: "答", turnTiming: timing,
+                          turnProviderName: "Provider 甲", turnModelID: "model-x-2026"),
+        ])
+        try ChatAttachmentPersistence.save(sessions: [thread], to: root)
+        let records = try #require(try ChatAttachmentPersistence.load(from: root)[id.uuidString])
+        let reopened = ChatAttachmentPersistence.restoreAttachments(from: thread.asPersisted(), records: records)
+        #expect(reopened.messages[0].hasUnverifiedTimestamp)
+        #expect(reopened.messages[1].timestamp == timing.startedAt)
+        #expect(!reopened.messages[1].hasUnverifiedTimestamp)
+    }
 }

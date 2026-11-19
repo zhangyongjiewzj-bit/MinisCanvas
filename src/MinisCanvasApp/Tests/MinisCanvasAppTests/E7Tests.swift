@@ -112,6 +112,26 @@ struct E7SessionSidebarTests {
         #expect(chat.duplicateSession(id: UUID()) == nil)
     }
 
+    /// S-04：编辑带附件的旧消息后“从这里分叉到新会话”，附件跟着草稿进新会话的输入框。
+    @Test func editForkCarriesTheEditedMessageAttachmentsIntoTheNewSession() throws {
+        let chat = ChatStore()
+        let sourceID = try #require(chat.activeSessionID)
+        let attachment = ChatAttachment(kind: .image, fileName: "设计稿.png", fileType: .image,
+                                        mimeType: "image/png", data: Data([0x89, 0x50, 0x4E, 0x47]))
+        chat.appendUser("看这张图", attachments: [attachment])
+        chat.appendAssistant("好的")
+        let messageID = try #require(chat.messages.first { $0.role == .user }?.id)
+        chat.beginEdit(messageID: messageID)
+        #expect(chat.pendingAttachments.count == 1)
+        chat.draftText = "改过的问题"
+
+        let forkID = try #require(chat.forkFromEditedMessage())
+        #expect(forkID != sourceID)
+        #expect(chat.activeSessionID == forkID)
+        #expect(chat.draftText == "改过的问题")
+        #expect(chat.pendingAttachments.map(\.id) == [attachment.id])
+    }
+
     // MARK: 归档 / 恢复（内存态，未装配持久化）
 
     @Test func archiveAndRestoreInMemory() {

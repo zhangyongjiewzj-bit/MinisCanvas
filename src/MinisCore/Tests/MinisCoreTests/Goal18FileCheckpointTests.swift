@@ -150,6 +150,7 @@ struct Goal18FileCheckpointTests {
         let executor = BuiltinToolExecutor(allowedRoot: root, deniedRoots: [])
         executor.fileCheckpointsEnabled = true
         executor.fileChangeSessionID = "s"
+        executor.markFileRead(path: file.path) // 覆盖已有文件要求先读；这里要验证的是检查点失败而不是未读
         await #expect(throws: (any Error).self) {
             try await executor.execute(name: "file_write", input: ["path": file.path, "content": "changed"])
         }

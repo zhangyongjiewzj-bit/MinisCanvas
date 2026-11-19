@@ -23,7 +23,7 @@ struct ComposerMessageEditRequest: Identifiable {
     var id: UUID { messageID }
 
     @MainActor static func prepare(chat: ChatStore, messageID: UUID) -> Self? {
-        guard chat.messages.contains(where: { $0.id == messageID && $0.role == .user }) else { return nil }
+        guard chat.messages.contains(where: { $0.id == messageID && $0.role == .user && !$0.isBackgroundCompletionNotice }) else { return nil }
         let draft = ComposerEditDraftIdentity.capture(chat)
         guard draft.needsConfirmation else { chat.beginEdit(messageID: messageID); return nil }
         return Self(messageID: messageID, draft: draft)
@@ -85,6 +85,12 @@ struct ComposerEditModeBar: View {
             .help("取消编辑")
             .accessibilityLabel("取消编辑")
             .accessibilityIdentifier(accessibilityID + ".cancel")
+            Button("从这里分叉到新会话") { _ = chat.forkFromEditedMessage() }
+                .buttonStyle(.plain)
+                .font((typography?.caption2 ?? .system(size: 9)).weight(.medium))
+                .disabled(chat.isActiveSessionGenerating)
+                .help("新会话保留这条消息之前的历史，编辑后的文字放进输入框；原会话不变")
+                .accessibilityIdentifier(accessibilityID + ".fork")
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 7)

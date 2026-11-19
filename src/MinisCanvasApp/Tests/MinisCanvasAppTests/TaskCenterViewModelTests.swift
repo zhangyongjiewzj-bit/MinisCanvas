@@ -42,7 +42,9 @@ struct TaskCenterViewModelTests {
             .appendingPathComponent("Sources/MinisCanvasApp/TaskCenterObservationView.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
         for contract in [
-            "receiptRows(now:",
+            // ed510247：外层不再每 0.5 秒带 now 重算，改按数据版本复用回执行；过滤仍带 now。
+            "receiptRowsReusingVersion(includeArchived: true)",
+            "filteredReceiptRows(filter, now:",
             "failureReason",
             ".accessibilityLabel(receipt?.accessibilityLabel",
             "task-center-receipt"

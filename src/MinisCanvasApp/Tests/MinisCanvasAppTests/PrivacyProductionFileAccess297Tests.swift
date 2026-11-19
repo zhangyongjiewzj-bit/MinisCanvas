@@ -127,7 +127,7 @@ struct PrivacyProductionFileAccess297Tests {
                 try "unchanged".write(to: note, atomically: true, encoding: .utf8)
                 // Dispatch through the real composition chain, whose existing ownership
                 // contract keeps the non-Sendable builtin on the production executor route.
-                #expect(try await beforeEngine.composedExecutor.execute(name: "file_read", input: ["path": note.path]) == "unchanged")
+                #expect(try await beforeEngine.composedExecutor.execute(name: "file_read", input: ["path": note.path]) == "     1\tunchanged")
 
                 center.unmountFolder(mounted.path)
                 await bridge.lastChildGovernorSafetyTask?.value
@@ -141,14 +141,14 @@ struct PrivacyProductionFileAccess297Tests {
                 #expect(afterEngineOwner !== beforeEngineOwner)
                 #expect(after.additionalAllowedRoots.isEmpty)
                 let afterBuiltinBox = ToolExecutorBox(value: after)
-                await #expect(throws: ToolExecutorError.invalidParameter("Policy violation: fileRootNotAllowed")) {
+                await #expect(throws: ToolExecutorError.invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)) {
                     _ = try await afterEngine.composedExecutor.execute(name: "file_read", input: ["path": note.path])
                 }
                 await #expect(throws: ToolExecutorError.pathViolation(note.path)) {
                     _ = try await afterBuiltinBox.value.execute(name: "file_read", input: ["path": note.path])
                 }
                 let target = mounted.appendingPathComponent("nested/new.txt")
-                await #expect(throws: ToolExecutorError.invalidParameter("Policy violation: fileRootNotAllowed")) {
+                await #expect(throws: ToolExecutorError.invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)) {
                     _ = try await afterEngine.composedExecutor.execute(name: "file_write", input: ["path": target.path, "content": "blocked", "create_dirs": true])
                 }
                 await #expect(throws: ToolExecutorError.pathViolation(target.path)) {
@@ -156,7 +156,7 @@ struct PrivacyProductionFileAccess297Tests {
                         "path": target.path, "content": "blocked", "create_dirs": true
                     ])
                 }
-                await #expect(throws: ToolExecutorError.invalidParameter("Policy violation: fileRootNotAllowed")) {
+                await #expect(throws: ToolExecutorError.invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)) {
                     _ = try await afterEngine.composedExecutor.execute(name: "file_edit", input: ["path": note.path, "old_string": "unchanged", "new_string": "changed"])
                 }
                 await #expect(throws: ToolExecutorError.pathViolation(note.path)) {
@@ -177,7 +177,7 @@ struct PrivacyProductionFileAccess297Tests {
                 #expect(remounted !== after)
                 #expect(remountedEngineOwner === remounted)
                 #expect(remountedEngineOwner !== afterEngineOwner)
-                #expect(try await remountedEngine.composedExecutor.execute(name: "file_read", input: ["path": note.path]) == "unchanged")
+                #expect(try await remountedEngine.composedExecutor.execute(name: "file_read", input: ["path": note.path]) == "     1\tunchanged")
             }
             await handle.finish()
         } catch {

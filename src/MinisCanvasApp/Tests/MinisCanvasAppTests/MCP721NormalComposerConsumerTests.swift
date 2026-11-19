@@ -209,8 +209,10 @@ struct MCP721NormalComposerConsumerTests {
                        center: center, registry: registry, bridge: bridge, effect: effect, transport: transport)
     }
 
-    @Test func approvedMCPToolUsesPersistedOtherToolTimeout() async throws {
-        for (limit, shouldTimeout) in [(1, true), (5, false)] {
+    // R3-11：MCP 工具不受设置里的“其它工具超时”约束，各自用 MCP 服务器配置的超时
+    // （MCP 页可单独设，对齐 Claude Code 的 MCP 工具超时独立）；设置值仍持久化并接到引擎。
+    @Test func approvedMCPToolIgnoresPersistedOtherToolTimeout() async throws {
+        for (limit, shouldTimeout) in [(1, false), (5, false)] {
             let f = try await makeFixture(toolTimeoutSeconds: limit, delay: .seconds(2))
             defer {
                 f.bridge.chat.stopAllStreamingForSafety()
@@ -295,16 +297,17 @@ struct MCP721NormalComposerConsumerTests {
         defer { f.registry.disconnectAll() }
         let messages = try await submit(f.bridge, f.provider,
             replies: [call("deny721", f.name, ["value": "owned721", "path": f.effect.path])], mode: .manual)
-        #expect((try terminal(messages, id: "deny721")).1)
-        #expect(f.transport.calls == 0)
-        #expect(!FileManager.default.fileExists(atPath: f.effect.path))
-        // MCP's arbitrary path input reaches the original PolicyRuntime root
-        // check after Composer approval; an approval is not a successful effect.
+        // MCP 工具的 path 参数是服务端自己的约定，不再按项目根拦截（对齐 Claude Code）：
+        // 授权目录外的路径参数经一次审批后照常执行；其余边界仍然拦住。
+        let reachesTool = boundary == "outside-root"
+        #expect((try terminal(messages, id: "deny721")).1 == !reachesTool)
+        #expect(f.transport.calls == (reachesTool ? 1 : 0))
+        #expect(FileManager.default.fileExists(atPath: f.effect.path) == reachesTool)
         let approvals = await f.approval.requests.count
         #expect(approvals == (["approval-denied", "outside-root"].contains(boundary) ? 1 : 0))
         #expect(f.bridge.composerApprovalReceipts.count == (boundary == "outside-root" ? 1 : 0))
         let engine = try #require(f.bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.toolExecutionFactLedger.facts.allSatisfy { $0.status != .succeeded })
+        #expect(engine.toolExecutionFactLedger.facts.allSatisfy { ($0.status == .succeeded) == reachesTool })
         #expect(try reopened(f.bridge).messages == f.bridge.chat.messages.map { $0.asLLMMessage() })
     }
 

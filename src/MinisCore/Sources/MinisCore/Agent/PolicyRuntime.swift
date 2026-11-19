@@ -389,7 +389,7 @@ public enum PolicyRuntimePathBoundary {
     /// normal form, otherwise the deny table is trivially bypassable.
     /// Allow-side comparisons intentionally stay exact (unfolded) so this
     /// folding can never grant access; it can only deny more.
-    static func foldedForPathComparison(_ path: String) -> String {
+    public static func foldedForPathComparison(_ path: String) -> String {
         let precomposed = (path as NSString).precomposedStringWithCanonicalMapping
         return precomposed.folding(
             options: [.caseInsensitive, .widthInsensitive],
@@ -470,5 +470,6 @@ private func domainAllowed(_ candidate: String, by allowed: String) -> Bool {
 extension GoalEnvelope {
     func permitsNetworkDomain(_ domain: String) -> Bool {
         networkDomains.contains { domainAllowed(domain, by: $0) }
+            || BrowserDomainApproval.shared.permits(host: domain)
     }
 }

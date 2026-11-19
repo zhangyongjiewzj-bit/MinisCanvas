@@ -38,6 +38,14 @@ public struct ApprovalFileVersion: Sendable, Equatable {
         ])
     }
 
+    /// 只有 mtime/ctime 不同（设备、inode、权限、大小都相同）。编辑器“碰一下”文件
+    /// 会出现这种情况；是否仍算同一版本由调用方再按内容摘要判断。
+    func differsOnlyInTimes(from other: Self) -> Bool {
+        path == other.path && canonicalPath == other.canonicalPath
+            && metadata.count == 8 && other.metadata.count == 8
+            && Array(metadata.prefix(4)) == Array(other.metadata.prefix(4))
+    }
+
     func matches(_ info: stat) -> Bool {
         metadata == [Int64(info.st_dev), Int64(info.st_ino), Int64(info.st_mode), Int64(info.st_size),
             Int64(info.st_mtimespec.tv_sec), Int64(info.st_mtimespec.tv_nsec),
@@ -58,6 +66,10 @@ public struct ApprovalFileVersion: Sendable, Equatable {
 
 public struct ApprovalFilePreview: Sendable, Equatable {
     public static let maximumCharacters = 4096
+    /// 覆盖写入的新旧对比只在旧文件不超过此大小时给出。
+    static let overwriteDiffMaxBytes = 256 * 1024
+    /// 时间变化后为核对内容摘要而重读文件的上限；更大的文件保持严格。
+    static let timeOnlyDigestMaxBytes = 8 * 1024 * 1024
     public let version: ApprovalFileVersion?
     public let text: String
     public let isSensitive: Bool
@@ -65,6 +77,19 @@ public struct ApprovalFilePreview: Sendable, Equatable {
     var deletionContentDigest: String? = nil
     public internal(set) var expandedText: String? = nil
     var parameterOnly: Bool = false
+    /// 写入/编辑预览：只有文件时间变化、内容摘要相同时仍算同一版本；删除预览保持严格。
+    var toleratesTimeOnlyChange: Bool = false
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        guard lhs.text == rhs.text, lhs.isSensitive == rhs.isSensitive, lhs.available == rhs.available,
+              lhs.deletionContentDigest == rhs.deletionContentDigest, lhs.expandedText == rhs.expandedText,
+              lhs.parameterOnly == rhs.parameterOnly,
+              lhs.toleratesTimeOnlyChange == rhs.toleratesTimeOnlyChange else { return false }
+        if lhs.version == rhs.version { return true }
+        guard lhs.toleratesTimeOnlyChange, lhs.deletionContentDigest != nil,
+              let left = lhs.version, let right = rhs.version else { return false }
+        return left.differsOnlyInTimes(from: right)
+    }
 
     static func bounded(_ text: String, lines: Int? = nil, bytes: Int) -> String {
         let lineBounded = lines.map { text.split(separator: "\n", omittingEmptySubsequences: false).prefix($0).joined(separator: "\n") } ?? text
@@ -91,7 +116,8 @@ public struct ApprovalFilePreview: Sendable, Equatable {
     }
 
     static func write(version: ApprovalFileVersion, content: String, exists: Bool,
-        oldLines: Int?, append: Bool, digest: String?, oldUnreadable: Bool = false) -> Self {
+        oldLines: Int?, append: Bool, digest: String?, oldUnreadable: Bool = false,
+        oldContent: String? = nil) -> Self {
         let proposed = lineCount(content)
         let delta: String
         if let oldLines {
@@ -99,8 +125,18 @@ public struct ApprovalFilePreview: Sendable, Equatable {
         } else { delta = oldUnreadable ? "旧内容不可读；旧行数差/旧全文摘要不可用"
             : (exists ? "旧文件不是UTF8文本，无法计算行数差" : "新建文件：\(proposed) 行") }
         let heading = ContentSecretRedactor.redact("路径：\(version.path)\n拟写入大小：\(content.utf8.count) bytes\n" + (exists ? (append ? "将追加" : "将覆盖") : "将新建") + "\n" + delta + "\n")
+        // 覆盖已有文件（旧文件 ≤256KiB 的 UTF-8 文本）：给新旧对比；两侧先脱敏再比对。
+        if exists, !append, let oldContent {
+            let hunks = TextDiff.diff(old: redactedLines(oldContent), new: redactedLines(content))
+            let safe = heading + DiffRenderer.renderUnifiedWithHeaders(hunks)
+            let initial = bounded(safe, lines: 80, bytes: 8 * 1024)
+            let expanded = bounded(safe, bytes: 64 * 1024)
+            return Self(version: version, text: initial, isSensitive: false, available: true,
+                deletionContentDigest: digest, expandedText: expanded == initial ? nil : expanded,
+                toleratesTimeOnlyChange: true)
+        }
         return Self(version: version, text: heading + writePreview(content, budget: max(64, maximumCharacters - heading.count)), isSensitive: false,
-            available: true, deletionContentDigest: digest)
+            available: true, deletionContentDigest: digest, toleratesTimeOnlyChange: true)
     }
 
     static func edit(version: ApprovalFileVersion, old: String, new: String, digest: String) -> Self {
@@ -111,7 +147,8 @@ public struct ApprovalFilePreview: Sendable, Equatable {
         let initial = bounded(safe, lines: 80, bytes: 8 * 1024)
         let expanded = bounded(safe, bytes: 64 * 1024)
         return Self(version: version, text: initial, isSensitive: false, available: true,
-            deletionContentDigest: digest, expandedText: expanded == initial ? nil : expanded)
+            deletionContentDigest: digest, expandedText: expanded == initial ? nil : expanded,
+            toleratesTimeOnlyChange: true)
     }
 
     func validateMutation(data: Data?) throws {
@@ -141,10 +178,15 @@ public struct ApprovalFilePreview: Sendable, Equatable {
 
     public static func capture(tool: String, input: [String: Any]) -> Self? {
         if tool == "shell_execute" {
-            let safe = ContentSecretRedactor.redact("工作目录：" + (input["cwd"] as? String ?? "（沿用当前目录）")
+            // 模型给的说明（tool_title）单独成行，只取首行、最多 120 字；命令完整放进展开预览（上限 72KB）。
+            let title = (input["tool_title"] as? String)
+                .map { String($0.split(whereSeparator: \.isNewline).first ?? "").trimmingCharacters(in: .whitespaces) }
+                .flatMap { $0.isEmpty ? nil : String($0.prefix(120)) }
+            let safe = ContentSecretRedactor.redact("工作目录：" + (ShellToolInput.explicitWorkingDirectory(input) as? String ?? "（沿用当前目录）")
+                + (title.map { "\n说明：" + $0 } ?? "")
                 + "\n命令：\n" + (input["command"] as? String ?? ""))
             let initial = bounded(safe, lines: 20, bytes: 4 * 1024)
-            let expanded = bounded(safe, bytes: 4 * 1024)
+            let expanded = bounded(safe, bytes: 72 * 1024)
             return Self(version: nil, text: initial, isSensitive: false, available: true,
                 expandedText: expanded == initial ? nil : expanded, parameterOnly: true)
         }
@@ -155,7 +197,10 @@ public struct ApprovalFilePreview: Sendable, Equatable {
         }
         let sensitive = SensitiveFilePolicy.contains(path) || SensitiveFilePolicy.contains(version.canonicalPath)
         if sensitive {
-            return Self(version: version, text: "敏感文件：内容已隐藏", isSensitive: true, available: true)
+            let noBackupNotice = (tool == "file_write" || tool == "file_edit")
+                && !SensitiveFilePolicy.isProtectedStatePath(path)
+                ? "\n" + SensitiveFilePolicy.uncheckpointedSecretNotice : ""
+            return Self(version: version, text: "敏感文件：内容已隐藏" + noBackupNotice, isSensitive: true, available: true)
         }
         let raw: String
         switch tool {
@@ -200,7 +245,19 @@ public struct ApprovalFilePreview: Sendable, Equatable {
         guard available, let version else {
             throw ApprovalError.denied(reason: "文件预览不可用，请修正路径后重新审批")
         }
-        try version.validateCurrent()
+        do {
+            try version.validateCurrent()
+        } catch let changed as ApprovalFileChangedError {
+            // 只有时间变化（编辑器碰了一下文件）且内容摘要不变：仍算已批准的那一版。
+            // 删除预览不容忍（toleratesTimeOnlyChange 为 false），保持严格。
+            guard toleratesTimeOnlyChange, let digest = deletionContentDigest,
+                  let now = try? ApprovalFileVersion.capture(path: version.path),
+                  version.differsOnlyInTimes(from: now),
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: now.canonicalPath),
+                  let size = (attributes[.size] as? NSNumber)?.intValue, size <= Self.timeOnlyDigestMaxBytes,
+                  let data = try? Data(contentsOf: URL(fileURLWithPath: now.canonicalPath)),
+                  Self.digest(data) == digest else { throw changed }
+        }
     }
 }
 

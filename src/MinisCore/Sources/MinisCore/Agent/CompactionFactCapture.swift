@@ -74,16 +74,23 @@ public enum CompactionFactCapture {
         return true
     }
 
+    /// What survives compaction besides the summary and the recent tail (the same
+    /// as Claude Code / Codex): tasks that are still unfinished, and tool receipts
+    /// that did not end in success. A succeeded receipt is never listed. The summary
+    /// already records what was done (its "已完成" and "文件与命令" sections and the
+    /// tool fact list), and the effect ledger itself refuses a duplicate dispatch.
+    /// This background is rebuilt every turn, so listing all succeeded receipts
+    /// would grow with every tool run until the checkpoint bound rejects it.
     public static func capture(sessionID: String, revision: UInt64, messages: [LLMMessage],
-                               taskStore: AgentTaskStore?, effectLedger: ToolExecutionFactLedger?,
-                               includeTerminalTasks: Bool = false)
+                               taskStore: AgentTaskStore?, effectLedger: ToolExecutionFactLedger?)
         -> [CompactionRetainedFact] {
         guard let digest = CompactionCheckpoint.digestOfSourcePrefix(messages) else { return [] }
         let tasks = (taskStore?.taskCenterSnapshots(includeArchived: false) ?? []).filter {
-            taskBelongs($0, to: sessionID)
-                && (includeTerminalTasks || $0.status == .queued || $0.status == .running)
+            taskBelongs($0, to: sessionID) && ($0.status == .queued || $0.status == .running)
         }
-        let effects = (effectLedger?.facts ?? []).filter { effectBelongs($0, to: sessionID) }
+        let effects = (effectLedger?.facts ?? []).filter {
+            effectBelongs($0, to: sessionID) && $0.status != .succeeded
+        }
         let sources = tasks.map { CompactionFactSource(sessionID: sessionID,
             transcriptRevision: revision, transcriptDigest: digest, task: $0) }
             + effects.map { CompactionFactSource(sessionID: sessionID,
@@ -91,11 +98,12 @@ public enum CompactionFactCapture {
         return sources.map { CompactionRetainedFact(kind: $0.kind, text: $0.backgroundText, source: $0) }
     }
 
-    /// At commit require the exact captured task value. At re-entry a task may
-    /// have legitimately settled; verify its canonical provenance, then rebuild
-    /// the current background instead of retaining a stale unfinished status.
+    /// A task fact only has to still exist with the same creation provenance and
+    /// ownership. Its status may have moved on while the summary request was in
+    /// flight (the text says "at capture"); the next turn rebuilds the current
+    /// background from the stores instead of retaining a stale status.
     public static func verifyStores(_ facts: [CompactionRetainedFact], taskStore: AgentTaskStore?,
-                                    effectLedger: ToolExecutionFactLedger?, atCommit: Bool) -> Bool {
+                                    effectLedger: ToolExecutionFactLedger?) -> Bool {
         facts.allSatisfy { fact in
             guard let source = fact.source else { return true }
             guard fact.kind == source.kind, fact.text == source.backgroundText else { return false }
@@ -104,7 +112,7 @@ public enum CompactionFactCapture {
                       taskBelongs(captured, to: source.sessionID),
                       taskBelongs(current, to: source.sessionID),
                       current.creation == captured.creation else { return false }
-                return !atCommit || current == captured
+                return true
             }
             if let captured = source.effect {
                 return effectLedger?.facts.contains(captured) == true

@@ -187,6 +187,8 @@ struct ModelPickerState: Equatable {
             didApply = true
         }
         guard didApply else { return false }
+        // 在选择器里选的模型同步为新会话默认，新建会话不再回到演示模式。
+        chat.adoptCurrentSelectionAsNewSessionDefault(persistToSettings: true)
 
         // R9：精确写模型 + 同步会话级记录（setProvider/setCustomProvider 只写首模型，
         // 不覆盖会丢用户所选模型——切会话再切回回退首模型）
@@ -374,6 +376,8 @@ struct ModelPickerPanel: View {
     @State private var localProbeGeneration = UUID()
     @State private var localProbeInFlight = false
     @State private var localProbeFailed = false
+    /// 本机 Ollama 已安装的模型（/api/tags），供点选；读不到时为空，仍可手输。
+    @State private var installedLocalModels: [String] = []
     @Environment(\.themeTokens) private var theme
     @Environment(\.minisOpenSettingsPage) private var openSettingsPage
 
@@ -472,6 +476,7 @@ struct ModelPickerPanel: View {
     static func modelSelectionEnabled(for option: ChatStore.ChatProvider, modelID: String, chat: ChatStore) -> Bool {
         guard chat.providerReadinessStore != nil else { return true }
         return chat.chatModelPickerReceipt(providerID: option.providerRuntimeID, modelID: modelID) != nil
+            || chat.isUncheckedChatModel(providerID: option.providerRuntimeID, modelID: modelID)
     }
 
     private func blockedReason(for option: ChatStore.ChatProvider, modelID: String? = nil) -> String? {
@@ -516,26 +521,62 @@ struct ModelPickerPanel: View {
     @ViewBuilder
     private func providerOptionRow(_ option: ChatStore.ChatProvider) -> some View {
         let reason = blockedReason(for: option)
+        if let reason {
+            // 未就绪的服务商：名称与"去设置"合并为一行可点条目（原先是不可点的两行行 + 单独的链接行）。
+            unreadyProviderRow(option, reason: reason)
+        } else {
+            switch option {
+            case .builtIn(let type):
+                row(isSelected: state.selectedOption == option, icon: providerIcon(type),
+                    title: type.displayName, subtitle: nil) {
+                    pickProvider(type)
+                }
+            case .custom(let record):
+                row(isSelected: state.selectedOption == option, icon: "externaldrive", keylineIcon: .database,
+                    title: chat.presentationProviderLabel(for: record.name),
+                    subtitle: nil) {
+                    pickCustomProvider(record)
+                }
+            }
+        }
+    }
+
+    /// 单行：服务商名（次级色）+ 右侧"去设置"；原因放悬停提示和读屏文字里。
+    private func unreadyProviderRow(_ option: ChatStore.ChatProvider, reason: String) -> some View {
+        let name: String
         switch option {
-        case .builtIn(let type):
-            row(isSelected: state.selectedOption == option, icon: providerIcon(type),
-                title: type.displayName, subtitle: reason, isEnabled: reason == nil) {
-                pickProvider(type)
-            }
-        case .custom(let record):
-            row(isSelected: state.selectedOption == option, icon: "externaldrive", keylineIcon: .database,
-                title: chat.presentationProviderLabel(for: record.name),
-                subtitle: reason, isEnabled: reason == nil) {
-                pickCustomProvider(record)
-            }
+        case .builtIn(let type): name = type.displayName
+        case .custom(let record): name = chat.presentationProviderLabel(for: record.name)
         }
-        if reason != nil {
-            Button("去设置 · \(option.displayName)") {
-                isPresented = false
-                openSettingsPage(ProviderConnectionRoute.id)
-            }
-                .buttonStyle(.link).font(.caption)
+        let open = {
+            isPresented = false
+            openSettingsPage(ProviderConnectionRoute.id)
         }
+        return Button(action: open) {
+            HStack(spacing: 6) {
+                Color.clear.frame(width: 12, height: 12)
+                Text(name)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("去设置")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("\(reason)，点击去设置")
+        .accessibilityElement(children: .ignore)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(.default, open)
+        .accessibilityLabel("\(name)，\(reason)")
+        .accessibilityValue("未选中")
+        .accessibilityHint("不可选择，点击打开设置检查模型连接")
     }
 
     /// ① 点内置 Provider：只更新选中 + 刷新模型列表（记忆预选），不关闭面板。
@@ -580,9 +621,21 @@ struct ModelPickerPanel: View {
                         state.modelID = newValue.isEmpty ? nil : newValue
                         state.modelChosen = true
                     }
+                    .task { await loadInstalledLocalModels() }
                 Text("输入已安装的 Ollama 模型名；点档位时检查固定本地端点并确认")
                     .font(.system(size: 9))
                     .foregroundStyle(.tertiary)
+                if !installedLocalModels.isEmpty {
+                    Text("已安装的模型（点选）")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    ForEach(installedLocalModels.prefix(12), id: \.self) { installed in
+                        Button(installed) { localModelText = installed }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 11))
+                            .accessibilityIdentifier("model-menu.local.installed.\(installed)")
+                    }
+                }
                 if localProbeInFlight {
                     Text("正在检查本地模型…")
                         .font(.system(size: 9))
@@ -604,7 +657,12 @@ struct ModelPickerPanel: View {
                     ForEach(sortedModels(models)) { model in
                         row(isSelected: state.modelID == model.id, icon: "cpu", keylineIcon: .cpu,
                             title: model.displayName,
-                            subtitle: blockedReason(for: option, modelID: model.id) ?? (model.id == model.displayName ? nil : model.id),
+                            subtitle: blockedReason(for: option, modelID: model.id)
+                                ?? (chat.providerReadinessStore != nil
+                                    && chat.chatModelPickerReceipt(providerID: option.providerRuntimeID, modelID: model.id) == nil
+                                    && chat.isUncheckedChatModel(providerID: option.providerRuntimeID, modelID: model.id)
+                                    ? "未检查：首次发送前会先检查连接"
+                                    : (model.id == model.displayName ? nil : model.id)),
                             isEnabled: Self.modelSelectionEnabled(for: option, modelID: model.id, chat: chat)) {
                             selectRemoteModel(model.id)
                         }
@@ -637,6 +695,19 @@ struct ModelPickerPanel: View {
                 .disabled(localProbeInFlight && state.provider == .local)
             }
         }
+    }
+
+    /// 读取本机 Ollama 已安装的模型列表（固定本地端点，3 秒超时）；失败时保持为空，仍可手输。
+    @MainActor
+    private func loadInstalledLocalModels() async {
+        let endpoint = ChatStore.LocalReadinessBinding.modelsURL
+        let names: [String]?
+        if let source = chat.localModelCatalogSource {
+            names = try? await source(endpoint)
+        } else {
+            names = try? await ChatStore.LocalReadinessBinding.probe(endpoint)
+        }
+        installedLocalModels = names ?? []
     }
 
     private func selectRemoteModel(_ id: String?) {

@@ -294,10 +294,16 @@ public struct SubAgentReport: Sendable, Equatable {
     public let parentID: String?
     public let runID: String?
     public let attemptID: String?
+    /// 隔离（worktree）子任务的工作区目录与分支；非隔离任务为 nil。
+    public let workspacePath: String?
+    public let workspaceBranch: String?
 
     public init(taskID: String, agentType: SubAgentAgentType, duration: TimeInterval, result: SubAgentResult,
                 parentID: String? = nil, runID: String? = nil, attemptID: String? = nil,
-                partialOutput: String? = nil) {
+                partialOutput: String? = nil,
+                workspacePath: String? = nil, workspaceBranch: String? = nil) {
+        self.workspacePath = workspacePath
+        self.workspaceBranch = workspaceBranch
         self.taskID = taskID
         self.agentType = agentType
         self.duration = duration
@@ -310,21 +316,29 @@ public struct SubAgentReport: Sendable, Equatable {
 
     func withResultIdentity(parentID: String, runID: String, attemptID: String) -> SubAgentReport {
         SubAgentReport(taskID: taskID, agentType: agentType, duration: duration, result: result,
-            parentID: parentID, runID: runID, attemptID: attemptID, partialOutput: partialOutput)
+            parentID: parentID, runID: runID, attemptID: attemptID, partialOutput: partialOutput,
+            workspacePath: workspacePath, workspaceBranch: workspaceBranch)
+    }
+
+    func withWorkspace(path: String, branch: String) -> SubAgentReport {
+        SubAgentReport(taskID: taskID, agentType: agentType, duration: duration, result: result,
+            parentID: parentID, runID: runID, attemptID: attemptID, partialOutput: partialOutput,
+            workspacePath: path, workspaceBranch: branch)
     }
 
     /// 给总控汇总用的一行摘要。
     public var summaryLine: String {
+        let workspace = workspacePath.map { "（隔离工作区：\($0)，分支：\(workspaceBranch ?? "未知")）" } ?? ""
         if let partialOutput {
             let preview = partialOutput.isEmpty ? "没有已结算的可见正文。" : OrchestrationToolExecutor.resultSummary(partialOutput)
-            return "[\(taskID)] 部分结果：\(preview)"
+            return "[\(taskID)] 部分结果：\(preview)\(workspace)"
         }
         switch result {
         case .succeeded(let output):
             let preview = OrchestrationToolExecutor.resultSummary(output)
-            return "[\(taskID)] 成功 (\(String(format: "%.2f", duration))s): \(preview)"
+            return "[\(taskID)] 成功 (\(String(format: "%.2f", duration))s): \(preview)\(workspace)"
         case .failed(let error):
-            return "[\(taskID)] 失败 (\(String(format: "%.2f", duration))s): \(OrchestrationToolExecutor.resultSummary(error))"
+            return "[\(taskID)] 失败 (\(String(format: "%.2f", duration))s): \(OrchestrationToolExecutor.resultSummary(error))\(workspace)"
         }
     }
 }

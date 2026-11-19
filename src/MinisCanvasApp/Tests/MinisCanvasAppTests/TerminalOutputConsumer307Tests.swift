@@ -25,7 +25,7 @@ struct TerminalOutputConsumer307Tests {
     func deniedCommandEchoDoesNotExposeSecret() {
         let terminal = store()
         let secret = "Terminal307BearerSyntheticInteriorABCDEFG"
-        let raw = "sudo --label 'Authorization: Bearer \(secret)' ordinary-body"
+        let raw = "halt --label 'Authorization: Bearer \(secret)' ordinary-body"
         terminal.input = raw
         terminal.submit()
 
@@ -33,7 +33,7 @@ struct TerminalOutputConsumer307Tests {
         #expect(terminal.pendingConfirmation == nil)
         #expect(terminal.input.isEmpty)
         #expect(terminal.output.contains("命令被拒绝"))
-        #expect(terminal.output.contains("sudo"))
+        #expect(terminal.output.contains("halt"))
         #expect(terminal.output.contains("ordinary-body"))
         #expect(terminal.output.contains(ContentSecretRedactor.mask(secret)))
         #expect(!terminal.output.contains(secret))
@@ -64,7 +64,7 @@ struct TerminalOutputConsumer307Tests {
 
         // A hard-denied command really echoes, without dispatching a runner.
         let denied = store()
-        denied.input = "sudo --label 'api_key=\(secret)' ordinary-tail"
+        denied.input = "halt --label 'api_key=\(secret)' ordinary-tail"
         denied.submit()
         #expect(!denied.isRunning)
         #expect(denied.pendingConfirmation == nil)

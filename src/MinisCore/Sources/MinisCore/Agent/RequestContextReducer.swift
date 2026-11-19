@@ -100,6 +100,7 @@ public struct RequestContextReducer: Sendable {
         for (index, message) in messages.enumerated() {
             var content = message.content
             var images = message.images
+            var audios = message.audios
             if isToolResult(message), !protectedTools.contains(index),
                content.count > policy.minimumReducibleCharacters {
                 let reduced = memo?.excerpt(
@@ -119,11 +120,18 @@ public struct RequestContextReducer: Sendable {
                 images = []
                 replacedImages += message.images.count
             }
-            if content == message.content, images.count == message.images.count {
+            // 音频同样占请求体：较早轮次的音频与图片一起换成文字占位。
+            if index < mediaFloor, !message.audios.isEmpty {
+                content += (content.isEmpty ? "" : "\n") + HistoryMediaBudget.audioPlaceholder
+                audios = []
+                replacedImages += message.audios.count
+            }
+            if content == message.content, images.count == message.images.count,
+               audios.count == message.audios.count {
                 result.append(message)
             } else {
                 result.append(LLMMessage(
-                    role: message.role, content: content, images: images, audios: message.audios,
+                    role: message.role, content: content, images: images, audios: audios,
                     toolCallID: message.toolCallID, toolCalls: message.toolCalls,
                     legacyToolOutputSummary: message.legacyToolOutputSummary))
             }
@@ -158,8 +166,35 @@ public final class ContextReductionState: @unchecked Sendable {
     private var active = false
     private let memo = RequestContextReducer.Memo()
 
+    /// How many of the newest tool results stay unreduced. Starts at the
+    /// policy's value; `AgentLoop` lowers it step by step only when the request
+    /// would otherwise be refused at the hard block.
+    private var protectedToolResults: Int
+
+    /// The steps below the policy's value: 2 newest tool results, then 1.
+    static let loweredToolResultProtection = [2, 1]
+
     public init(policy: RequestContextReducer.Policy = RequestContextReducer.Policy()) {
         self.policy = policy
+        self.protectedToolResults = policy.keepRecentToolExchanges
+    }
+
+    /// Protects the next lower number of newest tool results. False when
+    /// already at the last step. Only `AgentLoop` calls it.
+    func lowerToolResultProtection() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let next = Self.loweredToolResultProtection.first(where: { $0 < protectedToolResults }) else {
+            return false
+        }
+        protectedToolResults = next
+        return true
+    }
+
+    private var effectivePolicy: RequestContextReducer.Policy {
+        lock.lock(); defer { lock.unlock() }
+        var effective = policy
+        effective.keepRecentToolExchanges = protectedToolResults
+        return effective
     }
 
     public var isActive: Bool {
@@ -176,12 +211,12 @@ public final class ContextReductionState: @unchecked Sendable {
     /// Last stage of the delivery projection. Identity while inactive.
     public func apply(_ messages: [LLMMessage]) -> [LLMMessage] {
         guard isActive else { return messages }
-        return RequestContextReducer.reduce(messages, policy: policy, memo: memo).messages
+        return RequestContextReducer.reduce(messages, policy: effectivePolicy, memo: memo).messages
     }
 
     /// What `apply` would produce, regardless of activation. Used by the loop
     /// to estimate the reduced request before deciding to activate.
     func reducedView(of messages: [LLMMessage]) -> RequestContextReducer.Outcome {
-        RequestContextReducer.reduce(messages, policy: policy, memo: memo)
+        RequestContextReducer.reduce(messages, policy: effectivePolicy, memo: memo)
     }
 }

@@ -121,10 +121,9 @@ public struct BackgroundChildResultNotice: Sendable, Equatable, Identifiable {
         self.succeeded = report.result.isSuccess
         let firstLines = (report.result.output ?? report.result.error ?? "")
             .split(separator: "\n", omittingEmptySubsequences: false).prefix(5).joined(separator: "\n")
-        self.summary = ProductRedactionPolicy.redact(firstLines, maxLength: 600)
-        self.structuredResult = structuredResult.map {
-            ProductRedactionPolicy.redact($0, maxLength: Int.max)
-        }
+        // 交给父模型的子任务结果保留路径（对齐 Claude Code），只遮密钥与带凭据的链接。
+        self.summary = String(ProductRedactionPolicy.redactConversationBody(firstLines).prefix(600))
+        self.structuredResult = structuredResult.map { ProductRedactionPolicy.redactConversationBody($0) }
     }
 
     public var modelContext: String {

@@ -43,6 +43,64 @@ struct SchedulerTaskTargetPrefill: Equatable, Sendable {
     let turnID: Int
 }
 
+/// 新建/编辑定时任务时可选的会话（由 App 启动时从当前会话列表注入）。
+struct SchedulerSessionOption: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let title: String
+    let projectID: String?
+    let projectName: String?
+    /// 已发送的用户消息数；也是任务绑定的“回合号”（自动取最新）。
+    let userTurnCount: Int
+    /// 会话所属项目已被信任的根目录；保存任务时用它展开项目级自定义命令。
+    var projectRoot: URL? = nil
+
+    /// 任务必须绑定到“项目里、至少发过一条消息”的会话。
+    var isSchedulable: Bool {
+        projectID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false && userTurnCount > 0
+    }
+    var menuTitle: String {
+        let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = name.isEmpty ? "未命名会话" : name
+        guard let projectName, !projectName.isEmpty else { return base }
+        return base + "（" + projectName + "）"
+    }
+}
+
+/// 设置页「定时任务」新建表单的常用频率：生成 cron，也能把简单 cron 读回成频率。
+enum SchedulerCronPreset: String, CaseIterable, Identifiable, Sendable {
+    case hourly, daily, weekly, custom
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .hourly: return "每小时"
+        case .daily: return "每天"
+        case .weekly: return "每周"
+        case .custom: return "自定义 cron"
+        }
+    }
+
+    /// weekday：0 = 周日 … 6 = 周六（与 cron 一致）。
+    static func cron(_ preset: SchedulerCronPreset, hour: Int, minute: Int, weekday: Int) -> String? {
+        let m = min(max(minute, 0), 59), h = min(max(hour, 0), 23), w = min(max(weekday, 0), 6)
+        switch preset {
+        case .hourly: return "\(m) * * * *"
+        case .daily: return "\(m) \(h) * * *"
+        case .weekly: return "\(m) \(h) * * \(w)"
+        case .custom: return nil
+        }
+    }
+
+    static func parse(_ cron: String) -> (preset: SchedulerCronPreset, hour: Int, minute: Int, weekday: Int)? {
+        let f = cron.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard f.count == 5, let minute = Int(f[0]), (0...59).contains(minute), f[2] == "*", f[3] == "*" else { return nil }
+        if f[1] == "*", f[4] == "*" { return (.hourly, 9, minute, 1) }
+        guard let hour = Int(f[1]), (0...23).contains(hour) else { return nil }
+        if f[4] == "*" { return (.daily, hour, minute, 1) }
+        if let weekday = Int(f[4]), (0...6).contains(weekday) { return (.weekly, hour, minute, weekday) }
+        return nil
+    }
+}
+
 /// 会话右键菜单与设置页「定时任务」新建表单之间的一次性预填传递。
 @MainActor
 @Observable
@@ -50,6 +108,9 @@ final class SchedulerTaskPrefillInbox {
     static let shared = SchedulerTaskPrefillInbox()
     private init() {}
     var pending: SchedulerTaskTargetPrefill?
+    /// App 启动时注入：当前所有会话与正在查看的会话。未注入时（如测试）表单退回手填。
+    @ObservationIgnored var sessionOptions: @MainActor () -> [SchedulerSessionOption] = { [] }
+    @ObservationIgnored var currentSessionID: @MainActor () -> UUID? = { nil }
 }
 
 // MARK: - 任务模型
@@ -99,6 +160,12 @@ struct SchedulerTask: Codable, Equatable, Identifiable, Sendable {
     /// 2 means an explicitly confirmed fixed source anchor, not an execution turn.
     var sourceAnchorVersion: Int
     var sourceAnchorDigest: String?
+    /// true：每次触发都在目标会话所属项目里新建一个会话并在其中运行；目标会话只作为
+    /// “授权所在的项目与来源锚点”，其转录不被写入。改动它属于执行范围变化，需重新授权。
+    var opensNewSessionEachRun: Bool = false
+    /// 最近一次由"暂停"改为"启用"的时间。启动/唤醒补跑只从这个时刻之后算，
+    /// 不补跑暂停期间错过的触发（旧数据没有该字段，按 nil 处理）。
+    var enabledAt: Date?
 
     var hasValidTarget: Bool {
         guard targetSessionID != nil,
@@ -131,8 +198,10 @@ struct SchedulerTask: Codable, Equatable, Identifiable, Sendable {
         targetProjectID: String? = nil,
         targetTurnID: Int? = nil,
         sourceAnchorVersion: Int = 2,
-        sourceAnchorDigest: String? = nil
+        sourceAnchorDigest: String? = nil,
+        opensNewSessionEachRun: Bool = false
     ) {
+        self.opensNewSessionEachRun = opensNewSessionEachRun
         self.id = id
         self.name = name
         self.cronExpression = cronExpression
@@ -162,7 +231,8 @@ struct SchedulerTask: Codable, Equatable, Identifiable, Sendable {
         case id, name, cronExpression, timeZoneIdentifier, isEnabled, command, createdAt, version, enablementRevision, isAuthorized,
              authorizationVersion, revokedAuthorizationThroughVersion, authorizationActorID, authorizationScopeID, authorizationPolicyRevision,
              authorizationExpiresAt, authorizationRevoked, isDeleted,
-             targetSessionID, targetProjectID, targetTurnID, sourceAnchorVersion, sourceAnchorDigest
+             targetSessionID, targetProjectID, targetTurnID, sourceAnchorVersion, sourceAnchorDigest, opensNewSessionEachRun,
+             enabledAt
     }
 
     init(from decoder: Decoder) throws {
@@ -217,8 +287,10 @@ struct SchedulerTask: Codable, Equatable, Identifiable, Sendable {
             targetProjectID: try container.decodeIfPresent(String.self, forKey: .targetProjectID),
             targetTurnID: try container.decodeIfPresent(Int.self, forKey: .targetTurnID),
             sourceAnchorVersion: try container.decodeIfPresent(Int.self, forKey: .sourceAnchorVersion) ?? 0,
-            sourceAnchorDigest: try container.decodeIfPresent(String.self, forKey: .sourceAnchorDigest)
+            sourceAnchorDigest: try container.decodeIfPresent(String.self, forKey: .sourceAnchorDigest),
+            opensNewSessionEachRun: try container.decodeIfPresent(Bool.self, forKey: .opensNewSessionEachRun) ?? false
         )
+        self.enabledAt = try container.decodeIfPresent(Date.self, forKey: .enabledAt)
         if isAuthorized && (
             authorizationActorID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || authorizationScopeID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -257,11 +329,11 @@ enum SchedulerProviderPreflightStatus: String, Equatable, Sendable {
         switch self {
         case .ready: return "已验证"
         case .targetUnavailable: return "目标不可用"
-        case .missingProvider: return "未选 Provider"
+        case .missingProvider: return "未选服务商"
         case .missingModel: return "未选模型"
         case .missingCredential: return "凭据不可用"
-        case .staleReadiness: return "就绪事实已过期"
-        case .incompatibleSelection: return "选择未通过门禁"
+        case .staleReadiness: return "可用性检查已过期，请重新检查"
+        case .incompatibleSelection: return "当前选择没有通过可用性检查"
         }
     }
 }
@@ -1173,7 +1245,7 @@ final class SchedulerTaskStore {
     }
 
     private static func previewFingerprint(task: SchedulerTask, timeZoneIdentifier: String) -> String {
-        let canonical = [
+        let canonical = (([
             task.id.uuidString.lowercased(), String(task.version), task.name,
             task.cronExpression, task.command,
             task.targetSessionID?.uuidString.lowercased() ?? "",
@@ -1188,7 +1260,9 @@ final class SchedulerTaskStore {
             String(task.authorizationRevoked),
             task.timeZoneIdentifier ?? "unbound",
             timeZoneIdentifier,
-        ].joined(separator: "\u{0}")
+        ] as [String]) + (task.opensNewSessionEachRun ? ["new-session-each-run"] : [])
+        // 只有开启“每次开新会话”时才并入摘要，旧任务的预览摘要保持不变。
+        ).joined(separator: "\u{0}")
         return SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -1225,7 +1299,8 @@ final class SchedulerTaskStore {
         isEnabled: Bool = true,
         targetSessionID: UUID? = nil,
         targetProjectID: String? = nil,
-        targetTurnID: Int? = nil
+        targetTurnID: Int? = nil,
+        opensNewSessionEachRun: Bool = false
     ) -> String? {
         guard persistenceError == nil else {
             return "任务存储不可用，请处理存储错误后重新打开。"
@@ -1241,11 +1316,12 @@ final class SchedulerTaskStore {
             command: command,
             targetSessionID: targetSessionID,
             targetProjectID: targetProjectID,
-            targetTurnID: targetTurnID
+            targetTurnID: targetTurnID,
+            opensNewSessionEachRun: opensNewSessionEachRun
         ))
         guard persistConfirmedDefinitions() else {
             tasks = previousTasks
-            return "任务未保存：任务定义写入失败，请处理存储错误后重新打开。"
+            return "任务未保存：任务定义写入失败。请检查磁盘空间后重新打开应用。"
         }
         return nil
     }
@@ -1278,6 +1354,7 @@ final class SchedulerTaskStore {
                     || task.targetSessionID != current.targetSessionID
                     || task.targetProjectID != current.targetProjectID
                     || task.targetTurnID != current.targetTurnID
+                    || task.opensNewSessionEachRun != current.opensNewSessionEachRun
                     || task.authorizationScopeID != current.authorizationScopeID
                     || task.authorizationPolicyRevision != current.authorizationPolicyRevision
                 var next = task
@@ -1310,7 +1387,7 @@ final class SchedulerTaskStore {
                 tasks[idx] = next
                 guard persistConfirmedDefinitions() else {
                     tasks[idx] = current
-                    return "任务未保存：任务定义写入失败，请处理存储错误后重新打开。"
+                    return "任务未保存：任务定义写入失败。请检查磁盘空间后重新打开应用。"
                 }
             }
             return nil
@@ -1399,6 +1476,7 @@ final class SchedulerTaskStore {
         if stateChanged {
             tasks[idx].isEnabled = enabled
             tasks[idx].enablementRevision += 1
+            if enabled { tasks[idx].enabledAt = Date() }
         }
 
         // A pre-existing disabled task may have been persisted by an older
@@ -1491,7 +1569,18 @@ final class SchedulerTaskStore {
         tasks[idx].authorizationExpiresAt = expiresAt
         tasks[idx].authorizationRevoked = false
         let grant = tasks[idx]
+        // 未授权期间积压的多次等待触发：授权后只接上最近的一次，更早的取消，
+        // 避免一次授权就把积压的触发全部补跑。
+        let latestWaitingIndex = occurrences.indices
+            .filter { occurrences[$0].taskID == id && occurrences[$0].state == .waitingApproval }
+            .max { occurrences[$0].scheduledMinute < occurrences[$1].scheduledMinute }
         for occurrenceIndex in occurrences.indices where occurrences[occurrenceIndex].taskID == id {
+            if occurrences[occurrenceIndex].state == .waitingApproval,
+               occurrenceIndex != latestWaitingIndex {
+                occurrences[occurrenceIndex].state = .cancelled
+                appendJournal(for: occurrences[occurrenceIndex], at: now)
+                continue
+            }
             guard occurrences[occurrenceIndex].authorizeWaiting(
                 with: grant, confirmedSourceAnchorDigest: confirmedSourceAnchorDigest
             ) else { continue }

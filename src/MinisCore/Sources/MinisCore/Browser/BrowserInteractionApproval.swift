@@ -197,7 +197,65 @@ public struct BrowserPreparedInteraction {
     let rules: BrowserInteractionRuleStore
 }
 
+/// 用户在审批卡上"本次允许"的网站（应用运行期间有效，不写设置）。
+/// `GoalEnvelope.permitsNetworkDomain` 会一并认可它，所以同一次浏览器调用不会再被网站白名单拦下。
+public final class BrowserDomainApproval: @unchecked Sendable {
+    public static let shared = BrowserDomainApproval()
+    private let lock = NSLock()
+    private var hosts: Set<String> = []
+
+    public func allow(host: String) {
+        guard let normalized = BrowserNavigationPolicy.normalizedHost(host) else { return }
+        lock.lock(); defer { lock.unlock() }
+        hosts.insert(normalized)
+    }
+
+    public func permits(host: String) -> Bool {
+        guard let normalized = BrowserNavigationPolicy.normalizedHost(host) else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return hosts.contains(normalized)
+    }
+
+    public func revokeAll() {
+        lock.lock(); defer { lock.unlock() }
+        hosts.removeAll()
+    }
+}
+
 public enum BrowserInteractionApproval {
+    /// 用户选"以后都允许该网站"时，把域名写入现有的"允许访问的网站"设置。
+    /// 由 App 在装配时设置；未设置时审批卡不提供"以后都允许"。
+    @MainActor public static var persistAllowedDomain: (@MainActor (String) -> Void)?
+
+    /// 对齐 Claude Code：访问未允许的网站时弹审批卡，而不是直接拒绝。
+    @MainActor
+    static func decideUnlistedDomain(_ original: ApprovalRequest, destination: URL,
+                                     session: BrowserSession,
+                                     delegate: any ApprovalDelegate) async -> ApprovalDecision {
+        guard let host = destination.host.flatMap(BrowserNavigationPolicy.normalizedHost) else {
+            return ApprovalDecision(approved: false, reason: "网址缺少有效的主机名，无法访问",
+                requestID: original.requestID, bindingDigest: original.identityDigest)
+        }
+        var request = original
+        request.persistentAllowOffer = persistAllowedDomain == nil ? nil : ApprovalPersistentAllowOffer(
+            capability: "browser_domain", summary: host, unavailableReason: nil)
+        let decision = await delegate.requestApproval(request)
+        guard decision.approved, decision.confirmed,
+              decision.requestID == request.requestID,
+              decision.bindingDigest == request.identityDigest,
+              !Task.isCancelled else {
+            return decision.approved
+                ? ApprovalDecision(approved: false, reason: "审批已失效，未访问该网站",
+                    requestID: original.requestID, bindingDigest: original.identityDigest)
+                : decision
+        }
+        BrowserDomainApproval.shared.allow(host: host)
+        _ = session.authorizeNavigation(to: destination)
+        if decision.persistAllow { persistAllowedDomain?(host) }
+        return ApprovalDecision(approved: true, reason: decision.reason, confirmed: true,
+                                requestID: original.requestID, bindingDigest: original.identityDigest)
+    }
+
     /// Runs inside the existing production delegate. Approved results still pass
     /// through gate validation, receipt publication and the original redeemer.
     @MainActor
@@ -207,8 +265,8 @@ public enum BrowserInteractionApproval {
         if let destination = original.browserNavigationDestination {
             let decision = session.navigationDecision(for: destination, source: .initial)
             if decision == .deny(.domainNotAuthorized) || decision == .deny(.crossOriginNotAuthorized) {
-                return ApprovalDecision(approved: false, reason: BrowserNavigationPolicy.allowedWebsitesSettingsGuidance,
-                    requestID: original.requestID, bindingDigest: original.identityDigest)
+                return await decideUnlistedDomain(original, destination: destination,
+                                                  session: session, delegate: delegate)
             }
         }
         guard let input = original.browserInteractionInput else {
@@ -238,7 +296,7 @@ public enum BrowserInteractionApproval {
         }
         if let file = target.transferFile {
             request.browserRiskWarning = "\(input.category.title)：\(file.path)。文件身份：\(file.fingerprint)。"
-                + (input.action == "upload" ? "仅向已批准同源标准表单发送无Cookie原生POST，文件不交给网页脚本；服务器会看到文件内容。" : "仅写入已批准的新输出文件。")
+                + (input.action == "upload" ? "仅向已批准同源标准表单发送无Cookie原生POST，文件不交给网页脚本；服务器会看到文件内容。" : "仅写入已批准的新输出文件；最终保存位置就是上面显示的路径，即使在项目目录之外，你批准后也会写到那里。")
                 + "取消或失败不自动重试；POST失败仍可能已传输部分或全部字节。"
             request.persistentAllowOffer = nil
         }

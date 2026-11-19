@@ -117,6 +117,29 @@ struct SensitiveFilePolicyTests {
         }
     }
 
+    @Test func credentialLookingFilesAreSensitiveUnlessSourceCode() {
+        for path in ["/t/credentials.json.bak", "/t/credentials.yaml.old", "/t/cookies.sqlite-wal",
+                     "/t/cookies.sqlite-journal", "/t/.npmrc", "/t/.pypirc", "/t/.netrc", "/t/AuthKey_X.p8",
+                     "/t/release.jks", "/t/app.keystore", "/t/service-account-prod.json", "/t/credentials.conf"] {
+            #expect(SensitiveFilePolicy.contains(path), "\(path)")
+        }
+        for path in ["/t/credentials.swift", "/t/credentials.ts", "/t/cookies.py", "/t/credentials.md",
+                     "/t/credentials-guide.md", "/t/service-accounts.md"] {
+            #expect(!SensitiveFilePolicy.contains(path), "\(path)")
+        }
+    }
+
+    @Test func bypassShellOperandsHittingSecretsAreFlagged() {
+        let dir = FileManager.default.temporaryDirectory.path
+        for command in ["cat .env", "cat server.pem > /dev/null", "grep x --file=.env", "cat < .ssh/id_rsa",
+                        "echo hi; cat ~/.netrc"] {
+            #expect(ShellEffectGuard.sensitiveOperandViolation(command: command, workingDirectory: dir) != nil,
+                    "\(command)")
+        }
+        #expect(ShellEffectGuard.sensitiveOperandViolation(command: "cat README.md", workingDirectory: dir) == nil)
+        #expect(ShellEffectGuard.sensitiveOperandViolation(command: "cat .env.example", workingDirectory: dir) == nil)
+    }
+
     @Test func ordinaryNamesAreNotSilentlyBlocked() {
         for path in ["/test/notes.txt", "/test/environment.md", "/test/keynote.txt", "/test/server.pem.backup.txt",
             "/test/mycredentials.json", "/test/notes.cookies.txt", "/test/not.envrc",

@@ -51,12 +51,12 @@ struct TerminalPolicySnapshotSourceTests {
     @Test("hard-deny names cannot be laundered into allow or confirm lists")
     func hardDenyCannotBeLaunderedIntoEditableLists() {
         let laundered = TerminalPolicySnapshot(settings: TerminalPolicySettings(
-            automaticAllowCommands: ["echo", "sudo", "open"],
+            automaticAllowCommands: ["echo", "halt", "reboot"],
             confirmationCommands: ["git", "dd"],
             userDeniedCommands: ["shutdown"]
         ))
-        #expect(!laundered.automaticAllowCommands.contains("sudo"))
-        #expect(!laundered.automaticAllowCommands.contains("open"))
+        #expect(!laundered.automaticAllowCommands.contains("halt"))
+        #expect(!laundered.automaticAllowCommands.contains("reboot"))
         #expect(!laundered.confirmationCommands.contains("dd"))
         // userDenied is also kept disjoint from the hard set; the hard set is
         // never sourced from user data, so removing those entries cannot
@@ -64,8 +64,8 @@ struct TerminalPolicySnapshotSourceTests {
         #expect(!laundered.userDeniedCommands.contains("shutdown"))
         #expect(laundered.productHardDeniedCommands
             == TerminalPolicySnapshot.productHardDeniedCommands)
-        #expect(laundered.classify(command: "sudo ls") == .denied)
-        #expect(laundered.classify(command: "open My.app") == .denied)
+        #expect(laundered.classify(command: "halt ls") == .denied)
+        #expect(laundered.classify(command: "reboot My.app") == .denied)
         #expect(laundered.classify(command: "echo still-mine") == .allowed)
     }
 
@@ -76,8 +76,8 @@ struct TerminalPolicySnapshotSourceTests {
         // editable list. Decoding must restore the exact invariant the
         // interactive SettingsCenter setter enforces.
         let json = """
-        {"automaticAllowCommands":["echo","sudo","ls","dd"],\
-        "confirmationCommands":["git","open"],\
+        {"automaticAllowCommands":["echo","halt","ls","dd"],\
+        "confirmationCommands":["git","reboot"],\
         "userDeniedCommands":["shutdown","printf"]}
         """
         let settings = try JSONDecoder().decode(
@@ -98,16 +98,16 @@ struct TerminalPolicySnapshotSourceTests {
         // persisted, so settings mirror, UI editor text, and the consumed
         // snapshot can never disagree about a hard-deny name.
         let snapshot = TerminalPolicySnapshot(settings: settings)
-        #expect(snapshot.classify(command: "sudo ls") == .denied)
+        #expect(snapshot.classify(command: "halt ls") == .denied)
         #expect(snapshot.classify(command: "dd if=/dev/zero") == .denied)
-        #expect(snapshot.classify(command: "open X.app") == .denied)
+        #expect(snapshot.classify(command: "reboot X.app") == .denied)
         #expect(snapshot.classify(command: "echo ok") == .allowed)
     }
 
     @Test("snapshot JSON round-trips with stable revision and hard set")
     func snapshotDecodeRoundTripKeepsHardDenyAndRevision() throws {
         let original = TerminalPolicySnapshot(settings: TerminalPolicySettings(
-            automaticAllowCommands: ["echo", "sudo"],
+            automaticAllowCommands: ["echo", "halt"],
             confirmationCommands: ["git"],
             userDeniedCommands: ["printf"]
         ))
@@ -124,7 +124,7 @@ struct TerminalPolicySnapshotSourceTests {
         #expect(decoded.productHardDeniedCommands
             == TerminalPolicySnapshot.productHardDeniedCommands)
         #expect(decoded.classify(command: "git status") == original.classify(command: "git status"))
-        #expect(decoded.classify(command: "sudo ls") == .denied)
+        #expect(decoded.classify(command: "halt ls") == .denied)
     }
 
     // MARK: D-TERMINAL-04 — both consumers classify from the same snapshot
@@ -145,8 +145,8 @@ struct TerminalPolicySnapshotSourceTests {
             ("git push", .confirmation),
             ("rm note.txt", .confirmation),
             ("printf ok", .denied),
-            ("open My.app", .denied),
-            ("killall Finder", .denied),
+            ("reboot My.app", .denied),
+            ("halt Finder", .denied),
             ("qqqnotacommand", .unknown),
         ]
         for probe in battery {
@@ -171,19 +171,22 @@ struct TerminalPolicySnapshotSourceTests {
         }
         // Guard-level hard deny stays denied for both consumers even though
         // the agent path blocks it one layer earlier than the terminal path.
+        // sudo 不再是硬拒绝：语法守卫仍不当作单条简单命令，所以改为走审批（询问）。
         let wrapperProbe = snapshot.classify(command: "sudo ls")
-        #expect(wrapperProbe == .denied)
+        #expect(wrapperProbe == .confirmation)
         #expect(!TerminalGuard.inspect("sudo ls").isAllowed)
+        // 硬拒绝仍然是硬拒绝。
+        #expect(snapshot.classify(command: "shutdown -h now") == .denied)
     }
 
     @Test("path and quoting shapes cannot evade the shared hard-deny list")
     func pathAndWhitespaceVariantsCannotEvadeHardDeny() {
         let snapshot = TerminalPolicySnapshot.default
-        let shapes = ["/usr/bin/sudo ls", "  sudo ls", "sudo"]
+        let shapes = ["/sbin/shutdown now", "  shutdown now", "shutdown"]
         for command in shapes {
             #expect(snapshot.classify(command: command) == .denied, "\(command) must stay denied")
         }
-        let agentProbe = "/usr/bin/sudo"
+        let agentProbe = "/sbin/shutdown"
         let inspected = TerminalGuard.inspect(agentProbe)
         if inspected.isAllowed {
             // The guard may reject the shape outright; if it lexes, the shared
@@ -198,16 +201,16 @@ struct TerminalPolicySnapshotSourceTests {
     @Test("supported env and nice wrappers inherit the actual executable's rule")
     func wrappersCannotLaunderHardOrUserDeniedCommands() {
         let snapshot = TerminalPolicySnapshot(settings: TerminalPolicySettings(
-            automaticAllowCommands: ["env", "nice", "echo", "open", "printf"],
+            automaticAllowCommands: ["env", "nice", "echo", "reboot", "printf"],
             confirmationCommands: ["git"],
             userDeniedCommands: ["printf"]
         ))
         let probes: [(String, TerminalCommandDisposition)] = [
-            ("env open Synthetic.app", .denied),
-            ("/usr/bin/env -i -- open Synthetic.app", .denied),
-            ("SAFE2_MARKER=synthetic env open Synthetic.app", .denied),
-            ("nice -n 2 open Synthetic.app", .denied),
-            (#"'open' Synthetic.app"#, .denied),
+            ("env reboot Synthetic.app", .denied),
+            ("/usr/bin/env -i -- reboot Synthetic.app", .denied),
+            ("SAFE2_MARKER=synthetic env reboot Synthetic.app", .denied),
+            ("nice -n 2 reboot Synthetic.app", .denied),
+            (#"'reboot' Synthetic.app"#, .denied),
             ("env nice -- printf synthetic", .denied),
             ("env git status", .confirmation),
             ("nice echo synthetic", .allowed),
@@ -224,10 +227,27 @@ struct TerminalPolicySnapshotSourceTests {
         }
         // Rejected wrapper syntax remains behind the original structural
         // guard; a nested hard-deny still wins over the confirmation class.
-        #expect(!TerminalGuard.inspect("env -S open Synthetic.app").isAllowed)
-        #expect(snapshot.classify(command: "env -S open Synthetic.app") == .denied)
-        #expect(!TerminalGuard.inspect("nice -n 2 sudo ls").isAllowed)
-        #expect(snapshot.classify(command: "nice -n 2 sudo ls") == .denied)
+        #expect(!TerminalGuard.inspect("env -S reboot Synthetic.app").isAllowed)
+        #expect(snapshot.classify(command: "env -S reboot Synthetic.app") == .denied)
+        #expect(!TerminalGuard.inspect("nice -n 2 exec halt").isAllowed)
+        #expect(snapshot.classify(command: "nice -n 2 exec halt") == .denied)
+    }
+
+    @Test("security, diskutil and launchctl ask by default but dangerous subcommands stay hard-denied")
+    func conditionalHardDenyKeepsSafetyFloor() {
+        let snapshot = TerminalPolicySnapshot.default
+        // 对齐 Claude Code：这些命令的普通用法走审批。
+        for command in ["open Synthetic.app", "osascript -e 1", "screencapture x.png", "killall Finder",
+                        "sudo ls", "security list-keychains", "diskutil list", "launchctl list"] {
+            #expect(snapshot.classify(command: command) == .confirmation, "\(command) should ask")
+        }
+        // 读取钥匙串密码、抹盘、卸载系统服务仍然硬拒绝，包括写在复合命令或 sudo 之后。
+        for command in ["security find-generic-password -s x -w", "security dump-keychain",
+                        "diskutil eraseDisk APFS X disk2", "diskutil apfs deleteVolume disk3s1",
+                        "launchctl unload /Library/LaunchDaemons/x.plist", "launchctl bootout system/x",
+                        "sudo diskutil eraseDisk JHFS+ X disk2", "ls && security find-internet-password -w"] {
+            #expect(snapshot.classify(command: command) == .denied, "\(command) must stay denied")
+        }
     }
 
     @Test("an in-flight snapshot is not rewritten by a later settings edit")

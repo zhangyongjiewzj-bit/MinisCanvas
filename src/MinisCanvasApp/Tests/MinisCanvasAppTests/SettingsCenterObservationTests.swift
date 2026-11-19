@@ -188,12 +188,12 @@ final class SettingsCenterObservationTests: XCTestCase {
         // 旧主题轴不改变颜色或预设；随后真正改变预设，验证根视图
         // 所依赖的镜像仍受 Observation 跟踪。
         XCTAssertEqual(center.accentTheme, ThemePreset.canonicalAccentTheme, "crimson 写入立即重投影为定版伪仙")
-        XCTAssertEqual(center.themePreset, .system, "主题轴写入不得移动预设真值")
+        XCTAssertEqual(center.themePreset, .light, "主题轴写入不得移动预设真值（默认已是产品主题）")
 
-        center.appearance = .light
+        center.appearance = .dark
         XCTAssertEqual(tintInvalidated.count, 1, "真实镜像事务仍使根视图读取失效")
         XCTAssertEqual(schemeInvalidated.count, 1, "外观变更应使根视图 preferredColorScheme 重算")
-        XCTAssertEqual(center.themePreset, .light, "重基线新增：外观写入收敛为浅色预设，preferredColorScheme 读取的真值随之确定")
+        XCTAssertEqual(center.themePreset, .system, "重基线新增：旧深色写入收敛为跟随系统预设，preferredColorScheme 读取的真值随之确定")
     }
 
     // MARK: - 持久化：set 同时写入 store（重新加载可见）
@@ -210,8 +210,9 @@ final class SettingsCenterObservationTests: XCTestCase {
         // store.settings.general.accentTheme == .emerald（磁盘上存任意组合）
         // 正是 THEME-05 禁止的状态。同等强度（全部仍为精确等式）的新契约：
         // 存储真值是收敛后的预设，旧dark迁移为System，主题字段是定版投影。
-        XCTAssertEqual(center.settingsStore.settings.general.themePreset, .system)
-        XCTAssertEqual(center.settingsStore.settings.general.appearance, .system)
+        // F-1：明暗是独立选择，写 .dark 即固定深色，配色预设不变。
+        XCTAssertEqual(center.settingsStore.settings.general.themePreset, .light)
+        XCTAssertEqual(center.settingsStore.settings.general.appearance, .dark)
         XCTAssertEqual(center.settingsStore.settings.general.accentTheme, ThemePreset.canonicalAccentTheme)
         XCTAssertEqual(center.settingsStore.settings.general.defaultProviderID, "anthropic")
         XCTAssertEqual(center.settingsStore.settings.general.defaultModelID, "claude-sonnet")
@@ -219,8 +220,8 @@ final class SettingsCenterObservationTests: XCTestCase {
         // 重新从磁盘加载验证持久化（THEME-05：已迁移/收敛的预设必须能跨
         // save/reload 存活——这正是本 lane 补齐的 consumer 半恢复路径）。
         let reloaded = SettingsStore(directory: dir)
-        XCTAssertEqual(reloaded.settings.general.themePreset, .system, "迁移后预设必须跨重载存活")
-        XCTAssertEqual(reloaded.settings.general.appearance, .system)
+        XCTAssertEqual(reloaded.settings.general.themePreset, .light, "预设必须跨重载存活")
+        XCTAssertEqual(reloaded.settings.general.appearance, .dark, "固定深色必须跨重载存活")
         XCTAssertEqual(reloaded.settings.general.accentTheme, ThemePreset.canonicalAccentTheme)
         XCTAssertEqual(reloaded.settings.general.defaultProviderID, "anthropic")
         XCTAssertEqual(reloaded.settings.general.defaultModelID, "claude-sonnet")
@@ -232,7 +233,7 @@ final class SettingsCenterObservationTests: XCTestCase {
 
         center.appearance = .dark
         center.terminalPolicySettings = TerminalPolicySettings(
-            automaticAllowCommands: ["echo", "printf", "env", "nice", "open"],
+            automaticAllowCommands: ["echo", "printf", "env", "nice", "reboot"],
             confirmationCommands: ["git"],
             userDeniedCommands: ["printf", "custom-blocked"]
         )
@@ -249,20 +250,20 @@ final class SettingsCenterObservationTests: XCTestCase {
         XCTAssertEqual(reloaded.terminalPolicySettings, expected)
         XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "echo ok"), .allowed)
         XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "printf ok"), .denied)
-        XCTAssertFalse(reloaded.terminalPolicySettings.automaticAllowCommands.contains("open"))
-        XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "env open Synthetic.app"), .denied)
-        XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "nice open Synthetic.app"), .denied)
+        XCTAssertFalse(reloaded.terminalPolicySettings.automaticAllowCommands.contains("reboot"))
+        XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "env reboot Synthetic.app"), .denied)
+        XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "nice reboot Synthetic.app"), .denied)
 
         reloaded.resetTerminalPolicyToDefaults()
         XCTAssertEqual(reloaded.terminalPolicySettings, .default)
-        XCTAssertEqual(reloaded.appearance, .system, "域重置不应改动其它设置")
-        XCTAssertEqual(reloaded.settingsStore.settings.general.appearance, .system)
+        XCTAssertEqual(reloaded.appearance, .dark, "域重置不应改动其它设置")
+        XCTAssertEqual(reloaded.settingsStore.settings.general.appearance, .dark)
         // 重基线新增（lane 125 / THEME-01）：域重置同样不得改动收敛后的唯一
         // 外观真值及其定版投影——预设维度纳入域隔离证明（属性更强，等式精确）。
-        XCTAssertEqual(reloaded.themePreset, .system, "域重置不应改动主题预设真值")
+        XCTAssertEqual(reloaded.themePreset, .light, "域重置不应改动主题预设真值")
         XCTAssertEqual(reloaded.accentTheme, ThemePreset.canonicalAccentTheme, "域重置后主题字段仍是预设的定版投影")
         XCTAssertEqual(SettingsStore(directory: dir).settings.agent.terminalPolicy, .default)
-        XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "env open Synthetic.app"), .denied)
+        XCTAssertEqual(reloaded.terminalPolicySnapshot.classify(command: "env reboot Synthetic.app"), .denied)
     }
 
     func testLegacyAgentSettingsDecodeUsesTerminalPolicyDefaults() throws {
@@ -279,7 +280,8 @@ final class SettingsCenterObservationTests: XCTestCase {
         center.accentTheme = .ocean
         // 重基线新增（lane 125 / THEME-05）：重置前的旧组合已迁移为System预设
         // （ocean不恢复已撤销固定dark），这是原测试无法断言的真值维度。
-        XCTAssertEqual(center.themePreset, .system)
+        XCTAssertEqual(center.themePreset, .light)
+        XCTAssertEqual(center.appearance, .dark)
         center.defaultProviderID = "openai"
         center.defaultModelID = "gpt-4o-mini"
         center.maxLoopIterations = 99
@@ -294,9 +296,9 @@ final class SettingsCenterObservationTests: XCTestCase {
         XCTAssertEqual(center.maxLoopIterations, AppSettings.defaults.agent.maxLoopIterations)
         XCTAssertNotEqual(center.maxLoopIterations, 99)
         XCTAssertEqual(center.settingsStore.settings.general.appearance, .system)
-        // 重基线新增：默认预设 = 跟随系统，store 侧同样同步（精确等式）。
-        XCTAssertEqual(center.themePreset, .system)
-        XCTAssertEqual(center.settingsStore.settings.general.themePreset, .system)
+        // 重基线新增：默认预设 = 产品主题（第 1 套配色起），store 侧同样同步（精确等式）。
+        XCTAssertEqual(center.themePreset, .light)
+        XCTAssertEqual(center.settingsStore.settings.general.themePreset, .light)
     }
 
     func testPersistenceErrorIsObservableAndSecretFree() throws {
@@ -360,7 +362,7 @@ final class SettingsCenterObservationTests: XCTestCase {
             return
         }
         XCTAssertEqual(center.themePreset, .system, "1115迁移后System预设经生产投影→应用往返保持")
-        XCTAssertEqual(center.appearance, .system, "旧明暗字段读出为预设投影")
+        XCTAssertEqual(center.appearance, .dark, "明暗字段经 dispatch 原样写入，不再被预设覆盖")
         XCTAssertEqual(center.accentTheme, ThemePreset.canonicalAccentTheme, "旧主题字段读出为定版投影")
         XCTAssertEqual(center.settingsStore.settings.general.themePreset, .system, "往返结果已持久化")
         XCTAssertEqual(center.settingsStore.settings.general.legacyThemePresetRawValue, "dark")
@@ -413,7 +415,7 @@ final class SettingsCenterObservationTests: XCTestCase {
         switch result {
         case .success:
             XCTAssertEqual(center.themePreset, .light, "显式预设键必须成为真值而非被旧组合推导覆盖")
-            XCTAssertEqual(center.appearance, .light)
+            XCTAssertEqual(center.appearance, .system)  // 产品主题跟随系统明暗
             XCTAssertEqual(center.accentTheme, ThemePreset.canonicalAccentTheme)
         case let .failure(error):
             XCTFail(

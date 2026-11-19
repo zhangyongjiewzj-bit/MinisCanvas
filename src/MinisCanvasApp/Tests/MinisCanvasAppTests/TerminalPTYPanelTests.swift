@@ -87,9 +87,14 @@ struct TerminalPTYPanelTests {
         #expect(decide(enabled: false) == .blocked(.sideEffectsDisabled))
     }
 
-    @Test func missingOrBlankWorkdirIsBlocked() {
-        #expect(decide(workdir: nil) == .blocked(.missingWorkingDirectory))
-        #expect(decide(workdir: "  \n") == .blocked(.missingWorkingDirectory))
+    @Test func missingOrBlankWorkdirStartsInHomeDirectory() {
+        for workdir in [nil, "  \n"] as [String?] {
+            guard case .launch(let plan) = decide(workdir: workdir) else {
+                Issue.record("没有项目目录时应在家目录启动")
+                return
+            }
+            #expect(plan.currentDirectory == NSHomeDirectory())
+        }
     }
 
     @Test func nonexistentWorkdirIsBlockedWithPath() {
@@ -204,5 +209,103 @@ struct TerminalPTYPanelTests {
         #expect(lifecycle.phase == .idle)
         let terminated4 = lifecycle.requestTerminate()
         #expect(!terminated4)
+    }
+
+    // MARK: 多终端标签
+
+    @Test func tabListAddsSelectsNewTabAndNumbersNeverReuse() {
+        var list = TerminalPTYTabList()
+        #expect(list.selected == nil)
+        #expect(list.add() == 1)
+        #expect(list.add() == 2)
+        #expect(list.selected == 2)
+        list.select(1)
+        #expect(list.selected == 1)
+        list.select(99)
+        #expect(list.selected == 1)
+        list.close(2)
+        #expect(list.add() == 3)
+        #expect(list.tabs == [1, 3])
+    }
+
+    @Test func tabListCapsAtMaxAndFreesSlotOnClose() {
+        var list = TerminalPTYTabList()
+        for _ in 0..<TerminalPTYTabList.maxTabs { _ = list.add() }
+        #expect(!list.canAddTab)
+        #expect(list.add() == nil)
+        #expect(list.tabs.count == TerminalPTYTabList.maxTabs)
+        list.close(3)
+        #expect(list.canAddTab)
+        #expect(list.add() == TerminalPTYTabList.maxTabs + 1)
+    }
+
+    @Test func closingSelectedTabPicksRightNeighbourThenLeftThenNone() {
+        var list = TerminalPTYTabList()
+        for _ in 0..<4 { _ = list.add() }          // [1,2,3,4] 选中 4
+        list.select(2)
+        #expect(list.close(2) == 3)                // 右邻
+        #expect(list.close(4) == 3)                // 关非当前：选中不变
+        list.select(3)
+        #expect(list.close(3) == 1)                // 无右邻选左邻
+        #expect(list.close(1) == nil)              // 最后一个：不自动再开
+        #expect(list.tabs.isEmpty)
+        #expect(list.selected == nil)
+        #expect(list.close(1) == nil)
+    }
+
+    // MARK: MC4-006/007/008/018/022
+
+    @Test func onlySafetySwitchRetiresAllTerminals() {
+        #expect(TerminalPTYBlockReason.sideEffectsDisabled.retiresAllTerminals)
+        #expect(!TerminalPTYBlockReason.workingDirectoryUnavailable("/gone").retiresAllTerminals)
+        #expect(!TerminalPTYBlockReason.missingWorkingDirectory.retiresAllTerminals)
+    }
+
+    @Test func unavailableDirectoryMessageNamesPathAndPromisesNoSilentFallback() {
+        let message = TerminalPTYBlockReason.workingDirectoryUnavailable("/gone").message
+        #expect(message.contains("/gone"))
+        #expect(message.contains("不会自动改到其他目录"))
+    }
+
+    @Test func boundWorkdirIsKeptEvenIfMissingAndHomeOnlyWhenUnbound() {
+        #expect(TerminalPTYPlanner.resolveWorkdir(bound: "/bound/gone", home: "/home") == "/bound/gone")
+        #expect(TerminalPTYPlanner.resolveWorkdir(bound: " /bound \n", home: "/home") == "/bound")
+        #expect(TerminalPTYPlanner.resolveWorkdir(bound: nil, home: "/home") == "/home")
+        #expect(TerminalPTYPlanner.resolveWorkdir(bound: "  ", home: "/home") == "/home")
+    }
+
+    @Test func deletedSessionsAreSelectedForRetirementRegardlessOfPanelState() {
+        let stale = TerminalPTYPlanner.sessionIDsToRetire(live: ["a", "b", "c"], keeping: ["b"])
+        #expect(Set(stale) == ["a", "c"])
+        #expect(TerminalPTYPlanner.sessionIDsToRetire(live: ["a"], keeping: ["a"]).isEmpty)
+        #expect(TerminalPTYPlanner.sessionIDsToRetire(live: [], keeping: []).isEmpty)
+    }
+
+    @MainActor
+    @Test func snapshotKeepsBoundMissingDirectoryAndPlannerBlocksIt() {
+        let missing = NSTemporaryDirectory() + "mc4-008-missing-\(UUID().uuidString)"
+        let chat = ChatStore()
+        chat.newSession(projectID: "p", projectName: "P", workingDirectory: missing)
+        let snapshot = TerminalContextSnapshot.current(from: chat)
+        #expect(snapshot?.workdir == missing)
+        #expect(snapshot?.workdir != NSHomeDirectory())
+        #expect(decide(workdir: snapshot?.workdir, dirExists: false)
+            == .blocked(.workingDirectoryUnavailable(missing)))
+    }
+
+    @MainActor
+    @Test func snapshotWithoutProjectDirectoryUsesHome() {
+        let chat = ChatStore()
+        chat.newSession(projectID: nil, projectName: nil, workingDirectory: nil)
+        #expect(TerminalContextSnapshot.current(from: chat)?.workdir == NSHomeDirectory())
+    }
+
+    @Test func closingOtherTabKeepsSelection() {
+        var list = TerminalPTYTabList()
+        for _ in 0..<3 { _ = list.add() }
+        list.select(2)
+        list.close(1)
+        #expect(list.selected == 2)
+        #expect(list.tabs == [2, 3])
     }
 }

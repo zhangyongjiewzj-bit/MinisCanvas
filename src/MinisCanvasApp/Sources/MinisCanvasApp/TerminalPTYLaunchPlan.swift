@@ -26,10 +26,17 @@ enum TerminalPTYBlockReason: Equatable, Sendable {
         case .sideEffectsDisabled:
             return "终端已被当前安全设置禁用（“浏览器与终端副作用”已关闭），未启动 shell。"
         case .missingWorkingDirectory:
-            return "请先为当前会话绑定项目工作目录，再使用终端。"
+            return "找不到可用的起始目录，未启动终端。"
         case .workingDirectoryUnavailable(let path):
-            return "工作目录不存在或不可访问：\(path)"
+            return "项目目录不可用（已不存在或不是文件夹）：\(path)。终端不会自动改到其他目录。"
         }
+    }
+
+    /// 只有安全开关关闭才结束全部终端；目录不可用只影响“新开终端”，
+    /// 已在运行的终端（含其他会话的）不受目录检查结果影响。
+    var retiresAllTerminals: Bool {
+        if case .sideEffectsDisabled = self { return true }
+        return false
     }
 }
 
@@ -89,8 +96,21 @@ enum TerminalPTYPlanner {
         return env.keys.sorted().map { "\($0)=\(env[$0] ?? "")" }
     }
 
+    /// 终端起始目录：会话绑定了项目目录就用它（即使它已不存在，由 `decide` 拦截并提示，不回落家目录）；
+    /// 会话本来没有项目目录才用家目录。
+    static func resolveWorkdir(bound: String?, home: String) -> String {
+        let trimmed = bound?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? home : trimmed
+    }
+
+    /// 已存在的终端会话里，哪些会话已不在有效会话集合中（应结束其全部终端）。
+    static func sessionIDsToRetire(live: [String], keeping valid: Set<String>) -> [String] {
+        live.filter { !valid.contains($0) }
+    }
+
     static func decide(
         workdir: String?,
+        homeDirectory: String = NSHomeDirectory(),
         sideEffectsEnabled: Bool,
         shellCandidates: [String?],
         baseEnvironment: [String: String],
@@ -98,7 +118,9 @@ enum TerminalPTYPlanner {
         isExecutable: (String) -> Bool
     ) -> TerminalPTYDecision {
         guard sideEffectsEnabled else { return .blocked(.sideEffectsDisabled) }
-        let trimmed = workdir?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // 会话没有项目目录时在家目录启动终端（对齐 Claude Code：随处可开）。
+        var trimmed = workdir?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if trimmed.isEmpty { trimmed = homeDirectory.trimmingCharacters(in: .whitespacesAndNewlines) }
         guard !trimmed.isEmpty else { return .blocked(.missingWorkingDirectory) }
         guard directoryExists(trimmed) else { return .blocked(.workingDirectoryUnavailable(trimmed)) }
         let shell = resolveShell(candidates: shellCandidates, isExecutable: isExecutable)

@@ -184,4 +184,28 @@ struct B1L1ProviderFixesTests {
         chat.setCustomProvider(source)
         #expect(chat.selectedProvider != nil)
     }
+
+    /// B-6：已添加但从未检查的供应商只给轻提示，不显示大卡片。
+    @Test @MainActor func uncheckedProviderShowsLightHintOnly() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("unchecked-hint-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let chat = ChatStore(providerReadinessStore: ProviderReadinessStore(directory: dir))
+        let source = record("Alpha")
+        chat.providerRecordsSource = { [source] }
+        #expect(!chat.shouldShowModelConnectionCard)
+        #expect(chat.shouldShowUncheckedProviderHint)
+        chat.providerRecordsSource = { [] }
+        #expect(!chat.shouldShowUncheckedProviderHint)
+    }
+
+    /// B-7：默认是仍存在的自定义供应商时，演示模式不得回落到别家。
+    @Test func customDefaultProviderBlocksSilentFallback() {
+        let records = [record("Alpha")]
+        #expect(ChatStore.defaultCustomProviderBlocksFallback(defaultProviderID: "custom.alpha", records: records))
+        #expect(!ChatStore.defaultCustomProviderBlocksFallback(defaultProviderID: "custom.gone", records: records))
+        #expect(!ChatStore.defaultCustomProviderBlocksFallback(defaultProviderID: "openai", records: records))
+        #expect(!ChatStore.defaultCustomProviderBlocksFallback(defaultProviderID: nil, records: records))
+    }
 }

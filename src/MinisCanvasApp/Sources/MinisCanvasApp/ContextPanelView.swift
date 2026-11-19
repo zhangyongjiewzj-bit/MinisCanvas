@@ -8,11 +8,15 @@ import AVKit
 import ImageIO
 import Darwin
 import CryptoKit
+import CoreServices
+import PDFKit
 
 /// Read-only App projection of the durable compact/lineage consumer.
 struct SessionCompactProjection: Sendable, Equatable {
     enum State: String, Sendable, Equatable {
         case unavailable
+        /// 存储服务已装配，但这个会话还没有落盘（如刚打开的欢迎会话，发第一条消息后才生成会话文件）。
+        case sessionNotSaved
         case noCheckpoint
         case unverified = "UNVERIFIED"
         case checkpointed
@@ -41,6 +45,8 @@ struct SessionCompactProjection: Sendable, Equatable {
         switch state {
         case .unavailable:
             return "持久化未装配"
+        case .sessionNotSaved:
+            return "尚无会话文件（发送第一条消息后生成）"
         case .noCheckpoint:
             return "暂无压缩检查点"
         case .unverified:
@@ -54,9 +60,9 @@ struct SessionCompactProjection: Sendable, Equatable {
 
     init(sessionID: String?, store: SessionStore?) {
         self.sessionID = sessionID
-        guard let sessionID, let store,
-              let session = store.loadSession(id: sessionID) else {
-            state = .unavailable
+        let session = sessionID.flatMap { id in store?.loadSession(id: id) }
+        guard let sessionID, let store, let session else {
+            state = (sessionID != nil && store != nil) ? .sessionNotSaved : .unavailable
             summaryIdentity = nil
             undoIdentity = nil
             checkpointID = nil
@@ -352,6 +358,7 @@ struct ContextPanelView: View {
     var onLoadOlderToolEvents: () -> Void = {}
     /// Ordinary Agent file actions are revalidated by ContentView at click time.
     var onFileOutputAction: ((AgentFileChangeRecord, AgentFileOutputIntent) -> AgentFileOutputOutcome)? = nil
+    var onArtifactOutputAction: ((ProducedFileArtifactEvidence, AgentFileOutputIntent) -> AgentFileOutputOutcome)? = nil
     /// N2-02: callbacks retain explicit session/child/path identity through review.
     var childFileCheckpointSummaries: ((UUID, String, String) -> [FileCheckpointStore.Summary])? = nil
     var onRequestRestoreChildFileCheckpoint: ((UUID, UUID, String, String) async -> String)? = nil
@@ -373,7 +380,7 @@ struct ContextPanelView: View {
     @State private var changeRecoveryPath: String?
     @State private var childRecoveryRequest: ChildTaskFileReviewRecoveryRequest?
     @State private var browserSessionOwner = BrowserTabSessionOwner()
-    @State private var terminalSessionOwner = TerminalPTYSessionOwner()
+    private let terminalSessionOwner = TerminalPTYSessionOwner.shared
     @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
 
@@ -404,12 +411,10 @@ struct ContextPanelView: View {
         .onChange(of: browserPaneIdentity) { _, newIdentity in
             browserSessionOwner.retire(ifDifferentFrom: newIdentity)
         }
-        .onChange(of: terminalPanelIdentity) { _, newIdentity in
-            terminalSessionOwner.retire(ifDifferentFrom: newIdentity)
-        }
+        // 终端按会话保留：会话删除与安全开关的清理由常驻的 TerminalLifecycleObserver 负责
+        // （右栏标签不在终端、或右栏/任务中心不挂载时也要生效）。
         .onDisappear {
             browserSessionOwner.retire()
-            terminalSessionOwner.retire()
         }
         .onChange(of: chat.activeSessionID) { _, _ in childRecoveryRequest = nil }
         .sheet(item: $childRecoveryRequest) { request in
@@ -433,7 +438,7 @@ struct ContextPanelView: View {
                     Text("请求查看恢复：\(path)")
                         .font(typography?.caption ?? .caption).padding(.horizontal, 20)
                 }
-                FileCheckpointRecoveryView(chat: chat)
+                FileCheckpointRecoveryView(chat: chat, focusPath: changeRecoveryPath)
             }
         }
     }
@@ -474,16 +479,25 @@ struct ContextPanelView: View {
     // MARK: Tab 条
 
     private var tabBar: some View {
-        AdaptiveControlRowLayout(spacing: 2) {
-            ForEach(ContextTab.allCases) { tab in
-                tabButton(tab)
+        // 宽度够就显示图标+文字；不够时只显示图标（悬停有提示），不换行。
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 2) {
+                ForEach(ContextTab.allCases) { tab in
+                    tabButton(tab, iconOnly: false)
+                }
+            }
+            HStack(spacing: 2) {
+                ForEach(ContextTab.allCases) { tab in
+                    tabButton(tab, iconOnly: true)
+                }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
     }
 
-    private func tabButton(_ tab: ContextTab) -> some View {
+    private func tabButton(_ tab: ContextTab, iconOnly: Bool) -> some View {
         let isActive = selectedTab == tab
         return Button {
             selectedTab = tab
@@ -498,8 +512,12 @@ struct ContextPanelView: View {
                     Image(systemName: tab.icon)
                         .font(.system(size: 10, weight: .medium))
                 }
-                Text(tab == .node ? "上下文" : tab == .changes ? "改动" : tab.title)
-                    .font((typography?.caption ?? .system(size: 10)).weight(isActive ? .semibold : .regular))
+                if !iconOnly {
+                    Text(tab == .node ? "上下文" : tab == .changes ? "改动" : tab.title)
+                        .font((typography?.caption ?? .system(size: 10)).weight(isActive ? .semibold : .regular))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
             }
             .foregroundStyle(isActive ? Color.primary : Color.secondary)
             .padding(.horizontal, 8)
@@ -511,7 +529,8 @@ struct ContextPanelView: View {
         }
         .buttonStyle(.plain)
         .help("切换到\(tab.title)")
-        .accessibilityLabel(tab.title)
+        // G-05：有可见文字时读屏名与可见字一致（上下文/改动）；纯图标时读完整名。
+        .accessibilityLabel(iconOnly ? tab.title : (tab == .node ? "上下文" : tab == .changes ? "改动" : tab.title))
         .accessibilityHint("切换到\(tab.title)标签")
         .accessibilityIdentifier("context.panel.tab.\(tab.rawValue)")
     }
@@ -535,7 +554,8 @@ struct ContextPanelView: View {
                               chatSnapshot.sessionID == sessionID.uuidString else { return }
                         childRecoveryRequest = ChildTaskFileReviewRecoveryRequest(
                             sessionID: sessionID, childTaskID: childID, absolutePath: path)
-                    } : nil
+                    } : nil,
+                workspaceDirectory: activeSessionRoot?.path
             )
             .id(chatSnapshot.sessionID)
         case .files:
@@ -569,7 +589,7 @@ struct ContextPanelView: View {
     private var canSendChangeComment: Bool {
         chatSnapshot.sessionID != nil
             && chat.activeSessionID?.uuidString == chatSnapshot.sessionID
-            && chat.draftText.isEmpty && chat.pendingAttachments.isEmpty
+            && !chat.hasDraft && chat.pendingAttachments.isEmpty
             && chat.activePastedTextDrafts.isEmpty && !chat.isEditingMessage
             && !chat.isComposerCredentialPreflightPending
             && !chat.isComposerAttachmentPreflightPending
@@ -616,7 +636,7 @@ struct ContextPanelView: View {
                        sessionID == chat.activeSessionID {
                         Text(result.message)
                             .font(.caption)
-                            .foregroundStyle(result.state == .failed ? Color.orange : Color.secondary)
+                            .foregroundStyle(result.state == .failed ? (theme?.statusWarningText ?? AppStatusColor.warning) : Color.secondary)
                             .padding(.horizontal, 10)
                             .accessibilityIdentifier("context.compaction.result")
                     }
@@ -632,15 +652,18 @@ struct ContextPanelView: View {
                     onUndoCompaction: { chat.undoCompactionProjection($0) },
                     budgetResetTarget: chat.sessionBudgetResetTarget,
                     budgetResetBlockedReason: budgetResetBlockedReason,
-                    onConfirmBudgetReset: onConfirmBudgetReset
+                    onConfirmBudgetReset: onConfirmBudgetReset,
+                    onCompactWithHint: onCompact == nil ? nil : { (hint: String) in chat.compactContext(hint: hint) }
                 )
                     .environment(\.agentFileOutputAction, onFileOutputAction)
+                    .environment(\.agentArtifactOutputAction, onArtifactOutputAction)
+                    TaskBoardInspectorView(chat: chat)
                     if let result = chat.compactionUndoFeedback, result.sessionID == chat.activeSessionID {
                         Text(result.succeeded
                              ? "已撤销上下文压缩。"
                              : "未确认撤销压缩。请检查会话是否空闲，以及检查点是否仍然有效。")
                             .font(.caption)
-                            .foregroundStyle(result.succeeded ? Color.secondary : Color.orange)
+                            .foregroundStyle(result.succeeded ? Color.secondary : (theme?.statusWarningText ?? AppStatusColor.warning))
                             .padding(.horizontal, 10)
                             .accessibilityIdentifier("context.compaction.undo-result")
                     }
@@ -723,16 +746,30 @@ enum FileKind: Equatable, Sendable {
 
     init(url: URL) {
         switch url.pathExtension.lowercased() {
-        case "json": self = .json
+        case "json", "ipynb": self = .json
         // P3-MEDIA-01：SVG 是矢量/XML 文本，不是位图——从 .image 拆分，预览按文本处理，
         // 不再伪装成光栅图片进入位图解码/图片通道（LUNA SVG 污染缺陷的 UI 侧分类根因）。
         case "png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "tiff": self = .image
         case "svg": self = .svg
+        // .ts 绝大多数是 TypeScript，归文本；真正的 MPEG-TS 视频在预览时嗅探到二进制再改判。
         case "mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "3gp", "flv", "wmv",
-             "quicktime", "m2ts", "ts", "mts": self = .video
+             "quicktime", "m2ts", "mts": self = .video
         case "txt", "md", "markdown", "swift", "py", "js", "html", "css", "c", "h",
              "cpp", "java", "go", "rs", "yaml", "yml", "toml", "xml", "sh", "env", "plist",
-             "sql", "log", "csv", "gitignore", "modulemap", "entitlements": self = .text
+             "sql", "log", "csv", "gitignore", "modulemap", "entitlements",
+             "ts", "tsx", "jsx", "mjs", "cjs", "rb", "php", "kt", "kts", "vue", "svelte",
+             "ini", "conf", "cfg", "lock", "hpp", "cc", "cxx", "m", "mm", "cs", "scala", "lua",
+             "pl", "dart", "r", "ex", "exs", "hs", "clj", "zsh", "bash", "fish", "bat", "ps1",
+             "scss", "sass", "less", "tsv", "jsonl", "ndjson", "properties", "proto", "graphql",
+             "gql", "tf", "hcl", "nix", "zig", "gradle", "tex", "rst", "adoc", "diff", "patch",
+             "xcconfig", "strings", "resolved", "editorconfig", "gitattributes", "npmrc", "dockerignore":
+            self = .text
+        case "":
+            // 无扩展名的常见文本文件（Dockerfile、Makefile 等）。
+            let names: Set<String> = ["dockerfile", "makefile", "gnumakefile", "rakefile", "gemfile",
+                                      "podfile", "procfile", "vagrantfile", "license", "readme",
+                                      "changelog", "authors", "codeowners", "jenkinsfile"]
+            self = names.contains(url.lastPathComponent.lowercased()) ? .text : .other
         default: self = .other
         }
     }
@@ -750,64 +787,94 @@ enum FileKind: Equatable, Sendable {
 
     var supportsAgentOutputPreview: Bool {
         switch self {
-        case .text, .json, .svg, .image: return true
-        case .video, .other: return false
+        case .text, .json, .svg, .image, .video: return true
+        case .other: return false
         }
+    }
+
+    /// 智能体产出预览：除按类型支持外，PDF 也可预览（只读 PDFView）。
+    static func agentPreviewSupported(for url: URL) -> Bool {
+        FileKind(url: url).supportsAgentOutputPreview || url.pathExtension.lowercased() == "pdf"
     }
 }
 
 /// 目录树节点（纯值类型，可单测）。
 struct FileTreeNode: Identifiable, Equatable {
-    let id: UUID
+    /// 以路径为 id：刷新、重新扫描后节点身份不变，展开状态得以保留。
+    let id: String
     let url: URL
     let name: String
     let isDirectory: Bool
     var children: [FileTreeNode] = []
+    /// 目录的子项是否已读入；大目录与深层目录先不读，展开时再加载。
+    var isLoaded: Bool = true
 }
 
-/// 文件树纯逻辑：目录递归扫描 + 文件名搜索过滤（可单测）。
+/// 文件树纯逻辑：目录扫描（按需加载）+ 文件名搜索过滤（可单测）。
 enum FileTreeLogic {
-    /// 最大递归深度（防深链/符号环爆栈）。
-    /// AJ-69：收紧到 6 层，超过即截断——深层嵌套的大目录不会拖垮扫描。
-    static let maxDepth = 6
+    /// 一次扫描默认向下读入的目录层数；更深的目录显示出来、展开时再读。
+    static let maxDepth = 2
 
-    /// 跳过的大目录（构建产物/版本控制/缓存，扫描会爆炸且无价值）。
+    /// 不显示的版本控制元数据与系统噪声。
+    static let hiddenAlwaysNames: Set<String> = [".git", ".svn", ".hg", ".DS_Store"]
+
+    /// 显示但默认折叠、展开时才读取的大目录（构建产物/依赖/缓存）。
     static let skippedDirNames: Set<String> = [
-        ".build", ".git", ".svn", ".hg", "DerivedData", "node_modules", "Pods",
+        ".build", "DerivedData", "node_modules", "Pods",
         ".xcuserdata", ".swiftpm", ".hermes", ".venv", "venv", "dist", "build", "Carthage",
     ]
 
-    /// 递归扫描目录，返回排序后的树节点。跳过隐藏文件（. 开头）与构建产物大目录。
-    /// `maxDepth` 为扫描深度上限（AJ-69：默认 6 层，超出即截断，防大目录卡死）。
-    static func scanDirectory(at url: URL, skipHidden: Bool = true, depth: Int = 0, maxDepth: Int = FileTreeLogic.maxDepth) -> [FileTreeNode] {
-        guard depth <= maxDepth else { return [] }
+    /// 扫描目录，返回排序后的树节点。显示点开头的文件（.git 等除外）；
+    /// 大目录与深于 `maxDepth` 的目录只给出节点，`expanded` 里的路径（用户已展开的）会读入。
+    static func scanDirectory(at url: URL, skipHidden: Bool = true, depth: Int = 0,
+                              maxDepth: Int = FileTreeLogic.maxDepth,
+                              expanded: Set<String> = []) -> [FileTreeNode] {
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey]
         guard let entries = try? fm.contentsOfDirectory(
             at: url,
             includingPropertiesForKeys: keys,
-            options: [.skipsHiddenFiles]
+            options: []
         ) else { return [] }
 
         return entries
             .filter { entry in
-                if skipHidden, entry.lastPathComponent.hasPrefix(".") { return false }
-                return true
+                !(skipHidden && hiddenAlwaysNames.contains(entry.lastPathComponent))
             }
-            .compactMap { entry -> FileTreeNode? in
+            .map { entry -> FileTreeNode in
                 let values = try? entry.resourceValues(forKeys: Set(keys))
                 let isDir = values?.isDirectory ?? false
-                // 跳过构建产物/版本控制大目录（卡死主因）
-                if isDir, skippedDirNames.contains(entry.lastPathComponent) { return nil }
                 var node = FileTreeNode(
-                    id: UUID(), url: entry, name: entry.lastPathComponent, isDirectory: isDir
+                    id: entry.path, url: entry, name: entry.lastPathComponent, isDirectory: isDir
                 )
                 if isDir {
-                    node.children = scanDirectory(at: entry, skipHidden: skipHidden, depth: depth + 1, maxDepth: maxDepth)
+                    let heavy = skippedDirNames.contains(entry.lastPathComponent)
+                    let load = expanded.contains(entry.path) || (!heavy && depth < maxDepth)
+                    if load {
+                        node.children = scanDirectory(at: entry, skipHidden: skipHidden, depth: depth + 1,
+                                                      maxDepth: maxDepth, expanded: expanded)
+                    } else {
+                        node.isLoaded = false
+                    }
                 }
                 return node
             }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    /// 把某个目录（按路径）的子项换成新读到的结果，其余节点原样保留。
+    static func replacingChildren(in nodes: [FileTreeNode], path: String, with children: [FileTreeNode]) -> [FileTreeNode] {
+        nodes.map { node in
+            guard node.isDirectory else { return node }
+            var copy = node
+            if node.id == path {
+                copy.children = children
+                copy.isLoaded = true
+            } else if path.hasPrefix(node.id + "/") {
+                copy.children = replacingChildren(in: node.children, path: path, with: children)
+            }
+            return copy
+        }
     }
 
     /// 按关键字过滤目录树：匹配文件名的文件保留；目录保留匹配自身或含匹配子项者。
@@ -833,6 +900,62 @@ enum FileTreeLogic {
     }
 }
 
+/// 监听目录树的文件变化（FSEvents），变化合并后通知一次；对象释放时自动停止。
+final class FileTreeWatcher: @unchecked Sendable {
+    private final class Box: @unchecked Sendable {
+        private let lock = NSLock()
+        private var handler: (@Sendable () -> Void)?
+        init(_ handler: @escaping @Sendable () -> Void) { self.handler = handler }
+        func fire() { lock.lock(); let h = handler; lock.unlock(); h?() }
+        func clear() { lock.lock(); handler = nil; lock.unlock() }
+    }
+
+    /// 构建产物、版本库内部的改动不触发刷新。
+    private static let ignoredFragments = ["/.git/", "/.build/", "/node_modules/", "/DerivedData/", "/.DS_Store", "/.swiftpm/"]
+
+    let path: String
+    private let box: Box
+    private var stream: FSEventStreamRef?
+    private let queue = DispatchQueue(label: "miniscanvas.filetree.watcher", qos: .utility)
+
+    init?(path: String, onChange: @escaping @Sendable () -> Void) {
+        self.path = path
+        let box = Box(onChange)
+        self.box = box
+        var context = FSEventStreamContext(
+            version: 0, info: Unmanaged.passRetained(box).toOpaque(), retain: nil,
+            release: { info in if let info { Unmanaged<Box>.fromOpaque(info).release() } },
+            copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, count, eventPaths, _, _ in
+            guard let info else { return }
+            let paths = (Unmanaged<NSArray>.fromOpaque(eventPaths).takeUnretainedValue() as? [String]) ?? []
+            let relevant = paths.prefix(count).contains { changed in
+                !FileTreeWatcher.ignoredFragments.contains { changed.contains($0) }
+            }
+            if relevant { Unmanaged<Box>.fromOpaque(info).takeUnretainedValue().fire() }
+        }
+        guard let created = FSEventStreamCreate(
+            nil, callback, &context, [path] as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            1.0, FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents)
+        ) else {
+            Unmanaged<Box>.fromOpaque(context.info!).release()
+            return nil
+        }
+        stream = created
+        FSEventStreamSetDispatchQueue(created, queue)
+        FSEventStreamStart(created)
+    }
+
+    deinit {
+        box.clear()
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+        }
+    }
+}
+
 /// 文件预览：加载后的文本 / 图片 / 视频 / 元信息。
 struct FilePreview: Sendable {
     let kind: FileKind
@@ -841,7 +964,13 @@ struct FilePreview: Sendable {
     let videoURL: URL?
     let sizeText: String
     let error: String?
+    /// 智能体产出的 PDF（只读 PDFView 渲染）；其余预览为 nil。
+    var pdfURL: URL? = nil
+    /// 文本内容是 Markdown，按 Markdown 渲染。
+    var isMarkdown: Bool = false
 
+    /// 智能体 PDF / 视频预览的大小上限。
+    static let agentMediaByteLimit = 100 * 1024 * 1024
     /// 文本预览上限（截断超大文件，避免卡 UI）。
     static let textLimit = 200_000
     /// Agent output preview is deliberately smaller than the generic file
@@ -849,9 +978,22 @@ struct FilePreview: Sendable {
     static let agentTextByteLimit = 1 * 1024 * 1024
     static let agentImageByteLimit = 8 * 1024 * 1024
 
-    /// 从字节解码文本（utf8 优先，回落 utf16）。
-    static func text(from data: Data) -> String? {
-        String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16)
+    /// 文件树预览最多读入的字节数（超大文件只读开头一段）。
+    static let readByteLimit = 1 * 1024 * 1024
+
+    /// 从字节解码文本（utf8 优先；带 BOM 的 utf16；GB18030；最后回落 utf16）。
+    /// `mayBeCut` 为 true 表示末尾可能把一个多字节字符截断了。
+    static func text(from data: Data, mayBeCut: Bool = false) -> String? {
+        let gb = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        let hasBOM = data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF])
+        let encodings: [String.Encoding] = hasBOM ? [.utf16, .utf8, gb] : [.utf8, gb, .utf16]
+        for encoding in encodings {
+            for drop in 0...(mayBeCut ? 3 : 0) where data.count >= drop {
+                if let value = String(data: data.prefix(data.count - drop), encoding: encoding) { return value }
+            }
+        }
+        return nil
     }
 
     /// 截断到上限。
@@ -859,10 +1001,56 @@ struct FilePreview: Sendable {
         s.count <= limit ? s : String(s.prefix(limit))
     }
 
+    /// 只读文件开头至多 `limit` 字节；`cut` 表示文件比这更长。
+    static func readPrefix(of url: URL, limit: Int) -> (data: Data, cut: Bool)? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: limit + 1) else { return nil }
+        return data.count > limit ? (data.prefix(limit), true) : (data, false)
+    }
+
+    /// 嗅探开头 8 KB：没有 NUL 字节且能按文本解码就算文本（用于无扩展名或未知扩展名的文件）。
+    static func sniffsAsText(_ url: URL) -> Bool {
+        guard let (head, cut) = readPrefix(of: url, limit: 8 * 1024) else { return false }
+        if head.isEmpty { return true }
+        if head.contains(0) && !(head.starts(with: [0xFF, 0xFE]) || head.starts(with: [0xFE, 0xFF])) { return false }
+        return text(from: head, mayBeCut: cut) != nil
+    }
+
+    /// PDF 预览：抽取前若干页文字；没有文字层时给出说明。
+    static func pdfText(from url: URL) -> String {
+        guard let document = PDFDocument(url: url) else { return "（无法打开这个 PDF）" }
+        var collected = ""
+        for index in 0..<document.pageCount {
+            guard let page = document.page(at: index), let pageText = page.string,
+                  !pageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            collected += "[第 \(index + 1) 页]\n" + pageText + "\n\n"
+            if collected.count >= textLimit { break }
+        }
+        return collected.isEmpty ? "（这个 PDF 没有可提取的文字，可能是扫描件；请用系统打开查看。）" : collected
+    }
+
     static func load(url: URL) -> FilePreview {
-        let kind = FileKind(url: url)
+        // 凭据类文件（.env、私钥、令牌等，含符号链接指向的目标）不读取、不预览。
+        if SensitiveFilePolicy.contains(url.path) || SensitiveFilePolicy.contains(url.resolvingSymlinksInPath().path) {
+            return FilePreview(kind: .other, text: nil, imageData: nil, videoURL: nil, sizeText: "",
+                               error: "可能含密钥，未读取")
+        }
+        var kind = FileKind(url: url)
+        let ext = url.pathExtension.lowercased()
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         let sizeText = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+        // .ts 既可能是 TypeScript 也可能是 MPEG-TS 视频：内容是二进制才按视频处理。
+        if ext == "ts", kind == .text, !sniffsAsText(url) { kind = .video }
+        if kind == .other, ext == "pdf" {
+            guard FileManager.default.isReadableFile(atPath: url.path) else {
+                return FilePreview(kind: .other, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText, error: "无法读取文件")
+            }
+            // 文件树里的 PDF 与产物预览一致：直接用 PDFView 显示（含扫描件），不再只给提取的文字。
+            return FilePreview(kind: .other, text: nil, imageData: nil, videoURL: nil,
+                               sizeText: sizeText, error: nil, pdfURL: url)
+        }
+        if kind == .other, FileManager.default.isReadableFile(atPath: url.path), sniffsAsText(url) { kind = .text }
         // 视频：不读进内存（大文件），只存 URL 供 AVPlayer 播放。
         if kind == .video {
             var isDirectory = ObjCBool(false)
@@ -874,16 +1062,29 @@ struct FilePreview: Sendable {
             }
             return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: url, sizeText: sizeText, error: nil)
         }
-        guard let data = try? Data(contentsOf: url) else {
-            return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText, error: "无法读取文件")
-        }
         switch kind {
         case .image:
+            guard size <= 25 * 1024 * 1024 else {
+                return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText,
+                                   error: "图片超过 25MB，未在面板中预览，请用系统打开。")
+            }
+            guard let data = try? Data(contentsOf: url) else {
+                return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText, error: "无法读取文件")
+            }
             return FilePreview(kind: kind, text: nil, imageData: data, videoURL: nil, sizeText: sizeText, error: nil)
         case .text, .json, .svg:
-            let decoded = text(from: data) ?? "（无法解码为文本）"
-            return FilePreview(kind: kind, text: truncated(decoded), imageData: nil, videoURL: nil, sizeText: sizeText, error: nil)
+            // 只读开头一段（1 MB），大文件不整份读入内存。
+            guard let (data, cut) = readPrefix(of: url, limit: readByteLimit) else {
+                return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText, error: "无法读取文件")
+            }
+            var decoded = truncated(text(from: data, mayBeCut: cut) ?? "（无法解码为文本）")
+            // 先截断再追加提示，避免提示被截掉。
+            if cut { decoded += "\n\n…（文件较大，仅显示前 \(readByteLimit / 1024 / 1024) MB）" }
+            return FilePreview(kind: kind, text: decoded, imageData: nil, videoURL: nil, sizeText: sizeText, error: nil)
         case .video, .other:
+            guard FileManager.default.isReadableFile(atPath: url.path) else {
+                return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText, error: "无法读取文件")
+            }
             return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: nil, sizeText: sizeText, error: nil)
         }
     }
@@ -916,18 +1117,42 @@ struct FilePreview: Sendable {
         case .success(let approved): target = approved
         case .failure(let reason): return failed(reason.message)
         }
-        guard kind.supportsAgentOutputPreview else {
+        guard FileKind.agentPreviewSupported(for: url) else {
             return failed(AgentFileOutputFailure.previewUnsupported.message)
         }
         guard expectedSHA256 == nil || authorizeTarget(target) else {
             return failed(AgentFileOutputFailure.outOfBounds.message)
+        }
+        let targetExtension = target.pathExtension.lowercased()
+        if kind == .video || targetExtension == "pdf" {
+            // PDF / 视频只读预览：不读进内存，只在大小上限内交给 PDFView / AVPlayer。
+            guard let mediaSize = try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
+                return failed("无法核验文件大小，预览已阻止。")
+            }
+            guard mediaSize <= agentMediaByteLimit else {
+                return failed("文件超过当前预览大小上限，请在变更文件或产物行里点“系统打开”（会重新核验）。")
+            }
+            if let expectedSHA256 {
+                guard AgentFileOutputTargetResolver.generatedFileDigest(target) == expectedSHA256 else {
+                    return failed(AgentFileOutputFailure.stale.message)
+                }
+                guard validateBinding() else { return failed(AgentFileOutputFailure.unbound.message) }
+                guard authorizeTarget(target) else { return failed(AgentFileOutputFailure.outOfBounds.message) }
+            }
+            let mediaSizeText = ByteCountFormatter.string(fromByteCount: Int64(mediaSize), countStyle: .file)
+            if targetExtension == "pdf" {
+                return FilePreview(kind: .other, text: nil, imageData: nil, videoURL: nil,
+                                   sizeText: mediaSizeText, error: nil, pdfURL: target)
+            }
+            return FilePreview(kind: kind, text: nil, imageData: nil, videoURL: target,
+                               sizeText: mediaSizeText, error: nil)
         }
         let maxBytes = kind == .image ? agentImageByteLimit : agentTextByteLimit
         guard let size = try? target.resourceValues(forKeys: [.fileSizeKey]).fileSize else {
             return failed("无法核验文件大小，预览已阻止。")
         }
         guard size <= maxBytes else {
-            return failed("文件超过当前预览大小上限，请使用系统打开。")
+            return failed("文件超过当前预览大小上限，请在变更文件或产物行里点“系统打开”（会重新核验）。")
         }
         let data: Data
         do {
@@ -955,7 +1180,7 @@ struct FilePreview: Sendable {
             return failed("文件读取失败，预览已阻止。")
         }
         guard data.count <= maxBytes else {
-            return failed("文件超过当前预览大小上限，请使用系统打开。")
+            return failed("文件超过当前预览大小上限，请在变更文件或产物行里点“系统打开”（会重新核验）。")
         }
         let sizeText = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
         if kind == .image {
@@ -964,7 +1189,8 @@ struct FilePreview: Sendable {
         guard let decoded = text(from: data) else {
             return failed("无法解码为文本，预览已阻止。")
         }
-        return FilePreview(kind: kind, text: truncated(decoded), imageData: nil, videoURL: nil, sizeText: sizeText, error: nil)
+        return FilePreview(kind: kind, text: truncated(decoded), imageData: nil, videoURL: nil, sizeText: sizeText, error: nil,
+                           isMarkdown: ["md", "markdown"].contains(targetExtension))
     }
 }
 
@@ -990,7 +1216,10 @@ final class FileTreeStore {
     }
     /// 最近一次系统外部打开的可观察错误；成功或重新选择文件时清除。
     var externalOpenError: String?
-    var expandedIDs: Set<UUID> = []
+    /// 已展开目录的路径（与节点 id 一致，刷新后保持）。
+    var expandedIDs: Set<String> = []
+    private var watcher: FileTreeWatcher?
+    private var loadingPaths: Set<String> = []
     /// 进行中的预览加载任务（点文件串行化，防并发读文件卡 UI）。
     private var previewTask: Task<Void, Never>?
     /// 进行中的目录扫描任务（reload 串行化，防重复扫描并发打满 CPU——闪退根因）。
@@ -1022,11 +1251,19 @@ final class FileTreeStore {
         scanTask?.cancel()
         guard let url = rootURL else {
             rootNodes = []
+            watcher = nil
             return
         }
+        // 监听目录变化：新文件、删除、改名自动出现在树里（FSEvents 已合并延迟，这里再串行化扫描）。
+        if watcher?.path != url.path {
+            watcher = FileTreeWatcher(path: url.path) { [weak self] in
+                Task { @MainActor in self?.reload() }
+            }
+        }
+        let expanded = expandedIDs
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             guard !Task.isCancelled else { return }
-            let nodes = FileTreeLogic.scanDirectory(at: url)
+            let nodes = FileTreeLogic.scanDirectory(at: url, expanded: expanded)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self, !Task.isCancelled else { return }
@@ -1042,8 +1279,29 @@ final class FileTreeStore {
         FileTreeLogic.filter(nodes: rootNodes, query: searchText)
     }
 
-    func toggle(_ id: UUID) {
-        if expandedIDs.contains(id) { expandedIDs.remove(id) } else { expandedIDs.insert(id) }
+    func toggle(_ node: FileTreeNode) {
+        if expandedIDs.contains(node.id) {
+            expandedIDs.remove(node.id)
+        } else {
+            expandedIDs.insert(node.id)
+            loadChildren(of: node)
+        }
+    }
+
+    /// 大目录、深层目录展开时才读取它的直接子项。
+    func loadChildren(of node: FileTreeNode) {
+        guard node.isDirectory, !node.isLoaded, !loadingPaths.contains(node.id) else { return }
+        loadingPaths.insert(node.id)
+        let url = node.url
+        let expanded = expandedIDs
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let children = FileTreeLogic.scanDirectory(at: url, maxDepth: 0, expanded: expanded)
+            await MainActor.run {
+                guard let self else { return }
+                self.loadingPaths.remove(url.path)
+                self.rootNodes = FileTreeLogic.replacingChildren(in: self.rootNodes, path: url.path, with: children)
+            }
+        }
     }
 
     func select(_ url: URL) {
@@ -1107,12 +1365,28 @@ final class FileTreeStore {
     /// 使用系统默认应用打开当前文件；失败原因写入状态，交给右侧预览显示。
     func openSelectedExternally() {
         guard !agentPreviewOnly else {
-            externalOpenError = "请从变更文件操作区重新核验后打开。"
+            externalOpenError = "智能体产出需重新核验后才能打开：请在对话里该文件的变更文件或产物行点“系统打开”。"
             return
         }
         guard let selectedURL else {
             externalOpenError = "请先选择一个文件。"
             return
+        }
+        if SensitiveFilePolicy.contains(selectedURL.path) || SensitiveFilePolicy.contains(selectedURL.resolvingSymlinksInPath().path) {
+            externalOpenError = "该文件可能含密钥，不交给系统打开。"
+            return
+        }
+        // 与对话里的文件链接同一套类型拦截：可执行/自动运行类型只在访达显示，脚本用文本编辑器查看。
+        switch TranscriptLocalFileLink.openDisposition(for: selectedURL) {
+        case .revealOnly:
+            NSWorkspace.shared.activateFileViewerSelecting([selectedURL])
+            externalOpenError = "该类型的文件可能自动运行，已改为在访达中显示，没有直接打开。"
+            return
+        case .textEditor:
+            externalOpenError = TranscriptLocalFileLink.openInTextEditor(selectedURL) ? nil : "没有找到文本编辑器，无法查看该脚本。"
+            return
+        case .systemOpen:
+            break
         }
         do {
             try ChatAttachmentExternalOpener().open(url: selectedURL)
@@ -1217,10 +1491,11 @@ struct FileTreeTabView: View {
     }
 
     /// 递归收集全部目录节点 id（「展开全部」用，目录展开状态由 store.expandedIDs 驱动）。
-    private func allDirectoryIDs(in nodes: [FileTreeNode]) -> Set<UUID> {
-        var ids = Set<UUID>()
+    private func allDirectoryIDs(in nodes: [FileTreeNode]) -> Set<String> {
+        var ids = Set<String>()
         func visit(_ node: FileTreeNode) {
-            if node.isDirectory {
+            // 还没读入的大目录不随“展开全部”一起读，需要时单独点开。
+            if node.isDirectory, node.isLoaded {
                 ids.insert(node.id)
                 for child in node.children { visit(child) }
             }
@@ -1399,7 +1674,7 @@ struct FileTreeTabView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(theme?.aj38.accent.swiftUIColor ?? Color.accentColor)
                 .disabled(store.selectedURL == nil || store.agentPreviewOnly)
-                .help("在系统中打开")
+                .help(store.agentPreviewOnly ? "智能体产出需重新核验：请在变更文件或产物行点“系统打开”" : "在系统中打开")
                 .accessibilityLabel("在系统中打开")
                 .accessibilityHint("使用系统默认应用打开文件或图片")
             }
@@ -1407,8 +1682,14 @@ struct FileTreeTabView: View {
             .padding(.top, 8)
 
             // AJ-69：预览内容整体可滚动——高度由拖拽分隔条分配，内容超限时滚动查看。
-            ScrollView {
-                FilePreviewContents(preview: preview, imageCacheKey: store.agentPreviewOnly ? "" : (store.selectedURL?.path ?? ""))
+            // 图片预览高度跟随面板高度（至少 160），点击可放大。
+            GeometryReader { panel in
+                ScrollView {
+                    FilePreviewContents(
+                        preview: preview,
+                        imageCacheKey: store.agentPreviewOnly ? "" : (store.selectedURL.map { FileTreePreviewCache.cacheKey(for: $0) } ?? ""),
+                        imageHeight: max(160, panel.size.height - 12))
+                }
             }
             if let error = preview.error {
                 Text(error)
@@ -1436,11 +1717,81 @@ struct FileTreeTabView: View {
     /// 不再重复解码同一文件（此前每次重算都重新缩略图解码）。
 }
 
+/// 智能体产出 PDF 的只读预览（路径已由 loadAgentOutput 复验）。
+struct AgentPDFPreviewView: NSViewRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.document = PDFDocument(url: url)
+        view.delegate = context.coordinator
+        return view
+    }
+
+    func updateNSView(_ nsView: PDFView, context: Context) {
+        if nsView.document?.documentURL != url { nsView.document = PDFDocument(url: url) }
+    }
+
+    /// PDF 里的链接不直接交给系统：网页先确认，本地文件按类型拦截（脚本、可执行类型不运行）。
+    @MainActor final class Coordinator: NSObject, @preconcurrency PDFViewDelegate {
+        func pdfViewWillClick(onLink sender: PDFView, with url: URL) {
+            handle(url, in: sender)
+        }
+
+        @MainActor private func handle(_ url: URL, in view: PDFView) {
+            if let web = TranscriptExternalLink.allowedURL(url) {
+                let alert = NSAlert()
+                alert.messageText = "打开外部链接？"
+                alert.informativeText = "将使用默认浏览器打开：\n\(TranscriptExternalLink.confirmationDisplay(for: web))"
+                alert.addButton(withTitle: "取消")
+                alert.addButton(withTitle: "打开链接")
+                if alert.runModal() == .alertSecondButtonReturn { NSWorkspace.shared.open(web) }
+                return
+            }
+            guard let local = TranscriptLocalFileLink.resolve(url) else { return }
+            let action = TranscriptLocalFileLink.action(for: local)
+            let alert = NSAlert()
+            alert.messageText = "打开本地文件？"
+            alert.informativeText = TranscriptLocalFileLink.confirmationText(for: action)
+            if case .missing = action {
+                alert.messageText = "无法打开"
+                alert.addButton(withTitle: "好")
+                alert.runModal()
+                return
+            }
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "继续")
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+            switch action {
+            case .open(let target):
+                switch TranscriptLocalFileLink.openDisposition(for: target) {
+                case .systemOpen: NSWorkspace.shared.open(target)
+                case .textEditor: _ = TranscriptLocalFileLink.openInTextEditor(target)
+                case .revealOnly: NSWorkspace.shared.activateFileViewerSelecting([target])
+                }
+            case .revealFolder(let target), .revealBlocked(let target, _):
+                NSWorkspace.shared.activateFileViewerSelecting([target])
+            case .missing:
+                break
+            }
+        }
+    }
+}
+
 /// Shared rendering of already validated preview bytes; it never reads a path.
 struct FilePreviewContents: View {
     let preview: FilePreview
     let imageCacheKey: String
+    /// 图片预览高度；nil 沿用默认 160。
+    var imageHeight: CGFloat? = nil
     @Environment(\.typographyTokens) private var typography
+    @State private var enlargedImage: NSImage?
+    @State private var showsEnlarged = false
+    @State private var enlargedFitsWindow = true
     var body: some View {
                 Group {
                     switch preview.kind {
@@ -1456,20 +1807,59 @@ struct FilePreviewContents: View {
                                     .scaledToFit()
                                     .frame(width: geo.size.width, height: geo.size.height)
                             }
-                            .frame(height: 160)
+                            .frame(height: imageHeight ?? 160)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                enlargedImage = FileTreePreviewCache.enlargedImage(from: data) ?? img
+                                showsEnlarged = true
+                            }
+                            .help("点击放大")
+                            .sheet(isPresented: $showsEnlarged) {
+                                VStack(spacing: 8) {
+                                    if let enlargedImage {
+                                        if enlargedFitsWindow {
+                                            Image(nsImage: enlargedImage)
+                                                .resizable()
+                                                .scaledToFit()
+                                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                        } else {
+                                            ScrollView([.horizontal, .vertical]) {
+                                                Image(nsImage: enlargedImage)
+                                            }
+                                        }
+                                    }
+                                    HStack {
+                                        Button(enlargedFitsWindow ? "放大查看（最长边 2048 像素，可滚动）" : "适合窗口") {
+                                            enlargedFitsWindow.toggle()
+                                        }
+                                        Button("关闭") { showsEnlarged = false }
+                                            .keyboardShortcut(.cancelAction)
+                                    }
+                                }
+                                .padding(12)
+                                .frame(minWidth: 640, minHeight: 480)
+                            }
                         } else {
                             Text("无法加载图片")
                                 .font(typography?.caption ?? .system(size: 10))
                                 .foregroundStyle(.tertiary)
                         }
                     case .text, .json, .svg:
-                        Text(preview.text ?? "")
-                            .font(typography?.monospaced ?? .system(size: 10, design: .monospaced))
-                            .foregroundStyle(.primary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
+                        if preview.isMarkdown, let source = preview.text {
+                            Text(AttributedString(MarkdownAttributedTextBuilder.build(content: source, isMarkdown: true, baseSize: 12)))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                        } else {
+                            Text(preview.text ?? "")
+                                .font(typography?.monospaced ?? .system(size: 10, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                        }
                     case .video:
                         if let url = preview.videoURL {
                             // AVPlayerContainerView：规避 SwiftUI VideoPlayer 的 _AVKit_SwiftUI 元数据崩溃。
@@ -1482,10 +1872,16 @@ struct FilePreviewContents: View {
                                 .foregroundStyle(.tertiary)
                         }
                     case .other:
-                        Text("二进制文件，无文本预览")
-                            .font(typography?.caption ?? .system(size: 10))
-                            .foregroundStyle(.tertiary)
-                            .padding(10)
+                        if let pdfURL = preview.pdfURL {
+                            AgentPDFPreviewView(url: pdfURL)
+                                .frame(height: 360)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        } else {
+                            Text("二进制文件，无文本预览")
+                                .font(typography?.caption ?? .system(size: 10))
+                                .foregroundStyle(.tertiary)
+                                .padding(10)
+                        }
                     }
                 }
     }
@@ -1507,6 +1903,29 @@ enum FileTreePreviewCache {
 
     /// 测试/诊断：当前生效的内存预算（字节）= min(基线, storage.memoryLimitMB)。
     static var currentTotalCostLimitBytes: Int { cache.totalCostLimit }
+
+    /// 缓存键：路径 + 修改时间 + 文件大小，同名图片重新生成后不会命中旧缓存。
+    static func cacheKey(for url: URL) -> String {
+        // 不用 URL.resourceValues：同一个 URL 对象会缓存读过的修改时间，读到的可能是旧值。
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let stamp = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        return "\(url.path)|\(stamp)|\(size)"
+    }
+
+    /// 点击放大时按需解码的大图（最大边 ≤ 2048px），不入缓存。
+    static func enlargedImage(from data: Data) -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0 else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 2048,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSZeroSize)
+    }
 
     /// 预览缩略图：命中缓存直接返回；未命中限幅解码后入缓存（cost 按原图字节近似）。
     /// key = 文件路径；空 key（无选中路径的防御分支）跳过缓存，不共享条目。
@@ -1543,7 +1962,13 @@ private struct FileTreeRow: View {
     var body: some View {
         if node.isDirectory {
             DisclosureGroup(isExpanded: expandedBinding) {
-                if node.children.isEmpty {
+                if !node.isLoaded {
+                    Text("加载中…")
+                        .font(typography?.caption ?? .system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .padding(.leading, 4)
+                        .task { store.loadChildren(of: node) }
+                } else if node.children.isEmpty {
                     Text("空")
                         .font(typography?.caption ?? .system(size: 10))
                         .foregroundStyle(.tertiary)
@@ -1575,7 +2000,7 @@ private struct FileTreeRow: View {
     private var expandedBinding: Binding<Bool> {
         Binding(
             get: { store.expandedIDs.contains(node.id) },
-            set: { _ in store.toggle(node.id) }
+            set: { _ in store.toggle(node) }
         )
     }
 
@@ -1812,13 +2237,17 @@ struct TerminalContextSnapshot: Equatable, Hashable, Sendable {
     @MainActor
     static func current(from chat: ChatStore) -> Self? {
         guard let sessionID = chat.activeSessionID,
-              let session = chat.sessionsSorted.first(where: { $0.id == sessionID }),
-              let projectID = normalized(session.projectID),
-              let workdir = normalized(session.workingDirectory),
-              FileManager.default.fileExists(atPath: workdir)
+              let session = chat.sessions.first(where: { $0.id == sessionID })
         else {
             return nil
         }
+        // 没有项目目录的会话（普通会话）：用会话自己的工作目录，没有就用家目录，
+        // 终端随处可用；有项目目录时仍按项目目录和项目身份。
+        // 已绑定的项目目录即使消失也保持原路径（由启动决策提示，不静默回落家目录，
+        // 也不因此结束原目录里在跑的终端）；只有没绑定时才用家目录。
+        let projectID = normalized(session.projectID) ?? "session:\(sessionID.uuidString)"
+        let workdir = TerminalPTYPlanner.resolveWorkdir(
+            bound: session.workingDirectory, home: NSHomeDirectory())
 
         let execution = chat.executionSnapshot(forSessionID: sessionID)
         return Self(
@@ -1834,6 +2263,32 @@ struct TerminalContextSnapshot: Equatable, Hashable, Sendable {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// 常驻（挂在 ContentView 根上、与右栏是否显示无关）的终端生命周期观察者：
+/// 会话被删除时结束该会话全部终端；“浏览器与终端副作用”开关关闭时立即结束所有终端。
+/// 单独成视图，观察依赖不会让 ContentView 的 body 失效。
+struct TerminalLifecycleObserver: View {
+    let chat: ChatStore
+    let settings: SettingsCenter?
+
+    private var sideEffectsEnabled: Bool {
+        settings?.safetyRuntimeSnapshot.isEnabled(.browserTerminalSideEffects) ?? true
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: chat.sessionIDsBySidebarRevision, initial: true) { _, ids in
+                // 按会话身份清理：自动归档会话数先加后减，只看数量会漏清。
+                TerminalPTYSessionOwner.shared.retain(sessionIDs: Set(ids.map(\.uuidString)))
+            }
+            .onChange(of: sideEffectsEnabled) { _, enabled in
+                if !enabled { TerminalPTYSessionOwner.shared.retire() }
+            }
     }
 }
 
@@ -2400,6 +2855,10 @@ struct TerminalTabView: View {
     private let externalOwner: TerminalPTYSessionOwner?
     @State private var localOwner = TerminalPTYSessionOwner()
     @State private var session: TerminalPTYSession?
+    @State private var tabItems: [TerminalPTYTabItem] = []
+    @State private var selectedTabNumber: Int?
+    @State private var canAddTab = false
+    @State private var hasActivated = false
     @State private var blockReason: TerminalPTYBlockReason?
 
     @Environment(\.themeTokens) private var theme
@@ -2424,6 +2883,16 @@ struct TerminalTabView: View {
     var body: some View {
         VStack(spacing: 0) {
             if let session {
+                if let blockReason {
+                    Text(blockReason.message)
+                        .font(typography?.caption ?? .system(size: 11))
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .accessibilityIdentifier("terminal.blocked.notice")
+                }
+                tabBar
                 toolbar(session)
                 Divider()
                 TerminalPTYHostView(
@@ -2433,6 +2902,7 @@ struct TerminalTabView: View {
                         ?? Color(nsColor: .textBackgroundColor)),
                     caret: NSColor(theme?.aj38.accent.swiftUIColor ?? Color.accentColor)
                 )
+                .id(ObjectIdentifier(session))
                 .accessibilityIdentifier("terminal.pty.host")
                 if case .exited(let code) = session.lifecycle.phase {
                     statusBar(
@@ -2442,13 +2912,25 @@ struct TerminalTabView: View {
                 } else if case .failed(let message) = session.lifecycle.phase {
                     statusBar(text: message, session: session)
                 }
-            } else {
-                Text((blockReason ?? .missingWorkingDirectory).message)
+            } else if let blockReason {
+                Text(blockReason.message)
                     .font(typography?.caption ?? .system(size: 11))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                     .padding(12)
                     .accessibilityIdentifier("terminal.blocked")
+            } else if hasActivated {
+                VStack(spacing: 8) {
+                    Text("没有打开的终端")
+                        .font(typography?.caption ?? .system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Button("新建终端") { addTerminal() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("terminal.pty.new")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .accessibilityIdentifier("terminal.pty.empty")
             }
         }
         .background(theme?.aj38.backgroundSecondary.swiftUIColor ?? Color(nsColor: .textBackgroundColor))
@@ -2462,9 +2944,9 @@ struct TerminalTabView: View {
 
     // MARK: 启动
 
-    private func activate() {
+    private func launchDecision() -> TerminalPTYDecision {
         let environment = ProcessInfo.processInfo.environment
-        let decision = TerminalPTYPlanner.decide(
+        return TerminalPTYPlanner.decide(
             workdir: contextSnapshot?.workdir,
             sideEffectsEnabled: sideEffectsEnabled,
             shellCandidates: [Self.passwdShell(), environment["SHELL"]],
@@ -2476,19 +2958,67 @@ struct TerminalTabView: View {
             },
             isExecutable: { FileManager.default.isExecutableFile(atPath: $0) }
         )
-        switch decision {
+    }
+
+    private func activate() {
+        switch launchDecision() {
         case .blocked(let reason):
-            owner.retire()
-            session = nil
-            blockReason = reason
+            applyBlocked(reason)
         case .launch(let plan):
             guard let snapshot = contextSnapshot else { return }
             blockReason = nil
-            session = owner.acquire(
+            owner.acquire(
                 identity: TerminalPTYIdentity(sessionID: snapshot.sessionID, workdir: snapshot.workdir),
                 plan: plan
             )
+            hasActivated = true
+            refreshTabs()
         }
+    }
+
+    /// 启动被拦截：安全开关关闭才结束全部终端；目录不可用只提示，已在跑的终端保持原样。
+    private func applyBlocked(_ reason: TerminalPTYBlockReason) {
+        if reason.retiresAllTerminals {
+            owner.retire()
+        } else if let snapshot = contextSnapshot {
+            owner.activateExisting(
+                identity: TerminalPTYIdentity(sessionID: snapshot.sessionID, workdir: snapshot.workdir))
+        }
+        blockReason = reason
+        refreshTabs()
+    }
+
+    /// 从持有者同步标签条状态（只在用户动作和激活时调用，不在 body 里算）。
+    private func refreshTabs() {
+        tabItems = owner.tabItems
+        selectedTabNumber = owner.selectedTabNumber
+        canAddTab = owner.canAddTab
+        session = owner.session
+    }
+
+    private func addTerminal() {
+        switch launchDecision() {
+        case .blocked(let reason):
+            applyBlocked(reason)
+        case .launch(let plan):
+            guard let snapshot = contextSnapshot else { return }
+            blockReason = nil
+            owner.addTab(
+                identity: TerminalPTYIdentity(sessionID: snapshot.sessionID, workdir: snapshot.workdir),
+                plan: plan
+            )
+            refreshTabs()
+        }
+    }
+
+    private func closeTerminal(_ number: Int) {
+        owner.closeTab(number)
+        refreshTabs()
+    }
+
+    private func selectTerminal(_ number: Int) {
+        owner.selectTab(number)
+        refreshTabs()
     }
 
     private static func passwdShell() -> String? {
@@ -2498,6 +3028,55 @@ struct TerminalTabView: View {
 
     // MARK: 工具条与状态条
 
+    private var tabBar: some View {
+        HStack(spacing: 4) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(tabItems) { item in
+                        let isSelected = item.number == selectedTabNumber
+                        HStack(spacing: 2) {
+                            Button { selectTerminal(item.number) } label: {
+                                Text(item.displayTitle)
+                                    .font(typography?.caption ?? .system(size: 10))
+                                    .lineLimit(1)
+                                    .frame(maxWidth: 140)
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                            .accessibilityLabel("终端 \(item.number)")
+                            .accessibilityIdentifier("terminal.pty.tab.\(item.number)")
+                            Button { closeTerminal(item.number) } label: {
+                                MinisIconView(.close, size: 10)
+                            }
+                            .buttonStyle(.borderless)
+                            .controlSize(.small)
+                            .help("关闭这个终端")
+                            .accessibilityLabel("关闭终端 \(item.number)")
+                            .accessibilityIdentifier("terminal.pty.close")
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(isSelected ? Color.primary.opacity(0.12) : Color.clear)
+                        )
+                    }
+                }
+            }
+            Button { addTerminal() } label: {
+                MinisIconView(.add, size: 12)
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .disabled(!canAddTab)
+            .help(canAddTab ? "新建终端" : "最多同时打开 \(TerminalPTYTabList.maxTabs) 个终端，请先关闭一个")
+            .accessibilityLabel("新建终端")
+            .accessibilityIdentifier("terminal.pty.new")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 3)
+    }
+
     private func toolbar(_ session: TerminalPTYSession) -> some View {
         Self.inputRowLayout {
             Text(session.title.isEmpty ? "终端" : session.title)
@@ -2506,6 +3085,18 @@ struct TerminalTabView: View {
                 .lineLimit(1)
                 .help("终端尺寸 \(session.size.label)")
             Spacer()
+            Button("A−") { session.adjustFontSize(by: -1) }
+                .keyboardShortcut("-", modifiers: .command)
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .help("缩小终端字号（⌘-）")
+                .accessibilityLabel("缩小终端字号")
+            Button("A+") { session.adjustFontSize(by: 1) }
+                .keyboardShortcut("=", modifiers: .command)
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .help("放大终端字号（⌘+）")
+                .accessibilityLabel("放大终端字号")
             Button("清屏") { session.clearScreen() }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
@@ -3027,8 +3618,7 @@ struct BrowserTabView: View {
             sessionResourceGeneration = session.resourceGeneration
         } catch {
             guard !Task.isCancelled else { return }
-            let message = (error as? LocalizedError)?.errorDescription
-                ?? error.localizedDescription
+            let message = UserFacingErrorText.describe(error)
             _ = navigationState.complete(
                 requestID: requestID,
                 target: target,
@@ -3060,8 +3650,7 @@ struct BrowserTabView: View {
             )
         } catch {
             guard !Task.isCancelled else { return }
-            let message = (error as? LocalizedError)?.errorDescription
-                ?? error.localizedDescription
+            let message = UserFacingErrorText.describe(error)
             _ = navigationState.complete(
                 requestID: requestID,
                 target: target,

@@ -152,7 +152,10 @@ struct Policy08ActualEffortTurn2758Tests {
             ])
             #expect(nonExecution.events.count == 1)
             #expect(nonExecution.events.first?.0 == "policy08-call-2")
-            #expect(nonExecution.events.first?.1 == .blockedBeforeExecution)
+            // 拦截现在带固定原因分类（U-17）；分类具体值不在本测试范围。
+            var blockedByPolicy = false
+            if case .blockedByPolicy = nonExecution.events.first?.1 { blockedByPolicy = true }
+            #expect(blockedByPolicy)
             #expect(outcome.toolExecutionFacts.allSatisfy { !$0.receiptID.isEmpty })
             #expect(provider.histories.dropFirst().contains { history in
                 history.contains { $0.content.contains("local-effort-sample") }
@@ -164,5 +167,25 @@ struct Policy08ActualEffortTurn2758Tests {
             }
         }
         #expect(!FileManager.default.fileExists(atPath: denied.path))
+    }
+}
+
+@Suite("U-17 拦截原因分类")
+struct ToolBlockCategoryU17Tests {
+    @Test func fixedChineseCategoryCarriesNoPathOrArguments() {
+        let secret = "/Users/someone/private-token.txt"
+        let cases: [(ComposerAuthorizationError, ToolBlockCategory)] = [
+            (.approvalRequired("file_write"), .needsApproval),
+            (.missingCapabilityGrant("file_read"), .notGranted),
+            (.pathOutsideAllowedRoots(secret), .pathNotAllowed),
+            (.approvalDenied(secret), .denied),
+            (.hookRejected(secret), .hook),
+        ]
+        for (error, category) in cases {
+            #expect(error.blockCategory == category)
+            #expect(!category.displayText.isEmpty)
+            #expect(!category.displayText.contains(secret))
+            #expect(!category.displayText.contains("/"))
+        }
     }
 }

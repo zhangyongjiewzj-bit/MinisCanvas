@@ -275,7 +275,7 @@ public actor MCPOAuthCoordinator {
             } catch { throw MCPOAuthError.manualClientIDRequired }
         }
         let verifier = try Self.randomURLSafe(), state = try Self.randomURLSafe()
-        let challengeValue = Self.base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
+        let challengeValue = Self.pkceChallenge(verifier: verifier)
         let scopes = challenge.scope ?? (prm["scopes_supported"] as? [String])?.joined(separator: " ")
         var components = URLComponents(url: authorization, resolvingAgainstBaseURL: false)
         // Do not preserve server-provided authorization query fields which could duplicate OAuth parameters.
@@ -432,6 +432,10 @@ public actor MCPOAuthCoordinator {
         return values.sorted { $0.key < $1.key }.map {
             ($0.key.addingPercentEncoding(withAllowedCharacters: allowed) ?? "") + "=" + ($0.value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")
         }.joined(separator: "&")
+    }
+    /// PKCE S256 challenge, shared with the ChatGPT account sign-in.
+    static func pkceChallenge(verifier: String) -> String {
+        base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
     }
     static func base64URL(_ data: Data) -> String {
         data.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")

@@ -245,6 +245,16 @@ struct ChatBudgetAndRole541NativeConsumerTests {
         // Sample empty space on the marker's actual native line, not token metadata
         // or fixed screen coordinates. Capture before selection adds its own fill.
         let manager = try #require(text.layoutManager)
+        // 用户块是靠右圆角气泡：块类型为 UserBubbleTextBlock，正文段落左侧多缩进 wrapInset 点让文字不占满整栏
+        // （包上实测文本块外边距不生效，改用段落缩进），气泡底色按文字实际宽度贴合（绘制层）。
+        #expect(userStyle.textBlocks.first is UserBubbleTextBlock)
+        #expect(userStyle.headIndent >= UserBubbleTextBlock.wrapInset)
+        #expect(!(assistantStyle.textBlocks.first is UserBubbleTextBlock))
+        let userGlyphRange = manager.glyphRange(forCharacterRange: userRange, actualCharacterRange: nil)
+        let userLineWidth = manager.lineFragmentRect(forGlyphAt: userGlyphRange.location, effectiveRange: nil).width
+        let containerWidth = try #require(text.textContainer).size.width
+        #expect(userLineWidth <= containerWidth - UserBubbleTextBlock.wrapInset + 1,
+                "用户消息的文字换行宽度要扣掉左侧内缩")
         let bitmap = try #require(host.controller.view.bitmapImageRepForCachingDisplay(
             in: host.controller.view.bounds))
         host.controller.view.cacheDisplay(in: host.controller.view.bounds, to: bitmap)

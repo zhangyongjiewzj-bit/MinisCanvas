@@ -84,15 +84,47 @@ public enum SensitiveFilePolicy {
         let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
         let parts = path.lowercased().split(separator: "/").map(String.init)
             + normalized.lowercased().split(separator: "/").map(String.init)
-        return parts.contains { component in
-            isCredentialFileName(component)
+        // 只认真密钥：Keychain 目录名、credentials.swift、cookies.swift 这类普通源码
+        // 按普通文件处理（检查点、grep/glob、预览、风险等级共用此判据）。
+        for index in parts.indices {
+            let component = parts[index]
+            if isCredentialFileName(component)
                 || component == ".envrc"
-                || [".ssh", ".aws", ".gnupg", "keychain", "keychains"].contains(component)
-                || component == "credentials" || component.hasPrefix("credentials.")
-                || component == "cookies" || component.hasPrefix("cookies.")
-                || component.hasSuffix(".keychain") || component.hasSuffix(".keychain-db")
+                || [".ssh", ".aws", ".gnupg"].contains(component)
+                || isCredentialDataFileName(component, stem: "credentials")
+                || isCredentialDataFileName(component, stem: "cookies")
+                || component.hasSuffix(".keychain") || component.hasSuffix(".keychain-db") {
+                return true
+            }
+            // 系统钥匙串目录：Library/Keychains
+            if component == "keychains", index > 0, parts[index - 1] == "library" { return true }
         }
+        return false
     }
+
+    /// 反向判定：只有源码类扩展名放行，其余一律按凭据处理
+    /// （credentials.json.bak、cookies.sqlite-wal、cookies.sqlite-journal 等多段扩展名也算）。
+    private static let sourceCodeExtensions: Set<String> = [
+        "swift", "ts", "js", "py", "go", "rs", "java", "kt", "m", "h", "md",
+    ]
+
+    /// `credentials` 本身，或 `credentials.<任意扩展名>`；只有最后一段是源码扩展名（如 `credentials.swift`）才不算。
+    private static func isCredentialDataFileName(_ name: String, stem: String) -> Bool {
+        if name == stem { return true }
+        guard name.hasPrefix(stem + ".") else { return false }
+        let rest = name.dropFirst(stem.count + 1)
+        guard let last = rest.split(separator: ".").last else { return true }
+        return !sourceCodeExtensions.contains(String(last))
+    }
+
+    /// 真密钥文件（.env*、.pem、.key、.p12、id_rsa 及凭据目录内文件）：允许编辑，
+    /// 但不留检查点备份、改动不可撤销（用户 2026-11-16 决定）。
+    /// 受保护的应用状态文件不在此列，仍不可改。
+    public static func isUncheckpointedSecretFile(_ path: String) -> Bool {
+        contains(path) && !isProtectedStatePath(path)
+    }
+
+    public static let uncheckpointedSecretNotice = "此文件不留备份，改动不可撤销。"
 
     /// Repository control files require confirmation on every mutation, even
     /// in bypass mode. This is separate from sensitive-body redaction so reads
@@ -111,6 +143,28 @@ public enum SensitiveFilePolicy {
         return false
     }
 
+    /// 会改变工具或命令行行为的配置：`.vscode/`、`.husky/`、`.mcp.json`、
+    /// `.claude/settings*.json`、shell 启动文件。非绕过模式下每次写入都要确认；
+    /// 绕过模式不加确认（用户 2026-10-22 决定），所以这里与 `isProtectedGitWritePath`
+    /// 分开，只由 Composer 策略在绕过模式的提前返回之后使用。不打开任何文件。
+    public static func isProtectedToolConfigWritePath(_ path: String) -> Bool {
+        let parts = URL(fileURLWithPath: path).standardizedFileURL.path
+            .lowercased().split(separator: "/").map(String.init)
+        guard let last = parts.last else { return false }
+        if parts.contains(".vscode") || parts.contains(".husky") { return true }
+        if last == ".mcp.json" { return true }
+        let shellStartupNames: Set<String> = [
+            ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".bashrc", ".bash_profile",
+            ".bash_login", ".profile",
+        ]
+        if shellStartupNames.contains(last) { return true }
+        if let index = parts.lastIndex(of: ".claude"), index == parts.count - 2,
+           last.hasPrefix("settings"), last.hasSuffix(".json") {
+            return true
+        }
+        return false
+    }
+
     /// Shared by sensitive-body handling and the existing credential guard;
     /// templates use the same suffix exemption in both paths.
     private static func isCredentialFileName(_ name: String) -> Bool {
@@ -121,6 +175,9 @@ public enum SensitiveFilePolicy {
         return name == "id_rsa" || name == "id_ed25519" || name == "id_dsa" || name == "id_ecdsa"
             || name.hasSuffix(".pem") || name.hasSuffix(".key")
             || name.hasSuffix(".p12") || name.hasSuffix(".pfx")
+            || name.hasSuffix(".p8") || name.hasSuffix(".jks") || name.hasSuffix(".keystore")
+            || name == ".npmrc" || name == ".pypirc" || name == ".netrc"
+            || (name.hasPrefix("service-account") && name.hasSuffix(".json"))
     }
 }
 

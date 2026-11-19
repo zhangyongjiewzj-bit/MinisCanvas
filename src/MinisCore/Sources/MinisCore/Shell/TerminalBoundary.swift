@@ -180,12 +180,33 @@ public enum ChildProcessEnvironment {
     /// is inferred from App variables or expanded through the App environment.
     static func mcpValues(configured: [String: String]) throws -> [String: String] {
         var result = try values()
+        // 对齐 Claude Code：本地 MCP 的可执行文件搜索路径用用户登录 shell 的 PATH
+        // （只读复用启动快照里的 PATH，不继承任何凭据类变量），再追加常见工具目录，
+        // 这样 nvm / volta / fnm / asdf / uv / cargo 里的 npx、uvx 才找得到。
+        result["PATH"] = mcpSearchPath(loginPath: (try? ModelShellEnvironment.values())?["PATH"],
+                                       home: operatingSystemIdentity().home)
         let isolated = try profileRoot() != nil
         for (name, value) in configured where validName(name) && !value.utf8.contains(0) {
             if isolated && (name == "HOME" || name == "TMPDIR") { continue }
             result[name] = value
         }
         return result
+    }
+
+    static func mcpSearchPath(loginPath: String?, home: String) -> String {
+        let extras = [
+            "\(home)/.local/bin", "\(home)/.cargo/bin", "\(home)/.volta/bin",
+            "\(home)/.bun/bin", "\(home)/.asdf/shims", "\(home)/.local/share/mise/shims",
+            "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
+        ]
+        var seen = Set<String>()
+        var ordered: [String] = []
+        let sources = (loginPath.map { $0.split(separator: ":").map(String.init) } ?? [])
+            + executableSearchPath.split(separator: ":").map(String.init) + extras
+        for entry in sources where !entry.isEmpty && entry.hasPrefix("/") && seen.insert(entry).inserted {
+            ordered.append(entry)
+        }
+        return ordered.joined(separator: ":")
     }
 
     /// Keep allocations alive through posix_spawn and fail before spawning on
@@ -438,13 +459,41 @@ public struct TerminalPolicySnapshot: Codable, Equatable, Hashable, Sendable {
         "chmod", "chown", "kill", "pkill", "sed", "awk", "tar", "unzip", "zip",
         "plutil", "defaults", "install", "ln", "env", "printenv",
         "npm", "npx", "node", "pnpm", "yarn", "make", "pytest", "go", "gh", "jq", "rg", "uv", "docker",
+        "open", "osascript", "screencapture", "killall", "sudo", "security", "launchctl", "diskutil",
     ]
 
+    /// 对齐 Claude Code：open、osascript、screencapture、killall、sudo 以及
+    /// security / launchctl / diskutil 的普通用法改为走审批（询问），不再"批准也拒绝"。
+    /// 这里只留破坏系统或不可逆的命令；另有 `conditionalHardDeniedInvocation`
+    /// 对 security / diskutil / launchctl 的危险子命令继续硬拒绝。
     public static let productHardDeniedCommands: Set<String> = [
-        "open", "osascript", "screencapture", "shutdown", "reboot", "halt",
-        "dd", "mkfs", "sudo", "passwd", "launchctl", "diskutil", "kextload",
-        "mount", "umount", "systemsetup", "networksetup", "security", "killall",
+        "shutdown", "reboot", "halt",
+        "dd", "mkfs", "passwd", "kextload",
+        "mount", "umount", "systemsetup", "networksetup",
     ]
+
+    /// 读取钥匙串密码、抹盘、卸载系统服务这类子命令：即使用户批准也拒绝（安全底线）。
+    /// 逐词扫描整条命令（含复合命令、sudo 等前缀），避免换个写法绕开。
+    static func conditionalHardDeniedInvocation(in words: [String]) -> Bool {
+        let lowered = words.map { $0.lowercased() }
+        let table: [String: Set<String>] = [
+            "security": ["find-generic-password", "find-internet-password", "dump-keychain",
+                         "export", "unlock-keychain", "delete-keychain", "delete-generic-password",
+                         "delete-internet-password", "delete-identity", "delete-certificate",
+                         "import", "add-generic-password", "add-internet-password", "authorizationdb"],
+            "diskutil": ["erasedisk", "erasevolume", "reformat", "partitiondisk", "zerodisk",
+                         "randomdisk", "securerase", "repartition", "resizevolume", "deletevolume",
+                         "deletecontainer", "erasecontainer", "corestorage", "mergepartitions",
+                         "splitpartition"],
+            "launchctl": ["unload", "remove", "bootout", "disable"],
+        ]
+        for (index, word) in lowered.enumerated() {
+            let name = word.split(separator: "/").last.map(String.init) ?? word
+            guard let denied = table[name] else { continue }
+            if lowered[(index + 1)...].contains(where: { denied.contains($0) }) { return true }
+        }
+        return false
+    }
 
     public static let `default` = TerminalPolicySnapshot(settings: .default)
 
@@ -594,6 +643,7 @@ public struct TerminalPolicySnapshot: Codable, Equatable, Hashable, Sendable {
         if productHardDeniedCommands.contains(executable) || userDeniedCommands.contains(executable) {
             return .denied
         }
+        if Self.conditionalHardDeniedInvocation(in: normalizedWords) { return .denied }
         // `find` is generally read-only, but its expression can launch a
         // second command or write files without changing the executable.
         // Resolve validated env/nice wrappers from the token sequence even
@@ -675,7 +725,7 @@ public struct TerminalPolicySnapshot: Codable, Equatable, Hashable, Sendable {
     /// Retain executable-looking tokens after the Core syntax guard stops at
     /// an operator. This keeps `ls && sudo …` denied in both consumers while
     /// leaving quoted arguments such as `echo "sudo"` ordinary arguments.
-    fileprivate static func policyWords(_ command: String, fallback: [String]) -> [String] {
+    static func policyWords(_ command: String, fallback: [String]) -> [String] {
         var words: [String] = []
         var current = ""
         var quote: Character?

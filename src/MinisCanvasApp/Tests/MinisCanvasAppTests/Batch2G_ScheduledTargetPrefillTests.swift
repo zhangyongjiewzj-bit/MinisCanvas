@@ -53,4 +53,42 @@ struct Batch2G_ScheduledTargetPrefillTests {
             encoding: .utf8)
         #expect(source.contains("为此会话创建定时任务"))
     }
+    @Test("项目指令未加载时提示带原因和下一步，没有原因时回落固定提示")
+    func projectInstructionsNoticeCarriesReason() {
+        let chat = ChatStore()
+        chat.noteProjectInstructionsNotLoaded(reason: "项目目录暂时无法读取，请确认文件夹仍在原位置。")
+        #expect(chat.sessionContinuationNotice?.contains("请确认文件夹仍在原位置") == true)
+        chat.noteProjectInstructionsNotLoaded()
+        #expect(chat.sessionContinuationNotice?.contains("项目指令本次未加载") == true)
+        #expect(chat.sessionContinuationNotice?.contains("请确认文件夹仍在原位置") == false)
+    }
+
+    @Test("匹配但未批准的技能：同一会话同一技能只提示一次，提示不含正文")
+    func unapprovedSkillHintIsShownOncePerSession() {
+        let chat = ChatStore()
+        let session = UUID()
+        let first = chat.takeUnapprovedSkillHint(sessionID: session, ids: ["skill-a"])
+        #expect(first?.contains("「skill-a」") == true)
+        #expect(first?.contains("没有加载") == true)
+        #expect(chat.takeUnapprovedSkillHint(sessionID: session, ids: ["skill-a"]) == nil)
+        let second = chat.takeUnapprovedSkillHint(sessionID: session, ids: ["skill-a", "skill-b"])
+        #expect(second?.contains("「skill-b」") == true)
+        #expect(second?.contains("skill-a") == false)
+        // 另一个会话重新提示。
+        #expect(chat.takeUnapprovedSkillHint(sessionID: UUID(), ids: ["skill-a"]) != nil)
+    }
+
+    @Test("常用频率生成 cron，并能把简单 cron 读回成频率")
+    func cronPresetsRoundTrip() throws {
+        #expect(SchedulerCronPreset.cron(.hourly, hour: 9, minute: 30, weekday: 1) == "30 * * * *")
+        #expect(SchedulerCronPreset.cron(.daily, hour: 8, minute: 5, weekday: 1) == "5 8 * * *")
+        #expect(SchedulerCronPreset.cron(.weekly, hour: 9, minute: 0, weekday: 3) == "0 9 * * 3")
+        for preset in [SchedulerCronPreset.hourly, .daily, .weekly] {
+            let cron = try #require(SchedulerCronPreset.cron(preset, hour: 7, minute: 15, weekday: 2))
+            #expect(CronValidator.validate(cron) == nil)
+            #expect(SchedulerCronPreset.parse(cron)?.preset == preset)
+        }
+        #expect(SchedulerCronPreset.parse("*/5 * * * *") == nil)
+    }
+
 }

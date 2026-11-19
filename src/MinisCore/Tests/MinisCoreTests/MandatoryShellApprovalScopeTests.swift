@@ -27,6 +27,31 @@ struct MandatoryShellApprovalScopeTests {
         #expect(await delegate.requests.allSatisfy { $0.requiresApproval && $0.persistentAllowOffer == nil })
     }
 
+    @Test func shellCommandTouchingSensitiveFileRequiresExplicitClick() async throws {
+        let now = Date()
+        let snapshot = ComposerSubmissionSnapshot(mode: .auto, approvalScope: .session, effort: .standard,
+            sessionID: "synthetic-session", turnID: 1, taskID: "synthetic-task", messageID: "synthetic-message",
+            workspaceID: "synthetic-project", createdAt: now, policyRevision: "v1", autonomyCeiling: .l3)
+        let facts = ComposerPolicyFactSource(knownCapabilities: ["shell_execute"], grantedCapabilities: ["shell_execute"],
+            allowedWriteRoots: ["/synthetic/project"], workspaceID: "synthetic-project", revision: "v1",
+            leaseID: "synthetic-lease", expiresAt: now.addingTimeInterval(600), autonomyCeiling: .l3)
+        let controller = ComposerAuthorizationController(snapshot: snapshot, facts: facts)
+        let delegate = ShellDelegate()
+        let executor = ComposerPolicyEnforcedToolExecutor(base: ReceiptProbe(), controller: controller,
+            approvalGate: ApprovalGate(delegate: delegate), hookHandler: { invocation in
+                ComposerHookResult(verdict: .allow, invocationIdentityDigest: invocation.identityDigest)
+            })
+        for (callID, command) in [("sensitive", "cat .env"), ("plain", "synthetic_unregistered_tool --flag")] {
+            let input: [String: Any] = ["command": command, "cwd": "/synthetic/project"]
+            try await controller.recordApproval(capability: "shell_execute", input: ComposerToolInput(input))
+            _ = try await executor.execute(callID: callID, name: "shell_execute", input: input)
+        }
+        let requests = await delegate.requests
+        #expect(requests.count == 2)
+        #expect(requests.first?.requiresExplicitClick == true)
+        #expect(requests.last?.requiresExplicitClick == false)
+    }
+
     @Test func legacyLoopProjectsTheRealGateReceiptAroundItsSingleExecutorEffect() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("legacy-shell-receipt-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -263,7 +288,8 @@ struct MandatoryShellApprovalScopeTests {
 /// for `.unknown` ones.
 @Suite("Confirmation shell calls are not covered by a scoped approval of another command")
 struct ConfirmationShellApprovalScopeTests {
-    private static let approvedCommand = "pwd && ls -la"
+    // 手动档/自动档下只读复合命令（如 "pwd && ls -la"）现在免问；这里要一条仍属“确认类”且必须弹卡的命令。
+    private static let approvedCommand = "pwd && curl https://example.com"
     private static let laterWriteCommand = "echo G22 > shell-out/hello.txt"
 
     private static func controller(
@@ -288,7 +314,9 @@ struct ConfirmationShellApprovalScopeTests {
         scope: ComposerApprovalScope, mode: ComposerTaskMode
     ) async throws {
         let policy = TerminalPolicySnapshot.default
-        try #require(policy.classify(command: Self.approvedCommand) == .confirmation)
+        // 第一条必须是弹卡的确认类命令，才能验证“批准了一条确认类命令，不等于批准另一条”。
+        let firstCommand = Self.approvedCommand
+        try #require(policy.classify(command: firstCommand) == .confirmation)
         try #require(policy.classify(command: Self.laterWriteCommand) == .confirmation)
         let probe = ConfirmationScopeProbe()
         let delegate = ConfirmationScopeDelegate(probe: probe)
@@ -297,9 +325,9 @@ struct ConfirmationShellApprovalScopeTests {
             approvalGate: ApprovalGate(delegate: delegate))
 
         _ = try await executor.execute(callID: "confirmation-first", name: "shell_execute",
-            input: ["command": Self.approvedCommand])
+            input: ["command": firstCommand])
         #expect(await delegate.requests.count == 1)
-        #expect(probe.executed == [Self.approvedCommand])
+        #expect(probe.executed == [firstCommand])
 
         _ = try await executor.execute(callID: "confirmation-second", name: "shell_execute",
             input: ["command": Self.laterWriteCommand])
@@ -308,7 +336,7 @@ struct ConfirmationShellApprovalScopeTests {
         #expect(await delegate.requests.count == 2)
         #expect(await delegate.executedCountAtRequest == [0, 1])
         #expect(await delegate.requests.map(\.callID) == ["confirmation-first", "confirmation-second"])
-        #expect(probe.executed == [Self.approvedCommand, Self.laterWriteCommand])
+        #expect(probe.executed == [firstCommand, Self.laterWriteCommand])
     }
 
     /// The real field path: workspace/session consent outlives the task, so the
@@ -340,17 +368,18 @@ struct ConfirmationShellApprovalScopeTests {
     @Test(arguments: [ComposerApprovalScope.turn, .session, .workspace])
     func approvedAllowedCommandAsksAgainWithinTheTask(scope: ComposerApprovalScope) async throws {
         let policy = TerminalPolicySnapshot.default
-        try #require(policy.classify(command: "ls") == .allowed)
-        try #require(policy.classify(command: "pwd") == .allowed)
+        // ls、pwd 这类只读命令在手动档下免问；history、clear 同属自动放行表，但不是只读命令，仍要问。
+        try #require(policy.classify(command: "history") == .allowed)
+        try #require(policy.classify(command: "clear") == .allowed)
         let probe = ConfirmationScopeProbe()
         let delegate = ConfirmationScopeDelegate(probe: probe)
         let executor = ComposerPolicyEnforcedToolExecutor(base: probe,
             controller: Self.controller(mode: .manual, scope: scope, grants: ComposerApprovalGrantStore()),
             approvalGate: ApprovalGate(delegate: delegate))
-        _ = try await executor.execute(callID: "allowed-first", name: "shell_execute", input: ["command": "ls"])
-        _ = try await executor.execute(callID: "allowed-second", name: "shell_execute", input: ["command": "pwd"])
+        _ = try await executor.execute(callID: "allowed-first", name: "shell_execute", input: ["command": "history"])
+        _ = try await executor.execute(callID: "allowed-second", name: "shell_execute", input: ["command": "clear"])
         #expect(await delegate.requests.count == 2)
-        #expect(probe.executed == ["ls", "pwd"])
+        #expect(probe.executed == ["history", "clear"])
     }
 
     @Test(arguments: [ComposerApprovalScope.session, .workspace])
@@ -364,10 +393,10 @@ struct ConfirmationShellApprovalScopeTests {
         let later = ComposerPolicyEnforcedToolExecutor(base: probe,
             controller: Self.controller(mode: .manual, scope: scope, grants: grants, taskID: "confirmation-task-2",
                 turnID: 2, epoch: "confirmation-epoch-2", lease: "confirmation-lease-2"), approvalGate: gate)
-        _ = try await first.execute(callID: "allowed-task1", name: "shell_execute", input: ["command": "ls"])
-        _ = try await later.execute(callID: "allowed-task2", name: "shell_execute", input: ["command": "pwd"])
+        _ = try await first.execute(callID: "allowed-task1", name: "shell_execute", input: ["command": "history"])
+        _ = try await later.execute(callID: "allowed-task2", name: "shell_execute", input: ["command": "clear"])
         #expect(await delegate.requests.count == 2)
-        #expect(probe.executed == ["ls", "pwd"])
+        #expect(probe.executed == ["history", "clear"])
     }
 }
 

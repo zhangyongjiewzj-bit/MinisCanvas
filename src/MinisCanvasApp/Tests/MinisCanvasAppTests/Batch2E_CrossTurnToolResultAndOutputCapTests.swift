@@ -7,7 +7,7 @@ import Testing
 /// M10：前回合真实执行过的 MCP / external_session_read / conversation_settings 调用，
 ///      下一回合发给 Provider 的历史里必须带“真实结果头尾摘录 + 已真实执行”事实，
 ///      而不是整对丢弃（表外工具现状：CrossTurnToolTracePolicy.rules 白名单之外整对不落）。
-/// 单次输出上限：主聊天发给 Provider 的 maxTokens = min(16384, 模型目录 maxOutputTokens)。
+/// 单次输出上限：主聊天发给 Provider 的 maxTokens = 模型目录 maxOutputTokens（没有则 32000）。
 /// 夹具走真实 ChatStore / AgentLoopChatEngine / BuiltinToolExecutor(+MCP bridge) / SessionStore，
 /// 只有 Provider 与 MCP 传输（外部边界）是脚本化的；全部为合成数据。
 @Suite("Batch2E cross-turn tool results and output cap", .serialized)
@@ -69,25 +69,25 @@ struct Batch2E_CrossTurnToolResultAndOutputCapTests {
                               head: "PURE-HEAD-001", mid: "PURE-MID-777", tail: "PURE-TAIL-999")
     }
 
-    // MARK: 单次输出上限：主聊天高档 maxTokens = min(16384, 目录 maxOutputTokens)
+    // MARK: 单次输出上限（对齐 Claude Code）：主聊天 maxTokens = 目录 maxOutputTokens，目录没有时取 32000
 
     @Test func mainChatMaxTokensFollowsTheCatalogOutputLimitOfDeepSeekFlash() async throws {
         let catalog = try #require(LLMModel.deepSeekFlash.maxOutputTokens)
         try await expectMainChatMaxTokens(model: LLMModel.deepSeekFlash.withProvider("b2e-cap"),
-                                          expected: min(16_384, catalog), label: "b2e-cap-flash")
-        #expect(min(16_384, catalog) == 8_192, "catalog fixture drift: deepseek-flash is expected to be 8192")
+                                          expected: catalog, label: "b2e-cap-flash")
+        #expect(catalog == 8_192, "catalog fixture drift: deepseek-flash is expected to be 8192")
     }
 
-    @Test func mainChatMaxTokensIsCappedAtSixteenKForLargeCatalogLimits() async throws {
-        let large = LLMModel(id: "b2e-large", displayName: "B2E large", provider: "b2e-cap", maxOutputTokens: 32_000)
-        try await expectMainChatMaxTokens(model: large, expected: 16_384, label: "b2e-cap-large")
+    @Test func mainChatMaxTokensUsesTheFullCatalogLimitForLargeCatalogLimits() async throws {
+        let large = LLMModel(id: "b2e-large", displayName: "B2E large", provider: "b2e-cap", maxOutputTokens: 48_000)
+        try await expectMainChatMaxTokens(model: large, expected: 48_000, label: "b2e-cap-large")
     }
 
-    /// 假设：目录没有 maxOutputTokens 时取 16384（与 ComposerEffortExecutionProfile.maxTokenCap 同口径）。
-    @Test func mainChatMaxTokensIsSixteenKWhenTheCatalogHasNoOutputLimit() async throws {
+    /// 目录没有 maxOutputTokens 时取 32000（ChatStore.defaultChatMaxOutputTokens，对齐 Claude Code）。
+    @Test func mainChatMaxTokensIsThirtyTwoKWhenTheCatalogHasNoOutputLimit() async throws {
         let unknown = LLMModel(id: "b2e-unknown", displayName: "B2E unknown", provider: "b2e-cap")
         try #require(unknown.maxOutputTokens == nil)
-        try await expectMainChatMaxTokens(model: unknown, expected: 16_384, label: "b2e-cap-unknown")
+        try await expectMainChatMaxTokens(model: unknown, expected: ChatStore.defaultChatMaxOutputTokens, label: "b2e-cap-unknown")
     }
 
     private func expectMainChatMaxTokens(model: LLMModel, expected: Int, label: String) async throws {

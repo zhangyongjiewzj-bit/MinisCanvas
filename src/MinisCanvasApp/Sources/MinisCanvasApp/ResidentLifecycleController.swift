@@ -29,6 +29,8 @@ final class ResidentLifecycleController: NSObject {
     @ObservationIgnored private var openMainWindow: (() -> Void)?
     private var hasWork = false
     private var hasSchedulerEffects = false
+    /// 定时任务当前是否正在执行（退出确认用）。
+    var isSchedulerExecuting: Bool { hasSchedulerEffects }
 
     init(defaults: UserDefaults = .standard,
          createAssertion: @escaping () -> (IOReturn, IOPMAssertionID) = {
@@ -50,11 +52,34 @@ final class ResidentLifecycleController: NSObject {
         super.init()
     }
 
+    /// 菜单栏单色 logo：与应用图标一致的倾斜环带（莫比乌斯环的简化线稿）。
+    /// 模板图由系统按菜单栏深浅色自动着色；只在创建状态栏项时画一次。
+    static func menuBarLogo() -> NSImage {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            let transform = NSAffineTransform()
+            transform.translateX(by: 9, yBy: 9)
+            transform.rotate(byDegrees: -18)
+            transform.concat()
+            NSColor.black.setStroke()
+            let outer = NSBezierPath(ovalIn: NSRect(x: -7.6, y: -4.6, width: 15.2, height: 9.2))
+            outer.lineWidth = 1.7
+            outer.stroke()
+            // 内圈偏向右上，做出前宽后窄的环带透视。
+            let inner = NSBezierPath(ovalIn: NSRect(x: -4.4, y: -1.0, width: 10.0, height: 4.6))
+            inner.lineWidth = 1.1
+            inner.stroke()
+            return true
+        }
+        image.isTemplate = true
+        image.accessibilityDescription = "MinisCanvas"
+        return image
+    }
+
     func start(openMainWindow: @escaping () -> Void, onWake: @escaping @MainActor () -> Void, workload: @escaping () -> Bool) {
         guard statusItem == nil else { return }
         self.openMainWindow = openMainWindow
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "square.stack.3d.up", accessibilityDescription: "MinisCanvas")
+        item.button?.image = Self.menuBarLogo()
         let menu = NSMenu()
         let open = NSMenuItem(title: "打开 MinisCanvas", action: #selector(openWindow), keyEquivalent: "")
         open.target = self
@@ -88,7 +113,7 @@ final class ResidentLifecycleController: NSObject {
                 if enabled { try SMAppService.mainApp.register() }
                 else { try await SMAppService.mainApp.unregister() }
             } catch {
-                failureMessage = "登录项修改失败：\(error.localizedDescription)"
+                failureMessage = "登录项修改失败：\(UserFacingErrorText.describe(error))"
             }
             refreshLoginStatus()
         }
@@ -127,7 +152,7 @@ final class ResidentLifecycleController: NSObject {
     }
 
     func reportStartupFailure(_ error: Error) {
-        failureMessage = "后台任务恢复失败：\(error.localizedDescription)"
+        failureMessage = "后台任务恢复失败：\(UserFacingErrorText.describe(error))"
     }
 
     private func reconcileAssertion() {

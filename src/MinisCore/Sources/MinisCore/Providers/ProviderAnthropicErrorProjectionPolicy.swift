@@ -47,11 +47,12 @@ public enum ProviderAnthropicErrorProjectionPolicy {
     public static func project(
         statusCode: Int,
         headers: [String: String] = [:],
-        body: String = ""
+        body: String = "",
+        now: Date = Date()
     ) -> Projection {
         let category = category(for: statusCode)
         let retryAfter = category == .rateLimited
-            ? retryAfterSeconds(from: headers)
+            ? (retryAfterSeconds(from: headers) ?? rateLimitResetSeconds(from: headers, now: now))
             : nil
         let requestIDPresent = hasRequestID(in: headers)
 
@@ -65,7 +66,10 @@ public enum ProviderAnthropicErrorProjectionPolicy {
         if requestIDPresent {
             fields.append("request_id=present")
         }
-        if let reason = safeReason(from: body) {
+        if ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: statusCode, body: body) {
+            // 余额或额度不足：固定标签，供界面显示“余额或额度不足”并停止自动重试。
+            fields.append(ProviderHTTPErrorAdapter.quotaReasonLabel)
+        } else if let reason = safeReason(from: body) {
             fields.append("reason=\(reason)")
         }
 
@@ -113,6 +117,25 @@ public enum ProviderAnthropicErrorProjectionPolicy {
         return fields.joined(separator: "; ")
     }
 
+    /// 流内 error 事件（HTTP 已经返回 200 之后）映射成与同类 HTTP 失败一致的错误，
+    /// 这样用户文案和自动重试都和 529 / 429 / 5xx 走同一套：
+    /// overloaded_error → 529，rate_limit_error → 429，api_error → 瞬时错误；其余保持原来的服务错误。
+    /// 只带固定类别标签，不带服务端的任何文字。
+    public static func streamLLMError(_ event: [String: Any]) -> LLMError {
+        let rawType = ((event["error"] as? [String: Any])?["type"] as? String)?.lowercased()
+        let requestID = hasRequestID(in: event) ? "; request_id=present" : ""
+        switch rawType {
+        case "overloaded_error":
+            return .httpStatus(code: 529, detail: "status=529; category=\(Category.server.rawValue)" + requestID)
+        case "rate_limit_error":
+            return .httpStatus(code: 429, detail: "status=429; category=\(Category.rateLimited.rawValue)" + requestID)
+        case "api_error":
+            return .transientError(message: "The provider reported a temporary server error.")
+        default:
+            return .providerError(message: projectStreamError(event))
+        }
+    }
+
     private static func category(for statusCode: Int) -> Category {
         switch statusCode {
         case 401:
@@ -148,6 +171,35 @@ public enum ProviderAnthropicErrorProjectionPolicy {
             return nil
         }
         return seconds
+    }
+
+    /// 没有 Retry-After 时，改读 `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-reset`
+    /// （RFC 3339 时间点），换算成还要等的秒数。优先取 remaining 为 0 的那几类里最晚的；
+    /// 没有哪一类标明用完时，取最早的重置点（宁可早试一次，也不无谓地等）。
+    private static func rateLimitResetSeconds(from headers: [String: String], now: Date) -> Int? {
+        var lowered: [String: String] = [:]
+        for (key, value) in headers {
+            lowered[key.lowercased()] = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        var all: [Int] = []
+        var exhausted: [Int] = []
+        for bucket in ["requests", "tokens", "input-tokens", "output-tokens"] {
+            guard let raw = lowered["anthropic-ratelimit-\(bucket)-reset"],
+                  let date = parseResetTimestamp(raw) else { continue }
+            let seconds = Int(max(0, date.timeIntervalSince(now)).rounded(.up))
+            all.append(seconds)
+            if lowered["anthropic-ratelimit-\(bucket)-remaining"] == "0" { exhausted.append(seconds) }
+        }
+        guard let chosen = exhausted.max() ?? all.min() else { return nil }
+        return min(chosen, maximumRetryAfterSeconds)
+    }
+
+    private static func parseResetTimestamp(_ text: String) -> Date? {
+        let plain = ISO8601DateFormatter()
+        if let date = plain.date(from: text) { return date }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: text)
     }
 
     private static func hasRequestID(in headers: [String: String]) -> Bool {

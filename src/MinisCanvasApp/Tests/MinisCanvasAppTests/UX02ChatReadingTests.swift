@@ -76,7 +76,7 @@ struct UX02ChatReadingTests {
         #expect(rendered[1].string == rendered[2].string)
         for (document, palette) in zip(rendered, palettes) {
             let text = document.string as NSString
-            for (marker, alpha) in [("866 body", 1.0), ("let theme866", 1.0), ("swift", 0.75), ("•", 0.75)] {
+            for (marker, alpha) in [("866 body", 1.0), ("let theme866", 1.0), ("swift", 0.72), ("•", 0.75)] {
                 let range = text.range(of: marker)
                 #expect(range.location != NSNotFound)
                 guard range.location != NSNotFound else { continue }
@@ -159,14 +159,13 @@ struct UX02ChatReadingTests {
         #expect(attributed.string.contains("let result = items.map"))
         #expect(attributed.string.contains("工具输出："))
         #expect(attributed.string.contains("列名"))
-        #expect(userStyle?.firstLineHeadIndent == 28)
-        #expect(userStyle?.headIndent == 28)
+        // 11/18 用户消息改为靠右成块：左侧在阅读 gutter 之外再缩进 UserBubbleTextBlock.wrapInset，右侧与助手一致。
+        #expect(userStyle?.firstLineHeadIndent == 28 + UserBubbleTextBlock.wrapInset)
+        #expect(userStyle?.headIndent == 28 + UserBubbleTextBlock.wrapInset)
         #expect(userStyle?.tailIndent == -28)
         #expect(assistantStyle?.firstLineHeadIndent == 28)
         #expect(assistantStyle?.headIndent == 28)
         #expect(assistantStyle?.tailIndent == -28)
-        #expect(userStyle?.firstLineHeadIndent == assistantStyle?.firstLineHeadIndent)
-        #expect(userStyle?.headIndent == assistantStyle?.headIndent)
         #expect(userStyle?.tailIndent == assistantStyle?.tailIndent)
         #expect(userStyle?.paragraphSpacing == 10)
         #expect(userStyle?.lineSpacing == 2)
@@ -191,7 +190,8 @@ struct UX02ChatReadingTests {
         let secondCodeBlock = try #require(second.last)
         #expect(firstCodeBlock === secondCodeBlock)
         #expect(firstCodeBlock.backgroundColor != nil)
-        #expect(try blocks(at: "swift").count == prose.count)
+        // The language / copy header row sits inside the same code card.
+        #expect(try blocks(at: "swift").last === firstCodeBlock)
         #expect(ChatTranscriptFormatter.plainText(messages) == "【助手】\n\(content)")
     }
 
@@ -871,8 +871,11 @@ struct UX02ChatReadingTests {
                         leftTables[aTableID] = bTableID
                         rightTables[bTableID] = aTableID
                     } else {
-                        guard type(of: aBlock) == NSTextBlock.self,
-                              type(of: bBlock) == NSTextBlock.self else { return "unsupported block at \(offset)" }
+                        // Plain blocks, the code-card surface block, or the user bubble block (own classes, same style contract).
+                        guard type(of: aBlock) == type(of: bBlock),
+                              type(of: aBlock) == NSTextBlock.self || type(of: aBlock) == CodeSurfaceTextBlock.self
+                                  || type(of: aBlock) == UserBubbleTextBlock.self
+                        else { return "unsupported block at \(offset)" }
                     }
                     let aID = ObjectIdentifier(aBlock)
                     let bID = ObjectIdentifier(bBlock)
@@ -1126,4 +1129,38 @@ struct UX02ChatReadingTests {
     - exit: 0
     - result: passed
     """
+}
+
+extension UX02ChatReadingTests {
+    /// 11/19 旅途"色块"：局部重画只量到短行时，气泡左边缘按短行算，长行露在底色外。
+    @Test("user bubble left edge is measured over every line of the block, not only the redrawn ones")
+    func userBubbleLeftEdgeUsesAllLinesOfTheBlock() throws {
+        let block = UserBubbleTextBlock()
+        let style = NSMutableParagraphStyle()
+        style.alignment = .right
+        style.textBlocks = [block]
+        let text = "请用后台方式运行命令 sleep 6 && echo 后台完成XYZ，不要等它结束，启动后本轮直接结束。"
+        let storage = NSTextStorage(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 14), .paragraphStyle: style,
+        ])
+        let manager = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: 360, height: 10_000))
+        container.lineFragmentPadding = 0
+        manager.addTextContainer(container)
+        storage.addLayoutManager(manager)
+        manager.ensureLayout(for: container)
+
+        var lineMinXs: [CGFloat] = []
+        manager.enumerateLineFragments(forGlyphRange: NSRange(location: 0, length: manager.numberOfGlyphs)) {
+            _, _, _, glyphs, _ in
+            lineMinXs.append(manager.boundingRect(forGlyphRange: glyphs, in: container).minX)
+        }
+        try #require(lineMinXs.count >= 2, "fixture must wrap to at least two lines")
+        let whole = try #require(ChatTranscriptNativeTextView.bubbleTextMinX(
+            block, at: storage.length - 1, storage: storage, manager: manager, container: container))
+        // 从最后一行（短行）位置量起，仍得到整块里最靠左的那一行。
+        let shortLineMinX = try #require(lineMinXs.last)
+        #expect(whole == lineMinXs.min())
+        #expect(whole < shortLineMinX)
+    }
 }

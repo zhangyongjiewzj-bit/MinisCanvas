@@ -899,7 +899,9 @@ struct Perf03ThreeScaleProductionOperationTests {
         #expect(state.cache.lastFormattedMessageCount == messages.count)
         #expect(state.cache.update.generation == generation + 1)
         #expect(["parse", "redact", "layout"].allSatisfy { operation in control.contains { $0["operation"] == operation } })
-        #expect(control.filter { $0["parser"] == "assessment-inline" }.count > appended.filter { $0["parser"] == "assessment-inline" }.count,
+        // 消息级与块级缓存之后，历史编辑只重新评估被改动的那一条的变动块，
+        // 不再比追加两条新消息更多；仍须观察到真实的评估解析。
+        #expect(control.filter { $0["parser"] == "assessment-inline" }.count >= 1,
             "the actual historical-edit rebuild is an assessment-positive control")
         #expect(control.contains { $0["operation"] == "layout" && $0["startUTF16"] == "0" })
         #expect(!state.cache.document.attributedString.attributedSubstring(from: fullHistoryRange).isEqual(to: frozenFormatter))

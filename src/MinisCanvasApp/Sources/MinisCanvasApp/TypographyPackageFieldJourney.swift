@@ -4483,7 +4483,7 @@ enum UF03CompanionLocalLabelReader {
 
     static func syntheticSample(_ value: Any?, attribute: String) -> String? {
         guard let string = value as? String,
-              ["任务模式", "工作量", "Composer 任务模式", "Composer 工作量"].contains(string) else { return nil }
+              ["任务模式", "工作量"].contains(string) else { return nil }
         return "\(attribute):\(string)"
     }
 
@@ -4869,8 +4869,8 @@ extension ComposerNativeFixtureContract {
             add("policy_group", "composer.policy.companion")
             add("model", "composer.model.companion", enabled: true,
                 value: "\(chat.providerLabel)，模型 ID：\(chat.selectedModelID ?? "未选择")")
-            add("mode", "Composer 任务模式", kind: "labelOrTitle", enabled: true)
-            add("effort", "Composer 工作量", kind: "labelOrTitle", enabled: true)
+            add("mode", "任务模式", kind: "labelOrTitle", enabled: true)
+            add("effort", "工作量", kind: "labelOrTitle", enabled: true)
             add("bypass_confirmation", "确认绕过权限模式仍受硬安全边界约束", kind: "labelOrTitle",
                 present: chat.composerPolicySelection.mode == .bypassPermission, enabled: true,
                 checked: chat.composerPolicySelection.bypassModeConfirmed, text: "已知晓安全边界")
@@ -5586,7 +5586,7 @@ extension ComposerNativeFixtureContract {
                 var policy = before.policy
                 policy.mode = mode
                 if before.policy.mode != mode {
-                    let selected = await choose("Composer 任务模式", ComposerPolicyPresentation.modeLabel(mode))
+                    let selected = await choose("任务模式", ComposerPolicyPresentation.modeLabel(mode))
                     if selected { success = await observePolicy { onlyPolicyChanged($0, from: before, expectedPolicy: policy) } }
                 }
             case "effort_forward", "effort_restore":
@@ -5594,7 +5594,7 @@ extension ComposerNativeFixtureContract {
                 var policy = before.policy
                 policy.effort = effort
                 if before.policy.effort != effort {
-                    let selected = await choose("Composer 工作量", ComposerPolicyPresentation.effortLabel(effort))
+                    let selected = await choose("工作量", ComposerPolicyPresentation.effortLabel(effort))
                     if selected { success = await observePolicy { onlyPolicyChanged($0, from: before, expectedPolicy: policy) } }
                 }
             case "bypass_check", "bypass_uncheck":
@@ -5676,9 +5676,9 @@ extension ComposerNativeFixtureContract {
             case "frozen_summary_policy_roundtrip":
                 if before.streaming, before.snapshot != nil, before.policy.effort == .high,
                    chat.agentEngine is InterruptRecordingEngine {
-                    if await choose("Composer 工作量", ComposerPolicyPresentation.effortLabel(.low)) {
+                    if await choose("工作量", ComposerPolicyPresentation.effortLabel(.low)) {
                         if await observePolicy({ $0.policy.effort == .low && $0.snapshot == before.snapshot }) {
-                            if await choose("Composer 工作量", ComposerPolicyPresentation.effortLabel(.high)) {
+                            if await choose("工作量", ComposerPolicyPresentation.effortLabel(.high)) {
                                 success = await observePolicy { $0.policy == before.policy && $0.snapshot == before.snapshot }
                             }
                         }

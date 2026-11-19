@@ -111,7 +111,7 @@ struct CanvasCommandMetadataConsumer477Tests {
         let expectedIDs: Set<String> = ["help", "commands", "boundary", "boundary.set", "add-dir", "status", "copy", "tasks",
                 "stop", "compact", "retry", "canvas.run", "canvas.cancel", "canvas.minimap", "provider",
                 "provider.use", "model", "workflow", "approve", "reject", "memory", "memory.propose",
-                "skills", "permissions", "mcp", "context", "clear", "rewind", "doctor", "usage", "export",
+                "skills", "permissions", "mcp", "context", "clear", "rewind", "undo", "diff", "doctor", "usage", "export",
                 "rename", "resume", "plan", "shortcuts"]
         #expect(Set(declared.map(\.id)) == expectedIDs)
         #expect(declared.count == expectedIDs.count)

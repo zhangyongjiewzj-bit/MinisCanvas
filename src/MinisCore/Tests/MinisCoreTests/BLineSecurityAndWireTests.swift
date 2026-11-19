@@ -178,7 +178,7 @@ struct BLineTerminalGuardTests {
         // The verdicts below come from the SAME immutable snapshot the visible
         // terminal consumes; the expectations here are bound to that shared
         // classification, not to a test-local copy of it.
-        let deniedCompound = "echo safe; sudo tee should-not-run"
+        let deniedCompound = "echo safe; halt should-not-run"
         #expect(!TerminalGuard.inspect(deniedCompound).isAllowed,
                 "fixture must keep the guard-rejected syntax shape")
         #expect(TerminalPolicySnapshot.default.classify(command: deniedCompound) == .denied,

@@ -18,17 +18,41 @@ import Foundation
 public enum HookScriptReferenceAnalyzer {
     public static let protectedDirectory = ".miniscanvas/hooks"
     public static let protectedConfigFile = ".miniscanvas/hooks.json"
-    private static let projectDirectoryVariables = ["${MINISCANVAS_PROJECT_DIR}", "$MINISCANVAS_PROJECT_DIR"]
+    private static let projectDirectoryVariables = [
+        "${MINISCANVAS_PROJECT_DIR}", "$MINISCANVAS_PROJECT_DIR",
+        "${CLAUDE_PROJECT_DIR}", "$CLAUDE_PROJECT_DIR",
+    ]
     private static let shellNames: Set<String> = ["sh", "bash", "zsh", "dash", "ksh"]
     private static let inlineCodeFlags: Set<String> = ["-e", "-E", "-p", "-pe", "--eval", "--print"]
     private static let maximumNesting = 3
 
     /// Sorted, de-duplicated display paths (relative to the project root) that a
     /// command references outside the protected directory. Empty = none found.
-    public static func outsideReferences(command: String, projectRoot: String, allowsProjectDirectoryReferences: Bool = true) -> [String] {
+    ///
+    /// `.miniscanvas/hooks.json` 与 `.miniscanvas/hooks/` 只在项目 Hook 的信任哈希里。
+    /// Claude 格式的 settings.json 哈希只含钩子命令本身，所以它传
+    /// `protectsHooksDirectory: false`：引用那个目录里的脚本同样算"哈希之外"。
+    /// `homeDirectory` 非空时先把 `~`、`$HOME`、`${HOME}` 展开再判断。
+    public static func outsideReferences(
+        command: String,
+        projectRoot: String,
+        allowsProjectDirectoryReferences: Bool = true,
+        protectsHooksDirectory: Bool = true,
+        homeDirectory: String? = nil
+    ) -> [String] {
         var found: Set<String> = []
-        analyze(command, projectRoot: projectRoot, allowsProjectDirectoryReferences: allowsProjectDirectoryReferences, depth: 0, into: &found)
+        let options = Options(
+            allowsProjectDirectoryReferences: allowsProjectDirectoryReferences,
+            protectsHooksDirectory: protectsHooksDirectory,
+            homeDirectory: homeDirectory)
+        analyze(command, projectRoot: projectRoot, options: options, depth: 0, into: &found)
         return found.sorted()
+    }
+
+    private struct Options {
+        let allowsProjectDirectoryReferences: Bool
+        let protectsHooksDirectory: Bool
+        let homeDirectory: String?
     }
 
     private struct Word {
@@ -37,7 +61,7 @@ public enum HookScriptReferenceAnalyzer {
         let isCommandPosition: Bool
     }
 
-    private static func analyze(_ command: String, projectRoot: String, allowsProjectDirectoryReferences: Bool, depth: Int, into found: inout Set<String>) {
+    private static func analyze(_ command: String, projectRoot: String, options: Options, depth: Int, into found: inout Set<String>) {
         let words = tokenize(command)
         var index = 0
         var commandIsShell = false
@@ -57,7 +81,7 @@ public enum HookScriptReferenceAnalyzer {
                 // For a shell the next word is itself a command line; for any
                 // other interpreter it is inline code, which is not path syntax.
                 if commandIsShell, depth < maximumNesting {
-                    analyze(words[index].text, projectRoot: projectRoot, allowsProjectDirectoryReferences: allowsProjectDirectoryReferences, depth: depth + 1, into: &found)
+                    analyze(words[index].text, projectRoot: projectRoot, options: options, depth: depth + 1, into: &found)
                 }
                 index += 1
                 continue
@@ -66,11 +90,21 @@ public enum HookScriptReferenceAnalyzer {
                 skipNext = true
                 continue
             }
-            classify(word, projectRoot: projectRoot, allowsProjectDirectoryReferences: allowsProjectDirectoryReferences, into: &found)
+            classify(word, projectRoot: projectRoot, options: options, into: &found)
         }
     }
 
-    private static func classify(_ word: Word, projectRoot: String, allowsProjectDirectoryReferences: Bool, into found: inout Set<String>) {
+    /// `~`、`~/x`、`$HOME/x`、`${HOME}/x` → 家目录绝对路径；其它原样返回。
+    private static func expandingHome(_ text: String, home: String) -> String {
+        let base = home.hasSuffix("/") ? String(home.dropLast()) : home
+        for prefix in ["${HOME}", "$HOME", "~"] where text == prefix || text.hasPrefix(prefix + "/") {
+            return base + String(text.dropFirst(prefix.count))
+        }
+        return text
+    }
+
+    private static func classify(_ word: Word, projectRoot: String, options: Options, into found: inout Set<String>) {
+        let allowsProjectDirectoryReferences = options.allowsProjectDirectoryReferences
         var text = word.text
         guard !text.isEmpty else { return }
         // `--config=./x` and `NAME=./x`: look at the value.
@@ -88,6 +122,9 @@ public enum HookScriptReferenceAnalyzer {
         for variable in projectDirectoryVariables where text.hasPrefix(variable) {
             text = projectRoot + String(text.dropFirst(variable.count))
             break
+        }
+        if let home = options.homeDirectory {
+            text = expandingHome(text, home: home)
         }
         // Words that carry shell syntax are not plain paths.
         if text.contains(where: { "()'\";{}$`".contains($0) }) { return }
@@ -122,7 +159,7 @@ public enum HookScriptReferenceAnalyzer {
             guard FileManager.default.fileExists(atPath: candidate) else { return }
             relative = text
         }
-        if relative == "." || isProtected(relative) { return }
+        if relative == "." || (options.protectsHooksDirectory && isProtected(relative)) { return }
         found.insert(relative)
     }
 

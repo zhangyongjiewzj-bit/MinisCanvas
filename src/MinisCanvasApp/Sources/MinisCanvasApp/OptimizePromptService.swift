@@ -27,7 +27,7 @@ struct OptimizePromptService: @unchecked Sendable {
             messages: [LLMMessage(role: .user, content: text)],
             systemPrompt: Self.systemPrompt,
             maxTokens: 1500,
-            temperature: 0.4
+            temperature: nil
         )
         let result = response.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !result.isEmpty else { throw ServiceError.emptyResult }

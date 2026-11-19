@@ -36,12 +36,14 @@ private final class ComposerFailedTextProvider0741: LLMProvider, @unchecked Send
 @Suite("D-COMPOSER-08 failed text worker and explicit file-reference recovery", .serialized)
 @MainActor
 struct ComposerFailedTextReference0741Tests {
-    private func waitUntil(_ condition: @MainActor () -> Bool) async throws {
+    private func waitUntil(_ condition: @MainActor () -> Bool,
+                           sourceLocation: SourceLocation = #_sourceLocation) async throws {
         let deadline = ContinuousClock.now + .seconds(6)
         while !condition() && ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(20))
         }
-        try #require(condition(), "actual owned producer/ordinary request reached bounded phase")
+        try #require(condition(), "actual owned producer/ordinary request reached bounded phase",
+                     sourceLocation: sourceLocation)
     }
     private func digest(_ text: String) -> String {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -95,7 +97,7 @@ struct ComposerFailedTextReference0741Tests {
         let bText = "OWNED0741_B_UNSENT_DRAFT"
         let nextText = "OWNED0741_NEXT_PLAIN_REQUEST"
         let secretMaterial = "OWNED0741_BINARY_MATERIAL_NOT_DECODED"
-        let invalid = Data([0xFF, 0xFE, 0xFF]) + Data(secretMaterial.utf8)
+        let invalid = Data([0xFF, 0xFF, 0xFE]) + Data(secretMaterial.utf8)
         #expect(String(data: invalid, encoding: .utf8) == nil)
         let brokenURL = root.appendingPathComponent("owned-broken0741.txt")
         let referenceURL = root.appendingPathComponent("owned-reference0741.bin")

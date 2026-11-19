@@ -320,7 +320,8 @@ struct QuickFixAPermissionSettingsDispatchTests {
             #expect(!text.contains("Composer mode requires"), "仍是英文：\(text)")
             #expect(text.contains("手动审批"), "应提示改为手动审批：\(text)")
             #expect(text.contains("运行安全上限"), "应提示到 设置 → 智能体运行 → 运行安全上限 调高：\(text)")
-            #expect(text.contains("L3") && text.contains("L1"), "应说明所需级别与当前上限：\(text)")
+            #expect(text.contains("超出了你设置的运行安全上限"), "应说明当前模式超出上限：\(text)")
+            #expect(!text.contains("L3") && !text.contains("L1"), "不应露出内部级别：\(text)")
         }
     }
 
@@ -437,5 +438,20 @@ struct QuickFixAPermissionSettingsDispatchTests {
         await wired.bridge.lastChildGovernorSafetyTask?.value
         #expect(center.composerPolicy.mode == .autoEdit)
         #expect(ComposerTaskMode.autoEdit.requiredAutonomyLevel <= center.policyRuntimeDefaults.autonomyLevel)
+    }
+}
+
+@MainActor
+@Suite("规则面板编辑不放大权限")
+struct PermissionRulePanelEditTests {
+    @Test("仅编辑规则不可编辑（避免保存后升格为写入），写入规则仍可编辑")
+    func fileEditRuleIsDeleteOnly() {
+        func rule(_ capability: String) -> PersistentApprovalRule {
+            PersistentApprovalRule(
+                projectKey: PersistentApprovalRule.globalProjectKey, projectRoots: [],
+                kind: .projectDirectory, capability: capability, pattern: "/tmp/proj")
+        }
+        #expect(PermissionRulesPanelModel.draftFields(of: rule("file_edit")) == nil)
+        #expect(PermissionRulesPanelModel.draftFields(of: rule("file_write"))?.type == .writePath)
     }
 }

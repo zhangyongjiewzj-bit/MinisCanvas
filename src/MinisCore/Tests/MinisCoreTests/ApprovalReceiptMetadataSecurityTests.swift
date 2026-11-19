@@ -237,7 +237,7 @@ struct ApprovalReceiptMetadataSecurityTests {
         try Data("owned preview".utf8).write(to: file)
         let preview = try #require(ApprovalFilePreview.capture(tool: "file_write", input: ["path": file.path]))
         let cases: [(tool: String, input: [String: Any], expected: TerminalCommandDisposition?)] = [
-            ("shell_execute", ["command": "open Synthetic.app"], .denied),
+            ("shell_execute", ["command": "halt Synthetic.app"], .denied),
             ("file_read", ["path": file.path], nil)
         ]
         for item in cases {

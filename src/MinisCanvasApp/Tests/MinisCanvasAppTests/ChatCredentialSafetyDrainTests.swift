@@ -57,10 +57,12 @@ struct ChatCredentialSafetyDrainTests {
     private func expectNoSurvivingRawCopy(
         _ chat: ChatStore, messageID: UUID, secret: String, tag: String
     ) {
-        let rebuilt = chat.credentialBroker.projectStream(
+        let shown = chat.credentialBroker.projectStream(
             messageID: messageID, current: "干净后续", append: " next"
         )
-        #expect(!rebuilt.contains(secret), "\(tag)：broker 原始副本在 Kill Switch 后仍存活")
+        // 流式投影会扣住末尾的词；终态（finalize）给出完整文本。
+        let rebuilt = chat.credentialBroker.finalizeStream(messageID: messageID, current: shown)?.text ?? shown
+        #expect(!shown.contains(secret) && !rebuilt.contains(secret), "\(tag)：broker 原始副本在 Kill Switch 后仍存活")
         #expect(rebuilt == "干净后续 next", "\(tag)：投影必须从传入文本重建，而不是残留副本")
     }
 

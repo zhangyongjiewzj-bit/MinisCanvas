@@ -333,6 +333,115 @@ import MinisCore
         #expect(projectedContext.contains("\\u003C"))
     }
 
+    private func backgroundNotice(session: UUID, id: String = "child") -> BackgroundChildResultNotice {
+        let task = SubAgentTask(id: id, title: "后台检查", instructions: "synthetic")
+        let report = SubAgentReport(taskID: id, agentType: .builtin, duration: 1,
+            result: .succeeded(output: "done"), parentID: "parent", runID: "run-" + id, attemptID: "attempt-" + id)
+        return BackgroundChildResultNotice(sourceSessionID: session.uuidString,
+            executionIdentity: AgentExecutionIdentity(turn: AgentTurnIdentity(
+                sessionID: session.uuidString, turnID: 1, messageID: "message-" + id)),
+            task: task, parentID: "parent", report: report)
+    }
+
+    /// E2：开关关闭（或没有装配开关）时，后台子任务完成后仍不自动唤醒，结果只排队等下一条用户消息。
+    @Test func switchOffBackgroundChildCompletionStillDoesNotWakeTheSession() async throws {
+        let notAssembled: (() -> Bool)? = nil
+        let switchedOff: (() -> Bool)? = { false }
+        for provider in [notAssembled, switchedOff] {
+            let chat = ChatStore()
+            chat.backgroundAutoContinueEnabledProvider = provider
+            let session = try #require(chat.activeSessionID)
+            let before = chat.messages
+            chat.receiveBackgroundResult(backgroundNotice(session: session))
+            try await Task.sleep(for: .milliseconds(900))
+            #expect(chat.activePendingBackgroundResultCount == 1)
+            #expect(chat.messages == before)
+            #expect(!chat.isActiveSessionGenerating)
+            #expect(!chat.attemptBackgroundCompletionContinuation(sessionID: session))
+        }
+    }
+
+    /// E2：开关打开、会话空闲时，后台子任务完成后自动发起一轮续跑；通知文字不是用户自己的话，
+    /// 结果走已有通道随本轮带上（发起后待注入队列被取走）。
+    @Test func switchOnBackgroundChildCompletionStartsAContinuationTurn() async throws {
+        let chat = ChatStore()
+        defer { chat.stopAllStreamingForSafety() }
+        let facts = ComposerPolicyFactSource(knownCapabilities: [], grantedCapabilities: [],
+            allowedWriteRoots: [], workspaceID: chat.composerWorkspaceID,
+            revision: "bg-continue", grantEpoch: "bg-continue-epoch",
+            leaseID: "bg-continue-lease", expiresAt: Date().addingTimeInterval(60))
+        chat.configureComposerPolicy(facts)
+        chat.agentEngine = FallbackChatEngine(composerPolicyFacts: facts)
+        let gate = Goal18MemoryResponseGate()
+        chat.streamingProviderOverride = Goal18MemoryVisibilityProvider(gate: gate)
+        chat.backgroundAutoContinueEnabledProvider = { true }
+        let session = try #require(chat.activeSessionID)
+        chat.receiveBackgroundResult(backgroundNotice(session: session))
+        for _ in 0..<300 where !chat.isActiveSessionGenerating {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(chat.isActiveSessionGenerating)
+        let lastUser = chat.messages.last(where: { $0.role == .user })
+        #expect(lastUser?.content == ChatStore.backgroundCompletionContinuationPrompt)
+        // 待注入结果在请求送到模型之前才被取走（回合开头还有钩子、技能等异步准备），
+        // 所以要等 Provider 真正收到请求后再断言队列已清空，不能在回合刚登记时就断言。
+        for _ in 0..<300 where !(await gate.requested) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(await gate.requested)
+        #expect(chat.activePendingBackgroundResultCount == 0)
+        await gate.release()
+        if let running = chat.turnTaskForTests(sessionID: session) { await running.value }
+    }
+
+    /// E2：用户有未发出的草稿时不抢；结果保持待注入。
+    @Test func backgroundContinuationDoesNotTakeOverAUserDraft() async throws {
+        let chat = ChatStore()
+        chat.backgroundAutoContinueEnabledProvider = { true }
+        let session = try #require(chat.activeSessionID)
+        chat.draftText = "我正在写的一句话"
+        chat.receiveBackgroundResult(backgroundNotice(session: session))
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(chat.draftText == "我正在写的一句话")
+        #expect(!chat.isActiveSessionGenerating)
+        #expect(chat.activePendingBackgroundResultCount == 1)
+        #expect(!chat.attemptBackgroundCompletionContinuation(sessionID: session))
+    }
+
+    /// E2：连续自动续跑有上限；用户自己发过话后重新计数。
+    @Test func consecutiveAutoContinuationsAreCountedAndResetByAUserMessage() {
+        let prompt = ChatStore.backgroundCompletionContinuationPrompt
+        func user(_ text: String) -> ChatMessageUI { ChatMessageUI(role: .user, content: text) }
+        func assistant(_ text: String) -> ChatMessageUI { ChatMessageUI(role: .assistant, content: text) }
+        let cap = ChatStore.maxConsecutiveBackgroundAutoContinuations
+        #expect(cap == 3)
+        var messages: [ChatMessageUI] = [user("开始"), assistant("好")]
+        #expect(ChatStore.consecutiveBackgroundAutoContinuations(in: messages) == 0)
+        for expected in 1...cap {
+            messages += [user(prompt), assistant("继续")]
+            #expect(ChatStore.consecutiveBackgroundAutoContinuations(in: messages) == expected)
+        }
+        messages += [user("用户自己说的话"), assistant("好")]
+        #expect(ChatStore.consecutiveBackgroundAutoContinuations(in: messages) == 0)
+    }
+
+    /// E2：已连续自动续跑到上限的会话不再自动开新一轮，等用户发话。
+    @Test func backgroundContinuationStopsAtTheConsecutiveLimit() async throws {
+        let chat = ChatStore()
+        chat.backgroundAutoContinueEnabledProvider = { true }
+        let session = try #require(chat.activeSessionID)
+        let prompt = ChatStore.backgroundCompletionContinuationPrompt
+        // 用同样的通知文字模拟已经连续自动续跑过的转录。
+        for _ in 0..<ChatStore.maxConsecutiveBackgroundAutoContinuations {
+            #expect(chat.deliverSessionMessage(prompt, toSession: session))
+        }
+        chat.receiveBackgroundResult(backgroundNotice(session: session, id: "after-limit"))
+        #expect(!chat.attemptBackgroundCompletionContinuation(sessionID: session))
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(!chat.isActiveSessionGenerating)
+        #expect(chat.activePendingBackgroundResultCount == 1)
+    }
+
     @Test func explicitStopThenChildCompletionCannotQueueAParentInjection() async throws {
         let chat = ChatStore()
         defer { chat.stopAllStreamingForSafety() }
@@ -380,6 +489,45 @@ import MinisCore
             _ = try chat.previewPermanentDeletion(id: session)
         }
         store.finishLiveChildOrchestration(id: registration)
+    }
+
+    /// F-08：归档与删除用同一个后台子任务守卫；会话还有后台子任务在跑时不归档，并给一句说明，
+    /// 子任务结束后可以正常归档。
+    @Test func liveBackgroundChildBlocksArchivingTheSessionWithAnExplanation() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("f08-bg-archive-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = try AgentTaskStore(persistenceURL: root.appendingPathComponent("ledger.json"))
+        let chat = ChatStore()
+        chat.newSession()
+        let session = try #require(chat.activeSessionID)
+        chat.newSession()
+        let other = try #require(chat.activeSessionID)
+        chat.attachAgentTaskStore(store)
+        let execution = AgentExecutionIdentity(turn: AgentTurnIdentity(sessionID: session.uuidString, turnID: 1, messageID: "message"))
+        let parent = ParentRuntimeIdentity(sessionID: session.uuidString, conversationID: session.uuidString,
+            turnID: "turn-handle:1", taskID: "parent", actorID: "app")
+        let registration = store.registerLiveChildOrchestration(parent: parent, execution: execution,
+            taskIDs: ["child"], requestBackground: { true }, interruptOwner: {})
+        #expect(store.markLiveChildOrchestrationBackground(id: registration))
+        // 非当前会话：不归档，仍在活动列表，说明里写了原因和出路。
+        #expect(other == chat.activeSessionID && session != other)
+        #expect(!chat.archiveSession(id: session))
+        #expect(chat.sessions.contains { $0.id == session })
+        #expect(!chat.archivedSessions.contains { $0.id == session })
+        let reason = try #require(chat.backgroundArchiveBlockReason(sessionID: session.uuidString))
+        #expect(reason.contains("后台运行的子任务") && reason.contains("任务中心") && reason.contains("归档"))
+        // 当前会话也一样：不停止生成、不切走。
+        chat.switchSession(id: session)
+        #expect(!chat.archiveSession(id: session))
+        #expect(chat.activeSessionID == session)
+        // 没有后台子任务的会话不受影响。
+        #expect(chat.backgroundArchiveBlockReason(sessionID: other.uuidString) == nil)
+        // 子任务结束后可以归档。
+        store.finishLiveChildOrchestration(id: registration)
+        #expect(chat.backgroundArchiveBlockReason(sessionID: session.uuidString) == nil)
+        #expect(chat.archiveSession(id: session))
+        #expect(chat.archivedSessions.contains { $0.id == session })
     }
 
     @Test func realRetryPolicyRoutes429ToTheOwnedWaitWithoutAnotherRetryLoop() async throws {
@@ -449,6 +597,20 @@ import MinisCore
         #expect(chat.recallLocalInput("本地输入", expectedSessionID: session))
         #expect(chat.messages == before)
         #expect(chat.draftText == "本地输入")
+    }
+
+    @Test func queuedMessagesStopAtTheLimitAndKeepTheDraft() {
+        let chat = ChatStore()
+        for index in 0..<ChatStore.maximumQueuedComposerMessages {
+            chat.draftText = "排队 \(index)"
+            #expect(chat.enqueueComposer())
+        }
+        #expect(chat.queuedComposerMessages.count == ChatStore.maximumQueuedComposerMessages)
+        chat.draftText = "第 51 条"
+        #expect(chat.enqueueComposer())
+        #expect(chat.queuedComposerMessages.count == ChatStore.maximumQueuedComposerMessages)
+        #expect(chat.draftText == "第 51 条")
+        #expect(chat.pastedTextActionFeedback?.contains("待发队列已满") == true)
     }
 
     @Test func stoppingReturnsQueuedReferencePayloadToDraftWithoutSending() throws {
@@ -797,7 +959,7 @@ import MinisCore
         #expect(SessionSidebarPresentation.projectDirectory("relative") == nil)
     }
 
-    @Test(arguments: [19, 20, 21]) func searchExplainsItsResultLimit(count: Int) {
+    @Test(arguments: [99, 100, 101]) func searchExplainsItsResultLimit(count: Int) {
         let chat = ChatStore()
         chat.messages = (0..<count).map { ChatMessageUI(role: .user, content: "syntheticneedle \($0)") }
         let model = SessionSearchModel(chat: chat)
@@ -1349,7 +1511,7 @@ import MinisCore
         // exact owned bytes; native first-load confirmation is a separate journey.
         let physicalRoot = URL(fileURLWithPath: try DarwinSystemPathResolver.resolve(workspace), isDirectory: true)
         let trustedSnapshot = try #require(try TrustedProjectInstructions.loadSnapshot(atTrustedRoot: physicalRoot))
-        try #require(trustedSnapshot.loadedRelativePaths == ["AGENTS.md"])
+        try #require(trustedSnapshot.loadedRelativePaths.last == "AGENTS.md")
         try handler.grants.trustInstructions(trustedSnapshot, projectID: projectID)
         try #require(handler.grants.hasInstructionTrust(trustedSnapshot, projectID: projectID))
         let firstGate = Goal18MemoryResponseGate()
@@ -1406,8 +1568,9 @@ import MinisCore
         #expect(chat.draftText == "尚未发送的下一条草稿")
         chat.switchSession(id: continuedID)
 
-        // The same admitted project is read afresh: oversized text and a symlink
-        // cannot reuse the first turn's accepted instructions in a later prompt.
+        // The same admitted project is read afresh: oversized text is truncated and a
+        // symlink inside the project is followed; trust is per project, so edits to the
+        // file no longer ask again.
         for stage in ["oversized", "symlink"] {
             try FileManager.default.removeItem(at: instructionsURL)
             if stage == "oversized" {
@@ -1433,7 +1596,7 @@ import MinisCore
             try #require(entered)
             let completedTask = try #require(task)
             await completedTask.value
-            #expect(prompt?.contains(marker) == false)
+            #expect(prompt?.contains(marker) == true)
             #expect(chat.messages.last?.content.contains("owned project response") == true)
         }
     }

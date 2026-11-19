@@ -85,7 +85,7 @@ struct ComposerTextFailure3157ConsumerTests {
         if reason == "missing" {
             #expect(!FileManager.default.fileExists(atPath: url.path))
         } else {
-            let bytes = reason == "corrupt" ? Data([0xFF, 0xFE, 0xFF, 0xFE]) : Data("owned readable text".utf8)
+            let bytes = reason == "corrupt" ? Data([0xFF, 0xFF, 0xFE, 0xFE]) : Data("owned readable text".utf8)
             try bytes.write(to: url)
             if reason == "denied" {
                 try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: url.path)

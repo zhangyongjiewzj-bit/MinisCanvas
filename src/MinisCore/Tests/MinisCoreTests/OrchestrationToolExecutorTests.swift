@@ -623,6 +623,16 @@ struct OrchestrationToolExecutorTests {
         #expect(definition.parameters["tasks"]?.description.contains("allowed_tool_names") == true)
     }
 
+    /// T-07：后台子任务完成不会自动唤起模型，说明不能再写"会收到通知"，要写清结果随用户下一条消息送达。
+    @Test func backgroundDescriptionMatchesActualDeliveryNotAPushNotification() {
+        let definition = OrchestrationToolExecutor.makeDefinition()
+        #expect(!definition.description.contains("arrives as a notification"))
+        #expect(definition.description.contains("next message"))
+        let flag = definition.parameters["run_in_background"]?.description ?? ""
+        #expect(!flag.contains("with a notification"))
+        #expect(flag.contains("next message"))
+    }
+
     @Test func inheritedBindingIsFrozenInExternalTaskAndLedger() async throws {
         let runner = OETestRunner(name: "inherit-runner")
         let store = AgentTaskStore()

@@ -51,7 +51,7 @@ struct ProjectSessionPromptDeepLink1788Tests {
             targetID: targetID, projectID: projectID)
     }
 
-    private func assertPromptDenied(_ value: Fixture, target: String) {
+    private func assertPromptDenied(_ value: Fixture, target: String, failure: DeepLinkFailure) {
         let originalDraft = "保留来源草稿"
         value.bridge.chat.draftText = originalDraft
         let userCount = value.bridge.chat.sessions.reduce(0) { total, session in
@@ -65,7 +65,7 @@ struct ProjectSessionPromptDeepLink1788Tests {
             total + session.messages.filter { $0.role == .user }.count
         } == userCount)
         #expect(value.bridge.chat.messages.contains { $0.role == .system
-            && $0.content.contains("目标会话或项目授权当前不可用") })
+            && $0.content.contains(failure.notice) })
     }
 
     @Test("authorized target receives prompt through the real directed consumer")
@@ -90,7 +90,7 @@ struct ProjectSessionPromptDeepLink1788Tests {
         let value = try fixture()
         defer { try? FileManager.default.removeItem(at: value.root) }
         try value.handler.revokeProject(id: value.projectID)
-        assertPromptDenied(value, target: value.targetID.uuidString)
+        assertPromptDenied(value, target: value.targetID.uuidString, failure: .grantUnavailable)
     }
 
     @Test("stale native bookmark rejects directed prompt")
@@ -100,7 +100,7 @@ struct ProjectSessionPromptDeepLink1788Tests {
         try FileManager.default.moveItem(at: value.grantedDirectory,
             to: value.root.appendingPathComponent("moved-project", isDirectory: true))
         #expect(!value.handler.isProjectAvailable(id: value.projectID))
-        assertPromptDenied(value, target: value.targetID.uuidString)
+        assertPromptDenied(value, target: value.targetID.uuidString, failure: .grantUnavailable)
     }
 
     @Test("deleted canonical target cannot be revived by failure notice")
@@ -112,7 +112,7 @@ struct ProjectSessionPromptDeepLink1788Tests {
             .withSecondConfirmation("永久删除")
         _ = try value.store.deleteSession(id: value.targetID.uuidString, intent: intent)
         #expect(value.bridge.chat.sessions.contains { $0.id == value.targetID })
-        assertPromptDenied(value, target: value.targetID.uuidString)
+        assertPromptDenied(value, target: value.targetID.uuidString, failure: .sessionChanged)
         #expect(value.store.loadSession(id: value.targetID.uuidString) == nil)
     }
 
@@ -120,7 +120,7 @@ struct ProjectSessionPromptDeepLink1788Tests {
     func missingTargetPromptDoesNotFallBackToSource() throws {
         let value = try fixture()
         defer { try? FileManager.default.removeItem(at: value.root) }
-        assertPromptDenied(value, target: UUID().uuidString)
+        assertPromptDenied(value, target: UUID().uuidString, failure: .sessionMissing)
     }
 
     @Test("ordinary legacy session still accepts a directed local prompt")

@@ -15,6 +15,7 @@ struct MCPManagerView: View {
     @Environment(\.typographyTokens) private var typography
 
     @State private var showingAddSheet = false
+    @State private var showingImportSheet = false
     @State private var editingServer: MCPServer?
     /// 正在测试连接的服务器 id（按钮转圈）
     @State private var reconnectingIDs: Set<String> = []
@@ -29,12 +30,124 @@ struct MCPManagerView: View {
     @State private var discoveryRevision = 0
     @State private var lastActionMessage: String?
     @State private var pendingDeleteServer: MCPServer?
-    @State private var expandedToolAuthorizationServerIDs: Set<String> = []
+    /// 11/16：工具授权区默认展开，这里记录被用户手动收起的服务器。
+    @State private var collapsedToolAuthorizationServerIDs: Set<String> = []
     @State private var oauthStates: [String: MCPOAuthState] = [:]
     @State private var oauthClientIDs: [String: String] = [:]
     @State private var oauthLoginIDs: Set<String> = []
     @State private var oauthBrowser: MCPWebAuthentication?
     @State private var oauthLoginTask: Task<Void, Never>?
+    /// 项目 .mcp.json 的待批准状态（按已知项目）。批准之前不会启动、不会授权。
+    @State private var projectMCPSnapshots: [MCPProjectConfigSnapshot] = []
+
+    private var projectMCPStore: MCPProjectConfigStore {
+        MCPProjectConfigStore.resident(directory: center.mcpManager.fileURL.deletingLastPathComponent())
+    }
+
+    private func refreshProjectMCP() {
+        let store = projectMCPStore
+        let existing = Set(center.mcpServers.map(\.id))
+        let roots = MinisCore.HookRuntime.installed?.knownProjectRoots() ?? []
+        projectMCPSnapshots = roots.compactMap { root in
+            let snapshot = store.snapshot(projectRoot: root, existingIDs: existing, existingServers: center.mcpServers)
+            if case .noFile = snapshot.trust { return nil }
+            return snapshot
+        }
+    }
+
+    /// 批准项目 .mcp.json。默认不覆盖用户改过的同 id 服务器；`overwriteModified` 为真（用户点“仍然覆盖”）才覆盖。
+    /// 覆盖已有服务器时一律保留用户的启用开关与超时，已存凭据不动。
+    private func approveProjectMCP(_ snapshot: MCPProjectConfigSnapshot, overwriteModified: Bool = false) {
+        guard let hash = snapshot.contentHash else { return }
+        let root = URL(fileURLWithPath: snapshot.projectRoot, isDirectory: true)
+        let toImport = (overwriteModified ? snapshot.allServers : snapshot.servers).map { server -> MCPServer in
+            guard let local = center.mcpServers.first(where: { $0.id == server.id }) else { return server }
+            var merged = server
+            merged.enabled = local.enabled
+            merged.timeoutSeconds = local.timeoutSeconds
+            merged.callTimeoutSeconds = local.callTimeoutSeconds
+            return merged
+        }
+        do {
+            // 先导入，全部成功后才记“已批准”；导入失败时批准按钮保留，可以重试。
+            guard importServers(toImport) else {
+                refreshProjectMCP()
+                return
+            }
+            try projectMCPStore.trust(projectRoot: root, expectedHash: hash,
+                                      serverIDs: toImport.map(\.id), servers: snapshot.allServers)
+            let skipped = overwriteModified ? [] : snapshot.locallyModifiedServers
+            if !skipped.isEmpty {
+                lastActionMessage = (lastActionMessage.map { $0 + " " } ?? "")
+                    + "你改过的 \(skipped.count) 个服务器没有自动更新：\(skipped.map(\.name).joined(separator: "、"))。需要时点“仍然覆盖”。"
+            }
+        } catch {
+            lastActionMessage = (error as? LocalizedError)?.errorDescription ?? "批准失败，请重试。"
+        }
+        refreshProjectMCP()
+    }
+
+    private func revokeProjectMCP(_ snapshot: MCPProjectConfigSnapshot) {
+        do {
+            try projectMCPStore.revokeTrust(projectRoot: URL(fileURLWithPath: snapshot.projectRoot, isDirectory: true))
+        } catch {
+            lastActionMessage = (error as? LocalizedError)?.errorDescription ?? "撤销批准失败，批准状态没有变化，请重试。"
+            refreshProjectMCP()
+            return
+        }
+        // 撤销批准要真的停下来：从这份文件导入的服务器（按 ID 对应）一并停用。
+        let importedIDs = Set(snapshot.servers.map(\.id))
+        var disabled: [String] = []
+        for server in center.mcpServers where server.enabled && importedIDs.contains(server.id) {
+            if center.toggleMCPServer(id: server.id, enabled: false) { disabled.append(server.name) }
+        }
+        lastActionMessage = disabled.isEmpty
+            ? "已撤销批准。之前导入的服务器没有变化。"
+            : "已撤销批准，并停用了从该文件导入的 \(disabled.count) 个服务器：\(disabled.joined(separator: "、"))。"
+        refreshProjectMCP()
+    }
+
+    @ViewBuilder
+    private func projectMCPSection(_ snapshot: MCPProjectConfigSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(snapshot.projectRoot).font(.callout).lineLimit(1).truncationMode(.middle)
+            switch snapshot.trust {
+            case .invalid(let reason):
+                Text(reason).font(.caption).foregroundStyle(.secondary)
+            case .noFile:
+                EmptyView()
+            case .untrusted(let changed):
+                Text(changed ? "内容在上次批准之后变了，需要重新批准。批准前不会启动，也不会授权。"
+                             : "项目自带的服务器配置，批准前不会启动，也不会授权。")
+                    .font(.caption).foregroundStyle(.secondary)
+            case .trusted:
+                Text("已批准；服务器已导入上方列表，工具仍需在列表里逐个授权。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(snapshot.entries) { entry in
+                Text("· \(entry.sourceName)：\(entry.server != nil ? entry.summary : (entry.note ?? "无法导入"))")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                if entry.server != nil, let note = entry.note {
+                    Text(note).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack {
+                if snapshot.needsTrustDecision, !snapshot.allServers.isEmpty {
+                    Button(snapshot.trust == .untrusted(changedSinceTrust: true) ? "批准更新" : "批准并导入") { approveProjectMCP(snapshot) }
+                        .accessibilityIdentifier("mcp.project.approve")
+                }
+                if snapshot.needsTrustDecision, !snapshot.locallyModifiedServers.isEmpty {
+                    Button("仍然覆盖你改过的") { approveProjectMCP(snapshot, overwriteModified: true) }
+                        .accessibilityIdentifier("mcp.project.overwriteModified")
+                }
+                if case .trusted = snapshot.trust {
+                    Button("撤销批准") { revokeProjectMCP(snapshot) }
+                        .accessibilityIdentifier("mcp.project.revoke")
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
 
 
 
@@ -65,6 +178,20 @@ struct MCPManagerView: View {
         }
     }
 
+    /// 配置文件写入被拦下时的说明（读取与列表仍可用，改动不会保存）。
+    static func persistenceConflictMessage(_ conflict: MCPPersistenceConflict) -> String {
+        switch conflict {
+        case .staleSnapshot, .needsReopen:
+            return "MCP 配置文件已被其他窗口或进程改动，当前改动不会保存。请重新打开此页面后再改。"
+        case .writerBusy:
+            return "MCP 配置文件正被其他进程写入，暂时无法保存改动，请稍后重试。"
+        case .incompleteSnapshot:
+            return "MCP 配置文件读取不完整，为避免覆盖原文件，改动暂不保存。请检查配置文件后重新打开此页面。"
+        case .scopeUnavailable, .documentUnavailable, .documentTooLarge:
+            return "MCP 配置文件无法读写，改动不会保存。请检查文件是否存在、权限与大小是否正常。"
+        }
+    }
+
     var body: some View {
         GeometryReader { geometry in
             let resolvedWidthClass = widthClass ?? AdaptiveLayoutPolicy.widthClass(for: geometry.size.width)
@@ -73,8 +200,17 @@ struct MCPManagerView: View {
 
                 Divider()
 
+                if let conflict = center.mcpManager.persistenceWriteConflict() {
+                    Text(Self.persistenceConflictMessage(conflict))
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("mcp.persistence-conflict")
+                }
+
                 let trashedServers = center.mcpManager.trashedServers()
-                if center.mcpServers.isEmpty && trashedServers.isEmpty {
+                if center.mcpServers.isEmpty && trashedServers.isEmpty && projectMCPSnapshots.isEmpty {
                     ContentUnavailableView(
                         label: {
                             Label {
@@ -91,6 +227,13 @@ struct MCPManagerView: View {
                     List {
                         ForEach(center.mcpServers) { server in
                             serverRow(server, widthClass: resolvedWidthClass)
+                        }
+                        if !projectMCPSnapshots.isEmpty {
+                            Section("项目 .mcp.json（待批准）") {
+                                ForEach(projectMCPSnapshots, id: \.projectRoot) { snapshot in
+                                    projectMCPSection(snapshot)
+                                }
+                            }
                         }
                         if !trashedServers.isEmpty {
                             Section("已删除的 MCP 服务器") {
@@ -112,6 +255,9 @@ struct MCPManagerView: View {
         .sheet(isPresented: $showingAddSheet) {
             MCPServerEditSheet { draft in saveServerDraft(draft) }
         }
+        .sheet(isPresented: $showingImportSheet) {
+            MCPJSONImportSheet(existingIDs: Set(center.mcpServers.map(\.id))) { servers in importServers(servers) }
+        }
         .sheet(item: $editingServer) { server in
             MCPServerEditSheet(existing: server) { draft in saveServerDraft(draft) }
         }
@@ -127,13 +273,15 @@ struct MCPManagerView: View {
                 if center.removeMCPServer(id: server.id) {
                     testResults[server.id] = nil
                     lastActionMessage = "已删除服务器「\(server.name)」。"
+                } else {
+                    lastActionMessage = MCPFailureMessage.change(center.lastMCPWriteFailure)
                 }
             }
             Button("取消", role: .cancel) {}
         } message: { server in
             Text("将「\(server.name)」移入回收区。恢复配置后需要重新授权。")
         }
-        .task { center.reloadMCP() }
+        .task { center.reloadMCP(); refreshProjectMCP() }
         .task(id: discoveryRevision) { await refreshOAuthStates() }
         .onReceive(NotificationCenter.default.publisher(for: MCPOAuthCoordinator.stateChanged)
             .receive(on: RunLoop.main)) { _ in discoveryRevision &+= 1 }
@@ -149,6 +297,20 @@ struct MCPManagerView: View {
     }
 
     @MainActor
+    @discardableResult
+    private func importServers(_ servers: [MCPServer]) -> Bool {
+        var added = 0
+        var failed: [String] = []
+        for server in servers {
+            if center.addMCPServer(server) { added += 1 } else { failed.append(server.name) }
+        }
+        lastActionMessage = failed.isEmpty
+            ? "已导入 \(added) 个服务器，默认未授权；请在列表中逐个检查并授权。"
+            : "已导入 \(added) 个；\(failed.count) 个导入失败：\(failed.joined(separator: "、"))。请检查配置后重试。"
+        return failed.isEmpty
+    }
+
+    @MainActor
     private func saveServerDraft(_ draft: MCPServerEditDraft) -> Bool {
         let saved = draft.save(to: center)
         if saved {
@@ -159,7 +321,7 @@ struct MCPManagerView: View {
             discoveryErrors[draft.id] = nil
         }
         lastActionMessage = saved ? "已保存服务器「\(draft.name)」。"
-            : "保存失败：配置已变化或写入失败，请核对后重试。"
+            : MCPFailureMessage.save(center.lastMCPWriteFailure)
         return saved
     }
 
@@ -250,6 +412,13 @@ struct MCPManagerView: View {
                 }
             }
 
+            Button {
+                showingImportSheet = true
+            } label: {
+                Text("从 JSON 导入")
+            }
+            .accessibilityIdentifier("mcp.import-json")
+
             if let lastActionMessage {
                 Text(lastActionMessage)
                     .font(typography?.caption ?? .caption)
@@ -316,8 +485,8 @@ struct MCPManagerView: View {
                     .font(typography?.caption2 ?? .caption2)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(Capsule().fill(server.type == .stdio ? .blue.opacity(0.15) : .purple.opacity(0.15)))
-                    .foregroundStyle(server.type == .stdio ? .blue : .purple)
+                    .background(Capsule().fill(mcpTypeTagColor(server.type).opacity(0.15)))
+                    .foregroundStyle(mcpTypeTagColor(server.type))
             }
 
             if let message = center.mcpManager.runtimeMessage(serverID: server.id) {
@@ -407,6 +576,8 @@ struct MCPManagerView: View {
                         if center.toggleMCPServer(id: server.id, enabled: newValue) {
                             lastActionMessage = newValue ? "已启用「\(server.name)」。"
                                                          : "已禁用「\(server.name)」。"
+                        } else {
+                            lastActionMessage = MCPFailureMessage.change(center.lastMCPWriteFailure)
                         }
                     }
                 ))
@@ -425,6 +596,8 @@ struct MCPManagerView: View {
                             if newValue {
                                 discoverTools(for: server)
                             }
+                        } else {
+                            lastActionMessage = MCPFailureMessage.change(center.lastMCPWriteFailure)
                         }
                     }
                 ))
@@ -504,6 +677,14 @@ struct MCPManagerView: View {
         }
     }
 
+    /// 传输类型标签色：本地进程用信息色，网络用主题强调色（全 App 只保留一种强调色）。
+    private func mcpTypeTagColor(_ type: MCPTransportType) -> Color {
+        switch type {
+        case .stdio: return theme?.statusInfo ?? AppStatusColor.info
+        case .http: return theme?.aj38.accent.swiftUIColor ?? Color.accentColor
+        }
+    }
+
     private func runTest(_ server: MCPServer) {
         testingID = server.id
         testResults[server.id] = nil
@@ -519,14 +700,14 @@ struct MCPManagerView: View {
     }
 
     private func toolAuthorizationSection(for server: MCPServer) -> some View {
-        let expanded = expandedToolAuthorizationServerIDs.contains(server.id)
+        let expanded = !collapsedToolAuthorizationServerIDs.contains(server.id)
         // Both entry points share the existing snapshot-based, idempotent
         // expansion mutation. Neither discovery nor authorization is invoked.
         let changeExpansion: () -> Void = {
             if expanded {
-                expandedToolAuthorizationServerIDs.remove(server.id)
+                collapsedToolAuthorizationServerIDs.insert(server.id)
             } else {
-                expandedToolAuthorizationServerIDs.insert(server.id)
+                collapsedToolAuthorizationServerIDs.remove(server.id)
             }
         }
         return VStack(alignment: .leading, spacing: 8) {
@@ -616,6 +797,27 @@ struct MCPManagerView: View {
             }
 
             let tools = center.mcpManager.cachedTools(serverID: server.id)
+            Text("授权和配置改动从你发送下一条消息起生效；改动时正在进行的回复里，还没返回的 MCP 调用会被取消。")
+                .font(typography?.caption ?? .caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("mcp.server.\(accessibilityComponent(server.id)).tools.effect-note")
+            let narrowed = center.mcpNarrowedToolCount(serverID: server.id)
+            if narrowed > 0 {
+                Text("\(narrowed) 个工具因定义变化需要重新授权。")
+                    .font(typography?.caption ?? .caption)
+                    .foregroundStyle(theme.map { Self.feedbackTextToken(succeeded: false, theme: $0).swiftUIColor } ?? .red)
+                    .accessibilityIdentifier("mcp.server.\(accessibilityComponent(server.id)).tools.narrowed")
+            }
+            if !tools.isEmpty {
+                HStack(spacing: 12) {
+                    Button("全部授权") { setAllTools(server: server, tools: tools, authorized: true) }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("mcp.server.\(accessibilityComponent(server.id)).tools.authorize-all")
+                    Button("全部取消") { setAllTools(server: server, tools: tools, authorized: false) }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("mcp.server.\(accessibilityComponent(server.id)).tools.revoke-all")
+                }
+            }
             if tools.isEmpty {
                 Text("尚未发现工具")
                     .font(typography?.caption ?? .caption)
@@ -664,6 +866,17 @@ struct MCPManagerView: View {
         }
     }
 
+    private func setAllTools(server: MCPServer, tools: [MCPTool], authorized: Bool) {
+        let names = tools.map(\.name)
+        if center.setMCPToolsAuthorized(serverID: server.id, toolNames: names, authorized: authorized) {
+            lastActionMessage = authorized ? "已授权「\(server.name)」的全部 \(names.count) 个工具。"
+                                           : "已撤销「\(server.name)」的全部工具授权。"
+            discoveryRevision &+= 1
+        } else {
+            lastActionMessage = "工具授权保存失败。"
+        }
+    }
+
     private func discoverTools(for server: MCPServer) {
         guard discoveringToolsID == nil else { return }
         discoveringToolsID = server.id
@@ -684,7 +897,11 @@ struct MCPManagerView: View {
             do {
                 try await center.mcpManager.reconnect(serverID: server.id)
                 lastActionMessage = "已重连「\(server.name)」，工具列表已刷新。"
-            } catch { lastActionMessage = "重连「\(server.name)」失败，请检查配置后重试。" }
+            } catch {
+                lastActionMessage = center.isSafetyFeatureEnabled(.mcp)
+                    ? "重连「\(server.name)」失败：" + MCPFailureMessage.reconnect(error)
+                    : "重连「\(server.name)」失败：MCP 功能已被 Safe Mode/Kill Switch 关闭。"
+            }
             reconnectingIDs.remove(server.id)
             center.reloadMCP()
             discoveryRevision &+= 1
@@ -814,11 +1031,13 @@ private struct MCPServerEditSheet: View {
                     .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(draft.isEditing ? "新增或替换环境变量（留空保留原配置）" : "环境变量（KEY=VALUE，逗号分隔，可留空）").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
-                    TextField("API_KEY=xxx, DEBUG=1", text: $draft.envText)
+                    Text(draft.isEditing ? "新增或替换环境变量（每行一个，留空保留原配置）" : "环境变量（每行一个 KEY=VALUE，可留空）").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                    TextEditor(text: $draft.envText)
                         .font(typography?.monospaced ?? .system(.body, design: .monospaced))
-                        .textFieldStyle(.roundedBorder)
+                        .frame(height: 64)
+                        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.35)))
                         .focused($focusedField, equals: .env)
+                        .accessibilityIdentifier("mcp.server.edit.env")
                     Text("除安全基础运行变量外，仅这里列出的变量会传给该服务器；不会继承 App 中的 Provider 密钥。")
                         .font(typography?.caption ?? .caption)
                         .foregroundStyle(.secondary)
@@ -854,7 +1073,22 @@ private struct MCPServerEditSheet: View {
                 }
             }
 
+            VStack(alignment: .leading, spacing: 4) {
+                Text("工具调用超时（秒，留空为 600）").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                TextField("600", text: $draft.callTimeoutText)
+                    .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+                    .accessibilityIdentifier("mcp.server.edit.call-timeout")
+            }
+
             Toggle("启用（供智能体调用）", isOn: $draft.enabled)
+
+            if let problem = draft.problem {
+                Text(problem)
+                    .modifier(ReadableStatusForeground(status: .danger))
+                    .accessibilityIdentifier("mcp.server.edit.problem")
+            }
 
             if saveFailed {
                 Text("保存失败，草稿已保留；配置可能已变化，请核对后重试。")
@@ -883,6 +1117,75 @@ private struct MCPServerEditSheet: View {
         }
     }
 
+}
+
+// MARK: - 从 JSON 导入
+
+private struct MCPJSONImportSheet: View {
+    let existingIDs: Set<String>
+    let onImport: ([MCPServer]) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.typographyTokens) private var typography
+    @State private var text = ""
+
+    var body: some View {
+        let preview = MCPServerJSONImport.preview(text, existingIDs: existingIDs)
+        let importable = preview.importableServers
+        VStack(alignment: .leading, spacing: 12) {
+            Text("从 JSON 导入 MCP 服务器").font(typography?.headline ?? .headline)
+            Text("粘贴 Claude Code 或 Claude Desktop 的配置，例如 {\"mcpServers\": {…}}，也可以只粘贴单个服务器对象。")
+                .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+            TextEditor(text: $text)
+                .font(typography?.monospaced ?? .system(.body, design: .monospaced))
+                .frame(height: 160)
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.secondary.opacity(0.35)))
+                .accessibilityIdentifier("mcp.import.text")
+            if let error = preview.parseError {
+                Text(error).modifier(ReadableStatusForeground(status: .danger))
+            }
+            if !preview.entries.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(preview.entries) { entry in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(entry.sourceName).fontWeight(.medium)
+                                if !entry.summary.isEmpty {
+                                    Text(entry.summary)
+                                        .font(typography?.caption2 ?? .caption2).foregroundStyle(.secondary)
+                                        .lineLimit(2).truncationMode(.middle)
+                                }
+                                if let note = entry.note {
+                                    if entry.server == nil {
+                                        Text(note).font(typography?.caption ?? .caption)
+                                            .modifier(ReadableStatusForeground(status: .danger))
+                                    } else {
+                                        Text(note).font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 160)
+            }
+            Text("导入后的服务器默认未授权，需在列表中逐个授权后才会被智能体调用；环境变量和请求头里的密钥保存在钥匙串。")
+                .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("导入 \(importable.count) 个") {
+                    onImport(importable)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(importable.isEmpty)
+                .accessibilityIdentifier("mcp.import.confirm")
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
 }
 
 // MARK: - Preview

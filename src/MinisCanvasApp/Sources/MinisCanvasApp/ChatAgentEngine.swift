@@ -499,10 +499,6 @@ final class TurnToolCallAccumulator: @unchecked Sendable {
     /// Receipts decided at settlement time to be held for a transcript pair.
     private var heldReceiptIDs = Set<String>()
     private var nonExecutionResults: [(String, ToolNonExecutionReason)] = []
-    /// Excerpt pairs already kept this turn (D-07 per-turn ceiling).
-    private var keptExcerptPairs = 0
-    private var keptExcerptBytes = 0
-
 
     private struct SettlementID: Hashable {
         let key: ToolExecutionCompositeKey?
@@ -660,19 +656,11 @@ final class TurnToolCallAccumulator: @unchecked Sendable {
                 guard results.count == 1, let content = results.first,
                       forwardedSettlements.insert(SettlementID(key: fact.compositeKey,
                                                                receiptID: fact.receiptID)).inserted else { continue }
-                var transcript = CrossTurnToolTracePolicy.transcript(
+                // The per-turn excerpt ceiling (newest pairs win) is applied by the consumer
+                // that persists the pairs, see `CrossTurnExcerptWindow`.
+                let transcript = CrossTurnToolTracePolicy.transcript(
                     call: call, result: content,
                     knownSecrets: ModelShellEnvironment.knownCredentialValues()) ?? []
-                if let cost = CrossTurnToolTracePolicy.excerptCost(of: transcript) {
-                    // Over the per-turn ceiling the whole pair is dropped, never half of it.
-                    if keptExcerptPairs >= CrossTurnToolTracePolicy.excerptPairLimitPerTurn
-                        || keptExcerptBytes + cost > CrossTurnToolTracePolicy.excerptByteLimitPerTurn {
-                        transcript = []
-                    } else {
-                        keptExcerptPairs += 1
-                        keptExcerptBytes += cost
-                    }
-                }
                 completed.append((fact, transcript))
             }
             for (fact, _) in completed { pendingTraceFacts.removeValue(forKey: fact.receiptID) }
@@ -1025,13 +1013,16 @@ private func deduplicatedToolCalls(_ calls: [LLMToolCall]) throws -> [LLMToolCal
     return result
 }
 
-private func normalizedRetryFailurePartialMessages(
+/// The loop reports its whole message list on failure: prior-turn history first, then
+/// this attempt's output. A retry envelope may carry exactly one user message — the
+/// turn's own input, the last one before any produced message — never earlier turns.
+func normalizedRetryFailurePartialMessages(
     _ partialMessages: [LLMMessage],
     acceptedToolCallIDs: Set<String>
 ) -> [LLMMessage] {
     var seenAssistantCallIDs = Set<String>()
     var seenToolResultIDs = Set<String>()
-    return partialMessages.compactMap { message in
+    let kept: [LLMMessage] = partialMessages.compactMap { message in
         var normalized = message
         switch message.role {
         case .assistant:
@@ -1054,6 +1045,9 @@ private func normalizedRetryFailurePartialMessages(
             return normalized
         }
     }
+    let producedStart = kept.firstIndex { $0.role != .user } ?? kept.endIndex
+    guard let currentInput = kept[..<producedStart].last else { return kept }
+    return [currentInput] + kept[producedStart...]
 }
 
 enum ChatTurnRuntimeSnapshotError: Error, Equatable, Sendable {
@@ -1070,7 +1064,7 @@ extension ChatTurnRuntimeSnapshotError: LocalizedError {
         case .identityMismatch:
             return "聊天回合运行时快照身份不匹配，已拒绝执行"
         case .invalidExecutionIdentity:
-            return "聊天回合执行身份与 Composer 快照不匹配，已拒绝执行"
+            return "聊天回合执行身份与输入策略快照不匹配，已拒绝执行"
         }
     }
 }
@@ -1603,7 +1597,7 @@ struct FallbackChatEngine: ChatAgentEngine {
                     let messages = try await historyPreprocessor.prepare(history)
                     let stream = try await providerBox.value.streamMessage(
                         messages: messages, systemPrompt: systemPrompt,
-                        maxTokens: maxTokens, temperature: 0.7
+                        maxTokens: maxTokens, temperature: nil
                     )
                     for try await chunk in stream {
                         if Task.isCancelled { break }
@@ -1675,6 +1669,18 @@ enum ProductionContextRecoveryFailure: Error, Equatable, LocalizedError, Sendabl
     }
 }
 
+/// 同一会话同一组被跳过的 MCP 工具只提示一次（引擎每回合重建，状态须在进程级）。
+final class SkippedMCPNoticeLedger: @unchecked Sendable {
+    static let shared = SkippedMCPNoticeLedger()
+    private let lock = NSLock()
+    private var seen: [String: Set<String>] = [:]
+    /// 首次出现返回 true；同会话同一组（与顺序无关）再次出现返回 false。
+    func claim(sessionID: String, names: [String]) -> Bool {
+        let signature = names.sorted().joined(separator: "\u{1e}")
+        return lock.withLock { seen[sessionID, default: []].insert(signature).inserted }
+    }
+}
+
 struct AgentLoopChatEngine: ChatAgentEngine {
     /// Main chat wall clock: long enough for a 16K-token output (SecureAgentLoopFactory keeps 300 s for other callers).
     static let mainChatExecutionTimeout: TimeInterval = 900
@@ -1683,9 +1689,13 @@ struct AgentLoopChatEngine: ChatAgentEngine {
     /// The caller must retain its existing credential projection before storage.
     static func retryFailureMessage(for error: Error) -> String {
         if let llmError = error as? LLMError {
-            return llmError.friendlyMessage(locale: Locale(identifier: "zh_CN"))
+            // ChatGPT 账号的本地固定文案（用量上限、需重新登录等）原样带进重试信封，
+            // 对话界面从信封取文案时才不会被通用提示盖掉。
+            if let guidance = ChatGPTAccountErrors.fixedGuidance(for: llmError) { return guidance }
+            return UserFacingErrorText.stripEnglishTag(llmError.friendlyMessage(locale: Locale(identifier: "zh_CN")))
         }
-        return error.localizedDescription
+        // 非供应商错误：中文固定文案原样用，系统/第三方英文原文不进界面（见 UserFacingErrorText）。
+        return UserFacingErrorText.describe(error)
     }
 
     /// 95% window admission and a final provider overflow after retry: the two
@@ -1885,6 +1895,13 @@ struct AgentLoopChatEngine: ChatAgentEngine {
         guard let owner = (candidate as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner else { return false }
         return owner.webFetchAvailable && owner.registeredToolNames.contains(WebFetchToolContract.toolName)
     }
+    /// E1：只有配置了可用的搜索服务（后端已选、密钥或地址有效）才向模型广播 web_search。
+    static func webSearchAvailable(in executor: any ToolExecutor) -> Bool {
+        var candidate = executor
+        while let concurrent = candidate as? ConcurrentToolLimitingExecutor { candidate = concurrent.baseBox.value }
+        guard let owner = (candidate as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner else { return false }
+        return owner.webSearchAvailable && owner.registeredToolNames.contains(WebSearchToolContract.toolName)
+    }
 
     func makeTurnToolCatalog(
         bridge: (any MCPToolBridge)?, settingsAvailable: Bool,
@@ -1897,14 +1914,32 @@ struct AgentLoopChatEngine: ChatAgentEngine {
             speechAvailability: speechAvailability).tools
     }
 
+    /// 被跳过的 MCP 工具（参数类型暂不支持）的一次性可见提示；只含服务名与工具名。
+    static func skippedMCPToolsNotice(_ skipped: [(server: String, tool: String)]) -> String {
+        var order: [String] = []
+        var grouped: [String: [String]] = [:]
+        for item in skipped {
+            if grouped[item.server] == nil { order.append(item.server) }
+            grouped[item.server, default: []].append(item.tool)
+        }
+        let parts = order.map { server -> String in
+            let tools = grouped[server] ?? []
+            return "\(server) 的 \(tools.count) 个工具（\(tools.joined(separator: "、"))）"
+        }
+        return "⚠️ " + parts.joined(separator: "；") + "参数格式暂不支持，已跳过，其余工具可用。\n\n"
+    }
+
     func makeTurnToolCatalogWithSources(
         bridge: (any MCPToolBridge)?, settingsAvailable: Bool,
         skillMaintenanceAvailable: Bool = false,
         onDiscoveryState: AgentToolCatalog.DiscoveryObserver? = nil,
         speechAvailability: SpeechToolAvailabilitySnapshot?,
-        goalUpdateAvailable: Bool = false, memoryProposalAvailable: Bool = false
+        goalUpdateAvailable: Bool = false, memoryProposalAvailable: Bool = false,
+        skippedMCPNoticeSessionID: String? = nil,
+        onSkippedMCPNotice: (@Sendable (String) -> Void)? = nil
     ) async throws -> (tools: [AgentToolDefinition], mcpDefinitions: [AgentToolDefinition]?) {
         guard !answerOnlyRegeneration else { return ([], []) }
+        let skippedNames = OSAllocatedUnfairLock<[String]>(initialState: [])
         let remoteCount = OSAllocatedUnfairLock<Int?>(initialState: nil)
         let orchestration = try await orchestrationDefinitionSource?() ?? orchestrationDefinition
         // Re-read the exact current BrowserTool configuration for each catalog.
@@ -1923,8 +1958,20 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                 }
                 onDiscoveryState?(state)
             },
+            onSkippedMCPTools: { names in skippedNames.withLock { $0 = names } },
             speechAvailability: speechAvailability,
             browserWriteActionsVisible: browserWriteActionsVisible)
+        if let bridge, let onSkippedMCPNotice, let sessionID = skippedMCPNoticeSessionID {
+            let names = skippedNames.withLock { $0 }
+            if !names.isEmpty, SkippedMCPNoticeLedger.shared.claim(sessionID: sessionID, names: names) {
+                // 只为取服务名与原始工具名；发现已成功一次，这里只做名称映射。
+                let bound = (try? await bridge.mcpBoundTools()) ?? []
+                let byFullName = Dictionary(bound.map { ($0.fullName, $0) }, uniquingKeysWith: { first, _ in first })
+                onSkippedMCPNotice(Self.skippedMCPToolsNotice(names.map { name in
+                    byFullName[name].map { (server: $0.serverID, tool: $0.tool.name) } ?? (server: "MCP", tool: name)
+                }))
+            }
+        }
         // Core emits succeeded immediately before returning local + remote.
         // Capture that exact remote suffix before App-only additions below.
         let remoteDefinitions = remoteCount.withLock { count in
@@ -1937,6 +1984,9 @@ struct AgentLoopChatEngine: ChatAgentEngine {
             if let owner = (candidate as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner {
                 tools.append(WebFetchToolContract.definition(for: owner))
             }
+        }
+        if Self.webSearchAvailable(in: executorBox.value) {
+            tools.append(WebSearchToolContract.definition)
         }
         if let projectSessionDefinitions { tools.append(contentsOf: projectSessionDefinitions) }
         if userQuestions != nil { tools.append(AskUserQuestionTool.definition()) }
@@ -3159,13 +3209,16 @@ struct AgentLoopChatEngine: ChatAgentEngine {
             do {
                 let facts = CompactionFactCapture.capture(sessionID: sessionID,
                     revision: canonical.transcriptRevision, messages: closed,
-                    taskStore: tasks, effectLedger: ledger, includeTerminalTasks: true)
+                    taskStore: tasks, effectLedger: ledger)
                 let result = try await LossySummaryCompaction.compact(
                     messages: closed, keepRecent: ChatStore.defaultCompactionKeepRecent,
                     provider: summaryProvider, systemPrompt: systemPrompt,
                     attachmentNames: try ChatAttachmentPersistence.attachmentNames(
                         canonical: canonical, directory: store.directory),
-                    retentionFacts: facts)
+                    retentionFacts: facts,
+                    priorSummary: LossySummaryCompaction.priorSummary(
+                        checkpoint: try? store.loadLatestCompactionCheckpoint(sessionID: sessionID),
+                        messages: closed))
                 try Task.checkCancellation()
                 guard result.compactedCount > 0 else { return "没有可压缩的旧内容。" }
                 guard Compactor.hasMaterialRequestReduction(from: closed, to: result.messages) else {
@@ -3264,13 +3317,16 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                 }
                 let facts = CompactionFactCapture.capture(sessionID: sessionID,
                     revision: canonical.transcriptRevision, messages: closed,
-                    taskStore: tasks, effectLedger: ledger, includeTerminalTasks: true)
+                    taskStore: tasks, effectLedger: ledger)
                 let result = try await LossySummaryCompaction.compact(
                     messages: closed, keepRecent: compactor.keepRecentMessages, provider: summaryProvider,
                     systemPrompt: systemPrompt,
                     attachmentNames: try ChatAttachmentPersistence.attachmentNames(
                         canonical: canonical, directory: store.directory),
-                    retentionFacts: facts)
+                    retentionFacts: facts,
+                    priorSummary: LossySummaryCompaction.priorSummary(
+                        checkpoint: try? store.loadLatestCompactionCheckpoint(sessionID: sessionID),
+                        messages: closed))
                 try Task.checkCancellation()
                 // The live UI assistant is retained canonically for restart,
                 // but Core appends this response only after the budget branch.
@@ -3296,7 +3352,10 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                 // callback return is never proof that a checkpoint is durable.
                 let resumed = try ChatSessionBridge.resumeCanonicalMessages(
                     sessionStore: store, sessionID: sessionID, taskStore: tasks, effectLedger: ledger)
-                guard resumed == checkpoint.replacementHistory + live else {
+                // The background (unfinished tasks, non-succeeded receipts) is rebuilt from the
+                // stores on every resume; only the summary and the tail must match the checkpoint.
+                guard ChatSessionBridge.resumedMatchesCheckpoint(
+                    resumed, checkpoint: checkpoint, live: live) else {
                     throw AgentLoopError.compactionCheckpointUnavailable("canonical facts changed during commit")
                 }
                 try Task.checkCancellation()
@@ -3832,11 +3891,12 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                 return nil
             }
             let projected = try projectionSlot.read().apply(to: messages)
-            return mediaProjection?.apply(projected) ?? projected
+            // 历史媒体字节预算：较早轮次的媒体超出预算后换成文字占位，只作用于请求副本。
+            return HistoryMediaBudget.apply(mediaProjection?.apply(projected) ?? projected)
         }
         let providerMessageProjection: @Sendable ([LLMMessage]) throws -> [LLMMessage] = { messages in
             guard let delivered = try parentDeliveryProjection(messages) else {
-                return mediaProjection?.apply(messages) ?? messages
+                return HistoryMediaBudget.apply(mediaProjection?.apply(messages) ?? messages)
             }
             // C4: the request-copy reduction is the last stage, after history and
             // media projection (the media sidecar matches messages one by one).
@@ -3850,7 +3910,9 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                 windowTokens: config.windowTokens, triggerFraction: config.triggerFraction,
                 initialAnchor: config.initialAnchor, reduction: config.reduction,
                 compactionAlreadyJudged: config.compactionAlreadyJudged,
-                deliveryProjection: { messages in try parentDeliveryProjection(messages) ?? messages })
+                deliveryProjection: { messages in try parentDeliveryProjection(messages) ?? messages },
+                outputReserveTokens: config.outputReserveTokens,
+                allowsCompaction: config.allowsCompaction)
         }
         return AsyncThrowingStream { continuation in
             // D-PROVIDER-15: observe complete responses after retry/fallback,
@@ -3970,7 +4032,9 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                                 )
                             },
                             speechAvailability: turnSpeechAvailability,
-                            goalUpdateAvailable: goalUpdate != nil, memoryProposalAvailable: manualMemoryProposal != nil
+                            goalUpdateAvailable: goalUpdate != nil, memoryProposalAvailable: manualMemoryProposal != nil,
+                            skippedMCPNoticeSessionID: (contextInput?.executionIdentity ?? executionIdentity)?.turn.sessionID,
+                            onSkippedMCPNotice: { notice in continuation.yield(.textDelta(notice)) }
                             )
                             tools = catalog.tools
                             mcpDefinitions = catalog.mcpDefinitions
@@ -4001,6 +4065,9 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                         productionLoop.onAssistantTextDelta = { iteration, delta in
                             assistantDeltaRelay.append(iteration: iteration, delta: delta)
                             continuation.yield(.textDelta(delta))
+                        }
+                        productionLoop.onAssistantThinkingDelta = { _, delta in
+                            continuation.yield(.thinkingDelta(delta))
                         }
                         productionLoop.onTruncatedAssistantResponse = { iteration, partialText, notice in
                             let streamedText = assistantDeltaRelay.text(forIteration: iteration)
@@ -4035,6 +4102,10 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                         // and authority settlement observations; neither is a grant.
                         productionLoop.onApprovalLifecycle = { fact in
                             continuation.yield(.approvalLifecycle(fact))
+                        }
+                        // 前台命令的实时输出：只进界面看板，不进工具结果，也不起新一轮。
+                        productionLoop.onToolLiveOutput = { callID, text in
+                            ShellLiveOutputBoard.receive(callID: callID, text: text)
                         }
                         productionLoop.onToolNonExecution = { callID, reason in
                             if case .requestPreflightExpired = reason {
@@ -4101,7 +4172,7 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                                 maxTokens: loopOutputTokenBudget.baseMaxTokens,
                                 maxOutputTokensCeiling: loopOutputTokenBudget.hardCeiling,
                                 contextSettings: contextSettings,
-                                temperature: 0.7,
+                                temperature: nil,
                                 currentConversationID: conversationID,
                                 authorizedSessionReadSessionID: authorizedSessionReadSessionID,
                                 authorizedSessionReadScope: authorizedSessionReadScope,
@@ -4413,16 +4484,19 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                                 )
                             }
                         } catch let retryError {
-                            terminalError = ChatRetryFailureError(
-                                originalMessage: error.localizedDescription,
-                                retryMessage: retryError.localizedDescription
-                            )
+                            // 重试账本没记上只影响"重试"按钮能否复用本轮记录，不改变这轮为什么失败：
+                            // 界面照常按原始错误分类显示（如 HTTP 503、达到迭代上限），账本失败只进系统日志。
+                            os.Logger(subsystem: "com.miniscanvas.chat", category: "retry-ledger")
+                                .error("retry failure not recorded: \(String(reflecting: retryError), privacy: .public); original=\(String(reflecting: type(of: error)), privacy: .public)")
                         }
                     }
                     // The retry envelope above is already recorded. The envelope only
                     // carries a display string, so a terminal window-full failure is
                     // surfaced with its own type for ChatStore's continue card.
+                    // 额度不足、授权失败同理：保留原始类别，对话里才能给出"检查 API Key / 去充值"。
                     if Self.isTerminalContextWindowFailure(error) {
+                        terminalError = error
+                    } else if let llm = error as? LLMError, llm.isQuotaExhausted || llm.isAuthorizationFailure {
                         terminalError = error
                     }
                     if let runtime = preparedContext?.runtime,
@@ -4442,8 +4516,7 @@ struct AgentLoopChatEngine: ChatAgentEngine {
                         await turnRegistry.finish(turnID: turnID)
                     }
                     if let exhaustion, !Task.isCancelled,
-                       !retryCancellationState.isCancellationRequested,
-                       !(terminalError is ChatRetryFailureError) {
+                       !retryCancellationState.isCancellationRequested {
                         continuation.finish(throwing: exhaustion.preservingFact(with: terminalError))
                     } else {
                         continuation.finish(throwing: terminalError)
@@ -4701,7 +4774,7 @@ extension AgentLoopChatEngine {
         systemPrompt: String,
         userText: String,
         maxTokens: Int = 2048,
-        temperature: Double? = 0.7,
+        temperature: Double? = nil,
         onRecorded: (@Sendable (Int) -> Void)? = nil
     ) async throws -> String {
         // F18b：单轮路径同样接 MinisCore 重试包装（默认策略 3 次、0.5/1/2s）。
@@ -4998,8 +5071,8 @@ struct ManualMemoryFactProposal: Sendable {
         guard input.count == 1, let proposed = input["fact"] as? String else {
             throw ToolExecutorError.invalidParameter("请提供一条记忆候选事实")
         }
-        guard proposed.count <= 400, proposed.utf8.count <= 512 else {
-            throw ToolExecutorError.invalidParameter("记忆候选最多 400 个字符且不超过 512 个 UTF-8 字节")
+        guard proposed.count <= MemoryInjector.maxFactCharacters, proposed.utf8.count <= MemoryInjector.maxFactCharacters * 3 + 200 else {
+            throw ToolExecutorError.invalidParameter("记忆候选最多 \(MemoryInjector.maxFactCharacters) 个字符")
         }
         guard proposed.utf8.elementsEqual(fact.utf8) else {
             throw ToolExecutorError.invalidParameter("记忆候选必须与本回合用户原文一致")
@@ -5494,7 +5567,8 @@ extension ChatAgentEngine {
         history: [ChatMessageUI],
         systemPrompt: String,
         keepRecent: Int,
-        retentionFacts: [CompactionRetainedFact] = []
+        retentionFacts: [CompactionRetainedFact] = [],
+        priorSummary: LossySummaryCompaction.PriorSummary? = nil
     ) async throws -> CompactionResult {
         let messages = history.map { $0.asLLMMessage() }
         // A message still streaming has no final content to summarize.
@@ -5508,16 +5582,20 @@ extension ChatAgentEngine {
         return try await LossySummaryCompaction.compact(
             messages: messages, keepRecent: keepRecent, provider: provider,
             systemPrompt: systemPrompt, attachmentNames: ChatMessageUI.attachmentNames(in: history),
-            retentionFacts: retentionFacts)
+            retentionFacts: retentionFacts, priorSummary: priorSummary)
     }
 }
 
 extension ChatMessageUI {
-    /// Attachment file names by message index, for the summary's fact list.
+    /// Attachment file names (with the source path when known) by message index,
+    /// for the summary's fact list. The path lets the model re-read a file after
+    /// the original content is compacted away.
     static func attachmentNames(in history: [ChatMessageUI]) -> [Int: [String]] {
         var names: [Int: [String]] = [:]
         for (index, message) in history.enumerated() where !message.attachments.isEmpty {
-            names[index] = message.attachments.map(\.fileName)
+            names[index] = message.attachments.map { attachment in
+                attachment.fileURL.map { "\(attachment.fileName)（路径 \($0)）" } ?? attachment.fileName
+            }
         }
         return names
     }
@@ -5536,7 +5614,7 @@ extension ChatAttachmentPersistence {
 extension AgentLoopChatEngine {
     func validateCompactionFacts(_ facts: [CompactionRetainedFact]) -> Bool {
         CompactionFactCapture.verifyStores(facts, taskStore: loop.taskStore,
-            effectLedger: toolExecutionFactLedger, atCommit: true)
+            effectLedger: toolExecutionFactLedger)
     }
 
     func compactContext(provider: any LLMProvider, history: [ChatMessageUI],
@@ -5561,7 +5639,10 @@ extension AgentLoopChatEngine {
             revision: canonical.transcriptRevision, messages: messages,
             taskStore: loop.taskStore, effectLedger: toolExecutionFactLedger)
         return try await compactContextBySummary(provider: provider, history: history,
-            systemPrompt: systemPrompt, keepRecent: keepRecent, retentionFacts: facts)
+            systemPrompt: systemPrompt, keepRecent: keepRecent, retentionFacts: facts,
+            priorSummary: LossySummaryCompaction.priorSummary(
+                checkpoint: try? store.loadLatestCompactionCheckpoint(sessionID: sourceSessionID),
+                messages: messages))
     }
 
     func compactContext(
@@ -5618,6 +5699,10 @@ extension ChatStore {
             appendCompactionNotice(notice,
                 forSession: sessionID, expectedTranscriptRevision: transcriptRevision)
             return
+        }
+        if let sessionID {
+            MinisCore.HookRuntime.installed?.notifyEvent(
+                .preCompact, sessionID: sessionID.uuidString, fields: ["trigger": "manual"])
         }
         let snapshot = history
         // Keep the existing explicit override and intrinsic Mock path. A
@@ -5746,6 +5831,10 @@ extension ChatStore {
             } else {
                 finishCompactionPresentation(requestID: requestID, sessionID: presentationSessionID,
                     state: result == .adopted ? .succeeded : .notCompacted)
+                // 被压缩的旧消息里有图片：后续对话不再带原图，只在摘要里留文字和文件路径，提示一次。
+                if result == .adopted {
+                    noteCompactedImagesIfNeeded(history: history, keepRecent: keepRecent, sessionID: sessionID)
+                }
             }
         } catch {
             let providerCancelled: Bool
@@ -5774,6 +5863,24 @@ extension ChatStore {
                     forSession: sessionID, expectedTranscriptRevision: expectedTranscriptRevision)
             }
         }
+    }
+
+    /// 被压缩的旧消息里有图片：后续对话不再带原图，只在摘要里留文字和文件路径；每个会话提示一次。
+    /// 手动、自动、定时三条压缩路径共用。
+    private func noteCompactedImagesIfNeeded(history: [ChatMessageUI], keepRecent: Int, sessionID: UUID?) {
+        func hasImage(_ message: ChatMessageUI) -> Bool {
+            message.attachments.contains { $0.kind == .image || $0.videoFrames != nil }
+        }
+        guard let sessionID, !compactionImageNoticeSessionIDs.contains(sessionID),
+              history.contains(where: hasImage) else { return }
+        // 太大的近期消息（带大图、大段文字）也会被并入摘要，按实际保留条数算。
+        let retained = LossySummaryCompaction.retainedCount(
+            messages: history.map { $0.asLLMMessage() }, keepRecent: keepRecent)
+        guard history.prefix(max(0, history.count - retained)).contains(where: hasImage) else { return }
+        compactionImageNoticeSessionIDs.insert(sessionID)
+        appendCompactionNotice(
+            "提示：被压缩的旧消息里有图片，后续对话不再带原图，摘要里只保留文字描述和文件路径；需要模型再看图时，请重新添加图片。",
+            forSession: sessionID, expectedTranscriptRevision: nil)
     }
 
     /// Route a manual compaction notice to its captured source session. A nil
@@ -5833,6 +5940,9 @@ extension ChatStore {
             preflightWorkObserverForTests: preflightWorkObserverForTests,
             preflightPauseForTests: preflightPauseForTests, finalizationPauseForTests: finalizationPauseForTests,
             hint: hint)
+        if result == .adopted {
+            noteCompactedImagesIfNeeded(history: history, keepRecent: keepRecent, sessionID: sessionID)
+        }
         return result != .unchanged
     }
 
@@ -5926,7 +6036,10 @@ extension ChatStore {
                 result = try await compactionEngine.compactContextBySummary(
                     provider: resolvedProviderBox.value, history: history,
                     systemPrompt: N05CompactionGuidance.systemPrompt(base: Self.systemPrompt, hint: hint),
-                    keepRecent: keepRecent, retentionFacts: facts)
+                    keepRecent: keepRecent, retentionFacts: facts,
+                    priorSummary: LossySummaryCompaction.priorSummary(
+                        checkpoint: try? runtimeStore.loadLatestCompactionCheckpoint(sessionID: sessionID.uuidString),
+                        messages: historyProjection))
             } else {
                 result = try await compactionEngine.compactContext(
                     provider: resolvedProviderBox.value,

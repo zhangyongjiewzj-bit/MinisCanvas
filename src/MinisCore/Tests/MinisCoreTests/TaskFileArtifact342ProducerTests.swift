@@ -139,6 +139,8 @@ struct TaskFileArtifact342ProducerTests {
         let executor = TargetDispatch867(builtin: builtin, binding: binding, factURL: factURL)
         let output = root.appendingPathComponent("effect867.txt")
         try "before867\n".write(to: output, atomically: true, encoding: .utf8)
+        // 覆盖已有文件前须先读（用户附件/@ 引用同样登记为已读）；本测试关心的是写入效果的归属，不是先读规则。
+        builtin.markFileRead(path: output.path, sessionID: session)
         let input: [String: Any] = tool == "file_write"
             ? ["path": output.path, "content": "after867\n"]
             : ["path": output.path, "old_string": "before867", "new_string": "after867"]

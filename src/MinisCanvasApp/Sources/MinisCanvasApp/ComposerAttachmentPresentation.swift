@@ -37,7 +37,7 @@ enum ComposerAttachmentChipStatus: String, Equatable, Sendable {
         case .reading: return "读取中"
         case .readFailed: return "读取失败"
         case .resolvingOrDegraded: return "读取中或已降级为文件引用"
-        case .sampledVideoFrames: return "静帧已就绪，发送取决于模型图片能力"
+        case .sampledVideoFrames: return "静帧已就绪，模型不支持图片时发送为路径引用"
         case .videoSampling: return "视频抽帧中"
         case .videoSamplingFailed: return "视频抽帧失败，未发送画面"
         case .referenceOnly: return "文件引用"
@@ -87,21 +87,56 @@ enum ComposerAttachmentPresentation {
         }
     }
 
-    /// String.count matches the producer's prefix cap; unknown historical
-    /// totals stay unknown, with no guessed length from byte size or cap equality.
+    /// 状态行的截断说明，措辞与 ChatStore 的三种注入方式一致：
+    /// - 头尾保留：开头 48000 字 + 结尾 12000 字，中间省略，全文字数精确；
+    /// - 只读了文件开头：全文字数按文件大小估算，写“约 N 字”；
+    /// - 富文本文档提取：只截取前 N 字，全文较长、总数未知（不编造总字数）。
+    /// 其余历史/手工构造的附件沿用“前 X 字 / 共 N 字”。String.count 与生产端的前缀截断口径一致；
+    /// 未知的历史总数保持未知，不按字节数或恰好等于上限去猜。
     nonisolated static func truncationNotice(for attachment: ChatAttachment, sent: Bool) -> String? {
+        // 已就绪的文本附件没有内容、却留着原路径：会话元数据超限时被降级为只存引用。
+        if attachment.status == .ready, attachment.kind == .text,
+           attachment.data == nil, attachment.fileURL != nil {
+            return "内容过大，只保存了引用"
+        }
         guard attachment.status == .ready, attachment.kind == .text,
-              let original = attachment.originalTextCharacterCount, original > 0,
-              let data = attachment.data, let text = String(data: data, encoding: .utf8),
+              let data = attachment.data, let text = String(data: data, encoding: .utf8) else { return nil }
+        func number(_ value: Int) -> String {
+            value.formatted(.number.locale(Locale(identifier: "en_US_POSIX")))
+        }
+        let verb = sent ? "已发送" : "将发送"
+        if let note = text.range(of: "\n\n" + ChatStore.richDocumentTruncationNoteMarker, options: .backwards) {
+            return "\(verb)前 \(number(text[..<note.lowerBound].count)) 字，全文较长，其余未提取"
+        }
+        guard let original = attachment.originalTextCharacterCount, original > 0,
               text.count < original else { return nil }
-        let injected = text.count.formatted(.number.locale(Locale(identifier: "en_US_POSIX")))
-        let total = original.formatted(.number.locale(Locale(identifier: "en_US_POSIX")))
-        return "\(sent ? "已发送" : "将发送")前 \(injected) 字 / 共 \(total) 字，其余可让模型读取原文件"
+        if text.range(of: ChatStore.textOmissionNoteMarker) != nil {
+            return "\(verb)开头 \(number(ChatStore.textAttachmentHeadChars)) 字与结尾 \(number(ChatStore.textAttachmentTailChars)) 字，"
+                + "全文共 \(number(original)) 字，中间部分已省略"
+        }
+        if let note = text.range(of: "\n\n" + ChatStore.textHeadOnlyNoteMarker, options: .backwards) {
+            return "\(verb)开头 \(number(text[..<note.lowerBound].count)) 字，全文约 \(number(original)) 字（按文件大小估算），其余未发送"
+        }
+        return "\(verb)前 \(number(text.count)) 字 / 共 \(number(original)) 字，其余可让模型读取原文件"
+    }
+
+    /// 目录引用只带路径（mimeType 为 inode/directory），不算大小。
+    static func isDirectory(_ attachment: ChatAttachment) -> Bool {
+        attachment.mimeType == ChatStore.directoryAttachmentMimeType
+    }
+
+    /// 附件卡副标题：目录只写“文件夹”，大小未知时不写大小。
+    static func subtitle(for attachment: ChatAttachment) -> String {
+        let type = typeLabel(for: attachment)
+        if isDirectory(attachment) { return type }
+        guard let size = attachment.size else { return type }
+        return "\(type) · \(ChatStore.formatByteCount(size))"
     }
 
     /// 类型副标题（COMPOSER-04 的"类型"）：以分类事实源 FileType 为准，
     /// 不用 kind 反推——占位符的 kind 恒为 .file，会丢失类型信息。
     static func typeLabel(for attachment: ChatAttachment) -> String {
+        if isDirectory(attachment) { return "文件夹" }
         switch attachment.fileType {
         case .text: return "文本"
         case .markdown: return "Markdown"
@@ -128,8 +163,10 @@ enum ComposerAttachmentPresentation {
             parts.append(reason)
         }
         if status == .sampledVideoFrames, let frames = attachment.videoFrames {
-            parts.append(frames.map { ChatAttachment.videoTimecode($0.timecodeSeconds) }
-                .joined(separator: "、"))
+            if let first = frames.first, let last = frames.last {
+                parts.append("共 \(frames.count) 帧，\(ChatAttachment.videoTimecode(first.timecodeSeconds))"
+                    + "至 \(ChatAttachment.videoTimecode(last.timecodeSeconds))")
+            }
         }
         return parts.joined(separator: "，")
     }

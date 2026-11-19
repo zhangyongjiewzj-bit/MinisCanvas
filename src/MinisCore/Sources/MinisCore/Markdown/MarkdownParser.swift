@@ -78,22 +78,9 @@ public struct MarkdownParser: Sendable {
                 continue
             }
 
-            // 5) 列表（- / * / + 或 1. 开头；连续同类行合并）
-            if let (_, ordered) = listMarker(of: trimmed) {
-                var items: [String] = []
-                var isOrdered = ordered
-                while i < lines.count {
-                    let t = lines[i].trimmingCharacters(in: .whitespaces)
-                    if t.isEmpty { break }
-                    if let (len, ord) = listMarker(of: t) {
-                        isOrdered = isOrdered || ord
-                        items.append(String(t.dropFirst(len)).trimmingCharacters(in: .whitespaces))
-                        i += 1
-                    } else {
-                        break
-                    }
-                }
-                blocks.append(.list(items: items, ordered: isOrdered))
+            // 5) 列表（- / * / + 或 1. 开头；按缩进分级，空行不打断同一列表）
+            if listMarker(of: trimmed) != nil {
+                blocks.append(collectList(lines: lines, from: &i))
                 continue
             }
 
@@ -131,6 +118,73 @@ public struct MarkdownParser: Sendable {
     /// 静态便捷入口。
     public static func parse(_ markdown: String) -> [MarkdownBlock] {
         MarkdownParser().parse(markdown)
+    }
+
+    // MARK: - 列表
+
+    private func indentWidth(of line: String) -> Int {
+        var w = 0
+        for ch in line {
+            if ch == " " { w += 1 } else if ch == "\t" { w += 4 } else { break }
+        }
+        return w
+    }
+
+    /// 从 lines[i] 起收集一个完整列表（支持嵌套、有序起始序号、项间空行），推进 i。
+    private func collectList(lines: [String], from i: inout Int) -> MarkdownBlock {
+        var items: [MarkdownListItem] = []
+        var indentStack: [Int] = []
+        var counters: [Int: Int] = [:] // level -> 下一个序号
+
+        while i < lines.count {
+            let raw = lines[i]
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty {
+                // 空行：仅当后面（跳过空行）紧跟列表项时才继续同一列表
+                var j = i + 1
+                while j < lines.count, lines[j].trimmingCharacters(in: .whitespaces).isEmpty { j += 1 }
+                if j < lines.count, listMarker(of: lines[j].trimmingCharacters(in: .whitespaces)) != nil {
+                    i = j
+                    continue
+                }
+                break
+            }
+            if let (len, ordered) = listMarker(of: t) {
+                let indent = indentWidth(of: raw)
+                while let last = indentStack.last, last > indent { indentStack.removeLast() }
+                if indentStack.last != indent { indentStack.append(indent) }
+                let level = indentStack.count - 1
+                for key in Array(counters.keys) where key > level { counters[key] = nil }
+                var number = 0
+                if ordered {
+                    if let next = counters[level] {
+                        number = next
+                    } else {
+                        number = Int(t.prefix(while: { $0.isNumber })) ?? 1
+                    }
+                    counters[level] = number + 1
+                }
+                let text = String(t.dropFirst(len)).trimmingCharacters(in: .whitespaces)
+                items.append(MarkdownListItem(level: level, ordered: ordered, number: number, text: text))
+                i += 1
+            } else if !items.isEmpty, indentWidth(of: raw) >= 2, !isBlockStart(t) {
+                // 缩进的续行并入上一项
+                let last = items.removeLast()
+                items.append(MarkdownListItem(level: last.level, ordered: last.ordered, number: last.number,
+                                              text: last.text + "\n" + t))
+                i += 1
+            } else {
+                break
+            }
+        }
+
+        let simple = !items.isEmpty
+            && items.allSatisfy { $0.level == 0 && $0.ordered == items[0].ordered }
+            && (!items[0].ordered || items[0].number == 1)
+        if simple {
+            return .list(items: items.map(\.text), ordered: items[0].ordered)
+        }
+        return .nestedList(items: items)
     }
 
     // MARK: - 行级识别
@@ -184,7 +238,9 @@ public struct MarkdownParser: Sendable {
 
     private func headingInfo(of trimmed: String) -> (level: Int, text: String)? {
         var level = 0
-        for ch in trimmed where ch == "#" { level += 1 }
+        for ch in trimmed {
+            if ch == "#" { level += 1 } else { break }
+        }
         guard level >= 1 && level <= 6, level < trimmed.count else { return nil }
         let rest = trimmed.dropFirst(level)
         guard rest.first == " " else { return nil } // `#text` 不是标题

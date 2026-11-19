@@ -297,7 +297,7 @@ struct ProviderBridgeProductionCompositionTests {
             backupReadinessRequests: backup?.requestCount ?? 0)
     }
 
-    private func sendAndSettle(_ harness: Harness, text: String) async throws ->
+    private func sendAndSettle(_ harness: Harness, text: String, timeoutPolls: Int = 1_000) async throws ->
         (newMessages: [ChatMessageUI], identity: AgentExecutionIdentity) {
         let chat = harness.bridge.chat
         let priorIDs = Set(chat.messages.map(\.id))
@@ -305,7 +305,7 @@ struct ProviderBridgeProductionCompositionTests {
         chat.submitComposer()
         let identity = try #require(chat.activeExecutionIdentity(for: harness.sessionID))
         var terminal = false
-        for _ in 0..<1_000 {
+        for _ in 0..<timeoutPolls {
             terminal = !chat.isStreaming
                 && chat.terminalReceipt(for: identity) != nil
                 && chat.messages.contains {
@@ -323,12 +323,12 @@ struct ProviderBridgeProductionCompositionTests {
 
     @Test("production Bridge 429 failure then next request recovers without duplicate transcript")
     func typedFailureThenRecovery() async throws {
-        let harness = try await makeHarness(primaryReplies: [
-            .failure(429), .failure(429), .failure(429), .failure(429),
-            .completion("recovered-once")
-        ])
+        // 主对话重试策略（V-7）：首次 + 最多 8 次重试，共 9 次 429 后这一轮才以失败结束。
+        let harness = try await makeHarness(primaryReplies: Array(repeating: .failure(429), count: 9)
+            + [.completion("recovered-once")])
         defer { harness.finish() }
-        let first = try await sendAndSettle(harness, text: "first synthetic request")
+        // Nine attempts with the main-conversation backoff (0.5 s doubling to 32 s, about 95 s in all).
+        let first = try await sendAndSettle(harness, text: "first synthetic request", timeoutPolls: 15_000)
         #expect(first.newMessages.map(\.role) == [.user, .assistant])
         let failure = try #require(first.newMessages.last?.content)
         #expect(failure.contains("429"))
@@ -337,13 +337,13 @@ struct ProviderBridgeProductionCompositionTests {
         let firstObservation = try #require(harness.bridge.providerRuntimeObservations.last)
         #expect(firstObservation.attempts.first?.failureKind == .rateLimited)
         #expect(firstObservation.attempts.first?.statusCode == 429)
-        #expect(harness.primary.requestCount - harness.primaryReadinessRequests == 4)
+        #expect(harness.primary.requestCount - harness.primaryReadinessRequests == 9)
 
         let second = try await sendAndSettle(harness, text: "second synthetic request")
         #expect(second.newMessages.map(\.role) == [.user, .assistant])
         #expect(second.newMessages.last?.content.contains("recovered-once") == true)
         #expect(harness.bridge.chat.terminalReceipt(for: second.identity)?.outcome == .succeeded)
-        #expect(harness.primary.requestCount - harness.primaryReadinessRequests == 5)
+        #expect(harness.primary.requestCount - harness.primaryReadinessRequests == 10)
         let persisted = try #require(harness.sessions.loadSession(id: harness.sessionID.uuidString))
         #expect(persisted.messages.count == 4)
         #expect(persisted.messages.suffix(4).map { $0.role.rawValue }

@@ -225,6 +225,7 @@ private func collect(
         switch event {
         case .textDelta(let delta):
             projected.append("delta:\(delta)")
+        case .thinkingDelta: break
         case .completed(let response):
             projected.append("completed:\(response.text)")
         }
@@ -521,6 +522,7 @@ struct ProviderRuntimeAssistantStreamTests {
                 switch event {
                 case .textDelta(let delta):
                     received.append("delta:\(delta)")
+                case .thinkingDelta: break
                 case .completed(let response):
                     received.append("completed:\(response.text)")
                 }

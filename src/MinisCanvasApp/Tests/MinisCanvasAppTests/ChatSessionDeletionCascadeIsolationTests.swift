@@ -33,6 +33,8 @@ struct ChatSessionDeletionCascadeIsolationTests {
         chat.appendUser("被删会话的消息")
         let keeperID = chat.applyNewSession(title: "保留会话")
         chat.draftText = "保留会话的草稿"
+        // 会话落盘已改为后台合并写入；读磁盘前先把待写内容刷下去。
+        chat.flushPendingSessionPersistence()
 
         let activeURL = store.sessionsDirectory.appendingPathComponent("\(doomedID.uuidString).json")
         let keeperURL = store.sessionsDirectory.appendingPathComponent("\(keeperID.uuidString).json")

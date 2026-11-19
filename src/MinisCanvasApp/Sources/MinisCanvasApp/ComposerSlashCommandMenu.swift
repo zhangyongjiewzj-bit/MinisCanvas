@@ -198,6 +198,20 @@ struct ComposerSlashCommandDescriptor: Sendable {
         )
     }
 
+    /// 自定义斜杠命令（含 /init）：描述、参数提示来自命令文件。
+    init(custom command: CustomSlashCommand) {
+        self.init(
+            id: command.name,
+            zhTitle: command.source.displayName + "命令",
+            enTitle: command.name,
+            zhSummary: command.description,
+            enSummary: command.description,
+            category: .agent,
+            risk: nil,
+            argumentSummary: command.argumentHint ?? "无参数"
+        )
+    }
+
     /// Non-routed rows still need a `CommandDefinition` identity for the
     /// shared keyboard-completion state machine. This projection is local to
     /// the menu; it is never registered into any registry.
@@ -221,19 +235,27 @@ struct ComposerSlashMenuEntry: Identifiable {
     /// consume this ID; nil means the row is display-only (阻断：未接入路由).
     let routedCommand: CommandDefinition?
     let state: ComposerSlashCommandState
+    /// 非 nil 表示这是一条自定义斜杠命令（含 /init）：选中后展开成普通用户消息发送，
+    /// 不经过命令注册表。
+    var customCommand: CustomSlashCommand? = nil
 
     var id: String { descriptor.id }
 
     /// Command identity handed to the completion state machine.
     var completionCommand: CommandDefinition { routedCommand ?? descriptor.menuCommand }
 
-    var isRouted: Bool { routedCommand != nil }
+    var isRouted: Bool { routedCommand != nil || customCommand != nil }
 
     /// Enter/Return and click may dispatch only when the pipeline can consume
     /// the command and the session state does not block it. Blocked rows can
     /// still be completed into the draft with Tab for editing.
     var shouldSendOnAccept: Bool {
-        (state == .available || state == .requiresApproval)
+        if let customCommand {
+            // 没有参数提示的命令可直接发送；带参数提示的先补全到输入框等用户填参数。
+            // 模板里用了 $ARGUMENTS 或 $1 之类的位置参数时同样只补全，不用空参数直接发送。
+            return state == .available && !customCommand.acceptsArguments
+        }
+        return (state == .available || state == .requiresApproval)
             && routedCommand?.argumentSpecs.contains(where: \.required) != true
     }
 
@@ -314,7 +336,8 @@ enum ComposerSlashCommandMenu {
     static func entries(
         matching input: String,
         registry: CommandRegistry,
-        sessionState: ComposerSlashSessionState = .neutral
+        sessionState: ComposerSlashSessionState = .neutral,
+        customCommands: [CustomSlashCommand] = []
     ) -> [ComposerSlashMenuEntry] {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard text.hasPrefix("/") else { return [] }
@@ -327,10 +350,23 @@ enum ComposerSlashCommandMenu {
         let firstWord = String(fullPrefix.split(whereSeparator: \.isWhitespace).first ?? "")
         let prefix = descriptors.contains(where: { $0.matches(prefix: fullPrefix) })
             ? fullPrefix : firstWord
-        return descriptors.compactMap { descriptor in
+        let builtin = descriptors.compactMap { descriptor -> ComposerSlashMenuEntry? in
             if !prefix.isEmpty && !descriptor.matches(prefix: prefix) { return nil }
             return entry(for: descriptor, registry: registry, sessionState: sessionState)
         }
+        // 自定义命令排在内置命令之后；与内置命令重名的忽略（内置优先）。
+        let builtinIDs = Set(descriptors.map(\.id))
+        let custom = customCommands.compactMap { command -> ComposerSlashMenuEntry? in
+            let descriptor = ComposerSlashCommandDescriptor(custom: command)
+            guard !builtinIDs.contains(descriptor.id) else { return nil }
+            if !prefix.isEmpty && !descriptor.matches(prefix: prefix) { return nil }
+            // 例如普通会话没有项目目录时 /init 置灰并写明原因。
+            let state: ComposerSlashCommandState = sessionState.unavailableReasonsByCommandID[descriptor.id]
+                .map { .blocked(reason: $0) } ?? .available
+            return ComposerSlashMenuEntry(
+                descriptor: descriptor, routedCommand: nil, state: state, customCommand: command)
+        }
+        return builtin + custom
     }
 
     /// Resolves the keyboard selection to a row index by command identity so
@@ -382,6 +418,8 @@ enum ComposerSlashCommandMenu {
             return .blocked(reason: AppCommandCatalog.missingConfirmationReason(for: command)
                 ?? "此命令当前没有确认执行入口")
         }
+        // /compact 实际不弹审批卡（手动压缩直接执行），菜单上显示"可用"。
+        if descriptor.id == "compact" { return .available }
         if descriptor.requiresPolicyApproval || command.requiresConfirmation {
             return .requiresApproval
         }

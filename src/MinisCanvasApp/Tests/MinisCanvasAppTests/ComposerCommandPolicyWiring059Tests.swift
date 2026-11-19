@@ -139,6 +139,59 @@ private func makeWiredWiring059Pair(
     return (chat, center)
 }
 
+// 11/16 用户决定：用户自己提交的 /compact 在所有档位直接执行、不弹卡。
+// 下面两个夹具用来继续覆盖“通用审批机制”：
+//   · AddDir 夹具：/add-dir 仍需审批，且有合成的 prepare/apply 执行器（同 CCN203 夹具），
+//     审批取代、拒绝/过期、绕过授权按会话生效/撤销即恢复等机制都经真实 ChatStore ↔ Center 路径验证。
+//   · 非用户来源夹具：把 userComposerCommandRequestID 置空后再评估，模拟恢复自磁盘或非用户提交
+//     的 compact（生产里只有这类请求仍会挂审批卡），用于 compact 专属的批准重放机制
+//     （一次性令牌、输入框脏时拒绝批准、短上下文无检查点等）。
+private final class Wiring059AddDirApplyLog {
+    var count = 0
+}
+
+@MainActor
+private func makeWiredWiring059AddDirPair(
+    autonomyCeiling: AutonomyLevel? = nil
+) -> (ChatStore, ComposerCommandAdjudicationCenter, Wiring059AddDirApplyLog) {
+    let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: autonomyCeiling)
+    let log = Wiring059AddDirApplyLog()
+    center.onPendingTerminalResolution = { resolution in
+        let disposition: ComposerCommandPolicyDecision
+        switch resolution.outcome {
+        case .approvedExecuted, .handedToCanonicalSettings: disposition = .execute
+        case .deniedByUser, .expiredUnanswered, .supersededByNewCommand,
+             .rejectedByPolicy(_), .unavailableExecutor(_): disposition = .reject
+        }
+        _ = chat.resolvePendingComposerCommand(requestID: resolution.id, disposition: disposition)
+    }
+    // 合成执行器：只验证审批/授权机制，不声称任何目录授权被真实发布。
+    center.prepareAdditionalDirectory = { request, snapshot, facts in
+        .init(request: request, snapshot: snapshot, facts: facts,
+            physicalDirectory: URL(fileURLWithPath: request.args["path"]!),
+            directoryIdentity: "synthetic-device:inode", projectID: "synthetic-project",
+            workingDirectory: "/synthetic/project", attachmentGeneration: 1)
+    }
+    center.applyApprovedAdditionalDirectory = { context in
+        log.count += 1
+        return .init(requestID: context.request.id,
+            sessionID: context.snapshot.sessionID, path: context.physicalDirectory.path)
+    }
+    return (chat, center, log)
+}
+
+/// 评估时清空“用户提交”标记：等价于恢复的待批命令或非用户来源的 compact。
+@MainActor
+private func routeWiring059CommandsAsNonUserOrigin(
+    chat: ChatStore, center: ComposerCommandAdjudicationCenter
+) {
+    chat.onComposerCommandPolicy = { request, snapshot in
+        ChatStore.$userComposerCommandRequestID.withValue(nil) {
+            center.evaluate(request: request, snapshot: snapshot, facts: chat.composerPolicyFacts)
+        }
+    }
+}
+
 @Suite("Composer command policy wiring (059)")
 @MainActor
 struct ComposerCommandPolicyWiring059Tests {
@@ -237,8 +290,29 @@ struct ComposerCommandPolicyWiring059Tests {
         ) == .reject)
     }
 
-    // MARK: - 批准 → 规范执行闭环
+    // MARK: - 11/16 用户 /compact 免卡
 
+    // 11/16 用户决定：用户自己提交的 /compact 在所有权限档位直接执行、不挂审批卡。
+    @Test func userSubmittedCompactExecutesWithoutApprovalInEveryMode() {
+        for mode in [ComposerTaskMode.manual, .bypassPermission] {
+            let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: .l3)
+            chat.applyNewSession()
+            chat.composerPolicySelection.mode = mode
+            chat.draftText = "/compact"
+            chat.submitComposer()
+            #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+            #expect(chat.lastComposerCommandReceipt?.commandID == "compact")
+            #expect(chat.pendingComposerCommand == nil)
+            #expect(center.pendingAdjudication == nil)
+            // 新建空会话没有可压缩的历史，不会追加"无需压缩"提示；
+            // 免卡执行后真正跑到压缩流程（含提示）由 keyboardBypass 用例（有持久化会话）覆盖。
+            #expect(center.lastResolution == nil)
+        }
+    }
+
+
+    // 11/16 用户决定：用户 /compact 免卡，本测试改为非用户来源（恢复/直接评估）的 compact：
+    // 仍需审批，批准后经规范 Composer 路径重放并执行，令牌一次性。
     @Test func approveCompactReplaysThroughCanonicalRouteAndClearsPending() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("wiring-059-compact-success-\(UUID().uuidString)")
@@ -260,6 +334,7 @@ struct ComposerCommandPolicyWiring059Tests {
         ]
         for message in source { try store.saveMessage(message, sessionID: id) }
         let (chat, center) = makeWiredWiring059Pair()
+        routeWiring059CommandsAsNonUserOrigin(chat: chat, center: center)
         #expect(chat.attachPersistence(store))
         let provider = Wiring059CountingProvider()
         chat.compactionProviderOverride = provider
@@ -343,100 +418,119 @@ struct ComposerCommandPolicyWiring059Tests {
         #expect(try store.loadLatestCompactionCheckpoint(sessionID: id) == nil)
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改为：用户提交的 /compact 在所有来源与档位都直接执行、
+    // 无待批；非用户来源（直接 evaluate）的 compact 仍需审批。
     @Test func compactStillRequiresApprovalForOtherOriginsOrModes() {
         let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: .l3)
         chat.applyNewSession()
         chat.composerPolicySelection.mode = .bypassPermission
 
+        // 键盘提交、绕过档位未确认：直接执行。
         chat.draftText = "/compact"
         chat.submitComposerFromKeyboard()
-        #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
+        #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+        #expect(chat.pendingComposerCommand == nil)
+        #expect(center.pendingAdjudication == nil)
 
+        // 绕过已确认、非键盘提交：直接执行。
         #expect(chat.confirmComposerBypass(for: chat.activeSessionID))
         chat.draftText = "/compact"
         chat.submitComposer()
-        #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-        #expect(center.pendingAdjudication?.commandID == "compact")
-        #expect(center.approveCurrentAdjudication())
-        #expect(center.lastResolution?.outcome == .approvedExecuted)
         #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+        #expect(center.pendingAdjudication == nil)
 
+        // 命令行按钮提交：直接执行。
         #expect(chat.submitRegisteredComposerCommand(id: "compact", args: [:]))
-        #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-        #expect(center.pendingAdjudication?.commandID == "compact")
+        #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+        #expect(center.pendingAdjudication == nil)
 
+        // 手动审批档、键盘提交：直接执行。
         chat.composerPolicySelection.mode = .manual
-        chat.draftText = "/compact"
-        chat.submitComposerFromKeyboard()
-        #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-        #expect(center.pendingAdjudication?.commandID == "compact")
-        center.denyCurrentAdjudication()
-    }
-
-    @Test func confirmedBypassFromOneSessionDoesNotAuthorizeNativeCommandsInAnother() throws {
-        let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: .l3)
-        let first = chat.applyNewSession(title: "Confirmed session")
-        chat.composerPolicySelection.mode = .bypassPermission
-        #expect(chat.confirmComposerBypass(for: chat.activeSessionID))
-
-        chat.draftText = "/compact"
-        chat.submitComposerFromKeyboard()
-        try #require(chat.lastComposerCommandReceipt?.disposition == .execute)
-
-        let second = chat.applyNewSession(title: "Unconfirmed session")
-        try #require(first != second && chat.activeSessionID == second)
-        try #require(chat.composerPolicySelection.bypassModeConfirmed)
-        #expect(!chat.confirmComposerBypass(for: first))
-        chat.draftText = "/compact"
-        chat.submitComposerFromKeyboard()
-
-        #expect(chat.lastComposerCommandReceipt?.sessionID == second.uuidString)
-        #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-        #expect(center.pendingAdjudication?.sessionID == second.uuidString)
-        center.denyCurrentAdjudication()
-
-        try #require(chat.confirmComposerBypass(for: second))
         chat.draftText = "/compact"
         chat.submitComposerFromKeyboard()
         #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
         #expect(center.pendingAdjudication == nil)
+
+        // 非用户提交（不经 ChatStore 用户路径，userComposerCommandRequestID 为 nil）：仍要审批。
+        #expect(ChatStore.userComposerCommandRequestID == nil)
+        let direct = makeWiring059Request(commandID: "compact", requiresPolicyApproval: true)
+        let snapshot = makeWiring059Snapshot(workspaceID: chat.composerWorkspaceID)
+        #expect(center.evaluate(request: direct, snapshot: snapshot, facts: chat.composerPolicyFacts) == .pending)
+        #expect(center.pendingAdjudication?.commandID == "compact")
+        // 即使绕过档位已确认且 L3，非用户来源也没有原生授权，仍是同一张审批卡。
+        chat.composerPolicySelection.mode = .bypassPermission
+        let direct2 = makeWiring059Request(commandID: "compact", requiresPolicyApproval: true)
+        #expect(center.evaluate(request: direct2, snapshot: snapshot, facts: chat.composerPolicyFacts) == .pending)
+        #expect(center.pendingAdjudication?.id == direct2.id)
+        center.denyCurrentAdjudication()
     }
 
+    // 11/16 用户决定（对齐 Claude Code）：绕过确认后新建或切换会话继续沿用；用 /add-dir（合成执行器）验证。
+    @Test func confirmedBypassCarriesIntoNewSessions() throws {
+        let (chat, center, applyLog) = makeWiredWiring059AddDirPair(autonomyCeiling: .l3)
+        let first = chat.applyNewSession(title: "Confirmed session")
+        chat.composerPolicySelection.mode = .bypassPermission
+        #expect(chat.confirmComposerBypass(for: chat.activeSessionID))
+
+        chat.draftText = "/add-dir /synthetic/session-scope"
+        chat.submitComposerFromKeyboard()
+        try #require(chat.lastComposerCommandReceipt?.disposition == .execute)
+        #expect(applyLog.count == 1)
+
+        let second = chat.applyNewSession(title: "Inheriting session")
+        try #require(first != second && chat.activeSessionID == second)
+        try #require(chat.composerPolicySelection.bypassModeConfirmed)
+        #expect(chat.hasNativeCommandBypassConfirmation)
+        chat.draftText = "/add-dir /synthetic/session-scope"
+        chat.submitComposerFromKeyboard()
+
+        #expect(chat.lastComposerCommandReceipt?.sessionID == second.uuidString)
+        #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+        #expect(center.pendingAdjudication == nil)
+        #expect(applyLog.count == 2)
+    }
+
+    // 11/16 用户决定：用户 /compact 免卡，本测试改用仍需审批的 /add-dir（合成执行器）验证“撤销绕过立即恢复审批”。
     @Test func revokingBypassRestoresApprovalImmediatelyInTheSameSession() throws {
-        let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: .l3)
+        let (chat, center, applyLog) = makeWiredWiring059AddDirPair(autonomyCeiling: .l3)
         let session = chat.applyNewSession()
         chat.composerPolicySelection.mode = .bypassPermission
         try #require(chat.confirmComposerBypass(for: session))
-        chat.draftText = "/compact"
+        chat.draftText = "/add-dir /synthetic/revoke"
         chat.submitComposerFromKeyboard()
         try #require(chat.lastComposerCommandReceipt?.disposition == .execute)
+        #expect(applyLog.count == 1)
 
         chat.composerPolicySelection.bypassModeConfirmed = false
-        chat.draftText = "/compact"
+        chat.draftText = "/add-dir /synthetic/revoke"
         chat.submitComposerFromKeyboard()
 
         #expect(chat.activeSessionID == session)
         #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
         #expect(center.pendingAdjudication?.sessionID == session.uuidString)
+        #expect(applyLog.count == 1)
         center.denyCurrentAdjudication()
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改用仍需审批的 /add-dir（合成执行器）验证“恢复的全局绕过不授权原生命令”。
     @Test func restoredGlobalBypassDoesNotAuthorizeNativeCommands() {
-        let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: .l3)
+        let (chat, center, applyLog) = makeWiredWiring059AddDirPair(autonomyCeiling: .l3)
         chat.applyNewSession()
         chat.restoreComposerPolicy(.init(mode: .bypassPermission, bypassModeConfirmed: true))
         #expect(chat.composerPolicySelection.bypassModeConfirmed)
 
-        chat.draftText = "/compact"
+        chat.draftText = "/add-dir /synthetic/restored"
         chat.submitComposerFromKeyboard()
 
         #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-        #expect(center.pendingAdjudication?.commandID == "compact")
+        #expect(center.pendingAdjudication?.commandID == "add-dir")
+        #expect(applyLog.count == 0)
         center.denyCurrentAdjudication()
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改用仍需审批的 /add-dir（合成执行器）验证“自主权上限回落后键盘提交仍需审批”。
     @Test func keyboardCompactStillRequiresApprovalAfterBypassCeilingFalls() {
-        let (chat, center) = makeWiredWiring059Pair(autonomyCeiling: .l3)
+        let (chat, center, applyLog) = makeWiredWiring059AddDirPair(autonomyCeiling: .l3)
         chat.applyNewSession()
         chat.composerPolicySelection.mode = .bypassPermission
         #expect(chat.confirmComposerBypass(for: chat.activeSessionID))
@@ -445,14 +539,17 @@ struct ComposerCommandPolicyWiring059Tests {
         ))
         #expect(chat.composerPolicySelection.bypassModeConfirmed)
 
-        chat.draftText = "/compact"
+        chat.draftText = "/add-dir /synthetic/ceiling"
         chat.submitComposerFromKeyboard()
 
         #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-        #expect(center.pendingAdjudication?.commandID == "compact")
+        #expect(center.pendingAdjudication?.commandID == "add-dir")
+        #expect(applyLog.count == 0)
         center.denyCurrentAdjudication()
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改为非用户来源的 compact：批准后短上下文不产生检查点，
+    // 再次出现的非用户来源 compact 仍需新的审批。
     @Test func approvedShortCompactRefusesWithoutCheckpointAndRequiresNewApproval() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("wiring-059-compact-short-\(UUID().uuidString)")
@@ -464,6 +561,7 @@ struct ComposerCommandPolicyWiring059Tests {
         let source = (1...3).map { LLMMessage(role: .assistant, content: "seed \($0)") }
         for message in source { try store.saveMessage(message, sessionID: id) }
         let (chat, center) = makeWiredWiring059Pair()
+        routeWiring059CommandsAsNonUserOrigin(chat: chat, center: center)
         #expect(chat.attachPersistence(store))
         let provider = Wiring059CountingProvider()
         chat.compactionProviderOverride = provider
@@ -491,8 +589,10 @@ struct ComposerCommandPolicyWiring059Tests {
         center.denyCurrentAdjudication()
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改为非用户来源的 compact（批准重放才会检查输入框是否脏）。
     @Test func approvalRefusedWhileComposerInputDirtyAndNeverExecuted() {
         let (chat, center) = makeWiredWiring059Pair()
+        routeWiring059CommandsAsNonUserOrigin(chat: chat, center: center)
         chat.draftText = "/compact"
         chat.submitComposer()
         #expect(center.pendingAdjudication != nil)
@@ -507,14 +607,15 @@ struct ComposerCommandPolicyWiring059Tests {
         #expect(chat.draftText == "unsent user draft")
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改用仍需审批的 /add-dir（合成执行器）验证拒绝/过期终态绝不执行。
     @Test func denyAndExpireTerminalsNeverExecuteTheCommand() {
-        let (chat, center) = makeWiredWiring059Pair()
+        let (chat, center, applyLog) = makeWiredWiring059AddDirPair()
         var replayCount = 0
         center.replaySubmittedCommand = { _ in replayCount += 1 }
 
-        chat.draftText = "/compact hint=second"
+        chat.draftText = "/add-dir /synthetic/second"
         chat.submitComposer()
-        #expect(center.pendingAdjudication?.commandID == "compact")
+        #expect(center.pendingAdjudication?.commandID == "add-dir")
         center.denyCurrentAdjudication()
         #expect(center.lastResolution?.outcome == .deniedByUser)
         #expect(center.pendingAdjudication == nil)
@@ -522,18 +623,22 @@ struct ComposerCommandPolicyWiring059Tests {
         #expect(expectation561_1)
 
         // 超时未答复 → 按拒绝收敛，且之后没有可消费的令牌。
-        chat.draftText = "/compact hint=second"
+        chat.draftText = "/add-dir /synthetic/second"
         chat.submitComposer()
-        #expect(center.pendingAdjudication?.commandID == "compact")
+        #expect(center.pendingAdjudication?.commandID == "add-dir")
         center.expireCurrentAdjudication()
         #expect(center.lastResolution?.outcome == .expiredUnanswered)
         let expectation561_2 = (center.projection?.text ?? "").contains("按拒绝处理")
         #expect(expectation561_2)
 
-        chat.draftText = "/compact hint=second"
+        chat.draftText = "/add-dir /synthetic/second"
         chat.submitComposer()
         #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
         #expect(replayCount == 0)
+        #expect(applyLog.count == 0)
+        #expect(chat.pendingComposerCommand?.commandID == "add-dir")
+        center.denyCurrentAdjudication()
+        #expect(chat.pendingComposerCommand == nil)
     }
 
     // /model now opens the desktop model picker immediately. Exercise the
@@ -610,35 +715,42 @@ struct ComposerCommandPolicyWiring059Tests {
 
     // MARK: - 取代语义
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改用仍需审批的 /add-dir（合成执行器）验证新命令取代未答复裁决。
     @Test func newerCommandSupersedesUnansweredAdjudication() {
-        let (chat, center) = makeWiredWiring059Pair()
-        chat.draftText = "/compact"
+        let (chat, center, applyLog) = makeWiredWiring059AddDirPair()
+        chat.draftText = "/add-dir /synthetic/first"
         chat.submitComposer()
         let firstAdjudicationID = center.pendingAdjudication?.id
         #expect(firstAdjudicationID != nil)
 
-        chat.draftText = "/compact hint=second"
+        chat.draftText = "/add-dir /synthetic/second"
         chat.submitComposer()
         #expect(center.pendingAdjudication?.id != firstAdjudicationID)
-        #expect(center.pendingAdjudication?.commandID == "compact")
+        #expect(center.pendingAdjudication?.commandID == "add-dir")
+        #expect(center.pendingAdjudication?.id == chat.pendingComposerCommand?.id)
         // 旧未答复裁决被取代时不得留下任何令牌或可执行残留。
+        #expect(applyLog.count == 0)
         center.denyCurrentAdjudication()
     }
 
     // MARK: - 重启恢复
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试第一段改为：用一个只返回 .pending 的策略钩子制造
+    // 持久化的待批 compact（等价于免卡规则前遗留的 envelope）；第二段不变——恢复的 compact 不是本次
+    // 用户提交，仍须重新进入审批，批准后执行。
     @Test func restoredPendingCompactReEntersAdjudicationAndApproveExecutes() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("wiring-059-restore-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        // 第一段：提交 /compact → 生产接线挂裁决 → envelope 持久化 pending。
-        let (first, firstCenter) = makeWiredWiring059Pair()
+        // 第一段：策略钩子对 compact 返回 .pending → envelope 持久化 pending。
+        let first = ChatStore()
+        first.onComposerCommandPolicy = { _, _ in .pending }
         #expect(first.attachPersistence(SessionStore(directory: directory)))
         first.draftText = "/compact"
         first.submitComposer()
-        #expect(firstCenter.pendingAdjudication?.commandID == "compact")
+        #expect(first.pendingComposerCommand?.commandID == "compact")
         #expect(first.lastComposerCommandReceipt?.disposition == .pending)
 
         // 第二段：模拟重启 —— ChatStore 从磁盘恢复 pendingComposerCommand，
@@ -653,6 +765,7 @@ struct ComposerCommandPolicyWiring059Tests {
         restarted.onComposerCommandPolicy = { request, snapshot in
             center.evaluate(request: request, snapshot: snapshot, facts: restarted.composerPolicyFacts)
         }
+        // 批准重放走的是用户提交路径，但令牌先于免卡规则被消费，所以这里无需特殊处理。
         center.canReplayIntoComposer = { restarted.draftText.isEmpty && restarted.pendingAttachments.isEmpty }
         center.replaySubmittedCommand = { text in
             restarted.draftText = text

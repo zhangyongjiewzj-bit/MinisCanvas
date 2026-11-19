@@ -57,8 +57,6 @@ struct KeylineIconCoverageTests {
     // Frozen existing exceptions after removing the bypass warning SF Symbol.
     // Exact path + SF identifier/dynamic expression + multiplicity; removals are welcome.
     private static let existingSFCallLimits: [String: Int] = [
-        // AppKit NSStatusItem template 图标，审计线 2026-10-24 裁定保留。
-        "src/MinisCanvasApp/Sources/MinisCanvasApp/ResidentLifecycleController.swift | \"square.stack.3d.up\"": 1,
         "src/MinisCanvasApp/Sources/MinisCanvasApp/ApprovalPromptCenter.swift | riskIcon": 1,
         "src/MinisCanvasApp/Sources/MinisCanvasApp/AssetPanelView.swift | \"arrow.left.and.right\"": 1,
         "src/MinisCanvasApp/Sources/MinisCanvasApp/AssetPanelView.swift | \"arrow.up.forward.app\"": 2,
@@ -306,7 +304,15 @@ struct KeylineIconCoverageTests {
         // SwiftTerm replaces the old terminal's warning, prompt caret, stop,
         // and send Keyline calls. The new PTY toolbar uses text buttons.
         // 1419 adds one existing Keyline target icon in the Goal bar.
-        #expect(keylineCalls == 187)
+        // 第三波：对话失败行的“重试”改用 Keyline retry，另有一处新增 Keyline 图标；
+        // “检查 API Key”“压缩后重试”改为纯文字按钮，没有新增 SF Symbol。
+        // 终端多标签（11/18）：标签栏“新建”“关闭”用 Keyline add/close，各 +1，没有新增 SF Symbol。
+        // A7-A 对话操作行（11/18）：消息“复制”改图标按钮 MinisIconView(.copy)、“⋯”改 MinisIconView(.more)，各 +1；
+        // 会话失败标记换用 .info（原地替换，不增减），没有新增 SF Symbol。
+        // 历史审查补修（11/18）：重新生成按钮加 refresh、记忆读取失败用 warning、目标待办清除等界面
+        // 新增 Keyline 图标共 +4，都是 MinisIconView，没有新增 SF Symbol。
+        // 包上旅程发现下拉菜单按钮会把 copy/more 图标压成黑色剪影，这两处改回文字标签（-2）。
+        #expect(keylineCalls == 195)
 
         // Preserve the same 13-file scope and exclusions, but count complete
         // constructors: the old per-line scan silently missed multiline Label.
@@ -336,7 +342,7 @@ struct KeylineIconCoverageTests {
         // unallowlisted regression artificially improves Keyline coverage.
         let denominator = keylineCalls + nonExcludedLines.count
         // Same 13-file scope: prior icons plus reviewed Keyline A display changes.
-        #expect(denominator == 213)
+        #expect(denominator == 221)
         #expect(Double(keylineCalls) / Double(denominator) >= 0.80)
         #expect(Double(nonExcludedLines.count) / Double(denominator) <= 0.20)
     }

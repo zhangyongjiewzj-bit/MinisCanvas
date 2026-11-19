@@ -26,7 +26,13 @@ final class ChatCredentialBroker {
     private(set) var outcome: Outcome?
     private(set) var isConfirming = false
     private var entries: [String: Entry] = [:]
-    private var streamBuffers: [UUID: String] = [:]
+    /// 每条流式消息一份增量脱敏状态（原文 + 已提交前缀 + 尾部窗口）。
+    private var streams: [UUID: IncrementalSecretRedactor] = [:]
+    /// 托管撤销（cancel）时已脱敏、但尚未显示的尾部；下一次投影接在界面文本后面。
+    private var withheldAfterCancel: [UUID: String] = [:]
+    /// 思考通道（thinking）同样按消息增量脱敏，状态与正文分开。
+    private var thinkingStreams: [UUID: IncrementalSecretRedactor] = [:]
+    private var thinkingWithheldAfterCancel: [UUID: String] = [:]
     private var resolving: Request?
     private var activeRequest: Request?
     private var probeTask: Task<SettingsProviderReadinessReport?, Never>?
@@ -140,20 +146,97 @@ final class ChatCredentialBroker {
         return entries.values.map(\.value) + saved
     }
 
+    /// 流式片段投影：只重扫尾部窗口；尾部里可能是密钥前半段的末端先不显示，
+    /// 到下一个边界或回合结束（`finalizeStream`）才显示。
+    func projectStreamUpdate(messageID: UUID, current: String, append: String) -> IncrementalSecretRedactor.Update {
+        let perf = PerformanceSignposts.begin(.streamRedaction); defer { perf.end() }
+        var stream = streams.removeValue(forKey: messageID)
+            ?? IncrementalSecretRedactor(
+                surface: current, withheld: withheldAfterCancel.removeValue(forKey: messageID) ?? "")
+        let update = stream.append(append, knownSecrets: currentKnownSecrets())
+        streams[messageID] = stream
+        return update
+    }
+
     func projectStream(messageID: UUID, current: String, append: String) -> String {
-        let raw = (streamBuffers[messageID] ?? current) + append
-        streamBuffers[messageID] = raw
-        return protect(raw)
+        projectStreamUpdate(messageID: messageID, current: current, append: append).text
     }
 
     func replaceStream(messageID: UUID, with text: String) -> String {
-        streamBuffers[messageID] = text
-        return protect(text)
+        withheldAfterCancel.removeValue(forKey: messageID)
+        var stream = IncrementalSecretRedactor()
+        let shown = stream.replace(with: text, knownSecrets: currentKnownSecrets())
+        streams[messageID] = stream
+        return shown
     }
 
-    func finishStream(messageID: UUID) { streamBuffers.removeValue(forKey: messageID) }
+    /// 工具调用边界：把扣住的尾部放开并定稿，行内锚点才落在已显示文字之后。
+    func settleStream(messageID: UUID) -> IncrementalSecretRedactor.Update? {
+        guard var stream = streams.removeValue(forKey: messageID) else { return nil }
+        let update = stream.settle(knownSecrets: currentKnownSecrets())
+        streams[messageID] = stream
+        return update
+    }
+
+    /// 回合终态（完成/出错/停止共用）：对整条原文做一次全量脱敏并以它为准，
+    /// 同时释放这条消息的流状态。没有流状态、没有被扣住的尾部且无追加时返回 nil
+    /// （界面文本保持不变）。
+    func finalizeStream(messageID: UUID, current: String, append: String = "") -> IncrementalSecretRedactor.Update? {
+        let stream = streams.removeValue(forKey: messageID)
+        let withheld = withheldAfterCancel.removeValue(forKey: messageID)
+        guard stream != nil || withheld != nil || !append.isEmpty else { return nil }
+        let full: String
+        if let stream {
+            // 被扣住的尾部若可能是残缺密钥，并入正文前先遮蔽；追加的收尾文字单独脱敏。
+            full = stream.terminalProjection(knownSecrets: currentKnownSecrets())
+                + (append.isEmpty ? "" : protect(append))
+        } else {
+            full = protect(current + (withheld ?? "") + append)
+        }
+        return IncrementalSecretRedactor.Update(
+            text: full, extendsPrevious: full.utf8.starts(with: current.utf8))
+    }
+
+    func finishStream(messageID: UUID) {
+        streams.removeValue(forKey: messageID)
+        withheldAfterCancel.removeValue(forKey: messageID)
+        thinkingStreams.removeValue(forKey: messageID)
+        thinkingWithheldAfterCancel.removeValue(forKey: messageID)
+    }
+
+    /// 思考文字的增量投影：与正文同一套扣留规则，返回应显示的文本。
+    func projectThinking(messageID: UUID, current: String, append: String) -> String {
+        var stream = thinkingStreams.removeValue(forKey: messageID)
+            ?? IncrementalSecretRedactor(
+                surface: current, withheld: thinkingWithheldAfterCancel.removeValue(forKey: messageID) ?? "")
+        let update = stream.append(append, knownSecrets: currentKnownSecrets())
+        thinkingStreams[messageID] = stream
+        return update.text
+    }
+
+    /// 思考文字的终态：被扣住的尾部按与正文相同的规则放开或遮蔽。没有思考流状态时返回 nil。
+    func finalizeThinking(messageID: UUID, current: String) -> String? {
+        let stream = thinkingStreams.removeValue(forKey: messageID)
+        let withheld = thinkingWithheldAfterCancel.removeValue(forKey: messageID)
+        if let stream { return stream.terminalProjection(knownSecrets: currentKnownSecrets()) }
+        guard let withheld else { return nil }
+        return protect(current + withheld)
+    }
 
     func cancel(sessionID: UUID? = nil) {
+        // 先取走各流尚未显示的尾部（此刻托管仍有效，按当时的已知密钥脱敏），
+        // 否则撤销后这段文字既不在界面上、也无法再被掩码。
+        if !streams.isEmpty || !thinkingStreams.isEmpty {
+            let known = currentKnownSecrets()
+            for (id, stream) in streams {
+                let withheld = stream.withheldRedacted(knownSecrets: known)
+                if !withheld.isEmpty { withheldAfterCancel[id] = withheld }
+            }
+            for (id, stream) in thinkingStreams {
+                let withheld = stream.withheldRedacted(knownSecrets: known)
+                if !withheld.isEmpty { thinkingWithheldAfterCancel[id] = withheld }
+            }
+        }
         if sessionID == nil || activeRequest?.sessionID == sessionID {
             probeTask?.cancel()
         }
@@ -177,7 +260,8 @@ final class ChatCredentialBroker {
         // as (base + append), so credentials split across the removal
         // boundary stay covered by the pattern layer. This only ever withholds
         // more material; it never grants additional visibility.
-        streamBuffers.removeAll(keepingCapacity: false)
+        streams.removeAll(keepingCapacity: false)
+        thinkingStreams.removeAll(keepingCapacity: false)
     }
 
     /// Resolution is possible only inside the synchronous approved CAS write.

@@ -50,12 +50,21 @@ public enum AccentTheme: String, Codable, CaseIterable, Sendable {
     /// 主强调色 RGB 分量（0~1）。
     public var accentRGB: (r: Double, g: Double, b: Double) {
         switch self {
-        case .pseudo: (0.627, 0.380, 0.235)
+        // 第 1 套「暖中性 + 陶土橙」浅色强调 #A84E2A（深色强调 #E08B68 见 `darkAccentRGB`）。
+        case .pseudo: (168.0 / 255.0, 78.0 / 255.0, 42.0 / 255.0)
         case .codex: (0.35, 0.78, 0.90)
         case .graphite: (0.65, 0.67, 0.71)
         case .ocean: (0.20, 0.52, 0.94)
         case .crimson: (0.92, 0.26, 0.34)
         case .emerald: (0.15, 0.68, 0.46)
+        }
+    }
+
+    /// 深色模式下的强调色 RGB（仅产品主题 `.pseudo` 有专门深色值 #E08B68，其余沿用 `accentRGB`）。
+    public var darkAccentRGB: (r: Double, g: Double, b: Double) {
+        switch self {
+        case .pseudo: (224.0 / 255.0, 139.0 / 255.0, 104.0 / 255.0)
+        default: accentRGB
         }
     }
 
@@ -84,7 +93,7 @@ public enum ThemePreset: String, Codable, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .light: "产品主题"
+        case .light: "浅色（产品主题）"
         case .dark: "深色"
         case .system: "跟随系统（原生）"
         case .highContrast: "高对比"
@@ -117,7 +126,8 @@ public enum ThemePreset: String, Codable, CaseIterable, Sendable {
     /// 投影用的固定明暗：`.system` 返回 nil，交由 App 层按 macOS 明暗解析。
     public var fixedMode: ThemeMode? {
         switch self {
-        case .light: .light
+        // 产品主题（.light）自第 1 套配色起带深色版，明暗跟随系统，不再固定浅色。
+        case .light: nil
         case .dark, .highContrast: nil
         case .system: nil
         }
@@ -126,7 +136,7 @@ public enum ThemePreset: String, Codable, CaseIterable, Sendable {
     /// 收敛后跟随系统时用于 `ColorScheme` 投影的旧 `Appearance` 值。
     public var appearanceProjection: Appearance {
         switch self {
-        case .light: .light
+        case .light: .system
         case .dark, .highContrast: .system
         case .system: .system
         }
@@ -590,12 +600,11 @@ public struct GeneralSettings: Codable, Equatable, Sendable {
     public var chatOutputMode: ChatOutputMode
     public var language: String
 
-    /// 把 `themePreset` 投影回两个旧字段。
+    /// 把 `themePreset` 投影回旧的主题色字段。
     ///
-    /// 预设是唯一真值：投影后 `appearance`/`accentTheme` 只可能取该预设
-    /// 对应的那一组值，18 种任意组合因此在存储层也不可表示。
+    /// 配色（预设）是唯一真值；`appearance` 现在是独立的「浅色 / 深色 / 跟随系统」
+    /// 明暗选择（对齐 Claude Code），不再被预设覆盖。主题色恒为定版伪仙。
     public mutating func projectLegacyAppearanceFields() {
-        appearance = themePreset.appearanceProjection
         accentTheme = ThemePreset.canonicalAccentTheme
     }
 
@@ -622,10 +631,14 @@ public struct GeneralSettings: Codable, Equatable, Sendable {
         chatOutputMode: ChatOutputMode = .normal,
         language: String = "zh-Hans"
     ) {
+        // 默认主题 = 产品主题（第 1 套配色）；只有显式给了非默认的旧外观才走旧映射。
         let selected = themePreset?.current
-            ?? ThemePreset.nearest(for: appearance, accentTheme: accentTheme)
+            ?? (appearance == .system && accentTheme == .pseudo
+                ? ThemePreset.light
+                : ThemePreset.nearest(for: appearance, accentTheme: accentTheme))
         self.themePreset = selected
-        self.appearance = selected.appearanceProjection
+        // 明暗是独立选择：构造时给什么就是什么（旧深色词只收敛配色预设，不再抹掉明暗）。
+        self.appearance = appearance
         self.accentTheme = ThemePreset.canonicalAccentTheme
         if let themePreset, !themePreset.isAccepted {
             self.legacyThemePresetRawValue = themePreset.rawValue
@@ -661,7 +674,7 @@ public struct GeneralSettings: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case themePreset, legacyThemePresetRawValue
+        case themePreset, legacyThemePresetRawValue, productThemeDefaultMigrated
         case appearance, accentTheme, defaultProviderID, defaultModelID
         case subModelReference, subModelID, modelSpeedTier, chatOutputMode, language
     }
@@ -683,6 +696,13 @@ public struct GeneralSettings: Codable, Equatable, Sendable {
         let legacyAccent = accentTheme
         themePreset = storedPreset?.current
             ?? ThemePreset.nearest(for: legacyAppearance, accentTheme: legacyAccent)
+        // 一次性迁移（需披露）：第 1 套配色起默认主题改为产品主题。没有迁移标记的旧文件里，
+        // 存的是「跟随系统」的用户改成产品主题；标记随后恒写入，用户之后手动切回「跟随系统」不再被改。
+        let productDefaultMigrated = try c.decodeIfPresent(Bool.self, forKey: .productThemeDefaultMigrated) ?? false
+        let presetBeforeMigration = themePreset
+        if !productDefaultMigrated, themePreset == .system {
+            themePreset = .light
+        }
         legacyThemePresetRawValue = try c.decodeIfPresent(String.self, forKey: .legacyThemePresetRawValue)
         if legacyThemePresetRawValue == nil {
             if let storedPreset, !storedPreset.isAccepted { legacyThemePresetRawValue = storedPreset.rawValue }
@@ -690,7 +710,11 @@ public struct GeneralSettings: Codable, Equatable, Sendable {
                 legacyThemePresetRawValue = "\(legacyAppearance.rawValue)|\(legacyAccent.rawValue)"
             }
         }
-        appearance = themePreset.appearanceProjection
+        // 明暗选择（浅色 / 深色 / 跟随系统）是独立字段。没有迁移标记的旧文件写于「产品主题固定浅色」时代：
+        // 原来是浅色的用户保持固定浅色，其余一律跟随系统；有标记的文件按存储值读取。
+        if !productDefaultMigrated {
+            appearance = presetBeforeMigration == .light ? .light : .system
+        }
         accentTheme = ThemePreset.canonicalAccentTheme
         defaultProviderID = try c.decodeIfPresent(String.self, forKey: .defaultProviderID) ?? d.defaultProviderID
         defaultModelID = try c.decodeIfPresent(String.self, forKey: .defaultModelID) ?? d.defaultModelID
@@ -729,6 +753,7 @@ public struct GeneralSettings: Codable, Equatable, Sendable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(themePreset.current, forKey: .themePreset)
         try c.encodeIfPresent(legacyThemePresetRawValue, forKey: .legacyThemePresetRawValue)
+        try c.encode(true, forKey: .productThemeDefaultMigrated)
         try c.encode(appearance, forKey: .appearance)
         try c.encode(accentTheme, forKey: .accentTheme)
         try c.encodeIfPresent(defaultProviderID, forKey: .defaultProviderID)
@@ -752,6 +777,8 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     public var legacyApprovalPolicyOriginal: ApprovalPolicy? = nil
     public var legacyApprovalPolicyNoticePending = false
     public var legacyApprovalScopeNoticePending = false
+    /// 「停用所有工具」前的审批策略；恢复时还原并清空。nil 表示没有在停用中（旧数据解码为 nil，编码时不写）。
+    public var approvalPolicyBeforeToolsDisabled: ApprovalPolicy? = nil
 
     /// 单轮任务最大循环迭代次数。
     public var maxLoopIterations: Int
@@ -766,6 +793,11 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     /// Model shell only: credentials pass through unless explicitly stripped.
     public var stripModelShellCredentials: Bool
     public var modelShellNoninteractive: Bool
+    /// 审批卡的呈现方式：true = 输入框上方的行内提示条（默认），false = 弹窗。重启后保持。
+    public var approvalInlineEnabled: Bool = true
+    /// 交互审批等待超时自动拒绝的秒数；默认 300 秒，0 = 一直等。重启后保持。
+    /// 无人值守审批（定时任务等）不受这项影响，行为不变。
+    public var approvalTimeoutSeconds: Double = 300
     /// 并发工具执行上限。
     public var concurrentToolLimit: Int
     /// P3-CHILD-40：用户选择的 child 并发上限（1...40）。
@@ -821,6 +853,9 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     public var newMessageInterruptsGeneration: Bool
     /// Goal18 O11: controls new checkpoints and recovery entry, never deletes history.
     public var fileCheckpointsEnabled: Bool
+    /// 后台命令或后台子任务完成后，会话空闲时是否自动续跑一轮（默认开）。
+    /// 续跑沿用当前权限模式与审批；同一会话连续自动续跑有上限，用户发言后清零。
+    public var backgroundAutoContinueEnabled: Bool
     /// New child turns are writable by default; parent permissions and approval still apply.
     public var childMutationsEnabled: Bool
     public var childMutationsExplicitlySelected: Bool
@@ -863,7 +898,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         autoCompactThreshold: Double = 0.8,
         contextLengthTokens: Int? = nil,
         historyTurnLimit: Int? = nil,
-        fallbackEnabled: Bool = true,
+        fallbackEnabled: Bool = false,
         personaEnabled: Bool = false,
         personaPreset: PersonaPreset = .professional,
         persona: Persona = PersonaPreset.professional.defaultPersona,
@@ -873,6 +908,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         availableModelWhitelist: [String] = [],
         newMessageInterruptsGeneration: Bool = false,
         fileCheckpointsEnabled: Bool = true,
+        backgroundAutoContinueEnabled: Bool = true,
         childMutationsEnabled: Bool = true,
         childMutationsExplicitlySelected: Bool = false,
         browserWriteEnabled: Bool = true,
@@ -916,6 +952,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         self.availableModelWhitelist = availableModelWhitelist
         self.newMessageInterruptsGeneration = newMessageInterruptsGeneration
         self.fileCheckpointsEnabled = fileCheckpointsEnabled
+        self.backgroundAutoContinueEnabled = backgroundAutoContinueEnabled
         self.childMutationsEnabled = childMutationsEnabled
         self.childMutationsExplicitlySelected = childMutationsExplicitlySelected
         self.browserWriteEnabled = browserWriteEnabled
@@ -930,8 +967,10 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case legacyAutomaticApprovalCompatibilityActive, legacyApprovalPolicyOriginal, legacyApprovalPolicyNoticePending, legacyApprovalScopeNoticePending
-        case browserWriteEnabled, childMutationsExplicitlySelected, maxLoopIterationsNoticeAcknowledged, maxTokensPerSession, tokenBudgetUnlimited, maxLoopIterations, toolTimeoutSeconds, shellCommandTimeoutSeconds, stripModelShellCredentials, modelShellNoninteractive, concurrentToolLimit, childConcurrencyUserSelected, childConcurrencyEnabledSessionCount, autoCompactThreshold, contextLengthTokens, historyTurnLimit, fallbackEnabled, personaEnabled, personaPreset, persona, memoryEnabled, globalInstructionsEnabled, approvalPolicy, availableModelWhitelist, newMessageInterruptsGeneration, fileCheckpointsEnabled, childMutationsEnabled, childModelOverridesEnabled, childModelThinkingLevelCeiling, childDeletionAutoReviewEnabled, childDeletionAutoReviewWhitelist, composerPolicy, policyRuntimeDefaults, terminalPolicy
+        case legacyAutomaticApprovalCompatibilityActive, legacyApprovalPolicyOriginal, legacyApprovalPolicyNoticePending, legacyApprovalScopeNoticePending, approvalPolicyBeforeToolsDisabled
+        case approvalInlineEnabled, approvalTimeoutSeconds, approvalTimeoutDefaultMigrated
+        case backgroundAutoContinueEnabled
+        case browserWriteEnabled, childMutationsExplicitlySelected, maxLoopIterationsNoticeAcknowledged, maxTokensPerSession, tokenBudgetDefaultMigrated, tokenBudgetUnlimited, maxLoopIterations, toolTimeoutSeconds, shellCommandTimeoutSeconds, stripModelShellCredentials, modelShellNoninteractive, concurrentToolLimit, childConcurrencyUserSelected, childConcurrencyEnabledSessionCount, autoCompactThreshold, contextLengthTokens, historyTurnLimit, fallbackEnabled, fallbackDefaultOffMigrated, personaEnabled, personaPreset, persona, memoryEnabled, globalInstructionsEnabled, approvalPolicy, availableModelWhitelist, newMessageInterruptsGeneration, fileCheckpointsEnabled, childMutationsEnabled, childModelOverridesEnabled, childModelThinkingLevelCeiling, childDeletionAutoReviewEnabled, childDeletionAutoReviewWhitelist, composerPolicy, policyRuntimeDefaults, terminalPolicy
     }
 
     public init(from decoder: Decoder) throws {
@@ -940,13 +979,32 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         let storedIterations = try c.decodeIfPresent(Int.self, forKey: .maxLoopIterations)
         maxLoopIterations = min(100, max(1, storedIterations ?? d.maxLoopIterations))
         maxLoopIterationsNoticeAcknowledged = try c.decodeIfPresent(Bool.self, forKey: .maxLoopIterationsNoticeAcknowledged) ?? (storedIterations != 10)
-        maxTokensPerSession = max(1, try c.decodeIfPresent(Int.self, forKey: .maxTokensPerSession) ?? d.maxTokensPerSession)
+        // 旧默认 10 万迁移到新默认 100 万：只迁移恰好等于旧默认、且尚未迁移过的已存值；
+        // 迁移后落盘会带标记，之后用户再手动设为 10 万不会被改回。
+        let storedTokenCap = try c.decodeIfPresent(Int.self, forKey: .maxTokensPerSession)
+        let tokenCapMigrated = try c.decodeIfPresent(Bool.self, forKey: .tokenBudgetDefaultMigrated) ?? false
+        if !tokenCapMigrated, storedTokenCap == 100_000 {
+            maxTokensPerSession = d.maxTokensPerSession
+        } else {
+            maxTokensPerSession = max(1, storedTokenCap ?? d.maxTokensPerSession)
+        }
         tokenBudgetUnlimited = try c.decodeIfPresent(Bool.self, forKey: .tokenBudgetUnlimited) ?? false
         toolTimeoutSeconds = try c.decodeIfPresent(Int.self, forKey: .toolTimeoutSeconds) ?? d.toolTimeoutSeconds
         let commandTimeout = try c.decodeIfPresent(Int.self, forKey: .shellCommandTimeoutSeconds) ?? d.shellCommandTimeoutSeconds
         shellCommandTimeoutSeconds = Int(ShellCommandTimeoutPolicy.seconds(commandTimeout))
         stripModelShellCredentials = try c.decodeIfPresent(Bool.self, forKey: .stripModelShellCredentials) ?? d.stripModelShellCredentials
         modelShellNoninteractive = try c.decodeIfPresent(Bool.self, forKey: .modelShellNoninteractive) ?? d.modelShellNoninteractive
+        // 审批呈现：旧 JSON 无该键 → 行内提示条、不自动拒绝；超时值只接受有限的非负数，上限 1 小时。
+        approvalInlineEnabled = try c.decodeIfPresent(Bool.self, forKey: .approvalInlineEnabled) ?? d.approvalInlineEnabled
+        let storedApprovalTimeout = try c.decodeIfPresent(Double.self, forKey: .approvalTimeoutSeconds) ?? d.approvalTimeoutSeconds
+        // 旧默认是 0（一直等）：没有迁移标记且已存值为 0 时一次性改成新默认 300 秒；
+        // 落盘带标记后，用户再手动设为 0（一直等）会保持 0。
+        let approvalTimeoutMigrated = try c.decodeIfPresent(Bool.self, forKey: .approvalTimeoutDefaultMigrated) ?? false
+        if !approvalTimeoutMigrated, storedApprovalTimeout == 0 {
+            approvalTimeoutSeconds = d.approvalTimeoutSeconds
+        } else {
+            approvalTimeoutSeconds = storedApprovalTimeout.isFinite ? min(3600, max(0, storedApprovalTimeout)) : d.approvalTimeoutSeconds
+        }
         concurrentToolLimit = try c.decodeIfPresent(Int.self, forKey: .concurrentToolLimit) ?? d.concurrentToolLimit
         let decodedChildSelection = try c.decodeIfPresent(
             Int.self,
@@ -973,7 +1031,11 @@ public struct AgentSettings: Codable, Equatable, Sendable {
             .flatMap { $0 > 0 ? $0 : nil }
         historyTurnLimit = try c.decodeIfPresent(Int.self, forKey: .historyTurnLimit)
             .flatMap { $0 > 0 ? $0 : nil }
-        fallbackEnabled = try c.decodeIfPresent(Bool.self, forKey: .fallbackEnabled) ?? d.fallbackEnabled
+        // 跨供应商自动回退默认关闭。旧版本默认开启且无法区分“用户从未改过”和“用户主动开启”，
+        // 所以没有迁移标记的已存值统一按新默认处理为关闭；设置页可再次手动打开，之后落盘带标记不再被改回。
+        let fallbackMigrated = try c.decodeIfPresent(Bool.self, forKey: .fallbackDefaultOffMigrated) ?? false
+        let storedFallback = try c.decodeIfPresent(Bool.self, forKey: .fallbackEnabled)
+        fallbackEnabled = fallbackMigrated ? (storedFallback ?? d.fallbackEnabled) : d.fallbackEnabled
         // 波4：旧 JSON 无人格字段 → 默认禁用 + 专业助手预设。
         personaEnabled = try c.decodeIfPresent(Bool.self, forKey: .personaEnabled) ?? d.personaEnabled
         personaPreset = try c.decodeIfPresent(PersonaPreset.self, forKey: .personaPreset) ?? d.personaPreset
@@ -1008,6 +1070,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         // R8：旧 JSON 无 newMessageInterruptsGeneration → Goal18 默认排队；显式保存的选择不变。
         newMessageInterruptsGeneration = try c.decodeIfPresent(Bool.self, forKey: .newMessageInterruptsGeneration) ?? d.newMessageInterruptsGeneration
         fileCheckpointsEnabled = try c.decodeIfPresent(Bool.self, forKey: .fileCheckpointsEnabled) ?? d.fileCheckpointsEnabled
+        backgroundAutoContinueEnabled = try c.decodeIfPresent(Bool.self, forKey: .backgroundAutoContinueEnabled) ?? d.backgroundAutoContinueEnabled
         browserWriteEnabled = try c.decodeIfPresent(Bool.self, forKey: .browserWriteEnabled) ?? d.browserWriteEnabled
         childMutationsExplicitlySelected = try c.decodeIfPresent(Bool.self, forKey: .childMutationsExplicitlySelected) ?? false
         childMutationsEnabled = childMutationsExplicitlySelected
@@ -1026,6 +1089,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         composerPolicy = try c.decodeIfPresent(ComposerPolicySettings.self, forKey: .composerPolicy) ?? d.composerPolicy
         legacyApprovalScopeNoticePending = try c.decodeIfPresent(Bool.self, forKey: .legacyApprovalScopeNoticePending)
             ?? (composerPolicy.approvalScope != .request)
+        approvalPolicyBeforeToolsDisabled = try c.decodeIfPresent(ApprovalPolicy.self, forKey: .approvalPolicyBeforeToolsDisabled)
         // L2：旧 JSON 无 PolicyRuntime 默认边界 → 保守默认值。
         policyRuntimeDefaults = try c.decodeIfPresent(ProductionPolicyDefaults.self, forKey: .policyRuntimeDefaults) ?? d.policyRuntimeDefaults
         // P3-TERM-01：旧 JSON 无终端规则 → 保留原内置分类默认值。
@@ -1037,11 +1101,15 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         try c.encode(min(100, max(1, maxLoopIterations)), forKey: .maxLoopIterations)
         try c.encode(maxLoopIterationsNoticeAcknowledged, forKey: .maxLoopIterationsNoticeAcknowledged)
         try c.encode(max(1, maxTokensPerSession), forKey: .maxTokensPerSession)
+        try c.encode(true, forKey: .tokenBudgetDefaultMigrated)
         try c.encode(tokenBudgetUnlimited, forKey: .tokenBudgetUnlimited)
         try c.encode(toolTimeoutSeconds, forKey: .toolTimeoutSeconds)
         try c.encode(Int(ShellCommandTimeoutPolicy.seconds(shellCommandTimeoutSeconds)), forKey: .shellCommandTimeoutSeconds)
         try c.encode(stripModelShellCredentials, forKey: .stripModelShellCredentials)
         try c.encode(modelShellNoninteractive, forKey: .modelShellNoninteractive)
+        try c.encode(approvalInlineEnabled, forKey: .approvalInlineEnabled)
+        try c.encode(approvalTimeoutSeconds.isFinite ? min(3600, max(0, approvalTimeoutSeconds)) : 0, forKey: .approvalTimeoutSeconds)
+        try c.encode(true, forKey: .approvalTimeoutDefaultMigrated)
         try c.encode(concurrentToolLimit, forKey: .concurrentToolLimit)
         try c.encode(childConcurrencyUserSelected, forKey: .childConcurrencyUserSelected)
         try c.encode(childConcurrencyEnabledSessionCount, forKey: .childConcurrencyEnabledSessionCount)
@@ -1054,6 +1122,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         try c.encodeIfPresent(contextLengthTokens.flatMap { $0 > 0 ? $0 : nil }, forKey: .contextLengthTokens)
         try c.encodeIfPresent(historyTurnLimit.flatMap { $0 > 0 ? $0 : nil }, forKey: .historyTurnLimit)
         try c.encode(fallbackEnabled, forKey: .fallbackEnabled)
+        try c.encode(true, forKey: .fallbackDefaultOffMigrated)
         try c.encode(personaEnabled, forKey: .personaEnabled)
         try c.encode(personaPreset, forKey: .personaPreset)
         try c.encode(persona, forKey: .persona)
@@ -1064,9 +1133,11 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         try c.encodeIfPresent(legacyApprovalPolicyOriginal, forKey: .legacyApprovalPolicyOriginal)
         try c.encode(legacyApprovalPolicyNoticePending, forKey: .legacyApprovalPolicyNoticePending)
         try c.encode(legacyApprovalScopeNoticePending, forKey: .legacyApprovalScopeNoticePending)
+        try c.encodeIfPresent(approvalPolicyBeforeToolsDisabled, forKey: .approvalPolicyBeforeToolsDisabled)
         try c.encode(availableModelWhitelist, forKey: .availableModelWhitelist)
         try c.encode(newMessageInterruptsGeneration, forKey: .newMessageInterruptsGeneration)
         try c.encode(fileCheckpointsEnabled, forKey: .fileCheckpointsEnabled)
+        try c.encode(backgroundAutoContinueEnabled, forKey: .backgroundAutoContinueEnabled)
         try c.encode(childMutationsEnabled, forKey: .childMutationsEnabled)
         try c.encode(childMutationsExplicitlySelected, forKey: .childMutationsExplicitlySelected)
         try c.encode(browserWriteEnabled, forKey: .browserWriteEnabled)
@@ -1326,6 +1397,9 @@ public struct AppSettings: Codable, Equatable, Sendable {
     /// v4 新增：general.themePreset（SETTINGS-27/THEME-01 外观收敛，并把
     ///   旧的 appearance/accentTheme 收敛为该预设的投影）。
     /// （E19 general.modelSpeedTier 走宽容解码兜底默认值，不 bump 版本。）
+    /// v5：本版把各项“默认值已迁移”标记（令牌预算、回退默认关、子任务写入选择、
+    ///   自动批准兼容标记）一并固化。旧版本读到 v5 文件会按“未来版本”拒绝加载并备份，
+    ///   不会再把这些标记静默丢掉后重新迁移一遍。
     public static let currentVersion = 4
 
     public var settingsVersion: Int

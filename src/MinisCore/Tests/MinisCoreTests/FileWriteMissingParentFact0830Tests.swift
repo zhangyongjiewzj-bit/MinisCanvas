@@ -174,9 +174,12 @@ struct FileWriteMissingParentFact0830Tests {
             identity = AgentExecutionIdentity(turn: AgentTurnIdentity(sessionID: "actual-session0830",
                 turnID: 1, messageID: "message0830"), operationID: "operation0830", attempt: 1)
         }
-        func run(target: URL, createDirs: Bool = false) async throws -> (AgentLoopResult?, String?, [FileWriteWire0830.Request]) {
-            let input = try JSONSerialization.data(withJSONObject: ["tool_title": "Write owned synthetic artifact",
-                "path": target.path, "content": "owned artifact0830\n", "append": false, "create_dirs": createDirs])
+        /// createDirs 为 nil 时不传该参数，走默认值（默认自动建父目录）。
+        func run(target: URL, createDirs: Bool? = false) async throws -> (AgentLoopResult?, String?, [FileWriteWire0830.Request]) {
+            var arguments: [String: Any] = ["tool_title": "Write owned synthetic artifact",
+                "path": target.path, "content": "owned artifact0830\n", "append": false]
+            if let createDirs { arguments["create_dirs"] = createDirs }
+            let input = try JSONSerialization.data(withJSONObject: arguments)
             let wire = try FileWriteWire0830(input: String(decoding: input, as: UTF8.self))
             defer { wire.stop() }
             var config = ProviderConfig(label: "LUNA", providerType: .openAI, runtimeProviderID: "LUNA",
@@ -236,7 +239,8 @@ struct FileWriteMissingParentFact0830Tests {
             try Data("owned sentinel".utf8).write(to: parent)
             target = parent.appendingPathComponent("never.md")
         } else { target = f.foreign.appendingPathComponent("never.md") }
-        let (outcome, failure, requests) = try await f.run(target: target)
+        // 缺失父目录显式 create_dirs=false 时仍拒绝；父路径是普通文件时走默认（自动建目录）也要在写入前失败。
+        let (outcome, failure, requests) = try await f.run(target: target, createDirs: kind == "non-directory-parent" ? nil : false)
         #expect(failure == nil, "normal file refusal is not durable authority failure")
         #expect(outcome != nil)
         #expect(!FileManager.default.fileExists(atPath: target.path))
@@ -257,10 +261,10 @@ struct FileWriteMissingParentFact0830Tests {
         }
     }
 
-    @Test("create_dirs remains actual success, exact receipt/hash/artifact cannot leak to foreign session")
+    @Test("create_dirs defaults to true: missing parents are created, exact receipt/hash/artifact cannot leak to foreign session")
     func requestedParentCreationProducesBoundSuccess() async throws {
         let f = try Fixture(), target = f.allowed.appendingPathComponent("created/by-actual-tool.md")
-        let (outcome, failure, requests) = try await f.run(target: target, createDirs: true)
+        let (outcome, failure, requests) = try await f.run(target: target, createDirs: nil)
         #expect(failure == nil && outcome != nil)
         #expect(try Data(contentsOf: target) == Data("owned artifact0830\n".utf8))
         let terminal = try #require(f.facts.facts.first)

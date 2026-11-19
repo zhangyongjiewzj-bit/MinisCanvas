@@ -45,6 +45,23 @@ public enum ModelShellEnvironment {
         return result
     }
 
+    /// 导入 Key 页专用的登录 shell 快照读取：只返回 `names` 里列出的变量，不经 `values()`，
+    /// 所以不受"去掉凭据变量"设置影响、不改写 HOME/ZDOTDIR；也不会抛错。
+    /// 快照可能还在后台捕获（最长约 5 秒），等待发生在后台队列，调用方 `await` 即可，不会阻塞主线程。
+    /// 快照失败或超时返回空字典。结果只在内存里给导入页显示掩码用，不写日志、不落盘。
+    public static func loginShellValues(named names: Set<String>) async -> [String: String] {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: filteredValues(snapshot: state.snapshot(), names: names))
+            }
+        }
+    }
+
+    static func filteredValues(snapshot: [String: String]?, names: Set<String>) -> [String: String] {
+        guard let snapshot else { return [:] }
+        return snapshot.filter { names.contains($0.key) }
+    }
+
     /// Used only to redact command output in memory; never persist these values.
     public static func knownCredentialValues() -> [String] {
         state.cachedSnapshot().map { knownCredentialValues(snapshot: $0) } ?? []

@@ -2265,6 +2265,22 @@ struct UnifiedTurnRuntimeSnapshotTests {
             workingDirectory: root.path
         )
         let skillStore = SkillStore(skillsRoot: root.appendingPathComponent("skills"))
+        // 生产引擎在有运行期依赖时会读 SettingsCenter.active 并核对它的会话目录；别的测试遗留的
+        // 全局拥有者目录不同就会抛 contextSettingsScopeMismatch。本测试自带一个绑定本会话目录的拥有者，
+        // 并持有到测试结束。
+        let keychain = KeychainStore(backing: InMemoryKeychainBacking())
+        let settingsOwner = SettingsCenter(
+            settingsStore: SettingsStore(directory: root.appendingPathComponent("settings")),
+            envStore: EnvVarStore(directory: root.appendingPathComponent("env"), keychain: keychain),
+            memoryStore: MemoryStore(directory: root.appendingPathComponent("memory-owner")),
+            sessionStore: sessionStore,
+            logManager: LogManager(directory: root.appendingPathComponent("logs"), ringCapacity: 20),
+            mcpManager: MCPServerManager(fileURL: root.appendingPathComponent("mcps.json"), keychain: keychain),
+            skillStore: skillStore,
+            usageStore: UsageStore(domain: .suite("unified-turn-context-\(UUID().uuidString)")),
+            providerReadinessTransport: FailClosedProviderReadinessTransport()
+        )
+        defer { withExtendedLifetime(settingsOwner) {} }
         let scope = MemoryScope(sessionID: sessionID, projectID: projectID)
         let imported = try skillStore.importSkillThroughLifecycle(
             content: """

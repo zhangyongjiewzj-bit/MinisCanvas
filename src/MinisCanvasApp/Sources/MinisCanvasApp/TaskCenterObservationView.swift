@@ -76,6 +76,8 @@ enum TaskCenterRowLabelFormatter {
 /// Task-center surface backed by the canonical AgentTaskStore projection.
 /// Observation remains read-only; controls enter only through the Bridge consumer.
 struct TaskCenterObservationView: View {
+    @Environment(\.themeTokens) private var theme
+    @State private var ledgerSignature: [UInt64] = []
     @State private var confirmsStopAllBackground = false
     let bridge: BridgeStore
     let initialChildNavigation: TaskCenterChildSessionNavigation?
@@ -162,11 +164,14 @@ struct TaskCenterObservationView: View {
         let residualWorktreesPresentation = $showsResidualWorktrees
         let canEnterPanel = initialChildNavigation == nil
         return NavigationStack {
-            TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+            // 不再用计时器包住整个界面：只在账本数据变化时重算（见下面的 .task），
+            // 随时间走的文案（后台命令用时）由 BackgroundCommandsSection 自带时钟。
+            Group {
+                let _ = ledgerSignature
                 let observation = bridge.taskCenterObservation
                 let goalProjection = bridge.taskCenterGoalProjection(now: .now)
                 let consumer = bridge.taskCenterControlConsumer
-                let allReceiptRows = bridge.taskCenterControlConsumer.receiptRows(now: .now, includeArchived: true)
+                let allReceiptRows = bridge.taskCenterControlConsumer.receiptRowsReusingVersion(includeArchived: true)
                 let filter = TaskCenterReceiptFilter(
                     status: selectedFilterStatus,
                     sourceSessionID: selectedSourceSessionID,
@@ -178,12 +183,13 @@ struct TaskCenterObservationView: View {
                 let sourceSessionIDs = Array(
                     Set(allReceiptRows.compactMap(\.sourceSessionID))
                 ).sorted()
+                let knownSessionTitles = Dictionary(
+                    bridge.chat.sessions.map { ($0.id.uuidString, $0.title) },
+                    uniquingKeysWith: { first, _ in first }
+                )
                 let sourceLabels = TaskCenterRowLabelFormatter.sourceLabels(
                     ids: sourceSessionIDs,
-                    knownTitles: Dictionary(
-                        bridge.chat.sessions.map { ($0.id.uuidString, $0.title) },
-                        uniquingKeysWith: { first, _ in first }
-                    )
+                    knownTitles: knownSessionTitles
                 )
                 ScrollViewReader { scrollProxy in
                 ScrollView {
@@ -206,7 +212,7 @@ struct TaskCenterObservationView: View {
                                 Text("会中断所有仍在后台运行的子任务；已经完成的结果不受影响。")
                             }
                         }
-                        BackgroundCommandsSection(registry: .shared, now: .now)
+                        BackgroundCommandsSection(registry: .shared, sessionTitles: knownSessionTitles)
                         if bridge.approvalCenter.pendingExecutionOrigin.isUnattended,
                            bridge.approvalCenter.pendingRequest != nil {
                             Label {
@@ -315,6 +321,14 @@ struct TaskCenterObservationView: View {
                 }
                 }
             }
+            .task {
+                // 每 0.5 秒只比一次廉价签名（账本版本 + 后台子任务数 + 10 秒时间段）；变了才改状态、触发重算。
+                while !Task.isCancelled {
+                    let current = bridge.taskCenterControlConsumer.observationSignature(now: .now)
+                    if current != ledgerSignature { ledgerSignature = current }
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+            }
             .navigationTitle("任务中心")
             .sheet(isPresented: $showsResidualWorktrees) {
                 P03CleanupAppView(controller: bridge.p03CleanupAppController,
@@ -412,10 +426,10 @@ struct TaskCenterObservationView: View {
         let counts = observation.counts
         return AdaptiveControlRowLayout(spacing: 14) {
             TaskCenterMetric(title: "全部", value: counts.total, tint: .secondary)
-            TaskCenterMetric(title: "排队", value: counts.queued, tint: .blue)
-            TaskCenterMetric(title: "运行中", value: counts.running, tint: .orange)
-            TaskCenterMetric(title: "已完成", value: counts.succeeded, tint: .green)
-            TaskCenterMetric(title: "失败", value: counts.failed, tint: .red)
+            TaskCenterMetric(title: "排队", value: counts.queued, tint: theme?.statusInfo ?? AppStatusColor.info)
+            TaskCenterMetric(title: "运行中", value: counts.running, tint: theme?.statusWarning ?? AppStatusColor.warning)
+            TaskCenterMetric(title: "已完成", value: counts.succeeded, tint: theme?.statusSuccess ?? AppStatusColor.success)
+            TaskCenterMetric(title: "失败", value: counts.failed, tint: theme?.statusDanger ?? AppStatusColor.danger)
             TaskCenterMetric(title: "已取消", value: counts.cancelled, tint: .secondary)
         }
         .accessibilityElement(children: .contain)
@@ -443,7 +457,7 @@ struct TaskCenterObservationView: View {
             }
             ForEach(rows, id: \.stage) { row in
                 Text(row.displayText)
-                    .foregroundStyle(row.deviations.isEmpty ? Color.secondary : Color.orange)
+                    .foregroundStyle(row.deviations.isEmpty ? Color.secondary : (theme?.statusWarning ?? AppStatusColor.warning))
                     .accessibilityIdentifier("task-center-child-concurrency-\(row.stage.rawValue)")
             }
             Text(Self.childConcurrencyCeilingText)
@@ -487,10 +501,10 @@ struct TaskCenterObservationView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Label {
-                    Text("Goal")
+                    Text("任务授权")
                         .accessibilityIdentifier("typography.task.goal-headline")
                 } icon: {
-                    MinisIconView(.target, size: 16, accessibilityLabel: "Goal")
+                    MinisIconView(.target, size: 16, accessibilityLabel: "任务授权")
                 }
                 .font(typography?.headline ?? .headline)
                 Spacer()
@@ -502,8 +516,8 @@ struct TaskCenterObservationView: View {
             if projection.goals.isEmpty {
                 Text(
                     bridge.taskCenterControlConsumer.isAvailable
-                        ? "当前没有已绑定 Goal 的任务"
-                        : "Goal/Lease 生产 consumer 未接入，控制动作保持关闭"
+                        ? "当前没有绑定任务授权的任务（这里不是会话目标）"
+                        : "任务授权功能未接入，控制动作保持关闭"
                 )
                     .font(typography?.caption ?? .caption)
                     .foregroundStyle(.secondary)
@@ -547,10 +561,10 @@ struct TaskCenterObservationView: View {
                 .foregroundStyle(
                     projection.snapshot.state == .connected
                         ? Color.secondary
-                        : Color.orange
+                        : (theme?.statusWarning ?? AppStatusColor.warning)
                 )
             if let backlink = projection.snapshot.lastOutputBacklink {
-                Text("最近输出回链：\(backlink.threadID.rawValue) · seq \(backlink.sequence)")
+                Text("最近输出回链：\(backlink.threadID.rawValue) · 第 \(backlink.sequence) 条")
                     .font(typography?.caption2 ?? .caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -850,17 +864,17 @@ struct TaskCenterObservationView: View {
     }
 
     private func leaseAccessibilityLabel(_ state: GoalTaskCenterLeaseState) -> String {
-        "Goal " + leaseTitle(state)
+        "任务" + leaseTitle(state)
     }
 }
 
 private extension GoalTaskCenterLeaseState {
     var accessibilityLabel: String {
         switch self {
-        case .active: return "Goal 授权有效"
-        case .expired: return "Goal 授权过期"
-        case .revoked: return "Goal 授权撤销"
-        case .invalid: return "Goal 授权无效"
+        case .active: return "任务授权有效"
+        case .expired: return "任务授权过期"
+        case .revoked: return "任务授权撤销"
+        case .invalid: return "任务授权无效"
         }
     }
 }
@@ -923,6 +937,7 @@ private struct TaskCenterObservationStateRow: View {
     let isStale: Bool
     let taskID: String
     let displayTitle: String
+    @Environment(\.themeTokens) private var theme
     @Environment(\.typographyTokens) private var typography
 
     var body: some View {
@@ -940,7 +955,7 @@ private struct TaskCenterObservationStateRow: View {
             .font(typography?.caption2 ?? .caption2)
             .foregroundStyle(
                 isStale
-                    ? AnyShapeStyle(Color.orange)
+                    ? AnyShapeStyle(theme?.statusWarning ?? AppStatusColor.warning)
                     : AnyShapeStyle(HierarchicalShapeStyle.tertiary)
             )
             .accessibilityLabel(accessibilityLabel)
@@ -970,7 +985,7 @@ enum TaskCenterRecoveryRowText {
     static func visibleTitle(for row: TaskCenterReceiptRow) -> String? {
         guard row.recoveryState == .needsUserReview else { return nil }
         if row.needsChildTerminalReview {
-            return "恢复：子任务 \(row.taskID) · 父任务 \(row.parentID) · Run \(row.runID ?? "未记录") 的真实终态未记录，需人工复核"
+            return "恢复：子任务 \(row.taskID) · 父任务 \(row.parentID) · 运行 \(row.runID ?? "未记录") 的真实终态未记录，需人工复核"
         }
         return "恢复：" + row.recoveryState.title
     }
@@ -1043,6 +1058,7 @@ struct TaskCenterRowIconProjection {
 }
 
 private struct TaskCenterRow: View {
+    @Environment(\.themeTokens) private var theme
     let fact: GoalTaskCenterTaskFact
     let receipt: TaskCenterReceiptRow?
     let sourceDisplayTitle: String
@@ -1282,7 +1298,7 @@ private struct TaskCenterRow: View {
                 DisclosureGroup("展开详情", isExpanded: $showsInternalDetails) {
                     VStack(alignment: .leading, spacing: 3) {
                 if fact.isGoalBound && fact.scopeID != nil {
-                    Text("Goal · \(leaseTitle)")
+                    Text("任务授权 · \(leaseTitle)")
                         .font(typography?.caption2 ?? .caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -1291,7 +1307,7 @@ private struct TaskCenterRow: View {
                             "task-center-lease-state-\(fact.goalID?.uuidString ?? fact.taskCenterStableID)"
                         )
                 } else {
-                    Text("Goal 未绑定 · 只读")
+                    Text("未绑定任务授权 · 只读")
                         .font(typography?.caption2 ?? .caption2)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
@@ -1299,7 +1315,7 @@ private struct TaskCenterRow: View {
 
                         VStack(alignment: .leading, spacing: 3) {
                             Text("子能力摘要（具体操作仍受审批/安全策略约束）")
-                            Text("父 Goal 仅表示父级目标与上限，不等于子任务全部有效权限")
+                            Text("父任务授权仅表示父级目标与上限，不等于子任务全部有效权限")
                             if let granted = fact.childGrantedCapabilities,
                                let intersection = fact.childCapabilityIntersection {
                                 Text("已冻结能力：\(childCapabilityNames(granted))")
@@ -1323,17 +1339,17 @@ private struct TaskCenterRow: View {
                         // Only the canonical redacted category is safe to show verbatim.
                         // Unknown legacy failure text may contain credentials and stays hidden.
                         if receipt?.failureReason == "execution-failed" {
-                            Text("失败代码：execution-failed")
+                            Text("失败原因：执行失败")
                                 .accessibilityIdentifier("task-center-failure-code-\(fact.taskID)")
                         }
                         if let scopeID = fact.scopeID {
-                            Text("Goal scope：\(scopeID)")
+                            Text("授权范围：\(scopeID)")
                         }
                         Text(receiptSummary)
                             .accessibilityIdentifier("task-center-receipt-details-\(receipt?.stableID ?? fact.taskCenterStableID)")
                         if let succeededBacklink = receipt?.succeededBacklink {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("成功回执回链：run \(succeededBacklink.runID) · attempt \(succeededBacklink.attemptID) · seq \(succeededBacklink.terminalEventSequence)")
+                                Text("成功回执回链：运行 \(succeededBacklink.runID) · 第 \(succeededBacklink.attemptID) 次尝试 · 终态第 \(succeededBacklink.terminalEventSequence) 条")
                                     .lineLimit(1)
                                 if let outputDigest = succeededBacklink.outputDigest {
                                     Text("输出摘要：\(outputDigest)")
@@ -1367,7 +1383,7 @@ private struct TaskCenterRow: View {
                                 "task-center-artifact-summary-\(receipt?.stableID ?? fact.taskCenterStableID)"
                             )
                         }
-                        Text("revision: \(fact.revision)")
+                        Text("版本号：\(fact.revision)")
                     }
                     .font(typography?.caption2 ?? .caption2)
                     .foregroundStyle(.tertiary)
@@ -1497,23 +1513,26 @@ private struct TaskCenterRow: View {
     }
 
     private var statusColor: Color {
+        let warning = theme?.statusWarning ?? AppStatusColor.warning
+        let success = theme?.statusSuccess ?? AppStatusColor.success
+        let danger = theme?.statusDanger ?? AppStatusColor.danger
         if receipt?.isStale == true {
-            return .orange
+            return warning
         }
         switch receipt?.lifecycleState {
-        case .some(.retrying): return .orange
-        case .some(.completed): return .green
-        case .some(.failed): return .red
+        case .some(.retrying): return warning
+        case .some(.completed): return success
+        case .some(.failed): return danger
         case .some(.cancelled): return .secondary
-        case .some(.running): return .orange
-        case .some(.approvalRequired), .some(.inputRequired): return .orange
+        case .some(.running): return warning
+        case .some(.approvalRequired), .some(.inputRequired): return warning
         case .some(.queued), .none: break
         }
         switch fact.status {
-        case .queued: return .blue
-        case .running: return .orange
-        case .succeeded: return .green
-        case .failed: return .red
+        case .queued: return theme?.statusInfo ?? AppStatusColor.info
+        case .running: return warning
+        case .succeeded: return success
+        case .failed: return danger
         case .cancelled: return .secondary
         }
     }
@@ -1557,7 +1576,7 @@ private struct TaskCenterRow: View {
     }
 
     private var receiptSummary: String {
-        guard let receipt else { return "Task receipt 未生成" }
+        guard let receipt else { return "任务回执未生成" }
         let run = receipt.runID ?? "未创建"
         let attempt = receipt.attemptID ?? "未创建"
         let availableActions = [
@@ -1568,12 +1587,12 @@ private struct TaskCenterRow: View {
             ? "操作 无"
             : "操作 \(availableActions.joined(separator: "、"))"
         return [
-            "Receipt \(receipt.receiptID)",
-            "Session \(receipt.sessionID)",
-            "Task \(receipt.statusTitle)",
-            "Run \(run)（\(receipt.runState.title)）",
-            "Attempt \(attempt)（\(receipt.attemptState.title)）",
-            "Effect \(receipt.effectID)（\(receipt.effectState.title)）",
+            "回执 \(receipt.receiptID)",
+            "会话 \(receipt.sessionID)",
+            "任务 \(receipt.statusTitle)",
+            "运行 \(run)（\(receipt.runState.title)）",
+            "尝试 \(attempt)（\(receipt.attemptState.title)）",
+            "效果 \(receipt.effectID)（\(receipt.effectState.title)）",
             actionSummary
         ].joined(separator: " · ")
     }

@@ -32,8 +32,9 @@ struct TerminalCompoundActualSubmissionCurrentConsumerTests {
             ("command-substitution", "echo $(touch \(marker.path))", .pathViolation),
             ("backtick-substitution", "echo `touch \(marker.path)`", .pathViolation),
             ("background", "touch \(marker.path) &", .approvalRequired),
-            ("env-wrapper-hard-deny", "env open \(root.path)/Synthetic.app", .denied),
-            ("nice-wrapper-hard-deny", "nice -n 2 open \(root.path)/Synthetic.app", .denied)
+            // open 已改为走审批（对齐 Claude Code）；包装器里的硬拒绝改用仍被硬拒绝的 shutdown。
+            ("env-wrapper-hard-deny", "env shutdown -h now", .denied),
+            ("nice-wrapper-hard-deny", "nice -n 2 shutdown -h now", .denied)
         ]
         for (name, command, expectedError) in probes {
             logProbe(name, command)

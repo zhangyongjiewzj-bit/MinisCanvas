@@ -771,7 +771,7 @@ public struct ProviderRuntimeRoute: UsageRouteIdentityProviding, AssistantStream
     private var retryPolicy: LLMRetryPolicy? = nil
 
     /// Enable leaf retries for an already admitted turn without rebuilding its frozen route.
-    public func retryingProviderAttempts(_ policy: LLMRetryPolicy = .rateLimitAndOverloadOnly) -> Self {
+    public func retryingProviderAttempts(_ policy: LLMRetryPolicy = .mainConversation()) -> Self {
         var route = self
         route.retryPolicy = policy
         return route

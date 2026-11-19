@@ -93,6 +93,10 @@ struct ChatTurnPromptPreprocessResult: Sendable {
     var trustedProjectInstructions: TrustedProjectInstructionSnapshot? = nil
     var systemPromptWithoutProjectInstructions: String? = nil
     var projectInstructionsUnavailable = false
+    /// 仅在“项目有指令文件但没能加载”时有值（原因 + 下一步）；项目本来就没有指令文件时为 nil。
+    var projectInstructionsUnavailableReason: String? = nil
+    /// 与消息自动匹配、但未批准而没有加载的技能 id（已过滤成可显示字符）；只用于界面轻提示。
+    var unapprovedMatchedSkillIDs: [String] = []
 
     /// User-selected Skills whose body was withheld because they lack an exact
     /// current session/project review. Identity only; never Skill content.
@@ -102,12 +106,14 @@ struct ChatTurnPromptPreprocessResult: Sendable {
 
     /// Only plain identifier characters may enter a system prompt or UI notice.
     static func promptSafeSkillIDs(_ receipts: [SkillInjectionReceipt]) -> [String] {
-        receipts.filter { $0.omittedReason == "scope_rejected" }.map { receipt in
-            let safe = String(receipt.skillID.filter {
-                $0.isASCII && ($0.isLetter || $0.isNumber || "-_.:".contains($0))
-            }.prefix(64))
-            return safe.isEmpty ? "所选技能" : safe
-        }
+        receipts.filter { $0.omittedReason == "scope_rejected" }.map { promptSafeSkillID($0.skillID) }
+    }
+
+    static func promptSafeSkillID(_ skillID: String) -> String {
+        let safe = String(skillID.filter {
+            $0.isASCII && ($0.isLetter || $0.isNumber || "-_.:".contains($0))
+        }.prefix(64))
+        return safe.isEmpty ? "所选技能" : safe
     }
 
     func excludingProjectInstructions() -> Self {
@@ -161,9 +167,10 @@ enum ChatTurnPromptPreprocessor {
         var skillSourceCount = 0
         var memoryReadFailed = false
         var globalDocumentByteCount: Int? = nil
-        let trustedInstructions = try trustedProjectRoot.flatMap {
-            try TrustedProjectInstructions.loadSnapshot(atTrustedRoot: $0)
+        let instructionReport = try trustedProjectRoot.map {
+            try TrustedProjectInstructions.loadReport(atTrustedRoot: $0)
         }
+        let trustedInstructions = instructionReport?.snapshot
         if let trustedInstructions { prompt += "\n\n" + trustedInstructions.systemPromptPrefix }
         if globalInstructionsEnabled, let memoryInjector {
             do {
@@ -193,7 +200,7 @@ enum ChatTurnPromptPreprocessor {
         try Task.checkCancellation()
         if let skillInjector {
             // 2026-11-15 第七版：定时、跨项目回合也附技能目录；定时回合固定带上 scheduled-task 技能。
-            if let catalog = skillInjector.catalogFragment(within: memoryScope) {
+            if let catalog = skillInjector.catalogFragment(within: memoryScope, userMessage: userMessage) {
                 prompt += "\n\n" + catalog
                 withoutProject += "\n\n" + catalog
             }
@@ -210,7 +217,8 @@ enum ChatTurnPromptPreprocessor {
         return ChatTurnPromptPreprocessResult(systemPrompt: prompt, skillReceipts: [], memoryFactIDs: memoryFactIDs, memoryFactDisplayInputs: memoryFactDisplayInputs, memoryFactDisplayScope: memoryFactDisplayScope, memorySourceCount: memorySourceCount, skillSourceCount: skillSourceCount, memoryReadFailed: memoryReadFailed,
             globalDocumentByteCount: globalDocumentByteCount, trustedProjectInstructions: trustedInstructions,
             systemPromptWithoutProjectInstructions: withoutProject,
-            projectInstructionsUnavailable: trustedProjectRoot != nil && trustedInstructions == nil)
+            projectInstructionsUnavailable: instructionReport?.unavailableReason != nil,
+            projectInstructionsUnavailableReason: instructionReport?.unavailableReason)
     }
 
     static func prepare(
@@ -226,9 +234,15 @@ enum ChatTurnPromptPreprocessor {
         var skillSourceCount = 0
         var memoryReadFailed = false
         var globalDocumentByteCount: Int? = nil
-        let trustedInstructions = input.trustedProjectRoot.flatMap {
-            try? TrustedProjectInstructions.loadSnapshot(atTrustedRoot: $0)
-        }
+        let instructionReport: TrustedProjectInstructions.LoadReport?
+        var instructionReadFailed = false
+        if let root = input.trustedProjectRoot {
+            do { instructionReport = try TrustedProjectInstructions.loadReport(atTrustedRoot: root) }
+            catch { instructionReport = nil; instructionReadFailed = true }
+        } else { instructionReport = nil }
+        let trustedInstructions = instructionReport?.snapshot
+        let instructionUnavailableReason = instructionReadFailed
+            ? "项目目录暂时无法读取，请确认文件夹仍在原位置。" : instructionReport?.unavailableReason
         if let trustedInstructions { prompt += "\n\n" + trustedInstructions.systemPromptPrefix }
         if input.globalInstructionsEnabled, let injector = input.memoryInjector {
             do {
@@ -294,7 +308,7 @@ enum ChatTurnPromptPreprocessor {
             within: input.memoryScope
         ) ?? input.legacySkillResult
         guard !Task.isCancelled else { return nil }
-        if let catalog = input.skillInjector?.catalogFragment(within: input.memoryScope) {
+        if let catalog = input.skillInjector?.catalogFragment(within: input.memoryScope, userMessage: input.intentText) {
             prompt += "\n\n" + catalog
             withoutProject += "\n\n" + catalog
         }
@@ -309,6 +323,10 @@ enum ChatTurnPromptPreprocessor {
             prompt += "\n\n" + notice
             withoutProject += "\n\n" + notice
         }
+        // 自动匹配上但未批准的技能只做界面轻提示，不进发给模型的正文。
+        let unapprovedMatches = input.skillInjector?
+            .unapprovedMatchingSkillIDs(for: input.intentText, within: input.memoryScope)
+            .map(ChatTurnPromptPreprocessResult.promptSafeSkillID) ?? []
         if let extra = ChatStore.pickerContentInjectionFragment(for: pickerItems) {
             prompt += "\n\n" + extra
             withoutProject += "\n\n" + extra
@@ -323,7 +341,9 @@ enum ChatTurnPromptPreprocessor {
             memoryFactIDs: memoryFactIDs, memoryFactDisplayInputs: memoryFactDisplayInputs, memoryFactDisplayScope: memoryFactDisplayScope, memorySourceCount: memorySourceCount, skillSourceCount: skillSourceCount, memoryReadFailed: memoryReadFailed,
             globalDocumentByteCount: globalDocumentByteCount, trustedProjectInstructions: trustedInstructions,
             systemPromptWithoutProjectInstructions: withoutProject,
-            projectInstructionsUnavailable: input.trustedProjectRoot != nil && trustedInstructions == nil
+            projectInstructionsUnavailable: instructionUnavailableReason != nil,
+            projectInstructionsUnavailableReason: instructionUnavailableReason,
+            unapprovedMatchedSkillIDs: unapprovedMatches
         )
     }
 }

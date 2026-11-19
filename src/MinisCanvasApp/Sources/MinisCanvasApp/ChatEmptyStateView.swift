@@ -6,13 +6,14 @@ import MinisCore
 /// 该视图只描述空 session 的内容和发送回调，不读取或修改 ChatStore。
 /// 主控接线时应由 composer/ChatStore 负责把回调转换为真实发送动作。
 struct ChatEmptyStateView: View {
+    @Environment(\.themeTokens) private var theme
     struct Content: Equatable {
         let sessionID: UUID
 
         var title: String { "开始新的对话" }
         var prompt: String { "输入消息开始与 Minis 助手协作" }
         var identity: String { "chat.emptyState.\(sessionID.uuidString)" }
-        var accessibilityLabel: String { "空会话，\(sessionID.uuidString)" }
+        var accessibilityLabel: String { "空会话" }
     }
 
     struct LayoutMetrics: Equatable {
@@ -114,7 +115,7 @@ struct ChatEmptyStateView: View {
                         Group {
                             if content.isTerminal {
                                 MinisIconView(.warning, size: 28)
-                                    .foregroundPalette(Color.orange)
+                                    .foregroundPalette(theme?.statusWarning ?? AppStatusColor.warning)
                             } else {
                                 ProgressView().controlSize(.small).frame(width: 28, height: 28)
                             }
@@ -189,7 +190,7 @@ struct ChatEmptyStateView: View {
                             sendPrompt()
                         } label: {
                             Label {
-                                Text("发送提示")
+                                Text("填入示例提示")
                             } icon: {
                                 MinisIconView(.send, size: 14)
                                     .accessibilityHidden(true)
@@ -197,7 +198,7 @@ struct ChatEmptyStateView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("chat.emptyState.sendPrompt")
-                        .accessibilityHint("发送一条示例提示以开始对话")
+                        .accessibilityHint("把一条示例提示填入输入框，确认后再发送")
                     }
                     .frame(maxWidth: min(420, metrics.contentWidth))
                     .padding(.horizontal, 16)

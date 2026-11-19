@@ -105,20 +105,20 @@ struct CustomProviderURLSecurityTests {
 
     // MARK: OpenAICompatible — 不安全目的地必须 fail-closed
 
-    @Test("chat: http 非 loopback 自定义 base 必须抛错且零请求")
-    func chatRejectsNonLoopbackHTTP() async {
+    @Test("chat: 局域网 http 中转站可用且携带 Bearer")
+    func chatAllowsLANHTTP() async throws {
         defer { S4ProviderURLMockURLProtocol.reset() }
         S4ProviderURLMockURLProtocol.handler = { _ in (200, s4ChatCompletionOK, ["Content-Type": "application/json"]) }
-        let provider = Self.chatProvider(customBaseURL: "http://example.com/v1")
-        await #expect(throws: LLMError.self) {
-            try await provider.sendMessage(
-                messages: [LLMMessage(role: .user, content: "hi")],
-                systemPrompt: nil,
-                maxTokens: 10,
-                temperature: nil
-            )
-        }
-        #expect(S4ProviderURLMockURLProtocol.requests.isEmpty)
+        let provider = Self.chatProvider(customBaseURL: "http://192.168.1.20:3000/v1")
+        let response = try await provider.sendMessage(
+            messages: [LLMMessage(role: .user, content: "hi")],
+            systemPrompt: nil,
+            maxTokens: 10,
+            temperature: nil
+        )
+        #expect(response.text == "ok")
+        let sent = try #require(S4ProviderURLMockURLProtocol.requests.first)
+        #expect(sent.value(forHTTPHeaderField: "Authorization") == "Bearer \(Self.testAPIKey)")
     }
 
     @Test("chat: ftp scheme 必须抛错且零请求")
@@ -170,10 +170,10 @@ struct CustomProviderURLSecurityTests {
     }
 
     @Test("chat: streamMessage 不安全 base 同样 fail-closed 且零请求")
-    func chatStreamMessageRejectsNonLoopbackHTTP() async {
+    func chatStreamMessageRejectsUnsafeBase() async {
         defer { S4ProviderURLMockURLProtocol.reset() }
         S4ProviderURLMockURLProtocol.handler = { _ in (200, s4ChatCompletionOK, ["Content-Type": "application/json"]) }
-        let provider = Self.chatProvider(customBaseURL: "http://example.com/v1")
+        let provider = Self.chatProvider(customBaseURL: "ftp://example.com/v1")
         await #expect(throws: LLMError.self) {
             _ = try await provider.streamMessage(
                 messages: [LLMMessage(role: .user, content: "hi")],
@@ -186,8 +186,8 @@ struct CustomProviderURLSecurityTests {
     }
 
     @Test("chat: streamRaw 不安全 base 在触网前抛错")
-    func chatStreamRawRejectsNonLoopbackHTTP() async {
-        let provider = Self.chatProvider(customBaseURL: "http://example.com/v1")
+    func chatStreamRawRejectsUnsafeBase() async {
+        let provider = Self.chatProvider(customBaseURL: "ftp://example.com/v1")
         await #expect(throws: LLMError.self) {
             _ = try await provider.streamRaw(body: ["model": "gpt-4o-mini", "messages": []])
         }
@@ -211,6 +211,29 @@ struct CustomProviderURLSecurityTests {
         #expect(sent.value(forHTTPHeaderField: "Authorization") == "Bearer \(Self.testAPIKey)")
     }
 
+    @Test("chat: 地址已带版本段（/v1beta/openai、/api/paas/v4）不再追加 /v1，裸域名才补 /v1")
+    func chatDoesNotAppendV1AfterVersionedPath() async throws {
+        defer { S4ProviderURLMockURLProtocol.reset() }
+        S4ProviderURLMockURLProtocol.handler = { _ in (200, s4ChatCompletionOK, ["Content-Type": "application/json"]) }
+        let cases = [
+            ("https://generativelanguage.googleapis.com/v1beta/openai",
+             "/v1beta/openai/chat/completions"),
+            ("https://open.bigmodel.cn/api/paas/v4", "/api/paas/v4/chat/completions"),
+            ("https://api.example.com", "/v1/chat/completions"),
+            // OpenRouter 工厂默认地址不带版本段，仍补 /v1。
+            ("https://openrouter.ai/api", "/api/v1/chat/completions")
+        ]
+        for (base, expectedPath) in cases {
+            S4ProviderURLMockURLProtocol.requests = []
+            let provider = Self.chatProvider(customBaseURL: base)
+            _ = try await provider.sendMessage(
+                messages: [LLMMessage(role: .user, content: "hi")],
+                systemPrompt: nil, maxTokens: 10, temperature: nil)
+            let sent = try #require(S4ProviderURLMockURLProtocol.requests.first)
+            #expect(sent.url?.path == expectedPath)
+        }
+    }
+
     @Test("chat: loopback http 自定义 base 正常工作且携带 Bearer")
     func chatAllowsLoopbackHTTP() async throws {
         defer { S4ProviderURLMockURLProtocol.reset() }
@@ -229,14 +252,14 @@ struct CustomProviderURLSecurityTests {
 
     // MARK: OpenAIResponses — 同样 fail-closed
 
-    @Test("responses: http 非 loopback 自定义 base 必须抛错且零请求")
-    func responsesRejectsNonLoopbackHTTP() async throws {
+    @Test("responses: 不安全自定义 base 必须抛错且零请求")
+    func responsesRejectsUnsafeBase() async throws {
         defer { S4ProviderURLMockURLProtocol.reset() }
         let checkpointDirectory = try Self.makeResponsesCheckpointDirectory()
         defer { try? FileManager.default.removeItem(at: checkpointDirectory) }
         S4ProviderURLMockURLProtocol.handler = { _ in (200, s4ResponsesOK, ["Content-Type": "application/json"]) }
         let provider = Self.responsesProvider(
-            customBaseURL: "http://example.com/v1", checkpointDirectory: checkpointDirectory
+            customBaseURL: "ftp://example.com/v1", checkpointDirectory: checkpointDirectory
         )
         await #expect(throws: LLMError.self) {
             try await provider.sendMessage(
@@ -354,34 +377,27 @@ struct CustomProviderURLValidatorTests {
 
     // MARK: 拒绝
 
-    @Test("http 非 loopback host 拒绝")
-    func rejectsNonLoopbackHTTP() {
-        #expect(throws: CustomProviderURL.Failure.nonHTTPSHost("example.com")) {
-            try CustomProviderURL.validate("http://example.com/v1")
-        }
+    @Test("http 公网 host 允许（表单另行提示明文风险）")
+    func allowsPublicHTTP() throws {
+        _ = try CustomProviderURL.validate("http://example.com/v1")
+        #expect(ProviderEndpointPolicy.isPlainHTTPToPublicHost("http://example.com/v1"))
+        #expect(!ProviderEndpointPolicy.isPlainHTTPToPublicHost("https://example.com/v1"))
     }
 
-    @Test("http 到局域网/公网 IP 拒绝")
-    func rejectsNonLoopbackIP() {
-        #expect(throws: CustomProviderURL.Failure.nonHTTPSHost("192.168.1.1")) {
-            try CustomProviderURL.validate("http://192.168.1.1")
+    @Test("http 局域网 IP 与本机直接允许且不提示风险")
+    func allowsPrivateHTTP() throws {
+        for raw in ["http://192.168.1.1", "http://10.0.0.5", "http://172.20.0.2:3000/v1", "http://localhost:1234/v1", "http://nas.local:8080"] {
+            _ = try CustomProviderURL.validate(raw)
+            #expect(!ProviderEndpointPolicy.isPlainHTTPToPublicHost(raw), "\(raw)")
         }
-        #expect(throws: CustomProviderURL.Failure.nonHTTPSHost("10.0.0.5")) {
-            try CustomProviderURL.validate("http://10.0.0.5")
-        }
-        #expect(throws: CustomProviderURL.Failure.nonHTTPSHost("8.8.8.8")) {
-            try CustomProviderURL.validate("http://8.8.8.8")
-        }
+        #expect(ProviderEndpointPolicy.isPlainHTTPToPublicHost("http://8.8.8.8"))
+        #expect(ProviderEndpointPolicy.isPlainHTTPToPublicHost("http://172.32.0.1"))
     }
 
-    @Test("host 混淆：localhost.evil.com 拒绝")
-    func rejectsHostTrickery() {
-        #expect(throws: CustomProviderURL.Failure.nonHTTPSHost("localhost.evil.com")) {
-            try CustomProviderURL.validate("http://localhost.evil.com")
-        }
-        #expect(throws: CustomProviderURL.Failure.nonHTTPSHost("127.0.0.1.evil.com")) {
-            try CustomProviderURL.validate("http://127.0.0.1.evil.com")
-        }
+    @Test("host 混淆：localhost.evil.com 视为公网")
+    func hostTrickeryIsPublic() {
+        #expect(ProviderEndpointPolicy.isPlainHTTPToPublicHost("http://localhost.evil.com"))
+        #expect(ProviderEndpointPolicy.isPlainHTTPToPublicHost("http://127.0.0.1.evil.com"))
     }
 
     @Test("ftp scheme 拒绝")
@@ -456,7 +472,7 @@ struct CustomProviderURLValidatorTests {
         #expect(CustomProviderURL.isSafeDestination(try #require(URL(string: "https://api.example.com/v1"))))
         #expect(CustomProviderURL.isSafeDestination(try #require(URL(string: "http://127.0.0.1:11434"))))
         #expect(CustomProviderURL.isSafeDestination(try #require(URL(string: "http://localhost:11434"))))
-        #expect(!CustomProviderURL.isSafeDestination(try #require(URL(string: "http://example.com"))))
+        #expect(CustomProviderURL.isSafeDestination(try #require(URL(string: "http://example.com"))))
         #expect(!CustomProviderURL.isSafeDestination(try #require(URL(string: "ftp://example.com"))))
         #expect(!CustomProviderURL.isSafeDestination(try #require(URL(string: "file:///etc/passwd"))))
         #expect(!CustomProviderURL.isSafeDestination(try #require(URL(string: "https://user:pass@example.com"))))
@@ -482,7 +498,7 @@ struct ProviderRedirectGuardTests {
 
     @Test("不安全重定向取消（返回 nil，fail-closed）")
     func cancelsUnsafeRedirect() throws {
-        let http = try #require(URL(string: "http://example.com/steal"))
+        let http = try #require(URL(string: "ftp://example.com/steal"))
         var request = URLRequest(url: http)
         request.setValue("Bearer token", forHTTPHeaderField: "Authorization")
         #expect(ProviderRedirectGuard.guardedRedirect(for: request) == nil)
@@ -498,9 +514,9 @@ struct ProviderRedirectGuardTests {
 @Suite
 struct Gimage2ProviderURLSecurityTests {
 
-    @Test("gimage2: http 非 loopback base 必须抛错（网络前）")
-    func gimage2RejectsNonLoopbackHTTP() async {
-        let provider = Gimage2Provider(apiKey: "s4-test-unit-token", baseURL: "http://example.com")
+    @Test("gimage2: 不安全 base 必须抛错（网络前）")
+    func gimage2RejectsUnsafeBase() async {
+        let provider = Gimage2Provider(apiKey: "s4-test-unit-token", baseURL: "ftp://example.com")
         await #expect(throws: CloudBackendError.self) {
             _ = try await provider.generateImage(CloudImageRequest(prompt: "cat"))
         }

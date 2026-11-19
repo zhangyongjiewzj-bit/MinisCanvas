@@ -9,6 +9,7 @@ final class ChatRateLimitWaitController {
         let id: UUID
         let sessionID: UUID?
         let deadline: Date
+        let reason: LLMRateLimitWaitRequest.Reason
     }
     private(set) var pending: [UUID: Pending] = [:]
     @ObservationIgnored private var continuations: [UUID: CheckedContinuation<Void, any Error>] = [:]
@@ -24,7 +25,7 @@ final class ChatRateLimitWaitController {
                 guard !Task.isCancelled else { continuation.resume(throwing: CancellationError()); return }
                 continuations[id] = continuation
                 pending[id] = Pending(id: id, sessionID: sessionID,
-                    deadline: Date().addingTimeInterval(seconds))
+                    deadline: Date().addingTimeInterval(seconds), reason: request.reason)
                 sleeps[id] = Task { [weak self] in
                     do {
                         try await request.sleep(request.delay)
@@ -57,12 +58,20 @@ struct ChatRateLimitWaitCard: View {
     let sessionID: UUID?
     let onCancel: () -> Void
 
+    static func message(for reason: LLMRateLimitWaitRequest.Reason, seconds: Int) -> String {
+        switch reason {
+        case .rateLimited: "请求限流，等待 \(seconds) 秒后重试"
+        case .serviceUnavailable: "服务暂时不可用，等待 \(seconds) 秒后重试"
+        }
+    }
+
     var body: some View {
         if let pending = controller.current(sessionID: sessionID) {
-            TimelineView(.periodic(from: .now, by: 0.2)) { context in
+            TimelineView(.periodic(from: .now, by: 1)) { context in
                 HStack(spacing: 10) {
                     MinisIconView(.retry, size: 12)
-                    Text("请求限流，等待 \(max(0, Int(ceil(pending.deadline.timeIntervalSince(context.date))))) 秒后重试")
+                    Text(Self.message(for: pending.reason,
+                        seconds: max(0, Int(ceil(pending.deadline.timeIntervalSince(context.date))))))
                     Spacer()
                     Button("立即重试") { controller.finish(pending.id, cancelled: false) }
                     Button("取消", action: onCancel)

@@ -33,7 +33,7 @@ struct ThemePresetConvergenceTests {
     }
 
     @Test func namedPresetsAreAllPresent() {
-        #expect(ThemePreset.light.displayName == "产品主题")
+        #expect(ThemePreset.light.displayName == "浅色（产品主题）")
         #expect(ThemePreset.system.displayName == "跟随系统（原生）")
         #expect(!ThemePreset.selectable.contains(.dark))
         #expect(!ThemePreset.selectable.contains(.highContrast))
@@ -90,9 +90,10 @@ struct ThemePresetConvergenceTests {
             #expect(actual.stroke == raw.stroke)
             #expect(actual.focusRing == raw.focusRing)
             #expect(actual.textPrimary == raw.textPrimary)
-            // Keep the original bad raw palette observable as a negative control;
-            // changing the role gate to bless those pixels must not pass this test.
-            #expect(!ThemeContrast.violations(tokens: raw).isEmpty)
+            // 第 1 套色值已按 WCAG 算过：原始色板本身即达标，对比度修正不需要改动任何前景。
+            #expect(ThemeContrast.violations(tokens: raw).isEmpty)
+            #expect(actual.textSecondary == raw.textSecondary)
+            #expect(actual.statusDanger == raw.statusDanger)
             for background in [raw.background, raw.sidebarBackground, raw.surfaceRaised] {
                 #expect(ThemeContrast.violations(tokens: actual, background: background).isEmpty)
             }
@@ -148,9 +149,9 @@ struct ThemePresetConvergenceTests {
             #expect(general.accentTheme == ThemePreset.canonicalAccentTheme)
         }
         #expect(ThemePreset.selectable.count == 2)
-        // High contrast shares the dark compatibility projection; no fourth free axis.
+        // 第 1 套配色起产品主题也跟随系统明暗，两个预设都投影为 system|pseudo；不存在自由组合。
         #expect(reachablePairs.count < Self.expectedLegacyPairCount)
-        #expect(reachablePairs.count == 2)
+        #expect(reachablePairs == ["system|pseudo"])
     }
 
     /// 构造路径同样造不出自由组合：显式给预设时旧字段被覆盖投影。
@@ -158,18 +159,18 @@ struct ThemePresetConvergenceTests {
         // 显式预设胜出，旧字段成为投影。
         let fromPreset = GeneralSettings(themePreset: .dark, appearance: .light, accentTheme: .crimson)
         #expect(fromPreset.themePreset == .system)
-        #expect(fromPreset.appearance == .system)
+        #expect(fromPreset.appearance == .light)   // 明暗是独立选择，不被预设覆盖
         #expect(fromPreset.accentTheme == .pseudo)
 
-        // 只给旧字段时由 nearest 映射（THEME-05 语义）。
+        // 只给旧字段时配色由 nearest 映射（THEME-05 语义），明暗原样保留。
         let fromLegacy = GeneralSettings(appearance: .dark, accentTheme: .ocean)
         #expect(fromLegacy.themePreset == .system)
-        #expect(fromLegacy.appearance == .system)
+        #expect(fromLegacy.appearance == .dark)
 
-        // 高对比是显式第四预设，旧 appearance 只作投影。
+        // 高对比是显式第四预设，只收敛配色。
         let highContrast = GeneralSettings(themePreset: .highContrast, appearance: .light)
         #expect(highContrast.themePreset == .system)
-        #expect(highContrast.appearance == .system)
+        #expect(highContrast.appearance == .light)
         #expect(highContrast.accentTheme == .pseudo)
     }
 
@@ -209,14 +210,15 @@ struct ThemePresetConvergenceTests {
         for (appearance, accent) in Self.allLegacyPairs {
             let data = Data(Self.legacyV3JSON(appearance: appearance.rawValue, accent: accent.rawValue).utf8)
             let first = try SettingsMigration.migrate(data: data)
-            #expect(first.settings.general.themePreset
-                    == ThemePreset.nearest(for: appearance, accentTheme: accent))
+            // nearest 给出 system 的旧组合（无迁移标记）会被一次性迁到产品主题（.light）。
+            let nearest = ThemePreset.nearest(for: appearance, accentTheme: accent)
+            #expect(first.settings.general.themePreset == (nearest == .system ? .light : nearest))
             #expect(first.settings.general.themePreset.isAccepted)
             #expect(first.settings.settingsVersion == AppSettings.currentVersion)
             // 迁移后旧字段已是投影，不再携带未验收组合。
             #expect(first.settings.general.accentTheme == ThemePreset.canonicalAccentTheme)
-            #expect(first.settings.general.appearance
-                    == first.settings.general.themePreset.appearanceProjection)
+            // F-1：旧「固定浅色」仍是浅色；其余旧组合跟随系统。
+            #expect(first.settings.general.appearance == (appearance == .light ? .light : .system))
             assertionCount += 1
         }
         // 覆盖身份：迁移断言组数 == 旧组合枚举数 == 18。
@@ -243,11 +245,11 @@ struct ThemePresetConvergenceTests {
     /// 空 payload / 无版本 payload 也落到已验收预设。
     @Test func migrationDefaultsToReadablePreset() throws {
         let empty = try SettingsMigration.migrate(data: Data("{}".utf8))
-        #expect(empty.settings.general.themePreset == .system)
+        #expect(empty.settings.general.themePreset == .light)
         #expect(empty.settings.general.themePreset.isAccepted)
 
         let defaults = AppSettings.defaults
-        #expect(defaults.general.themePreset == .system)
+        #expect(defaults.general.themePreset == .light)
         #expect(defaults.general == GeneralSettings.default)
     }
 
@@ -290,12 +292,12 @@ struct ThemePresetConvergenceTests {
         )
 
         let firstBoot = SettingsStore(directory: dir)
-        #expect(firstBoot.settings.general.themePreset == .system)
+        #expect(firstBoot.settings.general.themePreset == .light)   // 旧深色 → 跟随系统 → 一次性迁到产品主题
         #expect(firstBoot.settings.general.accentTheme == .pseudo)
 
         let secondBoot = SettingsStore(directory: dir)
         #expect(secondBoot.settings == firstBoot.settings)
-        #expect(secondBoot.settings.general.themePreset == .system)
+        #expect(secondBoot.settings.general.themePreset == .light)
         #expect(secondBoot.settings.general.themePreset.isAccepted)
     }
 
@@ -322,4 +324,44 @@ struct ThemePresetConvergenceTests {
         #expect(ThemePreset(rawValue: raw) == nil)
     }
 
+}
+
+/// F-1：明暗选择（浅色 / 深色 / 跟随系统）独立于配色预设，旧「固定浅色」用户迁移后仍是浅色。
+struct AppearanceModeChoiceTests {
+    private func decode(_ general: [String: Any]) throws -> GeneralSettings {
+        let data = try JSONSerialization.data(withJSONObject: general)
+        return try JSONDecoder().decode(GeneralSettings.self, from: data)
+    }
+
+    @Test func oldFixedLightUserStaysLightAfterMigration() throws {
+        // 没有迁移标记 = 「产品主题固定浅色」时代写的文件。
+        let stored = try decode(["themePreset": "light", "appearance": "light"])
+        #expect(stored.themePreset == .light)
+        #expect(stored.appearance == .light)
+        let legacy = try decode(["appearance": "light", "accentTheme": "ocean"])
+        #expect(legacy.themePreset == .light)
+        #expect(legacy.appearance == .light)
+        // 原来跟随系统 / 深色的用户仍跟随系统。
+        #expect(try decode(["themePreset": "system"]).appearance == .system)
+        #expect(try decode(["appearance": "dark"]).appearance == .system)
+    }
+
+    @Test func choiceIsIndependentOfPresetAndSurvivesReopen() throws {
+        for mode in Appearance.allCases {
+            var general = GeneralSettings.default
+            general.appearance = mode
+            general.setThemePreset(.light)
+            #expect(general.appearance == mode)   // 写预设不覆盖明暗
+            let data = try JSONEncoder().encode(general)
+            let reopened = try JSONDecoder().decode(GeneralSettings.self, from: data)
+            #expect(reopened.appearance == mode)
+            #expect(reopened.themePreset == .light)
+        }
+    }
+
+    @Test func postChangeFileWithProductThemeKeepsFollowingSystem() throws {
+        // 有标记：新版本写的文件，产品主题 + 跟随系统不被改成固定浅色。
+        let stored = try decode(["themePreset": "light", "appearance": "system", "productThemeDefaultMigrated": true])
+        #expect(stored.appearance == .system)
+    }
 }

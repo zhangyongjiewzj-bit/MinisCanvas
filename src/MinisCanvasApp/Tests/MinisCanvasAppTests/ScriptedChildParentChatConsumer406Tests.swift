@@ -253,7 +253,8 @@ struct ScriptedChildParentChatConsumer406Tests {
         #expect(request.callID == "child406-orchestrate-call")
         #expect(request.toolName == OrchestrationToolExecutor.toolName)
         #expect(request.riskLevel == .high)
-        #expect(request.requiresSecondConfirmation)
+        // 2026-11-16 起只有不可逆操作才需要第二次确认；外部子任务编排仍是高风险、不提供持久放行。
+        #expect(!request.requiresSecondConfirmation)
         #expect(request.persistentAllowOffer == nil)
 
         let receipts = taskStore.allReceipts()

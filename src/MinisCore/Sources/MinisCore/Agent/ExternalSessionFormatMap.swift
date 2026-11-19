@@ -192,6 +192,67 @@ struct ExternalSessionFormatMap: Sendable {
         return nil
     }
 
+    /// 工具调用与工具结果（仅在调用方要求 `include_tools` 时使用）：角色为 `tool_call` / `tool_result`，
+    /// 文本是“工具名 + 参数”或结果的紧凑文本。字段名按两家 CLI 常见的行格式推断，未对真实会话文件逐一核对；
+    /// 对不上的行直接忽略。调用方负责脱敏和限长。
+    func toolItems(from row: [String: Any], fileSessionID: String) -> [(role: String, text: String)] {
+        if let filter = rowIDFilter, filter.mustEqualSessionID {
+            guard let rowID = value(at: filter.path, in: row) as? String,
+                  rowID.lowercased() == fileSessionID.lowercased() else { return [] }
+        }
+        var items: [(role: String, text: String)] = []
+        switch source {
+        case "claude_code":
+            guard let type = row["type"] as? String, type == "assistant" || type == "user",
+                  let blocks = value(at: ["message", "content"], in: row) as? [Any] else { return [] }
+            for case let block as [String: Any] in blocks {
+                switch block["type"] as? String {
+                case "tool_use":
+                    let name = (block["name"] as? String) ?? "未知工具"
+                    items.append(("tool_call", name + " " + Self.compactJSON(block["input"])))
+                case "tool_result":
+                    items.append(("tool_result", Self.resultText(block["content"])))
+                default: break
+                }
+            }
+        case "codex":
+            guard (row["type"] as? String) == "response_item",
+                  let payload = row["payload"] as? [String: Any],
+                  let type = payload["type"] as? String else { return [] }
+            switch type {
+            case "function_call", "custom_tool_call":
+                let name = (payload["name"] as? String) ?? "未知工具"
+                let arguments = (payload["arguments"] as? String) ?? (payload["input"] as? String)
+                    ?? Self.compactJSON(payload["arguments"] ?? payload["input"])
+                items.append(("tool_call", name + " " + arguments))
+            case "function_call_output", "custom_tool_call_output":
+                items.append(("tool_result", Self.resultText(payload["output"])))
+            default: break
+            }
+        default: break
+        }
+        return items.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private static func compactJSON(_ value: Any?) -> String {
+        guard let value, !(value is NSNull) else { return "" }
+        if let string = value as? String { return string }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+        else { return "\(value)" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func resultText(_ value: Any?) -> String {
+        if let string = value as? String { return string }
+        if let blocks = value as? [Any] {
+            let texts = blocks.compactMap { ($0 as? [String: Any])?["text"] as? String }
+            if !texts.isEmpty { return texts.joined(separator: "\n") }
+        }
+        if let object = value as? [String: Any], let content = object["content"] as? String { return content }
+        return compactJSON(value)
+    }
+
     func textFragments(_ content: Any?) -> [String] {
         if let string = content as? String { return [string] }
         guard let blocks = content as? [Any] else { return [] }

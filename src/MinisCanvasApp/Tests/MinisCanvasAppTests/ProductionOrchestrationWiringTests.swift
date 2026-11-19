@@ -496,7 +496,10 @@ struct ProductionOrchestrationWiringTests {
         ))
     }
 
-    @Test("runtime production orchestration preserves the absolute parent deadline")
+    // R3-11: the parent context deadline is run start + the per-request timeout (900 s), so a
+    // turn older than 15 minutes used to expire every later dispatch. A child's deadline now
+    // starts at dispatch (2 h cap, like the tool description); cancellation still follows the parent turn.
+    @Test("runtime production orchestration starts the child deadline at dispatch")
     func runtimeProductionOrchestratorReceivesAbsoluteDeadline() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("r35e-app-deadline-\(UUID().uuidString)", isDirectory: true)
@@ -556,15 +559,17 @@ struct ProductionOrchestrationWiringTests {
                     "strategy": "sequential",
                     "tasks": [[
                         "id": "r35e-app-deadline-child",
-                        "title": "expired deadline",
-                        "instructions": "must not call provider",
+                        "title": "old parent run",
+                        "instructions": "runs on its own dispatch-time deadline",
                     ]],
                 ]
             )
         }
 
-        #expect(output.contains("DEADLINE_EXCEEDED"))
-        #expect(provider.calls == 0)
+        // The expired parent-run deadline no longer stops the dispatch: the child passes the
+        // deadline gate and reaches the next check (this fixture has no resource scope).
+        #expect(!output.contains("DEADLINE_EXCEEDED"))
+        #expect(output.contains("TASK_RESOURCE_SCOPE_INVALID"))
     }
 
     @Test func appProductionCompositionAcceptsJSONBridgedIntegerVersion() async throws {

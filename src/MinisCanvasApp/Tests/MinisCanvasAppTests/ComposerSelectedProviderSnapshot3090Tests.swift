@@ -157,7 +157,8 @@ private final class ComposerSummary3090: LLMProvider, @unchecked Sendable {
                      temperature: Double?) async throws -> LLMResponse {
         lock.withLock { captured.append(messages) }
         if refusesSummary {
-            #expect(maxTokens == 4_096 && temperature == 0.2)
+            // R3-07：摘要请求不传温度。
+            #expect(maxTokens == 4_096 && temperature == nil)
             return LLMResponse(text: "", stopReason: "stop", usage: nil)
         }
         await pause.wait()

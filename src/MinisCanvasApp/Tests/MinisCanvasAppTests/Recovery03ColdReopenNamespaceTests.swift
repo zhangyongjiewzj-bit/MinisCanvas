@@ -74,7 +74,7 @@ struct Recovery03ColdReopenNamespaceTests {
         #expect(reopened.defaultProviderID == ProviderType.openAI.rawValue)
         #expect(reopened.defaultModelID == modelID)
         #expect(reopened.themePreset == .light)
-        #expect(reopened.colorSchemePreference == .light)
+        #expect(reopened.colorSchemePreference == nil)   // 产品主题跟随系统明暗，不固定浅色
         #expect(ThemeTokenProvider(center: reopened).mode == .light)
         #expect(reopenedBridge.shortcutStore.binding(for: .newSession)
             == ShortcutBinding(key: "g", modifiers: ShortcutModifiers.command))
@@ -90,7 +90,7 @@ struct Recovery03ColdReopenNamespaceTests {
         let unrelated = center(at: otherRoot)
         #expect(unrelated.defaultProviderID == nil)
         #expect(unrelated.defaultModelID == nil)
-        #expect(unrelated.themePreset == .system)
+        #expect(unrelated.themePreset == .light)   // 默认主题 = 产品主题
         // Retired theme names remain readable, but cannot become effective
         // settings again after a cold reopen.
         unrelated.themePreset = .dark

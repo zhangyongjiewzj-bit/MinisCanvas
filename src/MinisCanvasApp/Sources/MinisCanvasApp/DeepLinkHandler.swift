@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import CanvasCore
 import MinisCore
@@ -41,6 +42,49 @@ final class DeepLinkHandler {
         self.bridge = bridge
     }
 
+    /// 外部来源（点开链接、启动参数）的入口。
+    /// 只读类动作直接执行；会发送内容或运行任务的动作（prompt / run / pipeline）
+    /// 先弹确认，用户同意后才执行——外部链接不能静默替用户发消息或跑工作流。
+    func handleExternal(url: URL, confirm: ((String) -> Bool)? = nil) {
+        let result = DeepLinkRouter.parseResult(url: url)
+        if result.isDispatchable {
+            DeepLinkRouter.shared.handle(url: url)
+            return
+        }
+        guard result.disposition == .authorizationRequired, let action = result.action else { return }
+        let approved = (confirm ?? Self.confirmWithAlert)(Self.confirmationText(for: action))
+        guard approved else { return }
+        handle(action)
+    }
+
+    static func confirmationText(for action: DeepLinkAction) -> String {
+        func preview(_ text: String) -> String {
+            text.count > 600 ? String(text.prefix(600)) + "…" : text
+        }
+        switch action {
+        case .sendPrompt(let text, let session):
+            let target = session == nil ? "当前会话" : "指定会话"
+            return "外部链接请求向\(target)发送：\(preview(text))，是否发送？"
+        case .runWorkflow(let name, let input):
+            let extra = input.map { "，输入：\(preview($0))" } ?? ""
+            return "外部链接请求运行工作流「\(name)」\(extra)，是否运行？"
+        case .createPipeline:
+            return "外部链接请求创建一条漫剧流水线，是否创建？"
+        case .openSession, .newSession, .openSettings:
+            return "外部链接请求执行操作，是否继续？"
+        }
+    }
+
+    private static func confirmWithAlert(_ text: String) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "确认外部链接请求"
+        alert.informativeText = text
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "继续")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
     /// 处理一个深链动作；未知/失败 → 聊天提示，不崩。
     func handle(_ action: DeepLinkAction) {
         guard let bridge else { return }
@@ -67,14 +111,17 @@ final class DeepLinkHandler {
             // grant before switching; an unknown or rejected ID must not send
             // the prompt into whichever session happened to be active.
             if let session {
-                guard let target = bridge.chat.sessions.first(where: { $0.id.uuidString == session }),
-                      bridge.chat.canOpenDeepLinkedSession(id: target.id) else {
-                    bridge.chat.appendCanvasNotice("⚠️ 深链：目标会话或项目授权当前不可用。")
+                guard let target = bridge.chat.sessions.first(where: { $0.id.uuidString == session }) else {
+                    bridge.chat.appendCanvasNotice(DeepLinkFailure.sessionMissing.notice)
+                    return
+                }
+                guard bridge.chat.canOpenDeepLinkedSession(id: target.id) else {
+                    bridge.chat.appendCanvasNotice(Self.denialFailure(for: target.id, chat: bridge.chat).notice)
                     return
                 }
                 bridge.chat.switchSession(id: target.id)
                 guard bridge.chat.activeSessionID == target.id else {
-                    bridge.chat.appendCanvasNotice("⚠️ 深链：目标会话或项目授权当前不可用。")
+                    bridge.chat.appendCanvasNotice(DeepLinkFailure.switchFailed.notice)
                     return
                 }
             }
@@ -189,35 +236,65 @@ final class DeepLinkHandler {
     private func openSession(id: String) {
         guard let bridge else { return }
         guard let sessionID = UUID(uuidString: id) else {
-            bridge.chat.appendCanvasNotice("⚠️ 深链：未找到会话。")
+            bridge.chat.appendCanvasNotice(DeepLinkFailure.sessionMissing.notice)
             return
         }
         let activeSession = bridge.chat.sessions.first(where: { $0.id == sessionID })
         let archivedSession = bridge.chat.archivedSessions.first(where: { $0.id == sessionID })
         guard activeSession != nil || archivedSession != nil else {
-            bridge.chat.appendCanvasNotice("⚠️ 深链：未找到会话。")
+            bridge.chat.appendCanvasNotice(DeepLinkFailure.sessionMissing.notice)
             return
         }
         guard bridge.chat.canOpenDeepLinkedSession(id: sessionID) else {
-            bridge.chat.appendCanvasNotice("⚠️ 深链：目标会话或项目授权当前不可用。")
+            bridge.chat.appendCanvasNotice(Self.denialFailure(for: sessionID, chat: bridge.chat).notice)
             return
         }
-        if let session = activeSession {
+        // 切换成功是静默的：不往会话里追加系统消息，也不因此刷新更新时间/改变列表顺序。
+        if activeSession != nil {
             bridge.chat.switchSession(id: sessionID)
-            if bridge.chat.activeSessionID == sessionID {
-                bridge.chat.appendCanvasNotice("🔗 深链：已切换到会话「\(session.title)」")
-            } else {
-                bridge.chat.appendCanvasNotice("⚠️ 深链：目标会话或项目授权当前不可用。")
+            if bridge.chat.activeSessionID != sessionID {
+                bridge.chat.appendCanvasNotice(DeepLinkFailure.switchFailed.notice)
             }
-        } else if let session = archivedSession {
+        } else if archivedSession != nil {
             bridge.chat.restoreSession(id: sessionID)
-            if bridge.chat.activeSessionID == sessionID {
-                bridge.chat.appendCanvasNotice("🔗 深链：已切换到会话「\(session.title)」")
-            } else {
-                bridge.chat.appendCanvasNotice("⚠️ 深链：目标会话或项目授权当前不可用。")
+            if bridge.chat.activeSessionID != sessionID {
+                bridge.chat.appendCanvasNotice(DeepLinkFailure.switchFailed.notice)
             }
         } else {
-            bridge.chat.appendCanvasNotice("⚠️ 深链：目标会话或项目授权当前不可用。")
+            bridge.chat.appendCanvasNotice(DeepLinkFailure.switchFailed.notice)
+        }
+    }
+
+    /// 会话存在但不可打开时区分原因：项目目录授权不可用 / 会话记录已变化。
+    static func denialFailure(for id: UUID, chat: ChatStore) -> DeepLinkFailure {
+        let target = chat.sessions.first(where: { $0.id == id })
+            ?? chat.archivedSessions.first(where: { $0.id == id })
+        guard let target else { return .sessionMissing }
+        if let projectID = target.projectID, !projectID.isEmpty,
+           chat.projectSessionHandler?.isProjectAvailable(id: projectID) != true {
+            return .grantUnavailable
+        }
+        return .sessionChanged
+    }
+}
+
+/// 深链失败原因（每种对应不同的下一步）。
+enum DeepLinkFailure: Equatable {
+    case sessionMissing
+    case grantUnavailable
+    case sessionChanged
+    case switchFailed
+
+    var notice: String {
+        switch self {
+        case .sessionMissing:
+            return "⚠️ 深链：会话不存在（可能已被删除，或链接已过期）。"
+        case .grantUnavailable:
+            return "⚠️ 深链：该会话所属的项目目录未授权。请在设置 → 隐私中重新授权该目录后再试。"
+        case .sessionChanged:
+            return "⚠️ 深链：该会话的记录已变化或已被删除。请刷新会话列表后重试。"
+        case .switchFailed:
+            return "⚠️ 深链：切换会话失败。请重试；反复失败请重新打开应用。"
         }
     }
 }

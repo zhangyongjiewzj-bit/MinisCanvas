@@ -76,10 +76,11 @@ struct ToolWhitelistTests {
         let fileRead = try #require(AgentToolCatalog.makeTools().first { $0.name == "file_read" })
         #expect(fileRead.parameters.mapValues(\.type) == [
             "tool_title": .string, "path": .string, "offset": .integer, "lines": .integer,
-            "direction": .string, "max_length": .integer, "page_start": .integer, "page_count": .integer
+            "direction": .string, "max_length": .integer, "page_start": .integer, "page_count": .integer,
+            "as_images": .boolean
         ])
         #expect(fileRead.propertyOrdering == [
-            "tool_title", "path", "offset", "lines", "direction", "max_length", "page_start", "page_count"
+            "tool_title", "path", "offset", "lines", "direction", "max_length", "page_start", "page_count", "as_images"
         ])
         #expect(fileRead.required == ["tool_title", "path"])
     }

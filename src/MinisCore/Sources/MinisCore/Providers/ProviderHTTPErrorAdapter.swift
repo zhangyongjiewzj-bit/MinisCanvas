@@ -96,7 +96,7 @@ public enum ProviderHTTPErrorAdapter {
         switch statusCode {
         case 401:
             category = .unauthorized
-        case 403:
+        case 402, 403:
             category = .permissionDenied
         case 404:
             category = .notFound
@@ -115,6 +115,44 @@ public enum ProviderHTTPErrorAdapter {
             category: category,
             retryAfterSeconds: category == .rateLimited ? retryAfterSeconds(from: headers) : nil
         )
+    }
+
+    /// 固定标签：供应商明确表示余额或额度不足。只写入这个标签，响应正文不带出。
+    public static let quotaReasonLabel = "reason=quota"
+
+    /// 只用白名单关键词判断“余额或额度不足”，正文本身不保留、不外传。
+    /// 仅在 400/402/403/429 时判定（OpenAI 额度用尽是 429，Anthropic 余额不足是 400）。
+    public static func indicatesQuotaExhausted(statusCode: Int, body: String) -> Bool {
+        guard [400, 402, 403, 429].contains(statusCode), !body.isEmpty else { return false }
+        let lower = String(decoding: body.utf8.prefix(64 * 1024), as: UTF8.self).lowercased()
+        // 429 多半是限速（Gemini 免费额度的 RESOURCE_EXHAUSTED / quota exceeded 过一会儿就恢复），
+        // 只认明确的计费、余额关键词，不把通用的“额度用尽”当成余额不足。
+        let strongBillingKeywords = [
+            "insufficient_quota", "insufficient quota",
+            "credit balance is too low", "insufficient balance",
+            "insufficient_balance", "insufficient credit", "out of credits",
+            "billing_hard_limit_reached", "balance is not enough", "arrearage",
+            "payment required", "payment_required", "余额不足", "额度不足", "欠费"
+        ]
+        if statusCode == 429 {
+            if strongBillingKeywords.contains(where: { lower.contains($0) }) { return true }
+            // Gemini 的限速正文也会写“check your plan and billing details”，同时带
+            // RESOURCE_EXHAUSTED / exceeded your current quota，不能凭 billing 判余额不足。
+            if lower.contains("resource_exhausted") || lower.contains("exceeded your current quota") {
+                return false
+            }
+            return lower.contains("billing")
+        }
+        let otherKeywords = strongBillingKeywords + [
+            "exceeded your current quota", "quota exceeded"
+        ]
+        return otherKeywords.contains { lower.contains($0) }
+    }
+
+    /// 额度不足的安全详情：状态码、类别和固定标签，不含任何响应正文。
+    public static func quotaDetail(statusCode: Int, headers: [String: String] = [:]) -> String {
+        let classification = classify(statusCode: statusCode, headers: headers)
+        return "status=\(statusCode); category=\(classification.category.rawValue); \(quotaReasonLabel)"
     }
 
     /// Classifies a transport error by stable code only. Unknown domains are

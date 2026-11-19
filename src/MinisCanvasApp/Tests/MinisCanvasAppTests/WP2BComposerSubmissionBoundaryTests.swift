@@ -23,7 +23,8 @@ struct WP2BComposerSubmissionBoundaryTests {
         )
 
         #expect(global.contains("chat.submitComposer()"))
-        #expect(sidebar.contains("chat.submitComposer()"))
+        // 侧栏的起始提示按钮现在只预填输入框（不替用户发送），侧栏只剩键盘提交入口。
+        #expect(sidebar.contains("chat.submitComposerFromKeyboard()"))
         #expect(!global.contains("chat.sendDraft()"))
         #expect(!sidebar.contains("chat.sendDraft()"))
     }

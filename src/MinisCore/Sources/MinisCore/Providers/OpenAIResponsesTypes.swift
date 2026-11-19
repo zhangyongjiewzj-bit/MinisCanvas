@@ -98,8 +98,23 @@ public struct ResponsesAPIRequestBody: Encodable, @unchecked Sendable {
                 self.inputAudio = inputAudio
             }
 
+            /// Responses 规格：`input_image.image_url` 是字符串（外链或 data: URL），
+            /// 不是 Chat Completions 的 `{"url": ...}` 对象；对象形态会被服务端以 400 拒绝。
+            public func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(type, forKey: .type)
+                try container.encodeIfPresent(text, forKey: .text)
+                try container.encodeIfPresent(imageURL?.url, forKey: .imageURL)
+                try container.encodeIfPresent(inputAudio, forKey: .inputAudio)
+            }
+
             public static func textPart(_ text: String) -> ContentPart {
                 ContentPart(type: "input_text", text: text, imageURL: nil, inputAudio: nil)
+            }
+
+            /// 历史里的助手文本：Responses 只接受 `output_text`（或 refusal），`input_text` 会被拒。
+            public static func outputTextPart(_ text: String) -> ContentPart {
+                ContentPart(type: "output_text", text: text, imageURL: nil, inputAudio: nil)
             }
 
             public static func imagePart(dataURL: String) -> ContentPart {

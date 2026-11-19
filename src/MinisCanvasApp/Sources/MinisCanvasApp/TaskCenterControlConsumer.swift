@@ -1040,6 +1040,8 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
     private var fileArtifactFacts: ToolExecutionFactLedger?
     private var fileArtifactTargetValidator: (@Sendable (String, String) -> URL?)?
     private var fileArtifactProjectValidator: (@MainActor (String, String) -> Bool)?
+    /// 产物生成之后项目授权没有被撤销重授（授权版本未变）。未接线时不额外限制。
+    private var fileArtifactGrantCurrent: (@MainActor (String, Date) -> Bool)?
     private var fileArtifactBindingRevision: UInt64 = 0
 
     public init(
@@ -1146,13 +1148,15 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
     /// Reattachment invalidates destinations from the previous ledger instance.
     func bindFileArtifacts(ledger: FileChangeLedger?, facts: ToolExecutionFactLedger?,
                           targetValidator: (@Sendable (String, String) -> URL?)? = nil,
-                          projectValidator: (@MainActor (String, String) -> Bool)? = nil) {
+                          projectValidator: (@MainActor (String, String) -> Bool)? = nil,
+                          grantCurrent: (@MainActor (String, Date) -> Bool)? = nil) {
         lock.lock()
         defer { lock.unlock() }
         fileArtifactLedger = ledger
         fileArtifactFacts = facts
         fileArtifactTargetValidator = targetValidator
         fileArtifactProjectValidator = projectValidator
+        fileArtifactGrantCurrent = grantCurrent
         fileArtifactBindingRevision &+= 1
     }
 
@@ -1353,9 +1357,11 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
               let projectID = fileArtifactOrigin(task: task, binding: navigation.binding)?.projectID else { return false }
         lock.lock()
         let validator = fileArtifactProjectValidator
+        let grantCurrent = fileArtifactGrantCurrent
         let revision = fileArtifactBindingRevision
         lock.unlock()
         guard validator?(projectID, navigation.binding.workingDirectory) == true,
+              grantCurrent?(projectID, access.record.timestamp) ?? true,
               fileArtifactAccess(navigation: navigation) == access,
               target.map({ fileArtifactTargetAuthorized(navigation: navigation, target: $0) }) ?? true else { return false }
         lock.lock()
@@ -2005,13 +2011,14 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
               let session = validatedChildSession(locator) else { return nil }
         let limit = 100
         let skipped = max(0, session.messages.count - limit)
+        let toolNames = Self.toolNamesByCallID(session.messages)
         let messages = session.messages.enumerated().dropFirst(skipped).map { index, message in
             let roleTitle: String
             let content: String
             switch message.role {
             case .tool:
                 roleTitle = "工具结果"
-                content = "[工具结果内容已省略]"
+                content = Self.omittedToolResultText(message, toolNames: toolNames)
             case .user where index > 0:
                 roleTitle = "工具反馈"
                 content = "[工具结果内容已省略]"
@@ -2046,6 +2053,20 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
     func moveChildToBackground(navigation: TaskCenterChildSessionNavigation) async -> Bool {
         guard let locator = childLocator(for: navigation) else { return false }
         return await store.requestMoveChildToBackground(locator: locator)
+    }
+
+    /// 任务中心用来判断"数据是否变了"的廉价签名：账本版本 + 后台子任务数。
+    var observationSignature: [UInt64] {
+        [store.taskCenterReadVersion(), UInt64(store.liveBackgroundChildOrchestrationCount())]
+    }
+
+    /// 任务中心里有按时间变化的显示（Goal 租约是否到期、最近历史的时间窗口），只看账本版本时
+    /// 到点也不会刷新。所以在数据签名后面再带一个粗粒度的时间段：账本没变时每
+    /// `timeRefreshSeconds` 秒才重算一次，不回到半秒一次。
+    static let timeRefreshSeconds: Double = 10
+
+    func observationSignature(now: Date) -> [UInt64] {
+        observationSignature + [UInt64(max(0, now.timeIntervalSince1970) / Self.timeRefreshSeconds)]
     }
 
     func backgroundChildCount() -> Int {
@@ -2227,13 +2248,14 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
 
         let limit = 100
         let skipped = max(0, session.messages.count - limit)
+        let toolNames = Self.toolNamesByCallID(session.messages)
         let messages = session.messages.enumerated().dropFirst(skipped).map { index, message in
             let roleTitle: String
             let content: String
             switch message.role {
             case .tool:
                 roleTitle = "工具结果"
-                content = "[工具结果内容已省略]"
+                content = Self.omittedToolResultText(message, toolNames: toolNames)
             case .user:
                 roleTitle = "用户"
                 content = Self.safeChildMessageContent(message)
@@ -2321,11 +2343,32 @@ public final class TaskCenterControlConsumer: @unchecked Sendable {
         return envelope
     }
 
+    /// 工具调用 id 对应的工具名（只取名字，不取参数）。
+    private static func toolNamesByCallID(_ messages: [LLMMessage]) -> [String: String] {
+        var names: [String: String] = [:]
+        for call in messages.flatMap(\.toolCalls) { names[call.id] = call.name }
+        return names
+    }
+
+    /// 工具结果的正文不在任务记录里保存，这里至少说明是哪个工具的结果。
+    private static func omittedToolResultText(_ message: LLMMessage, toolNames: [String: String]) -> String {
+        guard let id = message.toolCallID, let name = toolNames[id] else { return "[工具结果内容已省略]" }
+        let safeName = ProductRedactionPolicy.redact(name, maxLength: 64)
+        return "[工具结果内容已省略] 工具：\(safeName)"
+    }
+
     private static func safeChildMessageContent(_ message: LLMMessage) -> String {
         guard message.toolCalls.isEmpty,
               !message.content.contains("\"tool_calls\""),
               !message.content.contains("<tool_call") else {
-            return "[工具调用参数已省略]"
+            // 写入记录时已把调用概括成“工具：名称 目标”行（已脱敏）；显示这些行，原始参数仍不显示。
+            let summaryLines = message.content.split(separator: "\n")
+                .filter { $0.hasPrefix("工具：") }
+                .map { ProductRedactionPolicy.redact(String($0), maxLength: 200) }
+            let names = message.toolCalls.map { "工具：" + ProductRedactionPolicy.redact($0.name, maxLength: 64) }
+            let lines = summaryLines.isEmpty ? names : summaryLines
+            return lines.isEmpty ? "[工具调用参数已省略]"
+                : "[工具调用参数已省略]\n" + lines.joined(separator: "\n")
         }
         let safe = ProductRedactionPolicy.redact(message.content, maxLength: 1_024)
         return safe.isEmpty ? "（无可显示内容）" : safe

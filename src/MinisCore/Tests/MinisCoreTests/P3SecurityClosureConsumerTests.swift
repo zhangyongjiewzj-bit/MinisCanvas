@@ -16,10 +16,11 @@ struct P3SecurityClosureConsumerTests {
         #expect(delegate.requests.isEmpty)
 
         let asking = ApprovalGate(delegate: P3SecurityApprovalDelegate(decision: .approve))
+        // 只有不可逆操作（删除）才要求第二次确认；普通 shell 命令一次批准即可。
         await #expect(throws: ApprovalError.denied(reason: "L3 requires second confirmation")) {
             try await asking.gate(
                 tool: "shell_execute",
-                input: ["command": "synthetic no-op"],
+                input: ["command": "rm -rf /tmp/synthetic-irreversible-target"],
                 delegate: P3SecurityApprovalDelegate(decision: ApprovalDecision(approved: true))
             )
         }

@@ -83,12 +83,48 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
         set { modify { $0.identity = newValue; $0.followsEndpoint = newValue != nil && $0.base != nil } }
     }
 
+    /// 组装请求消息：工具返回的图片在这一批连续 tool 消息之后，各追加一条 user 消息
+    /// （"[工具 xxx 返回的图片]" + image_url），因为 chat completions 的 tool 消息不支持图片。
+    public static func openAIRequestMessages(_ messages: [LLMMessage],
+                                             mediaCapabilities: ModelCapabilities? = nil,
+                                             reasoningField: String? = nil) -> [[String: Any]] {
+        var toolNames: [String: String] = [:]
+        var items: [[String: Any]] = []
+        var pendingImageMessages: [LLMMessage] = []
+        func flush() {
+            for message in pendingImageMessages {
+                items.append(openAIMessageDict(message, mediaCapabilities: mediaCapabilities))
+            }
+            pendingImageMessages.removeAll()
+        }
+        for message in messages {
+            if message.role != .tool { flush() }
+            for call in message.toolCalls { toolNames[call.id] = call.name }
+            items.append(openAIMessageDict(message, mediaCapabilities: mediaCapabilities,
+                                           reasoningField: reasoningField))
+            if message.role == .tool, !message.images.isEmpty {
+                let name = message.toolCallID.flatMap { toolNames[$0] } ?? "未知工具"
+                pendingImageMessages.append(LLMMessage(role: .user, content: "[工具 \(name) 返回的图片]",
+                                                       images: message.images))
+            }
+        }
+        flush()
+        return items
+    }
+
     public static func openAIMessageDict(_ msg: LLMMessage,
-                                        mediaCapabilities: ModelCapabilities? = nil) -> [String: Any] {
+                                        mediaCapabilities: ModelCapabilities? = nil,
+                                        reasoningField: String? = nil) -> [String: Any] {
         var result: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
         if let id = msg.toolCallID { result["tool_call_id"] = id }
         if !msg.toolCalls.isEmpty { result["tool_calls"] = msg.toolCalls.map(\.openAIDict) }
-        guard !msg.images.isEmpty || !msg.audios.isEmpty else { return result }
+        // DeepSeek 思考模式 + 工具调用：同一轮内要把本轮助手消息的思考文本回传（只对声明了该字段的模型）。
+        if msg.role == .assistant, let reasoningField, !reasoningField.isEmpty,
+           let reasoning = msg.toolCalls.first?.reasoningContent, !reasoning.isEmpty {
+            result[reasoningField] = reasoning
+        }
+        // tool 消息本身不能带图片，工具图片由 openAIRequestMessages 追加成后续 user 消息。
+        guard msg.role != .tool, !msg.images.isEmpty || !msg.audios.isEmpty else { return result }
         var parts: [[String: Any]] = []
         for image in msg.images {
             let kind = MediaPartKind.classify(mimeType: image.mimeType)
@@ -134,7 +170,7 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
     public static func parseNativeToolCalls(from message: [String: Any]) -> [LLMToolCall] {
         let items = message["tool_calls"] as? [[String: Any]] ?? []
         guard items.count <= ProviderToolCallBoundary.maximumCalls else { return [] }
-        let calls = items.compactMap(ProviderToolCallBoundary.parseOpenAI)
+        let calls = items.compactMap(ProviderToolCallBoundary.parseOpenAIAdmittingOversized)
         return ProviderToolCallBoundary.hasUniqueIdentifiers(calls) ? calls : []
     }
     public static func parseChatCompletionsUsage(_ usage: [String: Any]) -> LLMUsage {
@@ -170,7 +206,10 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
         }
         for part in message["images"] as? [[String: Any]] ?? [] { takeImage(part) }
         let stopReason = first["finish_reason"] as? String
-        let calls = parseNativeToolCalls(from: message)
+        var calls = parseNativeToolCalls(from: message)
+        if let reasoning = message["reasoning_content"] as? String, !reasoning.isEmpty, !calls.isEmpty {
+            calls[0].reasoningContent = reasoning
+        }
         let items = message["tool_calls"] as? [[String: Any]] ?? []
         let ids = items.compactMap { $0["id"] as? String }
         let discarded = stopReason == "length" && items.count <= ProviderToolCallBoundary.maximumCalls
@@ -201,6 +240,7 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
         let items: [[String: Any]] = toolCalls.completedCalls().map { call in
             var value: [String: Any] = ["type": "function", "function": ["name": call.name ?? "", "arguments": call.arguments]]
             if let id = call.id { value["id"] = id }
+            if call.argumentsOversized { value[ProviderToolCallBoundary.oversizedMarkerKey] = true }
             return value
         }
         let calls = parseNativeToolCalls(from: ["tool_calls": items])
@@ -227,10 +267,16 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
         return .providerError(message: "The provider request failed.")
     }
     public func mapHTTPError(statusCode: Int, body: String) -> LLMError {
-        ProviderHTTPErrorAdapter.classify(statusCode: statusCode).llmError
+        if ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: statusCode, body: body) {
+            return .httpStatus(code: statusCode, detail: ProviderHTTPErrorAdapter.quotaDetail(statusCode: statusCode))
+        }
+        return ProviderHTTPErrorAdapter.classify(statusCode: statusCode).llmError
     }
     public func mapHTTPError(statusCode: Int, body: String, headers: [String: String]) -> LLMError {
         if ProviderContextOverflowClassifier.isOpenAIStyleOverflow(statusCode: statusCode, body: body) { return .contextLengthExceeded }
+        if ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: statusCode, body: body) {
+            return .httpStatus(code: statusCode, detail: ProviderHTTPErrorAdapter.quotaDetail(statusCode: statusCode, headers: headers))
+        }
         let classification = ProviderHTTPErrorAdapter.classify(statusCode: statusCode, headers: headers)
         var detail = "status=\(statusCode); category=\(classification.category.rawValue)"
         if let seconds = classification.retryAfterSeconds { detail += "; retry_after=\(seconds)" }
@@ -242,10 +288,9 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
         return .httpStatus(code: statusCode, detail: detail)
     }
 
-    /// F-J08-a: DeepSeek's official Chat Completions API only honours `max_tokens`.
-    /// Matches https + host api.deepseek.com (any path); nothing else.
-    private static func usesMaxTokensField(_ url: URL) -> Bool {
-        url.scheme?.lowercased() == "https" && url.host?.lowercased() == "api.deepseek.com"
+    /// MC4-012: OpenAI 官方端点与推理模型用 `max_completion_tokens`，其余自定义兼容端点（含 DeepSeek 官方）用 `max_tokens`。
+    private static func outputCapField(_ url: URL, modelID: String) -> String {
+        OpenAIOutputCapField.name(endpointHost: url.host, scheme: url.scheme, modelID: modelID)
     }
 
     private nonisolated(nonsending) func prepare(messages: [LLMMessage] = [], system: String? = nil,
@@ -269,15 +314,17 @@ public final class OpenAICompatibleProvider: LLMProvider, AssistantStreamingLLMP
             var components = URLComponents(url: base, resolvingAgainstBaseURL: false)!
             while components.path.hasSuffix("/") { components.path.removeLast() }
             var endpoint = components.url!
-            if state.appendVersion && endpoint.lastPathComponent != "v1" { endpoint.appendPathComponent("v1") }
+            // 与连接检查同一规则：路径里没有版本段才补 /v1（/v1beta/openai、/api/paas/v4 原样；/api → /api/v1）。
+            if state.appendVersion && OpenAICompatibleVersionPath.needsV1(endpoint.path) { endpoint.appendPathComponent("v1") }
             endpoint.appendPathComponent("chat/completions")
             var body: [String: Any]
             if let raw { body = raw.object }
             else {
-                var items = messages.map { Self.openAIMessageDict($0, mediaCapabilities: state.model.capabilities) }
+                var items = Self.openAIRequestMessages(messages, mediaCapabilities: state.model.capabilities,
+                                                       reasoningField: state.model.interleavedReasoningField)
                 if let system, !system.isEmpty { items.insert(["role": "system", "content": system], at: 0) }
                 body = ["model": state.model.id, "messages": items, "stream": streaming,
-                    state.router || Self.usesMaxTokensField(endpoint) ? "max_tokens" : "max_completion_tokens": tokens]
+                    state.router ? "max_tokens" : Self.outputCapField(endpoint, modelID: state.model.id): tokens]
                 if streaming && !state.router { body["stream_options"] = ["include_usage": true] }
                 if let temperature { body["temperature"] = temperature }
                 if !tools.isEmpty { body["tools"] = tools.map(\.providerOpenAIFunctionDict) }
@@ -493,6 +540,7 @@ extension OpenAICompatibleProvider {
                     var budget = ProviderResponseStreamPolicy.DecodedByteBudget()
                     var tools = OpenAIStreamDecoder.ToolCallAccumulator()
                     var text = ""
+                    var reasoning = ""
                     var usage: LLMUsage?
                     var reason: String?
                     var contentClosed = false
@@ -514,6 +562,12 @@ extension OpenAICompatibleProvider {
                         if let fragment = chunk.textDelta, !fragment.isEmpty {
                             text += fragment
                             try ProviderStreamCancellationPolicy.yield(.textDelta(fragment), to: continuation)
+                        }
+                        // reasoning_content 不进入 text；展示用 thinkingDelta。带工具调用的回合另挂在第一个
+                        // 工具调用上，供声明了 interleavedReasoningField 的模型（DeepSeek 思考模式）同轮回传。
+                        if let thought = chunk.reasoningDelta, !thought.isEmpty {
+                            reasoning += thought
+                            try ProviderStreamCancellationPolicy.yield(.thinkingDelta(thought), to: continuation)
                         }
                         if let choice = (object["choices"] as? [[String: Any]])?.first,
                            let delta = choice["delta"] as? [String: Any],
@@ -548,8 +602,11 @@ extension OpenAICompatibleProvider {
                             }
                             let current = existing?.arguments.utf8.count ?? 0
                             let extra = delta.arguments?.utf8.count ?? 0
-                            guard extra <= ProviderToolCallBoundary.maximumArgumentsBytes - current else {
-                                throw LLMError.providerError(message: "Tool arguments exceed the supported size.")
+                            if extra > ProviderToolCallBoundary.maximumArgumentsBytes - current {
+                                // V-6：不整轮失败；丢掉这个调用已累计的参数并标记，收尾时回给模型固定的工具错误。
+                                tools.apply(delta)
+                                tools.markArgumentsOversized(index: delta.index)
+                                continue
                             }
                             tools.apply(delta)
                         }
@@ -569,9 +626,12 @@ extension OpenAICompatibleProvider {
                     if reason == nil && !done {
                         throw LLMError.transientError(message: "Provider stream ended before a complete response was received.")
                     }
-                    let response = Self.assistantStreamCompletedResponse(text: text, stopReason: reason,
+                    var response = Self.assistantStreamCompletedResponse(text: text, stopReason: reason,
                         usage: usage, toolCalls: tools, countToolSlots: !hasAmbiguousToolSlots,
                         offeredNames: offeredNames, ambiguousToolNameSlots: ambiguousToolNameSlots)
+                    if !reasoning.isEmpty, !response.toolCalls.isEmpty {
+                        response.toolCalls[0].reasoningContent = reasoning
+                    }
                     try ProviderStreamCancellationPolicy.yield(.completed(response), to: continuation)
                     continuation.finish()
                 } catch { permit?.fail(); continuation.finish(throwing: self.mapError(error)) }

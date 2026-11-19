@@ -453,7 +453,8 @@ struct MCPPersistentPairFenceTests {
             #expect(try bytes(owner.authorizationFileURL) == authBefore)
             // This succeeds only if the same owner's auth-only baseline refreshed.
             try owner.updateServer(server("A", name: "after revoke"))
-            #expect(manager(owner.fileURL, backing).authorization(serverID: "A") == nil)
+            // 11/16：撤销服务器授权改为保留工具名单、只把服务器授权置为关闭，撤销仍然生效。
+            #expect(manager(owner.fileURL, backing).authorization(serverID: "A")?.serverAuthorized != true)
         }
     }
 
@@ -861,18 +862,19 @@ struct MCPPersistentPairFenceTests {
 
             // The counters above stay flat only because both snapshots are still
             // valid, so they cannot show that the revoked A is skipped when
-            // discovery really runs. Re-authorizing the already trusted server
-            // advances the manager revision without touching any tool grant, which
-            // makes every accepted snapshot (A and B) unavailable. Now the
-            // automatic read must rediscover B only, and never the revoked A.
+            // discovery really runs. Re-authorizing the already trusted server A
+            // advances the manager revision without touching any tool grant: A's
+            // own snapshot becomes unavailable, while the unrelated B is
+            // re-stamped and stays valid (11/19 D-2). The automatic read must
+            // therefore not rediscover B, and must never rediscover the revoked A.
             _ = try owner.authorizeServer(id: "A")
             #expect(owner.discoverySnapshot(serverID: "A") == nil)
-            #expect(owner.discoverySnapshot(serverID: "B") == nil)
+            #expect(owner.discoverySnapshot(serverID: "B") != nil)
             #expect(owner.authorization(serverID: "A")?.authorizedToolNames.isEmpty == true)
             let aListsBeforeAutomatic = a.listCalls
             let bListsBeforeAutomatic = b.listCalls
             #expect(try await registry.mcpBoundTools().map(\.fullName) == [bName])
-            #expect(b.listCalls == bListsBeforeAutomatic + 1)
+            #expect(b.listCalls == bListsBeforeAutomatic)
             #expect(a.listCalls == aListsBeforeAutomatic)
             #expect(owner.discoverySnapshot(serverID: "B") != nil)
             #expect(owner.discoverySnapshot(serverID: "A") == nil)

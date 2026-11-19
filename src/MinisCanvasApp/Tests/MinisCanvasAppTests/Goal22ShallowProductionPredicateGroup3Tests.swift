@@ -743,14 +743,11 @@ struct Goal22ShallowProductionPredicateGroup3Tests {
                     #expect(actual["child-b"] == "Error executing tool file_read: 用户拒绝",
                         Comment(rawValue: String("targetFailure=\(UUID(uuidString: targetID).flatMap { bridge.chat.executionSnapshot(forSessionID: $0)?.failureReason } ?? "UNOBSERVED") wireRequests=\(wire.requests.count) \(provider.diagnosticShape)".prefix(320))))
                     #expect(actual["child-b"]?.contains("G3_OTHER_PROJECT_MUST_NOT_LEAK") == false)
-                    #expect(approvedReadRequests.count == 1 && deniedReadRequests.count == 1)
-                    let approvedA = try #require(approvedReadRequests.first)
+                    // 对齐 Claude Code：项目目录内的只读文件工具不再弹审批卡，所以 A 的读取没有卡片也没有审批回执；
+                    // 项目目录之外的 B 仍然逐次询问，并被用户拒绝。
+                    #expect(approvedReadRequests.isEmpty && deniedReadRequests.count == 1)
                     let deniedB = try #require(deniedReadRequests.first)
-                    let receiptA = try #require(bridge.composerApprovalReceipts.first {
-                        $0.callID == approvedA.callID && $0.requestID == approvedA.requestID
-                            && $0.inputDigest == expectedReadA && $0.sessionID == targetID && $0.taskID == taskID
-                    })
-                    #expect(receiptA.persistentRuleID == nil)
+                    #expect(!bridge.composerApprovalReceipts.contains { $0.callID == "g3-child-read-a" })
                     let hasBReceipt = bridge.composerApprovalReceipts.contains {
                         $0.callID == deniedB.callID && $0.requestID == deniedB.requestID
                     }
@@ -763,7 +760,7 @@ struct Goal22ShallowProductionPredicateGroup3Tests {
                     #expect(decisionB.identity.sessionID == targetID && decisionB.identity.taskID == taskID)
                     #expect(bridge.chat.composerPolicyFacts.allowedWriteRoots == originalSourceFacts.allowedWriteRoots)
                     #expect(bridge.chat.composerPolicyFacts.grantEpoch == originalSourceFacts.grantEpoch)
-                    print("G22_PROJECT_READ_AUTH stage=settled aFreshReceipt=true aReceiptDigest=\(receiptA.receiptDigest) bDecisionDenied=\(decisionB.approvalDecision == .denied) bApprovalReceipt=\(hasBReceipt)")
+                    print("G22_PROJECT_READ_AUTH stage=settled aNoCardNeeded=true bDecisionDenied=\(decisionB.approvalDecision == .denied) bApprovalReceipt=\(hasBReceipt)")
                     #expect(Set(bridge.chat.sessions.map(\.id)).subtracting(baselineIDs).count == 1)
                 } else {
                     #expect(targets.isEmpty)

@@ -224,6 +224,8 @@ struct SchedulerTaskStoreTests {
         var resumedTask = authorized
         resumedTask.enablementRevision += 2
         let enabledReload = SchedulerTaskStore(defaults: defaults, occurrenceLedgerURL: ledger)
+        // 暂停改启用会记录启用时刻（新字段，有意为之）；其余字段必须与重开前完全一致。
+        resumedTask.enabledAt = try #require(enabledReload.task(id: saved.id)?.enabledAt)
         #expect(enabledReload.allTasks() == [resumedTask])
         #expect(enabledReload.enabledTasks() == [resumedTask])
         #expect(enabledReload.occurrences == [paused])
@@ -683,6 +685,36 @@ struct SchedulerTaskStoreTests {
             id: occurrence.id, owner: "new-runtime",
             expectedControlRevision: task.version, now: now.addingTimeInterval(1)
         ) == nil)
+    }
+
+    // MARK: 每次运行开新会话
+
+    @Test func newSessionOptionSurvivesRestartAndNeedsReauthorization() throws {
+        let (d, cleanup) = makeDefaults()
+        defer { cleanup() }
+        let store = SchedulerTaskStore(defaults: d)
+        let sessionID = UUID()
+        #expect(store.add(name: "日报", cronExpression: "0 9 * * *", command: "总结昨天",
+                          targetSessionID: sessionID, targetProjectID: "P1", targetTurnID: 1,
+                          opensNewSessionEachRun: true) == nil)
+        var task = try #require(store.tasks.first)
+        #expect(task.opensNewSessionEachRun)
+        #expect(SchedulerTaskStore(defaults: d).tasks.first?.opensNewSessionEachRun == true)
+
+        // 关掉这个选项属于执行范围变化：授权版本前进、需要重新授权。
+        let before = task.authorizationVersion
+        task.opensNewSessionEachRun = false
+        #expect(store.update(task, expectedVersion: task.version,
+                             expectedEnablementRevision: task.enablementRevision) == nil)
+        let after = try #require(store.tasks.first)
+        #expect(after.authorizationVersion == before + 1)
+        #expect(!after.isAuthorized)
+    }
+
+    @Test func scheduledRunSessionIDIsStablePerTrigger() {
+        let a = ChatStore.scheduledRunSessionID(effectID: "effect-1")
+        #expect(a == ChatStore.scheduledRunSessionID(effectID: "effect-1"))
+        #expect(a != ChatStore.scheduledRunSessionID(effectID: "effect-2"))
     }
 
 }

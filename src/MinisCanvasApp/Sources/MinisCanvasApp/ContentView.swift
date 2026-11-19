@@ -822,6 +822,12 @@ struct ContentView: View {
         }
     }
 
+    /// G-02：覆盖式面板（窗口较窄时浮在内容上）点外部或按 Esc 关闭；与折叠按钮同一路径。
+    private func dismissOverlayPanels(leftIsOverlay: Bool, rightIsOverlay: Bool) {
+        if rightIsOverlay && showContextPanel { collapseContextPanel() }
+        else if leftIsOverlay && !sessionSidebarCollapsed { collapseSidebar() }
+    }
+
     /// A7-A：只同步 reducer 的展示投影，不通过自动折叠路径写回用户宽度。
     private func syncAdaptiveLayoutProjection() {
         sessionSidebarCollapsed = adaptiveLayoutState.sessionSidebarCollapsed
@@ -855,8 +861,12 @@ struct ContentView: View {
             transcriptEnvStore: transcriptEnvStore,
             collapsed: companionCollapsed,
             onToggleCollapse: { toggleCompanion() },
-            onOpenAttachment: openAttachmentInContextPanel
+            onOpenAttachment: openAttachmentInContextPanel,
+            onPreviewAttachment: openPendingAttachmentInContextPanel
         )
+        .environment(\.transcriptImagePreviewAction, { url in
+            presentAgentOutputPreview(url, workspaceRoot: ledgerRoot(forChangePath: url.path) ?? bridge.productionFileChangeLedger?.workspaceRoot)
+        })
         .frame(
             // AJ-69：折叠时 0 宽（DeterministicSplitView 对 w < 1 不渲染）——
             // 旧值 1 是 HSplitView 时代的残留（NSSplitView 要求最小宽 > 0），
@@ -1050,6 +1060,7 @@ struct ContentView: View {
                 )
                 syncAdaptiveLayoutProjection()
             }
+            .background(TerminalLifecycleObserver(chat: bridge.chat, settings: settingsCenter))
             .onChange(of: bridge.chat.activeSessionID) { _, activeSessionID in
                 attachmentPreviewSelection = attachmentPreviewSelection?.visible(in: activeSessionID)
                 pendingAttachmentPreview = nil
@@ -1066,6 +1077,7 @@ struct ContentView: View {
             }
         }
         .font(typography?.body ?? .body)
+        .environment(\.previewToolOutputFile, { url in presentToolOutputPreview(url) })
         .frame(minWidth: AdaptiveLayoutPolicy.minimumSupportedWidth, minHeight: 620)
         // 半透明浮动右键菜单层（用户定案：背景透明度 50%、文字不透明）
         .overlay { FloatingMenuOverlay() }
@@ -1159,7 +1171,10 @@ struct ContentView: View {
             ApprovalPromptView(
                 center: bridge.approvalCenter, shortcutStore: bridge.shortcutStore,
                 onViewTaskCenter: taskCenterApprovalDestination == nil
-                    ? nil : { viewPendingApprovalInTaskCenter() }
+                    ? nil : { viewPendingApprovalInTaskCenter() },
+                originSessionTitle: { request in
+                    bridge.chat.approvalOriginSessionTitle(requestSessionID: request.sessionID)
+                }
             )
         }
         // E15 节点内容编辑器：双击画布节点弹出（TextEditor + 粘贴 + 文件导入 + setContent 写回）
@@ -1175,6 +1190,13 @@ struct ContentView: View {
                 ChatArtifactPanelView(snapshot: chatInspectorSnapshot, preferencesDefaults: bridge.preferencesDefaults)
                     .environment(\.agentFileOutputAction, { change, intent in
                         let outcome = performFileOutputAction(change, intent)
+                        if case .preview = intent, outcome == .completed {
+                            chatAssetPanelPresented = false
+                        }
+                        return outcome
+                    })
+                    .environment(\.agentArtifactOutputAction, { artifact, intent in
+                        let outcome = performArtifactOutputAction(artifact, intent)
                         if case .preview = intent, outcome == .completed {
                             chatAssetPanelPresented = false
                         }
@@ -1196,7 +1218,10 @@ struct ContentView: View {
             // requests still use the original approval card and waiter here.
             .sheet(isPresented: taskCenterApprovalBinding) {
                 ApprovalPromptView(
-                    center: bridge.approvalCenter, shortcutStore: bridge.shortcutStore
+                    center: bridge.approvalCenter, shortcutStore: bridge.shortcutStore,
+                    originSessionTitle: { request in
+                        bridge.chat.approvalOriginSessionTitle(requestSessionID: request.sessionID)
+                    }
                 )
             }
         }
@@ -1525,6 +1550,20 @@ struct ContentView: View {
                     }
                 }
             }
+            // G-02：覆盖式侧栏打开时，点外部空白处关闭（遮罩在两个面板之下）。
+            .overlay {
+                if (leftIsOverlay && !sessionSidebarCollapsed) || (rightIsOverlay && showContextPanel) {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { dismissOverlayPanels(leftIsOverlay: leftIsOverlay, rightIsOverlay: rightIsOverlay) }
+                        .accessibilityHidden(true)
+                }
+            }
+            .onExitCommand {
+                if (leftIsOverlay && !sessionSidebarCollapsed) || (rightIsOverlay && showContextPanel) {
+                    dismissOverlayPanels(leftIsOverlay: leftIsOverlay, rightIsOverlay: rightIsOverlay)
+                }
+            }
             .overlay(alignment: .topLeading) {
                 if leftIsOverlay && !sessionSidebarCollapsed {
                     sessionSidebarPanel(
@@ -1533,7 +1572,7 @@ struct ContentView: View {
                         maximumWidth: decision.leftMaximumWidth
                     )
                         .frame(width: decision.leftWidth)
-                        .background(Color(nsColor: .windowBackgroundColor))
+                        .background(theme?.background ?? Color(nsColor: .windowBackgroundColor))
                         .shadow(color: .black.opacity(0.18), radius: 16, x: 4)
                         .padding(.bottom, composerClearance)
                         .zIndex(3)
@@ -1547,7 +1586,7 @@ struct ContentView: View {
                         maximumWidth: decision.rightMaximumWidth
                     )
                         .frame(width: decision.rightWidth)
-                        .background(Color(nsColor: .windowBackgroundColor))
+                        .background(theme?.background ?? Color(nsColor: .windowBackgroundColor))
                         .shadow(color: .black.opacity(0.18), radius: 16, x: -4)
                         .padding(.bottom, composerClearance)
                         .zIndex(4)
@@ -1668,6 +1707,7 @@ struct ContentView: View {
                 )
             },
             onFileOutputAction: performFileOutputAction,
+            onArtifactOutputAction: performArtifactOutputAction,
             childFileCheckpointSummaries: { sessionID, childTaskID, path in
                 bridge.childFileCheckpointSummaries(sessionID: sessionID, childTaskID: childTaskID, path: path)
             },
@@ -1690,36 +1730,92 @@ struct ContentView: View {
     /// Inspector and asset presentation share the original action consumer.
     /// The current session, durable record and filesystem are checked at click time.
     private func performFileOutputAction(_ change: AgentFileChangeRecord, _ intent: AgentFileOutputIntent) -> AgentFileOutputOutcome {
-        AgentFileOutputActionConsumer.performInApp(
+        // 变更文件按台账记录自带的根解析（挂载目录、绕过档项目外的文件也能打开），缺失才回落主根。
+        let root = ledgerRoot(forChangePath: change.path) ?? bridge.productionFileChangeLedger?.workspaceRoot
+        return AgentFileOutputActionConsumer.performInApp(
             change: change,
             viewerSessionID: bridge.chat.activeSessionID?.uuidString,
             records: bridge.actionHistory.records,
-            workspaceRoot: bridge.productionFileChangeLedger?.workspaceRoot,
+            workspaceRoot: root,
             intent: intent,
             preview: { url in
-                guard let sessionID = bridge.chat.activeSessionID,
-                      let root = bridge.productionFileChangeLedger?.workspaceRoot else {
-                    return false
-                }
-                attachmentPreviewSelection = ChatAttachmentPreviewSelection(
-                    sessionID: sessionID,
-                    url: url,
-                    agentWorkspaceRoot: URL(fileURLWithPath: root, isDirectory: true)
-                )
-                showContextPanel = true
-                adaptiveLayoutState = AdaptiveLayoutReducer.reduce(
-                    adaptiveLayoutState,
-                    .userSetContextPanelCollapsed(false)
-                )
-                adaptiveLayoutState = AdaptiveLayoutReducer.reduce(
-                    adaptiveLayoutState,
-                    .compactOverlayOpened(.contextPanel)
-                )
-                syncAdaptiveLayoutProjection()
-                if bridge.layoutMode != .split { bridge.layoutMode = .split }
-                return true
+                presentAgentOutputPreview(url, workspaceRoot: root)
             }
         )
+    }
+
+    /// 在当前会话的台账记录里找与该绝对路径对应、且带自有根的记录，取其根。
+    private func ledgerRoot(forChangePath path: String) -> String? {
+        guard let sessionID = bridge.chat.activeSessionID?.uuidString,
+              let ledger = bridge.productionFileChangeLedger else { return nil }
+        let target = URL(fileURLWithPath: path).standardizedFileURL.path
+        return ledger.records(sessionID: sessionID).last { record in
+            guard let root = record.workspaceRoot else { return false }
+            return URL(fileURLWithPath: root, isDirectory: true)
+                .appendingPathComponent(record.path).standardizedFileURL.path == target
+        }?.workspaceRoot
+    }
+
+    /// 已证实产物行的操作：按台账记录和 outputSHA256 在点击时重新核验，根取记录自带的根。
+    private func performArtifactOutputAction(_ artifact: ProducedFileArtifactEvidence, _ intent: AgentFileOutputIntent) -> AgentFileOutputOutcome {
+        let sessionID = bridge.chat.activeSessionID?.uuidString
+        let record = sessionID.flatMap { bridge.productionFileChangeLedger?.record(diffID: artifact.diffID, sessionID: $0) }
+        let root = record?.workspaceRoot ?? bridge.productionFileChangeLedger?.workspaceRoot
+        return AgentFileOutputActionConsumer.performLedgerArtifact(
+            artifact: artifact,
+            ledgerRecord: record,
+            fallbackRoot: bridge.productionFileChangeLedger?.workspaceRoot,
+            viewerSessionID: sessionID,
+            intent: intent,
+            preview: { url in presentAgentOutputPreview(url, workspaceRoot: root) },
+            probe: AgentFileOutputTargetResolver.fileSystemProbe,
+            digest: AgentFileOutputTargetResolver.generatedFileDigestDeferringLarge,
+            open: { NSWorkspace.shared.open($0) },
+            reveal: { NSWorkspace.shared.selectFile($0.path, inFileViewerRootedAtPath: $0.deletingLastPathComponent().path) },
+            copy: { NSPasteboard.general.clearContents(); return NSPasteboard.general.setString($0, forType: .string) }
+        )
+    }
+
+    /// 工具卡片里的“预览”：工具返回的图片（会话输出目录、浏览器截图）送右侧面板。
+    /// 路径在卡片里已按图片文件和敏感路径筛过；这里按普通预览项打开，不当作工作区文件。
+    private func presentToolOutputPreview(_ url: URL) {
+        guard let sessionID = bridge.chat.activeSessionID else { return }
+        attachmentPreviewSelection = ChatAttachmentPreviewSelection(sessionID: sessionID, url: url)
+        showContextPanel = true
+        adaptiveLayoutState = AdaptiveLayoutReducer.reduce(
+            adaptiveLayoutState,
+            .userSetContextPanelCollapsed(false)
+        )
+        adaptiveLayoutState = AdaptiveLayoutReducer.reduce(
+            adaptiveLayoutState,
+            .compactOverlayOpened(.contextPanel)
+        )
+        syncAdaptiveLayoutProjection()
+        if bridge.layoutMode != .split { bridge.layoutMode = .split }
+    }
+
+    private func presentAgentOutputPreview(_ url: URL, workspaceRoot: String?) -> Bool {
+        guard let sessionID = bridge.chat.activeSessionID,
+              let root = workspaceRoot else {
+            return false
+        }
+        attachmentPreviewSelection = ChatAttachmentPreviewSelection(
+            sessionID: sessionID,
+            url: url,
+            agentWorkspaceRoot: URL(fileURLWithPath: root, isDirectory: true)
+        )
+        showContextPanel = true
+        adaptiveLayoutState = AdaptiveLayoutReducer.reduce(
+            adaptiveLayoutState,
+            .userSetContextPanelCollapsed(false)
+        )
+        adaptiveLayoutState = AdaptiveLayoutReducer.reduce(
+            adaptiveLayoutState,
+            .compactOverlayOpened(.contextPanel)
+        )
+        syncAdaptiveLayoutProjection()
+        if bridge.layoutMode != .split { bridge.layoutMode = .split }
+        return true
     }
 
     /// F13-ui：侧栏折叠后主区左上浮动恢复入口（24x24 小按钮 + 浅色圆角背景，边距 8pt）。
@@ -1856,6 +1952,9 @@ struct ContentView: View {
                     transcriptEnvStore: transcriptEnvStore,
                     onOpenAttachment: openAttachmentInContextPanel
                 )
+                .environment(\.transcriptImagePreviewAction, { url in
+                    presentAgentOutputPreview(url, workspaceRoot: ledgerRoot(forChangePath: url.path) ?? bridge.productionFileChangeLedger?.workspaceRoot)
+                })
                 .padding(.horizontal, metrics.surfaceGutter)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(ChatLayoutMetrics.messageListLayoutPriority)
@@ -1863,7 +1962,9 @@ struct ContentView: View {
                 .onDisappear { bridge.approvalCenter.inlineHostAvailable = false }
                 if bridge.approvalCenter.usesInlinePresentation && !taskCenterModalPresentationActive
                     && !bridge.p03CleanupAppController.isPanelPresented {
-                    InlineApprovalPromptView(center: bridge.approvalCenter)
+                    InlineApprovalPromptView(center: bridge.approvalCenter, originSessionTitle: { request in
+                        bridge.chat.approvalOriginSessionTitle(requestSessionID: request.sessionID)
+                    })
                 }
                 ChatChildTaskSummaryView(onOpen: { navigation in
                     guard let sessionID = bridge.chat.activeSessionID,
@@ -1890,6 +1991,8 @@ struct ContentView: View {
                         action: fact.status == .queued ? .cancel : .stop, runID: row.runID
                     ))
                 }) {
+                    // 子任务变化经此观察信号通知；任务消费者本身不可观察，空闲时靠它触发重算而不是 0.5 秒时钟。
+                    _ = bridge.chat.toolLifecyclePresentationRevision
                     let sessionID = bridge.chat.activeSessionID
                     let parentTaskID = sessionID.flatMap {
                         bridge.chat.executionSnapshot(forSessionID: $0)?.taskID
@@ -1978,7 +2081,7 @@ struct ContentView: View {
                 bridge.layoutMode = .split
             }
         } catch {
-            attachmentPreviewError = error.localizedDescription
+            attachmentPreviewError = UserFacingErrorText.describe(error)
         }
     }
 
@@ -2436,7 +2539,8 @@ struct ContentView: View {
             providerLabel: chat.providerLabel,
             modelLabel: chat.selectedModelID ?? "默认",
             engineLabel: chat.agentEngine.isAvailable ? "在线" : "回退 LLM 直连",
-            messageCount: chat.messages.count,
+            // 读摘要而不是 `messages`：后者随每个流式分片失效，会让右侧面板每帧重算。
+            messageCount: chat.activeMessageCount,
             activeSessionCount: chat.sessionList.count,
             archivedSessionCount: chat.archivedList.count,
             tokenUsageLabel: ChatStore.tokenUsageLabel(
@@ -2463,6 +2567,9 @@ struct ContentView: View {
             } ?? [],
             fileArtifacts: fileArtifacts,
             artifactPersistenceUnavailable: bridge.productionFileChangeLedger?.artifactPersistenceUnavailable ?? false,
+            commandGeneratedPaths: sessionID.flatMap {
+                bridge.productionBuiltinToolExecutor?.commandGeneratedArtifacts.paths(sessionID: $0)
+            } ?? [],
             persistence: SessionCompactProjection(
                 sessionID: sessionID,
                 store: chat.sessionManager?.store

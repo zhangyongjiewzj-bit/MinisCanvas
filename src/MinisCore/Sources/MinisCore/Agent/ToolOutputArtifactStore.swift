@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 public struct ToolOutputArtifact: Sendable, Equatable {
     public let artifactID: UUID
@@ -17,8 +18,9 @@ public struct ToolOutputArtifact: Sendable, Equatable {
 /// Stores only output already passed through the consumer's secret redactor.
 /// The consumer injects its SessionStore root and admitted session identity.
 public struct ToolOutputArtifactStore: Sendable {
-    // A successful producer write is the only registration entry point. These
-    // receipts live only in this process; restarting never restores a grant.
+    // A successful producer write is the only registration entry point. Receipts
+    // live in this process; after a restart a grant returns only when the
+    // session manifest (size + SHA-256) still matches the file byte for byte.
     private struct Receipt: Sendable {
         let path: String
         let inode: UInt64
@@ -36,6 +38,10 @@ public struct ToolOutputArtifactStore: Sendable {
         func receipt(path: String) -> Receipt? {
             lock.lock(); defer { lock.unlock() }
             return values[path]
+        }
+        func remove(path: String) {
+            lock.lock(); defer { lock.unlock() }
+            values[path] = nil
         }
         func remove(directory: String) {
             lock.lock(); defer { lock.unlock() }
@@ -142,13 +148,23 @@ public struct ToolOutputArtifactStore: Sendable {
         guard rawPath.hasPrefix(outputRoot) else { return nil }
         let directory = try validatedDirectory()
         let url = URL(fileURLWithPath: rawPath)
+        // 文本输出叫 <UUID>.txt；MCP 图片叫 mcp-image-<UUID>.<png|jpg|gif|webp>。
+        let baseName = url.deletingPathExtension().lastPathComponent
+        let idText: String
+        if url.pathExtension == "txt" {
+            idText = baseName
+        } else if Self.imageExtensions.contains(url.pathExtension), baseName.hasPrefix(Self.imagePrefix) {
+            idText = String(baseName.dropFirst(Self.imagePrefix.count))
+        } else {
+            throw ToolExecutorError.pathViolation(rawPath)
+        }
         guard rawPath == url.standardizedFileURL.path,
               url.deletingLastPathComponent().path == directory.path,
-              url.pathExtension == "txt",
-              let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
-              id.uuidString == url.deletingPathExtension().lastPathComponent,
+              let id = UUID(uuidString: idText),
+              id.uuidString == idText,
               url.resolvingSymlinksInPath().path == rawPath,
-              let receipt = Self.receipts.receipt(path: rawPath) else {
+              let receipt = Self.receipts.receipt(path: rawPath)
+                ?? Self.restoreReceiptFromManifest(url: url, directory: directory) else {
             throw ToolExecutorError.pathViolation(rawPath)
         }
         let current: Receipt
@@ -185,6 +201,89 @@ public struct ToolOutputArtifactStore: Sendable {
         return nil
     }
 
+    private static let imageExtensions: Set<String> = ["png", "jpg", "gif", "webp"]
+    private static let imagePrefix = "mcp-image-"
+    private static let manifestName = "manifest.json"
+    private static let manifestLock = NSLock()
+
+    private struct ManifestEntry: Codable {
+        let bytes: UInt64
+        let sha256: String
+    }
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 登记读取凭据的同时，把“文件名 -> 字节数 + 内容 SHA-256”写进会话输出目录的清单。
+    /// 重启后凭据只在清单存在且文件字节数与哈希都仍然匹配时才恢复；清单写失败只影响重启后的续读。
+    private static func recordManifest(directory: URL, fileName: String, data: Data) {
+        manifestLock.lock(); defer { manifestLock.unlock() }
+        let manifestURL = directory.appendingPathComponent(manifestName)
+        var entries: [String: ManifestEntry] = [:]
+        if let existing = try? Data(contentsOf: manifestURL),
+           let decoded = try? JSONDecoder().decode([String: ManifestEntry].self, from: existing) {
+            entries = decoded
+        }
+        entries[fileName] = ManifestEntry(bytes: UInt64(data.count), sha256: sha256Hex(data))
+        guard let encoded = try? JSONEncoder().encode(entries) else { return }
+        FileManager.default.createFile(
+            atPath: manifestURL.path, contents: encoded, attributes: [.posixPermissions: 0o600])
+    }
+
+    /// 每个会话输出目录的总量上限（图片与超长输出合计）。
+    static let sessionByteLimit: UInt64 = 512 * 1024 * 1024
+
+    /// 写入后检查会话输出目录总量：超过上限就按修改时间从最旧的删起，直到不超过上限；
+    /// 刚写入的文件和清单不删。被删文件同时从清单和读取回执里去掉，之后按路径读取会提示文件不存在。
+    static func enforceSessionQuota(directory: URL, keeping keptFileName: String, limit: UInt64 = sessionByteLimit) {
+        let keys: [URLResourceKey] = [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey]
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: keys) else { return }
+        var files: [(url: URL, size: UInt64, date: Date)] = []
+        var total: UInt64 = 0
+        for url in urls where url.lastPathComponent != manifestName {
+            guard let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else { continue }
+            let size = UInt64(values.fileSize ?? 0)
+            total += size
+            files.append((url, size, values.contentModificationDate ?? .distantPast))
+        }
+        guard total > limit else { return }
+        var removed: [String] = []
+        for file in files.sorted(by: { $0.date < $1.date }) where total > limit {
+            if file.url.lastPathComponent == keptFileName { continue }
+            guard (try? FileManager.default.removeItem(at: file.url)) != nil else { continue }
+            total -= file.size
+            removed.append(file.url.lastPathComponent)
+            receipts.remove(path: file.url.path)
+        }
+        guard !removed.isEmpty else { return }
+        manifestLock.lock(); defer { manifestLock.unlock() }
+        let manifestURL = directory.appendingPathComponent(manifestName)
+        guard let existing = try? Data(contentsOf: manifestURL),
+              var entries = try? JSONDecoder().decode([String: ManifestEntry].self, from: existing) else { return }
+        for name in removed { entries[name] = nil }
+        guard let encoded = try? JSONEncoder().encode(entries) else { return }
+        FileManager.default.createFile(
+            atPath: manifestURL.path, contents: encoded, attributes: [.posixPermissions: 0o600])
+    }
+
+    private static func restoreReceiptFromManifest(url: URL, directory: URL) -> Receipt? {
+        manifestLock.lock()
+        let manifestData = try? Data(contentsOf: directory.appendingPathComponent(manifestName))
+        manifestLock.unlock()
+        guard let manifestData,
+              let entries = try? JSONDecoder().decode([String: ManifestEntry].self, from: manifestData),
+              let entry = entries[url.lastPathComponent],
+              let current = try? fileReceipt(at: url),
+              current.bytes == entry.bytes,
+              let data = try? Data(contentsOf: url),
+              UInt64(data.count) == entry.bytes,
+              sha256Hex(data) == entry.sha256 else { return nil }
+        receipts.insert(current)
+        return current
+    }
+
     private static func fileReceipt(at url: URL) throws -> Receipt {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         guard attributes[.type] as? FileAttributeType == .typeRegular,
@@ -204,6 +303,29 @@ public struct ToolOutputArtifactStore: Sendable {
             try FileManager.default.removeItem(at: directory)
         }
         Self.receipts.remove(directory: directory.path)
+    }
+
+    /// 把工具返回的图片存进会话输出目录，供工具卡片显示缩略图。
+    /// 同时登记读取回执和清单，模型之后可按路径 file_read 这张图（只限本会话输出目录）。
+    /// 会话被永久删除时随输出目录一起清掉。
+    public func persistImage(_ data: Data, fileExtension: String) throws -> URL {
+        let allowed: Set<String> = ["png", "jpg", "gif", "webp"]
+        guard allowed.contains(fileExtension), !data.isEmpty else {
+            throw ToolExecutorError.invalidParameter("image extension")
+        }
+        let directory = try validatedDirectory()
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let fileURL = directory.appendingPathComponent("\(Self.imagePrefix)\(UUID().uuidString).\(fileExtension)")
+        guard FileManager.default.createFile(
+            atPath: fileURL.path, contents: data, attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: fileURL.path])
+        }
+        Self.receipts.insert(try Self.fileReceipt(at: fileURL))
+        Self.recordManifest(directory: directory, fileName: fileURL.lastPathComponent, data: data)
+        Self.enforceSessionQuota(directory: directory, keeping: fileURL.lastPathComponent)
+        return fileURL
     }
 
     /// At exactly the threshold, keep the existing inline output contract.
@@ -229,6 +351,9 @@ public struct ToolOutputArtifactStore: Sendable {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: fileURL.path])
         }
         Self.receipts.insert(try Self.fileReceipt(at: fileURL))
+        Self.recordManifest(directory: directory, fileName: fileURL.lastPathComponent,
+                            data: Data(redactedOutput.utf8))
+        Self.enforceSessionQuota(directory: directory, keeping: fileURL.lastPathComponent)
         let excerptLength = min(1_500, max(1, thresholdCharacters / 2))
         let preview = String(redactedOutput.prefix(excerptLength))
             + "\n…中间内容见输出文件…\n"

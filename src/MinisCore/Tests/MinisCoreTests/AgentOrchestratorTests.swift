@@ -100,6 +100,43 @@ enum ProbeFailure: Error {
     case failedTask
 }
 
+/// 一直挂着直到被取消的 provider（可取消的睡眠）：模拟长时间运行的子任务。
+final class HoldUntilCancelledLLMProvider: LLMProvider {
+    var name: String { "HoldUntilCancelled" }
+    var model: LLMModel = .claudeHaiku45
+    private let probe: OrchestrationProbe
+
+    init(probe: OrchestrationProbe) { self.probe = probe }
+
+    func sendMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        maxTokens: Int,
+        temperature: Double?
+    ) async throws -> LLMResponse {
+        await probe.enter(systemPrompt: systemPrompt)
+        do {
+            try await Task.sleep(for: .seconds(120))
+        } catch {
+            await probe.exit()
+            throw error
+        }
+        await probe.exit()
+        return LLMResponse(text: "不该走到这里", stopReason: nil, usage: nil)
+    }
+
+    func streamMessage(
+        messages: [LLMMessage],
+        systemPrompt: String?,
+        maxTokens: Int,
+        temperature: Double?
+    ) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+}
+
 /// 空工具执行器（内置子 agent 测试不需要真工具）。
 final class NoopToolExecutor: ToolExecutor {
     func execute(name: String, input: [String: Any]) async throws -> String {
@@ -836,6 +873,24 @@ struct AgentOrchestratorChildControlsTests {
         #expect(prompt.hasSuffix(parentPrompt))
     }
 
+    // R3-05: the built-in child loop is admitted against its own model's window.
+    @Test func builtinChildIsAdmittedAgainstTheModelWindow() async throws {
+        let longTask = SubAgentTask(
+            id: "window", title: "长任务", instructions: String(repeating: "读", count: 30_000))
+        for (window, succeeds) in [(1_000, false), (200_000, true)] {
+            let probe = OrchestrationProbe()
+            let model = LLMModel(id: "tiny", displayName: "Tiny", provider: "Synthetic", contextWindow: window)
+            let orchestrator = AgentOrchestrator().withBuiltinExecution(
+                provider: ProbeLLMProvider(model: model, probe: probe), toolExecutor: NoopToolExecutor())
+            let reports = await orchestrator.orchestrate(tasks: [longTask])
+            try #require(reports.count == 1)
+            #expect(reports[0].result.isSuccess == succeeds)
+            if !succeeds {
+                #expect(await probe.prompts.isEmpty, "窗口已满时不发出请求")
+            }
+        }
+    }
+
     @Test func pendingInterruptStopsChildBeforeFirstProviderCall() async {
         // 共享 TurnController：停止信号先于编排到达（P2-9 竞态场景）→
         // 子循环在第一次迭代边界即被中断，provider 一次都不被调用。
@@ -854,14 +909,49 @@ struct AgentOrchestratorChildControlsTests {
         #expect(await probe.maxActive == 0, "中断必须先于首个 provider 调用生效")
     }
 
+    /// R3-11：子任务时限改成从派发起算的 2 小时之后，停止仍然跟着父回合——
+    /// 父回合一停，正在跑的子任务立刻被取消，不会等到时限，也不会继续占着请求。
+    @Test func parentInterruptCancelsARunningChildWithTheTwoHourDeadline() async throws {
+        let controller = TurnController()
+        let probe = OrchestrationProbe()
+        let orchestrator = AgentOrchestrator(
+            childTimeout: AgentOrchestrator.hardMaxChildTimeout,
+            deadline: Date().addingTimeInterval(AgentOrchestrator.hardMaxChildTimeout)
+        )
+        .withBuiltinExecution(provider: HoldUntilCancelledLLMProvider(probe: probe), toolExecutor: NoopToolExecutor())
+        .withChildControls(approvalGate: ApprovalGate(), turnController: controller)
+
+        let started = Date()
+        let running = Task { await orchestrator.orchestrate(tasks: makeTasks(["held"]), strategy: .sequential) }
+        var waited = 0
+        while await probe.maxActive == 0, waited < 300 {
+            try await Task.sleep(for: .milliseconds(10))
+            waited += 1
+        }
+        try #require(await probe.maxActive == 1, "子任务应已开始请求模型")
+        // 与 App 的“停止”一致：中断父回合并取消父回合的执行任务。中断信号在迭代边界生效，
+        // 进行中的模型请求靠任务取消一路传到子任务。
+        await controller.interrupt()
+        running.cancel()
+        let reports = await running.value
+
+        #expect(reports.count == 1)
+        #expect(reports[0].result.isSuccess == false)
+        #expect(Date().timeIntervalSince(started) < 10, "停止必须跟着父回合立即生效，不能等 2 小时时限或模型请求结束")
+        #expect(await probe.maxActive == 1)
+    }
+
     @Test func childLoopDetectorBlocksDeadLoop() async throws {
-        // 逐子 ToolLoopDetector：子 agent 重复同参调用，第 3 次起被 LOOP BLOCKED，
-        // 只烧 2 次真实执行，最终正常收尾（而非跑满 maxIterationsPerTask）。
+        // 逐子 ToolLoopDetector：子 agent 重复同参调用，第 6 次起被 LOOP BLOCKED（只读查询类工具阈值为基础阈值 3 的 2 倍），
+        // 只烧 5 次真实执行，最终正常收尾（而非跑满 maxIterationsPerTask）。
         let provider = ScriptedChildProvider(responses: [
             orchEnvelope(id: "c1", name: "file_read", input: ["path": "/a"]),
             orchEnvelope(id: "c2", name: "file_read", input: ["path": "/a"]),
             orchEnvelope(id: "c3", name: "file_read", input: ["path": "/a"]),
             orchEnvelope(id: "c4", name: "file_read", input: ["path": "/a"]),
+            orchEnvelope(id: "c5", name: "file_read", input: ["path": "/a"]),
+            orchEnvelope(id: "c6", name: "file_read", input: ["path": "/a"]),
+            orchEnvelope(id: "c7", name: "file_read", input: ["path": "/a"]),
             "收尾",
         ])
         let executor = RecordingOrchestratorExecutor()
@@ -882,7 +972,7 @@ struct AgentOrchestratorChildControlsTests {
         let reports = await orchestrator.orchestrate(tasks: makeTasks(["a"]), strategy: .sequential)
 
         #expect(reports[0].result.isSuccess)
-        #expect(executor.executedNames.count == 2, "前 2 次执行，第 3/4 次被循环检测拦截")
+        #expect(executor.executedNames.count == 5, "前 5 次执行，第 6/7 次被循环检测拦截")
     }
 }
 
@@ -1645,15 +1735,22 @@ struct AgentOrchestratorTests {
         #expect(decoded.tokenUsage == nil)
     }
 
-    @Test func fullResultKeepsTrailingTextWhenShortPathRedactionExpands() throws {
+    /// 子任务结果交回父模型时保留路径与 glob 写法（对齐 Claude Code），密钥仍遮蔽。
+    @Test func childResultKeepsPathsButMasksSecrets() throws {
+        let secret = "sk-" + String(repeating: "a1B2", count: 10)
+        let output = "文件：/tmp/journey/hello.txt；pattern **/*；不可读/敏感 0 个；key=\(secret) final-tail"
         let envelope = ChildResultEnvelope(taskID: "child", runID: "run", attemptID: "attempt",
             parentContextSnapshotID: nil, childExecutionID: "execution", outcome: .succeeded,
-            outputDigest: "digest", output: "/a /b final-tail")
+            outputDigest: "digest", output: output)
         let result = try OrchestrationToolExecutor.makeResultPage(envelope: envelope, offset: 0)
         let page = try #require(JSONSerialization.jsonObject(with: Data(result.utf8)) as? [String: Any])
         let content = try #require(page["content"] as? String)
-        #expect(content.hasSuffix("final-tail"))
-        #expect(!content.contains("/a") && !content.contains("/b"))
+        let summary = OrchestrationToolExecutor.resultSummary(output)
+        for text in [content, summary] {
+            #expect(text.contains("/tmp/journey/hello.txt") && text.contains("**/*") && text.contains("不可读/敏感"))
+            #expect(!text.contains(secret) && !text.contains("<path>"))
+            #expect(text.hasSuffix("final-tail"))
+        }
     }
 
     @Test func childResultToolRejectsUnboundCallerWithoutDispatch() async {
@@ -1917,7 +2014,7 @@ struct AgentOrchestratorTests {
         let received = try #require(provider.receivedRequests.dropFirst().first?.last)
         let parts = try #require(JSONSerialization.jsonObject(with: Data(received.content.utf8)) as? [[String: Any]])
         #expect(parts.count == 1 && parts.first?["tool_use_id"] as? String == "842-one-effect")
-        #expect(parts.first?["content"] as? String == "owned read effect842\n")
+        #expect(parts.first?["content"] as? String == "     1\towned read effect842")
         #expect(parts.first?["is_error"] as? Bool == false)
         if replay {
             let late = try #require(provider.receivedRequests.last?.last)

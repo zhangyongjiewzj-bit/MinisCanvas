@@ -13,8 +13,12 @@ struct ChatChildTaskSummaryView: View {
     @State private var actionError: String?
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
-            let projection = readProjection()
+        // 外层读一次投影：读取里的观察信号（toolLifecyclePresentationRevision）变化时重算；
+        // 没有进行中/状态待更新的子任务时时钟暂停，空闲不再每 0.5 秒重算。
+        let current = readProjection()
+        let needsClock = current.rows.contains { $0.cancelAvailable || $0.isStale }
+        TimelineView(.animation(minimumInterval: 0.5, paused: !needsClock)) { _ in
+            let projection = needsClock ? readProjection() : current
             if !projection.rows.isEmpty {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(projection.summaryTitle)

@@ -24,16 +24,16 @@ struct DeepSeekReadinessCompatibilityTests {
         let adapter = ProviderReadinessWireAdapterFactory.make(for: .openaiResponses)
         for (base, expectedTokens) in [
             ("https://api.deepseek.com", 32), ("https://api.deepseek.com/v1", 32),
-            ("https://api.deepseek.com:443/v1", 32), ("https://api.deepseek.com:8443", 1),
-            ("http://api.deepseek.com", 1), ("https://api.deepseek.com/proxy", 1),
-            ("https://provider.example/v1", 1), ("https://api.deepseek.com?route=x", 1)
+            ("https://api.deepseek.com:443/v1", 32), ("https://api.deepseek.com:8443", 16),
+            ("http://api.deepseek.com", 16), ("https://api.deepseek.com/proxy", 16),
+            ("https://provider.example/v1", 16), ("https://api.deepseek.com?route=x", 16)
         ] {
             let request = try adapter.makeRequest(operation: .modelRequest(modelID: "test"), baseURL: #require(URL(string: base)), modelID: nil, apiKey: "synthetic")
             let data = try #require(request.httpBody)
             let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
             #expect(body["max_output_tokens"] as? Int == expectedTokens)
             #expect((body["reasoning"] as? [String: String])?["effort"] == (expectedTokens == 32 ? "none" : nil))
-            #expect(request.timeoutInterval == 15)
+            #expect(request.timeoutInterval == 30)
         }
     }
 
@@ -64,7 +64,8 @@ struct DeepSeekReadinessCompatibilityTests {
             let base = try #require(URL(string: raw))
             let adapter = ProviderReadinessWireAdapterFactory.make(for: .anthropic, baseURL: base)
             let request = try adapter.makeRequest(operation: .modelCatalog, baseURL: base, modelID: nil, apiKey: "synthetic")
-            #expect(request.url == base.appendingPathComponent("models"))
+            // B-3（2026-11-17）：非 DeepSeek 的 Anthropic 网关与对话路径同一规则，最后一段不是 v1 就补 /v1。
+            #expect(request.url?.absoluteString == base.appendingPathComponent("v1").appendingPathComponent("models").absoluteString + "?limit=1000")
             #expect(request.value(forHTTPHeaderField: "x-api-key") == "synthetic")
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
             #expect(throws: ProviderReadinessWireAdapterError.malformedModelCatalog) {

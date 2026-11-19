@@ -965,13 +965,30 @@ public func sanitizeToolId(_ value: String) -> String {
     })
 }
 
-public enum AgentParamType: String, Sendable { case string, integer, boolean, object }
+public enum AgentParamType: String, Sendable { case string, integer, number, boolean, object, array }
 public struct AgentToolParam: Sendable, Equatable {
     public let type: AgentParamType
     public let description: String
     public let enumValues: [String]?
-    public init(type: AgentParamType, description: String, enumValues: [String]? = nil) {
+    /// 外部（MCP）工具给出的、已清理的 JSON Schema 片段（数组 items、嵌套对象、整数枚举等）。
+    /// 有值时线上直接使用它；没有时按 type/description/enumValues 生成。
+    public let schema: MCPJSONValue?
+    public init(type: AgentParamType, description: String, enumValues: [String]? = nil,
+                schema: MCPJSONValue? = nil) {
         self.type = type; self.description = description; self.enumValues = enumValues
+        self.schema = schema
+    }
+    /// 发给各接口的参数 schema。
+    public var wireSchema: [String: Any] {
+        var entry: [String: Any]
+        if case .object(let fields)? = schema {
+            entry = fields.mapValues { $0.asAny }
+        } else {
+            entry = ["type": type.rawValue]
+        }
+        if !description.isEmpty { entry["description"] = description }
+        if let values = enumValues { entry["enum"] = values }
+        return entry
     }
 }
 public struct AgentToolDefinition: Sendable, Equatable {
@@ -989,10 +1006,7 @@ public struct AgentToolDefinition: Sendable, Equatable {
     private var schema: [String: Any] {
         var properties: [String: Any] = [:]
         for (key, param) in parameters {
-            var entry: [String: Any] = ["type": param.type.rawValue]
-            if !param.description.isEmpty { entry["description"] = param.description }
-            if let values = param.enumValues { entry["enum"] = values }
-            properties[key] = entry
+            properties[key] = param.wireSchema
         }
         return ["type": "object", "properties": properties, "required": required]
     }
@@ -1056,6 +1070,7 @@ public enum AgentContentBlockStart: Sendable {
 }
 public enum ToolNonExecutionReason: Sendable, Equatable {
     case dryRun, blockedBeforeExecution, requestPreflightExpired
+    case blockedByPolicy(ToolBlockCategory)
 }
 /// Non-Codable feedback accompanying one successful durable settlement.
 /// It carries no raw error text/path and is never an authorization decision.

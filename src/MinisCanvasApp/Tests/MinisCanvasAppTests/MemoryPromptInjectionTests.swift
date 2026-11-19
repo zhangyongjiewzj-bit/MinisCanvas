@@ -1028,6 +1028,30 @@ struct SkillScopeExpansionWarningTests {
         #expect(lines == ["新增工具：文件读取", "新增目录：样例目录", "扩大写入范围：样例输出"])
     }
 
+    /// 内置技能和工具说明里的数字必须和实际上限一致，不能再出现"最多约 5 分钟"这类旧说法。
+    @Test func subagentDispatchSkillNumbersMatchRuntimeLimits() throws {
+        let entry = try #require(DefaultPromptSkills.entries.first { $0.name == "subagent-dispatch" })
+        #expect(entry.body.contains("一批最多 \(ChildConcurrencySelection.hardMaximum) 个子任务"))
+        #expect(!entry.body.contains("约 5 分钟"))
+        let goalEntry = try #require(DefaultPromptSkills.entries.first { $0.body.contains("默认预算是") })
+        let defaultTurns = try #require(ConversationGoalState.Budget()?.turnLimit)
+        #expect(goalEntry.body.contains("默认预算是 \(defaultTurns) 个回合"))
+        #expect(!OrchestrationToolExecutor.makeDefinition().description.contains("about 5 minutes"))
+    }
+
+    /// 记忆说明要和实际行为一致：对话里有批准卡；用户本人打“请记住”或以 # 开头由应用直接写入。
+    /// 说明改过，内置库版本必须随之加一，已安装用户才会收到改正（第 4 版起）。
+    @Test func memorySkillsDescribeApprovalCardAndDirectWrite() throws {
+        #expect(DefaultPromptSkills.version >= 4)
+        let care = try #require(DefaultPromptSkills.entries.first { $0.name == "memory-care" })
+        #expect(care.body.contains("批准卡"))
+        #expect(care.body.contains("以 # 开头"))
+        let withSectionSeven = try #require(DefaultPromptSkills.entries.first { $0.body.contains("## 七、用户说\"记住……\"") })
+        #expect(withSectionSeven.body.contains("批准卡"))
+        #expect(withSectionSeven.body.contains("不经过你"))
+        #expect(!withSectionSeven.body.contains("所以说\"已提交，等你在设置里批准\""))
+    }
+
     @Test func removedOrNeutralLinesDoNotWarn() {
         #expect(ApprovalPromptView.skillScopeExpansionLines("@@ -1 +1 @@\n-新增工具：旧的\n+换一种说法描述步骤") == nil)
         #expect(ApprovalPromptView.skillScopeExpansionLines("+++ b/SKILL.md\n+只改了措辞") == nil)

@@ -16,6 +16,9 @@ struct SkillImportReviewDraft: Identifiable, Equatable {
     let bodyPreviewIsTruncated: Bool
     let scope: MemoryScope?
     let replacesExistingApproval: Bool
+    /// S1：现有批准是"全局批准"（没有绑定会话和项目）。确认后会改成只在当前会话和
+    /// 项目批准，审核弹窗要如实告诉用户。
+    var replacesGlobalApproval: Bool = false
 
     var id: String { skillID }
 }
@@ -950,11 +953,13 @@ final class SkillsStore {
               receipt.contentHash == SkillManifest.hash(content),
               receipt.sourceIdentity == "skill:\(id)@\(receipt.contentHash)"
         else { return .failure(.proposalChanged) }
-        return .success(reviewDraft(
+        var draft = reviewDraft(
             skillID: id, receipt: receipt, name: skill.name, version: skill.version,
             sourcePath: appStore.skillDirectoryURL(for: id).path,
             body: SkillStore.parse(skillMD: content).body,
-            scope: scope, replacesExistingApproval: true))
+            scope: scope, replacesExistingApproval: true)
+        draft.replacesGlobalApproval = receipt.scope == nil
+        return .success(draft)
     }
 
     /// The button in Settings is the explicit review event. Its approverID

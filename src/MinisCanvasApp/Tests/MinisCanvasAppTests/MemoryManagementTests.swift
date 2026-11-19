@@ -689,4 +689,57 @@ struct MemoryManagementTests {
         #expect(try JSONDecoder().decode([MemoryFact].self, from: Data(contentsOf: jsonURL)).count == 1)
         #expect(try MemoryMarkdownCodec.decode(Data(contentsOf: markdownURL)).facts.count == 1)
     }
+
+    private func personalPrincipal() -> MemoryTrustedPrincipal {
+        MemoryTrustedPrincipal.validated(userID: "test-owner", by: { _ in true })!
+    }
+
+    @Test("普通会话的“请记住”存成个人事实，不改写 GLOBAL.md")
+    func userTypedPersonalMemoryIsStoredAsPersonalFact() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let center = makeCenter(dir: dir)
+        let principal = personalPrincipal()
+        center.memoryTrustedPrincipalProvider = { principal }
+
+        #expect(center.addUserTypedMemory("回答请用简体中文", within: nil, sessionID: "s1") == .personal)
+        #expect(center.addUserTypedMemory("回答请用简体中文", within: nil, sessionID: "s1") == .personal)
+
+        let personal = try center.memoryStore.activeFacts().filter { $0.visibility == .personal }
+        #expect(personal.count == 1)
+        #expect(personal.first?.text == "回答请用简体中文")
+        #expect(personal.first?.ownerUserID == "test-owner")
+        #expect(center.memoryFileStore.readGlobal().isEmpty)
+    }
+
+    @Test("旧版写进 GLOBAL.md 的“我的记忆”段迁成个人事实，剩下默认内容时删回未自定义")
+    func legacyPersonalSectionMigratesAndGlobalReturnsToDefault() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let center = makeCenter(dir: dir)
+        let principal = personalPrincipal()
+        center.memoryTrustedPrincipalProvider = { principal }
+        try center.memoryFileStore.writeGlobal(
+            MemoryInjector.defaultGlobalInstructions + "\n\n【我的记忆】\n- 喜欢简短回答\n- 不要用表情")
+
+        #expect(center.migratePersonalMemorySectionFromGlobal() == 2)
+
+        let texts = Set(try center.memoryStore.activeFacts().filter { $0.visibility == .personal }.map(\.text))
+        #expect(texts == ["喜欢简短回答", "不要用表情"])
+        #expect(center.memoryFileStore.readGlobal().isEmpty)
+        #expect(center.migratePersonalMemorySectionFromGlobal() == 0)
+    }
+
+    @Test("用户自己改过的 GLOBAL.md 迁移后保留自定义内容、只去掉“我的记忆”段")
+    func customizedGlobalKeepsUserContentAfterMigration() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let center = makeCenter(dir: dir)
+        let principal = personalPrincipal()
+        center.memoryTrustedPrincipalProvider = { principal }
+        try center.memoryFileStore.writeGlobal("我自己的全局指令\n\n【我的记忆】\n- 偏好深色主题")
+
+        #expect(center.migratePersonalMemorySectionFromGlobal() == 1)
+        #expect(center.memoryFileStore.readGlobal() == "我自己的全局指令")
+    }
 }

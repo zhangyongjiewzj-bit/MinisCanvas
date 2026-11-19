@@ -39,8 +39,8 @@ struct DChat1213SharedStreamConsumer2483Tests {
         chat.sendDraft()
         #expect(try await waitUntil { other.executionIdentity != nil })
         let otherTurn = try #require(chat.turnTaskForTests(sessionID: otherID))
-        other.continuation.yield(.textDelta("B-只属于 B"))
-        #expect(try await waitUntil { chat.messages.last?.content == "B-只属于 B" })
+        other.continuation.yield(.textDelta("B-只属于 B。"))
+        #expect(try await waitUntil { chat.messages.last?.content == "B-只属于 B。" })
 
         let lateChunks = (0..<48).map { index in
             "A-后续-\(index):" + String(repeating: "甲🙂", count: 128) + "\n"
@@ -51,7 +51,7 @@ struct DChat1213SharedStreamConsumer2483Tests {
         await originTurn.value
 
         #expect(chat.activeSessionID == otherID)
-        #expect(chat.messages.last?.content == "B-只属于 B")
+        #expect(chat.messages.last?.content == "B-只属于 B。")
         #expect(chat.messages.last?.isStreaming == true)
         let origin = try #require(chat.sessions.first { $0.id == originID })
         let fullAnswer = "A-首段\n" + lateChunks.joined()
@@ -68,7 +68,7 @@ struct DChat1213SharedStreamConsumer2483Tests {
         #expect(!chat.isActiveSessionStreaming)
         #expect(chat.sessions.first(where: { $0.id == originID })?.unread == false)
         _ = try bridge.performSessionAction(.switch(sessionID: otherID.uuidString))
-        #expect(chat.messages.last?.content == "B-只属于 B")
+        #expect(chat.messages.last?.content == "B-只属于 B。")
         other.continuation.finish()
         await otherTurn.value
         #expect(chat.messages.last?.isStreaming == false)

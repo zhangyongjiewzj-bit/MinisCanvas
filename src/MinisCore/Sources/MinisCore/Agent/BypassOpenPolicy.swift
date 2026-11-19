@@ -286,13 +286,13 @@ public enum BypassSystemFloor {
     private static let skipFirstVerbs: Set<String> = ["chmod", "chown", "chgrp", "chflags"]
     private static let wrapperVerbs: Set<String> = ["sudo", "command", "env", "nohup", "time", "exec", "builtin"]
 
-    private struct Segment {
+    struct Segment {
         var words: [String] = []
         var redirects: [String] = []
     }
 
     /// 极简分词：处理单双引号、反斜杠、分隔符（; & | ( ) 反引号 换行）与重定向。
-    private static func segments(_ command: String) -> [Segment] {
+    static func segments(_ command: String) -> [Segment] {
         var result: [Segment] = []
         var current = Segment()
         var word = ""
@@ -364,6 +364,17 @@ public enum BypassSystemFloor {
         return words
     }
 
+    /// 命令里每个子命令的操作数（不含命令名本身）加上重定向目标，供绕过档的敏感文件检查使用。
+    /// 与底线共用同一套分词：能处理引号、反斜杠、`;`、`&&`、管道和重定向。尽力匹配。
+    static func shellOperands(command: String) -> [String] {
+        var operands: [String] = []
+        for segment in segments(command) {
+            operands.append(contentsOf: stripWrappers(segment.words).dropFirst())
+            operands.append(contentsOf: segment.redirects)
+        }
+        return operands
+    }
+
     /// Explicit irreversible operations visible in the shell command. This
     /// uses the same tokenization as the floors and cannot inspect scripts.
     static func requiresIrreversibleDeletionApproval(command: String) -> Bool {
@@ -377,9 +388,32 @@ public enum BypassSystemFloor {
             case "find":
                 return arguments.contains("-delete")
             case "git":
-                return arguments.contains("clean") && arguments.contains { argument in
-                    argument == "--force" || (argument.hasPrefix("-") && !argument.hasPrefix("--") && argument.contains("f"))
+                // 不可逆的 git 操作：clean -f、reset --hard、push --force / -f / --force-with-lease。
+                let forced: (String) -> Bool = { argument in
+                    argument == "--force" || argument.hasPrefix("--force-with-lease")
+                        || (argument.hasPrefix("-") && !argument.hasPrefix("--") && argument.contains("f"))
                 }
+                if arguments.contains("clean") && arguments.contains(where: forced) { return true }
+                if arguments.contains("reset") && arguments.contains("--hard") { return true }
+                if arguments.contains("push") && arguments.contains(where: { forced($0) || $0.hasPrefix("+") }) { return true }
+                let list = Array(arguments)
+                // 丢弃工作区改动：checkout -- <路径> / checkout .、restore（只取消暂存的 --staged 除外）。
+                if let index = list.firstIndex(of: "checkout") {
+                    let tail = list[(index + 1)...]
+                    if tail.contains("--") || tail.contains(".") || tail.contains(where: { $0 == "-f" || $0 == "--force" }) {
+                        return true
+                    }
+                }
+                if let index = list.firstIndex(of: "restore") {
+                    let flags = list[(index + 1)...].filter { $0.hasPrefix("-") }
+                    let stagedOnly = flags.contains(where: { $0 == "--staged" || $0 == "-S" })
+                        && !flags.contains(where: { $0 == "--worktree" || $0 == "-W" })
+                    if !stagedOnly { return true }
+                }
+                // 丢弃暂存的改动：stash drop / stash clear。
+                if let index = list.firstIndex(of: "stash"), list.indices.contains(index + 1),
+                   ["drop", "clear"].contains(list[index + 1]) { return true }
+                return false
             case "osascript":
                 return arguments.contains { $0.localizedCaseInsensitiveContains("empty trash") }
             default:

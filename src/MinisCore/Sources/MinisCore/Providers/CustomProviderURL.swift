@@ -7,8 +7,8 @@ import Foundation
 /// \`Authorization: Bearer <apiKey>\`。为阻止把凭据发往不安全目的地，本类型
 /// 提供统一校验规则：
 ///
-/// - 仅允许 \`https\`（任意 host）与**显式 loopback** 的 \`http\`
-///   （\`localhost\` / \`127.0.0.0/8\` / IPv6 \`::1\`）；
+/// - 允许 \`https\` 与 \`http\`（对齐 Claude Code：本机/局域网中转站常用 http；
+///   公网 http 由设置表单提示明文传输风险，不在此拒绝）；
 /// - 拒绝其它 scheme（\`ftp\` / \`file\` / \`javascript:\` 等）、缺失 scheme、
 ///   空 host、以及内嵌凭据（\`user:pass@host\`，可被用于凭据混淆/钓鱼）；
 /// - **fail-closed**：校验失败即抛错；任何携带 Bearer 的请求在发出前都必须
@@ -41,24 +41,30 @@ public enum CustomProviderURL {
         public var errorDescription: String? {
             switch self {
             case .invalidURL:
-                return "not a valid URL"
+                return "基础地址格式不正确，请检查后重新填写。"
             case .unsupportedScheme(let scheme):
-                let shown = scheme ?? "<missing>"
-                return "unsupported scheme '\(shown)'; only https (or explicit loopback http) is allowed"
+                _ = scheme
+                return "基础地址的协议不受支持，请以 https:// 或 http:// 开头。"
             case .emptyHost:
-                return "missing host"
+                return "基础地址缺少主机名，请补全后重试。"
             case .embeddedCredentials:
-                return "URL must not embed userinfo credentials"
-            case .nonHTTPSHost(let host):
-                return "non-HTTPS destination (http is allowed only for loopback hosts): \(host)"
+                return "基础地址里不能包含用户名或密码，请把密钥填在 API Key 一栏。"
+            case .nonHTTPSHost:
+                return "该基础地址不被接受，请改用 https:// 地址。"
             case .credentialInQuery:
-                return "URL query must not contain credential-like fields"
+                return "基础地址的查询参数里不能带密钥，请把密钥填在 API Key 一栏。"
             case .credentialInFragment:
-                return "URL fragment must not contain credential-like fields"
+                return "基础地址的片段里不能带密钥，请把密钥填在 API Key 一栏。"
             case .controlCharacter:
-                return "URL must not contain control characters"
+                return "基础地址含有不可见的控制字符，请重新输入。"
             }
         }
+
+        /// 全部固定文案（不含用户输入），供界面按原文显示。
+        public static let allFixedMessages: [String] = [
+            Failure.invalidURL(""), .unsupportedScheme(nil), .emptyHost, .embeddedCredentials,
+            .nonHTTPSHost(""), .credentialInQuery, .credentialInFragment, .controlCharacter
+        ].compactMap(\.errorDescription)
 
         /// Never use the enum's synthesized representation, which would
         /// include the legacy invalidURL associated value.

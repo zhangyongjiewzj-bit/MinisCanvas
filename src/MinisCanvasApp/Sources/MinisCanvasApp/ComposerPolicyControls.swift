@@ -100,7 +100,7 @@ struct ComposerPolicyControls: View {
 
     private var modeMenu: some View {
         ComposerPolicyMenu(
-            label: "Composer 任务模式",
+            label: "任务模式",
             selection: Binding(
                 get: { chat.composerPolicySelection.mode },
                 set: { chat.selectInteractiveComposerMode($0, owner: ceilingRequestOwner) }
@@ -120,7 +120,7 @@ struct ComposerPolicyControls: View {
 
     private var effortMenu: some View {
         ComposerPolicyMenu(
-            label: "Composer 工作量",
+            label: "工作量",
             selection: Binding(
                 get: { chat.composerPolicySelection.effort },
                 set: { chat.composerPolicySelection.effort = $0 }
@@ -134,7 +134,7 @@ struct ComposerPolicyControls: View {
 
     private var thinkingMenu: some View {
         ComposerPolicyMenu(
-            label: "Composer 思考强度",
+            label: "思考强度",
             selection: Binding<ThinkingLevel?>(
                 get: {
                     ComposerThinkingSelection.capturedLevel(
@@ -170,7 +170,7 @@ struct ComposerPolicyControls: View {
             // （scripts/release/run_typography_package_journey.sh）按它找控件。
             // 新的完整说明放在可见标题与下面的 help（AXHelp）里。
             .accessibilityLabel("确认绕过权限模式仍受硬安全边界约束")
-            .help("可读写删除电脑上任意文件、执行任意命令（系统文件与已安装软件除外）；删除会移入废纸篓；权限类设置修改仍需逐次审批")
+            .help("可读写删除电脑上任意文件、执行任意命令（系统文件与已安装软件除外）；删除：文件检查点开启时可从恢复入口找回（不进废纸篓），关闭检查点时才移入废纸篓；权限类设置修改仍需逐次审批")
             .accessibilityIdentifier("composer.bypass-confirm")
 
             if chat.composerPolicySelection.bypassModeConfirmed,
@@ -287,6 +287,11 @@ struct ComposerPolicyControls: View {
                     .font(typography?.caption ?? .caption)
                     .modifier(ReadableStatusForeground(status: .warning))
                     .accessibilityIdentifier("composer.bypass-disabled-feedback")
+            } else if chat.composerBypassUnconfirmedFallbackActive {
+                Text("绕过权限未确认，暂按手动审批处理")
+                    .font(typography?.caption ?? .caption)
+                    .modifier(ReadableStatusForeground(status: .warning))
+                    .accessibilityIdentifier("composer.bypass-unconfirmed-feedback")
             }
             if let snapshot = activeSessionSnapshot {
                 Text(ComposerPolicyPresentation.snapshotSummary(snapshot))
@@ -298,6 +303,16 @@ struct ComposerPolicyControls: View {
                     .accessibilityIdentifier("composer.snapshot")
                     .accessibilityLabel("当前回合冻结策略")
                     .accessibilityValue(ComposerPolicyPresentation.snapshotSummary(snapshot))
+                if let hint = ComposerPolicyPresentation.modeChangeDeferredHint(
+                    snapshot: snapshot,
+                    currentMode: chat.composerPolicySelection.mode,
+                    isTurnInFlight: chat.isStreaming
+                ) {
+                    Text(hint)
+                        .font(typography?.caption ?? .caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("composer.mode-change-deferred-hint")
+                }
             }
 
             if let reasoning = activeReasoningSummary {
@@ -886,13 +901,13 @@ enum ComposerModeAvailability {
     }
     static func explanation(_ mode: ComposerTaskMode, ceiling: AutonomyLevel?) -> String {
         if !isEnabled(mode, ceiling: ceiling) {
-            return "需要最高模式 L\(mode.requiredAutonomyLevel.rawValue) · 选择后确认"
+            return "当前权限上限不允许此模式；选择后需先确认提高上限"
         }
         switch mode {
-        case .manual: return "手动执行，按审批策略确认工具操作"
+        case .manual: return "每一步都先问你，你同意后才执行工具操作"
         case .plan: return "仅制定计划，不修改文件"
         case .autoEdit: return "自动编辑文件，其它操作按审批策略确认"
-        case .auto: return "在自主权上限内自动执行"
+        case .auto: return "自动编辑文件；只读命令、已记住的命令、项目内构建测试和新建、移动、复制文件的命令免问，其余仍询问"
         case .bypassPermission: return "可读写删除任意文件、执行任意命令（系统文件与已安装软件除外）；权限类设置修改仍逐次确认"
         }
     }

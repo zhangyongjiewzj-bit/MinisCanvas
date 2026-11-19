@@ -60,7 +60,7 @@ struct DeepLinkWiringTests {
     @Test func openSessionUnknownDoesNotCrash() {
         let bridge = makeBridge()
         bridge.deepLinkHandler.handle(.openSession(id: "no-such-session"))
-        #expect(bridge.chat.messages.contains { $0.role == .system && $0.content.contains("未找到会话") })
+        #expect(bridge.chat.messages.contains { $0.role == .system && $0.content.contains("会话不存在") })
         // 会话数不变（不误建新会话）
         #expect(bridge.chat.sessions.count == 1)
     }
@@ -72,6 +72,20 @@ struct DeepLinkWiringTests {
         bridge.chat.switchSession(id: bridge.chat.sessions[1].id)
         bridge.deepLinkHandler.handle(.openSession(id: targetID.uuidString))
         #expect(bridge.chat.activeSessionID == targetID)
+        // 切换成功是静默的：不往会话里追加系统消息。
+        #expect(!bridge.chat.messages.contains { $0.role == .system && $0.content.contains("已切换到会话") })
+    }
+
+    @Test func externalPromptLinkNeedsConfirmationBeforeSending() {
+        let bridge = makeBridge()
+        let url = URL(string: "miniscanvas://prompt/hello")!
+        var asked: String?
+        bridge.deepLinkHandler.handleExternal(url: url) { text in asked = text; return false }
+        #expect(asked?.contains("hello") == true)
+        #expect(!bridge.chat.messages.contains { $0.role == .user && $0.content == "hello" })
+        bridge.deepLinkHandler.handleExternal(url: url) { _ in true }
+        // 普通文本不是画布指令，不会产生画布完成任务；用户消息在提交时同步写入。
+        #expect(bridge.chat.messages.contains { $0.role == .user && $0.content == "hello" })
     }
 
     // MARK: 断链处理（不崩）

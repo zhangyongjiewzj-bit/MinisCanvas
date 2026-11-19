@@ -1,7 +1,9 @@
 import AppKit
+import AVFoundation
 import Foundation
 import ImageIO
 import PDFKit
+import SwiftSoup
 
 // MARK: - P3-MEDIA-01 media conversion / extraction
 //
@@ -51,6 +53,13 @@ public enum MediaConversionFailure: String, Error, Sendable, Hashable, Equatable
     case encodingFailed
     /// Input exceeds the bounded PDF text-extraction byte budget.
     case sourceTooLarge
+    /// The format is recognised but not convertible on this system (e.g. ogg
+    /// audio, xlsx/pptx documents). Distinct from `.undecodableSource`, which
+    /// means the bytes are corrupt for a supported format.
+    case unsupportedFormat
+    /// The conversion succeeded but could not be brought under the caller's
+    /// output byte budget (image shrink/quality ladder exhausted, WAV too big).
+    case outputTooLarge
 }
 
 /// One text-bearing PDF page. `pageNumber` is the original 1-based document
@@ -176,7 +185,11 @@ public enum MediaConversion {
         case .encodingFailed:
             reason = "the decoded image could not be re-encoded as PNG"
         case .sourceTooLarge:
-            reason = "the source exceeded the PDF extraction byte limit"
+            reason = "the source exceeded the size limit (PDF extraction bytes or image pixels)"
+        case .unsupportedFormat:
+            reason = "this format cannot be converted on this system"
+        case .outputTooLarge:
+            reason = "the converted result exceeded the size limit"
         }
         return "[media-convert] Conversion of an attachment (\(mimeType)) did not produce a usable replacement: \(reason). The media capability gate note applies unchanged; nothing partial was sent."
     }
@@ -186,9 +199,9 @@ public enum MediaConversion {
     /// The PDF extraction path has independent byte, page and text budgets.
     /// Keeping the bounds here lets the App reject large files before PDFKit
     /// decoding and makes the same bytes produce the same frozen page payload.
-    public static let defaultMaxPDFInputBytes = 4 * 1024 * 1024
-    public static let defaultMaxPDFPages = 20
-    public static let defaultMaxPDFCharacters = 12_000
+    public static let defaultMaxPDFInputBytes = 32 * 1024 * 1024
+    public static let defaultMaxPDFPages = 100
+    public static let defaultMaxPDFCharacters = 100_000
 
     /// Extract a bounded text layer while retaining the source page numbers.
     /// Blank/scanned pages are omitted from `pages`, not renumbered. This
@@ -242,6 +255,13 @@ public enum MediaConversion {
         ))
     }
 
+    /// 受密码保护（加密且未解锁）的 PDF：PDFKit 读不到文字，也不能渲染页面。
+    /// 调用方据此报“受密码保护”，而不是误报成“扫描件，没有文字层”。
+    public static func isPasswordProtectedPDF(_ data: Data) -> Bool {
+        guard !data.isEmpty, let document = PDFDocument(data: data) else { return false }
+        return document.isLocked
+    }
+
     /// Extract the text layer of a PDF document, page by page, joined with a
     /// blank line between pages. MainActor-isolated defensively: PDFKit is a
     /// UI-framework dependency, and the chat attachment pipeline that consumes
@@ -271,5 +291,331 @@ public enum MediaConversion {
             return .failure(.emptyResult)
         }
         return .success(joined)
+    }
+
+    // MARK: - PDF page → image (scanned PDFs, model-side viewing)
+
+    /// 把 PDF 的页面渲染成图片（JPEG，白底，长边不超过 `maxLongEdge`），供扫描件和
+    /// file_read 的按页看图共用。`firstPage` 从 1 开始；最多渲染 `maxPages` 页，
+    /// 超出文档末尾即停止。`page` 是文档里的原始页号（1 起）。
+    /// 失败：无法解码 → `.undecodableSource`；文档有密码 → `.unsupportedFormat`
+    /// （调用方应先判 isLocked 并给出"受密码保护"提示）；起始页超出范围或没有页 → `.emptyResult`。
+    /// 同步函数，PDFKit 对象只在函数内使用；调用方应放在后台 worker 上执行。
+    public static func renderPDFPagesAsImages(
+        url: URL, maxPages: Int, maxLongEdge: Int, firstPage: Int = 1
+    ) throws -> [(data: Data, mimeType: String, page: Int)] {
+        guard let document = PDFDocument(url: url) else { throw MediaConversionFailure.undecodableSource }
+        return try renderPDFPages(document: document, maxPages: maxPages, maxLongEdge: maxLongEdge, firstPage: firstPage)
+    }
+
+    /// 同上，但直接用已读入的字节（调用方已经过授权读取，避免第二次打开文件）。
+    public static func renderPDFPagesAsImages(
+        data: Data, maxPages: Int, maxLongEdge: Int, firstPage: Int = 1
+    ) throws -> [(data: Data, mimeType: String, page: Int)] {
+        guard let document = PDFDocument(data: data) else { throw MediaConversionFailure.undecodableSource }
+        return try renderPDFPages(document: document, maxPages: maxPages, maxLongEdge: maxLongEdge, firstPage: firstPage)
+    }
+
+    private static func renderPDFPages(
+        document: PDFDocument, maxPages: Int, maxLongEdge: Int, firstPage: Int
+    ) throws -> [(data: Data, mimeType: String, page: Int)] {
+        guard maxPages > 0, maxLongEdge > 0, firstPage > 0 else {
+            throw MediaConversionFailure.undecodableSource
+        }
+        guard !document.isLocked else { throw MediaConversionFailure.unsupportedFormat }
+        let total = document.pageCount
+        guard total > 0, firstPage <= total else { throw MediaConversionFailure.emptyResult }
+        let lastPage = min(total, firstPage + maxPages - 1)
+        var rendered: [(data: Data, mimeType: String, page: Int)] = []
+        for index in (firstPage - 1)..<lastPage {
+            guard let page = document.page(at: index) else { continue }
+            let bounds = page.bounds(for: .mediaBox)
+            let longest = max(bounds.width, bounds.height)
+            guard longest > 0 else { continue }
+            let scale = CGFloat(maxLongEdge) / longest
+            let size = NSSize(width: max(1, (bounds.width * scale).rounded()),
+                              height: max(1, (bounds.height * scale).rounded()))
+            let thumbnail = page.thumbnail(of: size, for: .mediaBox)
+            var rect = CGRect(origin: .zero, size: thumbnail.size)
+            guard let cgImage = thumbnail.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+                  let encoded = encodeImage(cgImage, type: "public.jpeg", quality: 0.8) else { continue }
+            rendered.append((data: encoded, mimeType: "image/jpeg", page: index + 1))
+        }
+        guard !rendered.isEmpty else { throw MediaConversionFailure.undecodableSource }
+        return rendered
+    }
+
+    // MARK: - Any ImageIO raster → PNG / JPEG for upload
+
+    /// Lowest longest-edge the shrink ladder will reach before giving up.
+    private static let minUploadEdge = 64
+    /// JPEG qualities tried (descending) at each size step.
+    private static let jpegQualityLadder: [Double] = [0.85, 0.7, 0.55, 0.4]
+
+    /// Re-encode any ImageIO-readable raster (HEIC, GIF first frame, TIFF,
+    /// BMP, AVIF where the OS decodes it, ...) as PNG (source has an alpha
+    /// channel) or JPEG (opaque, quality 0.85 first). The longest edge never
+    /// exceeds `maxPixel` and never grows past the source. If the result is
+    /// over `maxBytes` the JPEG quality is lowered, then the size is reduced by
+    /// 25% per step (PNG: size only) down to a 64 px edge, after which
+    /// `.outputTooLarge` is returned. EXIF orientation is applied.
+    ///
+    /// ImageIO / CoreGraphics only (no AppKit): safe on any background thread.
+    /// 转码前允许的来源图片总像素上限（1 亿）。
+    public static let maxSourceTotalPixels = 100_000_000
+
+    public static func convertImageForUpload(
+        _ data: Data, maxBytes: Int, maxPixel: Int
+    ) -> Result<(data: Data, mimeType: String), MediaConversionFailure> {
+        guard maxBytes > 0, maxPixel > 0, !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else {
+            return .failure(.undecodableSource)
+        }
+        // 只读了文件头：像素总数超过上限就在解码之前拒绝，防止小文件解出巨量内存。
+        guard width <= maxSourceTotalPixels / height else { return .failure(.sourceTooLarge) }
+        // Source-declared alpha, not the decoded bitmap's alphaInfo: ImageIO
+        // returns opaque HEIC as premultipliedLast.
+        let hasAlpha = properties[kCGImagePropertyHasAlpha] as? Bool ?? false
+        var edge = min(maxPixel, max(width, height))
+        while true {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: edge,
+            ]
+            guard let image = CGImageSourceCreateThumbnailAtIndex(
+                source, 0, options as CFDictionary
+            ) else {
+                return .failure(.undecodableSource)
+            }
+            if hasAlpha {
+                guard let encoded = encodeImage(image, type: "public.png", quality: nil) else {
+                    return .failure(.encodingFailed)
+                }
+                if encoded.count <= maxBytes {
+                    return .success((data: encoded, mimeType: "image/png"))
+                }
+            } else {
+                for quality in jpegQualityLadder {
+                    guard let encoded = encodeImage(image, type: "public.jpeg", quality: quality) else {
+                        return .failure(.encodingFailed)
+                    }
+                    if encoded.count <= maxBytes {
+                        return .success((data: encoded, mimeType: "image/jpeg"))
+                    }
+                }
+            }
+            if edge <= minUploadEdge { return .failure(.outputTooLarge) }
+            edge = max(minUploadEdge, edge * 3 / 4)
+        }
+    }
+
+    /// Pixel size from the image header only (no full decode). Lets the caller
+    /// transcode a small-in-bytes but huge-in-pixels PNG/JPEG/WebP that would
+    /// otherwise be passed through and rejected by the provider.
+    public static func imagePixelSize(_ data: Data) -> (width: Int, height: Int)? {
+        let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary),
+              CGImageSourceGetCount(source) > 0,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0 else { return nil }
+        return (width, height)
+    }
+
+    /// A raster image that is too large in pixels to pass through unchanged:
+    /// longest edge over `maxLongEdge` (the transcode target; Anthropic requires
+    /// every edge ≤ 2000 px once a request carries more than 20 images).
+    public static func imageExceedsPassThroughPixels(width: Int, height: Int, maxLongEdge: Int) -> Bool {
+        max(width, height) > maxLongEdge
+    }
+
+    private static func encodeImage(_ image: CGImage, type: String, quality: Double?) -> Data? {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(output, type as CFString, 1, nil) else {
+            return nil
+        }
+        var options: [CFString: Any] = [:]
+        if let quality { options[kCGImageDestinationLossyCompressionQuality] = quality }
+        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        guard CGImageDestinationFinalize(destination), output.length > 0 else { return nil }
+        return output as Data
+    }
+
+    // MARK: - Audio → 16 kHz mono 16-bit PCM WAV
+
+    public static let wavTargetSampleRate: Double = 16_000
+
+    /// Transcode an AVFoundation-readable audio file (m4a, aac, flac, aiff,
+    /// caf, ...) to a 16 kHz mono 16-bit PCM WAV. Streams in 16384-frame
+    /// chunks through a temporary file (deleted on exit), so memory stays
+    /// bounded. The decode runs on a detached utility task, never on the
+    /// caller's actor. A file the system cannot open yields `.unsupportedFormat`
+    /// for ogg/oga/opus extensions and `.undecodableSource` otherwise; an
+    /// estimated or actual WAV above `maxBytes` yields `.outputTooLarge`.
+    public static func convertAudioToWAV(
+        fileURL: URL, maxBytes: Int
+    ) async -> Result<Data, MediaConversionFailure> {
+        await Task.detached(priority: .utility) {
+            MediaConversion.transcodeAudioToWAV(fileURL: fileURL, maxBytes: maxBytes)
+        }.value
+    }
+
+    private static func transcodeAudioToWAV(
+        fileURL: URL, maxBytes: Int
+    ) -> Result<Data, MediaConversionFailure> {
+        guard maxBytes > 0 else { return .failure(.outputTooLarge) }
+        let input: AVAudioFile
+        do {
+            input = try AVAudioFile(forReading: fileURL)
+        } catch {
+            let ext = fileURL.pathExtension.lowercased()
+            return .failure(["ogg", "oga", "opus"].contains(ext) ? .unsupportedFormat : .undecodableSource)
+        }
+        let inputFormat = input.processingFormat
+        guard input.length > 0, inputFormat.sampleRate > 0 else { return .failure(.emptyResult) }
+        let estimatedFrames = Double(input.length) / inputFormat.sampleRate * wavTargetSampleRate
+        guard Int(estimatedFrames) * 2 + 44 <= maxBytes else { return .failure(.outputTooLarge) }
+
+        guard let outputFormat = AVAudioFormat(
+            commonFormat: .pcmFormatInt16, sampleRate: wavTargetSampleRate, channels: 1, interleaved: true
+        ), let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            return .failure(.encodingFailed)
+        }
+        let inputChunk: AVAudioFrameCount = 16_384
+        let outputCapacity = AVAudioFrameCount(Double(inputChunk) * wavTargetSampleRate / inputFormat.sampleRate) + 1024
+        guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: inputChunk),
+              let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: outputCapacity) else {
+            return .failure(.encodingFailed)
+        }
+
+        let temporary = FileManager.default.temporaryDirectory
+            .appendingPathComponent("minis-audio-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: wavTargetSampleRate,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        do {
+            let output = try AVAudioFile(
+                forWriting: temporary, settings: settings,
+                commonFormat: .pcmFormatInt16, interleaved: true
+            )
+            let feed = AudioChunkFeed(file: input, buffer: inputBuffer, chunk: inputChunk)
+            while true {
+                var conversionError: NSError?
+                let status = converter.convert(to: outputBuffer, error: &conversionError) { _, inputStatus in
+                    feed.next(inputStatus)
+                }
+                if feed.readFailed || status == .error { return .failure(.undecodableSource) }
+                if outputBuffer.frameLength > 0 { try output.write(from: outputBuffer) }
+                if status == .endOfStream { break }
+            }
+        } catch {
+            return .failure(.encodingFailed)
+        }
+        guard let wav = try? Data(contentsOf: temporary) else { return .failure(.encodingFailed) }
+        guard wav.count > 44 else { return .failure(.emptyResult) }
+        guard wav.count <= maxBytes else { return .failure(.outputTooLarge) }
+        return .success(wav)
+    }
+
+    /// Feeds `AVAudioConverter`'s `@Sendable` input block from an
+    /// `AVAudioFile`. `@unchecked Sendable` is sound here: the converter calls
+    /// the block synchronously on the thread running `convert`, and the owning
+    /// function never touches the file or buffer concurrently.
+    private final class AudioChunkFeed: @unchecked Sendable {
+        private let file: AVAudioFile
+        private let buffer: AVAudioPCMBuffer
+        private let chunk: AVAudioFrameCount
+        private(set) var readFailed = false
+
+        init(file: AVAudioFile, buffer: AVAudioPCMBuffer, chunk: AVAudioFrameCount) {
+            self.file = file
+            self.buffer = buffer
+            self.chunk = chunk
+        }
+
+        func next(_ status: UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer? {
+            if file.framePosition >= file.length {
+                status.pointee = .endOfStream
+                return nil
+            }
+            do {
+                try file.read(into: buffer, frameCount: chunk)
+            } catch {
+                readFailed = true
+                status.pointee = .noDataNow
+                return nil
+            }
+            if buffer.frameLength == 0 {
+                status.pointee = .endOfStream
+                return nil
+            }
+            status.pointee = .haveData
+            return buffer
+        }
+    }
+
+    // MARK: - Rich document → plain text
+
+    /// Extract plain text from docx / doc / rtf / rtfd / odt via
+    /// `NSAttributedString` and from html / htm via SwiftSoup (the
+    /// `NSAttributedString` HTML importer needs the main thread; SwiftSoup does
+    /// not). Everything else, including xlsx and pptx, is `.unsupportedFormat`.
+    /// Object-replacement characters (embedded images) are dropped; the text is
+    /// trimmed and cut to `maxCharacters` (`truncated` reports the cut).
+    /// Non-HTML formats are synchronous and background-thread safe.
+    public static func extractRichDocumentText(
+        _ data: Data, fileExtension: String, maxCharacters: Int
+    ) -> Result<(text: String, truncated: Bool), MediaConversionFailure> {
+        guard maxCharacters > 0, !data.isEmpty else { return .failure(.undecodableSource) }
+        let ext = fileExtension.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let raw: String
+        switch ext {
+        case "html", "htm":
+            let source = String(decoding: data, as: UTF8.self)
+            guard let parsed = try? SwiftSoup.parse(source),
+                  (try? parsed.select("script,style,noscript,template").remove()) != nil,
+                  let text = try? parsed.body()?.text() else {
+                return .failure(.undecodableSource)
+            }
+            raw = text
+        case "docx", "doc", "rtf", "rtfd", "odt":
+            let type: NSAttributedString.DocumentType
+            switch ext {
+            case "docx": type = .officeOpenXML
+            case "doc": type = .docFormat
+            case "rtf": type = .rtf
+            case "rtfd": type = .rtfd
+            default: type = .openDocument
+            }
+            let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [.documentType: type]
+            guard let attributed = try? NSAttributedString(
+                data: data, options: options, documentAttributes: nil
+            ) else {
+                return .failure(.undecodableSource)
+            }
+            raw = attributed.string
+        default:
+            return .failure(.unsupportedFormat)
+        }
+        let text = raw.replacingOccurrences(of: "\u{FFFC}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .failure(.emptyResult) }
+        let truncated = text.count > maxCharacters
+        return .success((text: truncated ? String(text.prefix(maxCharacters)) : text, truncated: truncated))
     }
 }

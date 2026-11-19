@@ -43,6 +43,8 @@ public enum ThemePresetCatalogAcceptance: String, Equatable, Sendable {
 /// 本枚举只承载该事实，供记账与回执引用，不构成任何豁免行为或色值推导。
 public enum ThemePresetBranchAdjudication: String, Equatable, Sendable {
     case pending
+    /// 用户 11/17 选定第 1 套配色（含深色）：产品主题暗侧强调色获批。
+    case approved
 }
 
 /// 迁移结果携带的中性明暗分支表示（两分支能力，均不预设豁免结论）。
@@ -160,8 +162,13 @@ public enum ThemePresetCatalog {
 
     /// keylineOrangeA7A 亮侧定版色值的字节同源分量（与 MinisIconTokens
     /// 的已批准字面量同一算式：0xD9/0x77/0x07 ÷ 255），不复制为新的色值。
+    /// 第 1 套配色（用户 11/17 选定）把亮侧强调色由 #D97707 换为陶土橙 #A84E2A。
     public static let keylineOrangeApprovedLightComponents =
-        (r: Double(0xD9) / 255.0, g: Double(0x77) / 255.0, b: Double(0x07) / 255.0)
+        (r: Double(0xA8) / 255.0, g: Double(0x4E) / 255.0, b: Double(0x2A) / 255.0)
+
+    /// 暗侧强调色 #E08B68（第 1 套深色强调）。
+    public static let keylineOrangeApprovedDarkComponents =
+        (r: Double(0xE0) / 255.0, g: Double(0x8B) / 255.0, b: Double(0x68) / 255.0)
 
     /// v1 全部条目，确定性顺序（目录身份 stable，便于逐值断言与记账）。
     public static let entries: [ThemePresetCatalogEntry] = [
@@ -174,8 +181,11 @@ public enum ThemePresetCatalog {
                 g: keylineOrangeApprovedLightComponents.g,
                 b: keylineOrangeApprovedLightComponents.b
             ),
-            // dark 豁免待裁决 + 无批准暗侧材料 → 失败关闭，不填。
-            darkAccent: nil
+            darkAccent: ThemeColor(
+                r: keylineOrangeApprovedDarkComponents.r,
+                g: keylineOrangeApprovedDarkComponents.g,
+                b: keylineOrangeApprovedDarkComponents.b
+            )
         ),
         ThemePresetCatalogEntry(
             id: .warmCoralA7A,
@@ -197,7 +207,7 @@ public enum ThemePresetCatalog {
     }
 
     /// dark / System 豁免裁决状态：唯一合法记录是 pending。本线不得自造规则。
-    public static let darkBranchAdjudication: ThemePresetBranchAdjudication = .pending
+    public static let darkBranchAdjudication: ThemePresetBranchAdjudication = .approved
     public static let systemBranchAdjudication: ThemePresetBranchAdjudication = .pending
 
     // MARK: 占比校验（可计算）

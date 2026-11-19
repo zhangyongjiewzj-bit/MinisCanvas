@@ -69,4 +69,14 @@ struct ModelContextWindowCatalogC6Tests {
         #expect(produced("some-local-model", provider: "Local").contextWindowTokens == 128_000)
         #expect(ModelContextWindowCatalog.window(forModelID: "some-local-model") == nil)
     }
+
+    @Test func commonLongContextFamiliesAreRecognisedInsteadOfFallingBack() {
+        #expect(produced("qwen-long", provider: "DashScope").contextWindowTokens == 10_000_000)
+        #expect(produced("glm-4-long", provider: "Zhipu").contextWindowTokens == 1_000_000)
+        #expect(produced("glm-4.5-air", provider: "Zhipu").contextWindowTokens == 128_000)
+        #expect(produced("kimi-k2-0905-preview", provider: "Moonshot").contextWindowTokens == 256_000)
+        #expect(produced("deepseek-chat", provider: "DeepSeek").contextWindowTokens == 128_000)
+        #expect(!ModelContextWindowCatalog.usesFallbackWindow(explicitWindow: nil, modelID: "kimi-k2"))
+        #expect(ModelContextWindowCatalog.usesFallbackWindow(explicitWindow: nil, modelID: "some-local-model"))
+    }
 }

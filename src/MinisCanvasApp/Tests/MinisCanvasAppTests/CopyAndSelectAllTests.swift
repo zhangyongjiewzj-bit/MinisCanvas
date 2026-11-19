@@ -368,7 +368,7 @@ struct CopyAndSelectAllTests {
             #expect(ChatTranscriptFormatter.plainText([roleMessage]) == "【" + label + "】\n" + body)
             #expect(ChatTranscriptFormatter.accessibilityText([roleMessage]) == label + "：" + body)
             #expect(SessionMarkdownExport.markdown(title: "合成表格", messages: [roleMessage], redactor: redactor)
-                == "# 合成表格\n\n## " + label + "\n\n" + body + "\n")
+                == "# 合成表格\n\n" + SessionMarkdownExport.sectionHeader(for: roleMessage) + "\n\n" + body + "\n")
         }
         #expect(message.content == markdown)
         #expect(plainBefore == "【助手】\n" + markdown)
@@ -376,7 +376,8 @@ struct CopyAndSelectAllTests {
         #expect(ChatTranscriptFormatter.plainText([message]) == plainBefore)
         #expect(ChatTranscriptFormatter.accessibilityText([message]) == accessibleBefore)
         #expect(SessionMarkdownExport.markdown(title: "合成表格", messages: [message], redactor: redactor) == exportBefore)
-        #expect(exportBefore == "# 合成表格\n\n## 助手\n\n" + markdown + "\n")
+        // 导出的小标题现在带时间（与可选的模型名）。
+        #expect(exportBefore == "# 合成表格\n\n" + SessionMarkdownExport.sectionHeader(for: message) + "\n\n" + markdown + "\n")
     }
 
     @Test func plainTextBuildIsMonospaced() {

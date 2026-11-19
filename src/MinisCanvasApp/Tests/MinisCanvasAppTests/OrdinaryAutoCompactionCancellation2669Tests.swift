@@ -338,7 +338,9 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
     @Test("own checkpoint followed by a real streamed reply budget pause must not isolate the window")
     func ownedCheckpointBudgetPauseKeepsFreshConversationWritable() async throws {
         let fixture = try Fixture()
-        let dialogue = Dialogue(replyUsage: LLMUsage(inputTokens: 1_200, outputTokens: 100))
+        // 流式显示会扣住尚未遇到边界的末尾词（防止半截密钥闪现），回复带空格边界才能在终止前上屏。
+        let reply = "CURRENT_REPLY_2669 streamed."
+        let dialogue = Dialogue(replyText: reply, replyUsage: LLMUsage(inputTokens: 1_200, outputTokens: 100))
         let chat = fixture.bridge.chat
         defer {
             chat.stopAllStreamingForSafety()
@@ -361,7 +363,7 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
         chat.draftText = submitted
         chat.submitComposer()
         let liveReply = await waitUntil {
-            chat.messages.last?.isStreaming == true && chat.messages.last?.content == "CURRENT_REPLY_2669"
+            chat.messages.last?.isStreaming == true && chat.messages.last?.content.hasPrefix("CURRENT_REPLY_2669 ") == true
         }
         try #require(liveReply, "the actual normal-mode consumer must display a nonempty delta before terminal usage")
         let checkpoint = try #require(try fixture.settings.sessionStore.loadLatestCompactionCheckpoint(
@@ -374,7 +376,7 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
         #expect(canonical.messages.filter { $0.role == .user && $0.content == submitted }.count == 1)
         let pausedReply = try #require(canonical.messages.last)
         #expect(pausedReply.role == .assistant && pausedReply.content.contains("CURRENT_REPLY_2669"))
-        #expect(pausedReply.content.contains("本会话累计用量已达上限，已暂停。可以在新会话继续；原会话保留。"))
+        #expect(pausedReply.content.contains("本会话累计用量已达上限，已暂停。可重置本会话预算，或到设置里调高上限或改为不限；也可以在新会话继续，原会话保留。"))
         #expect(!pausedReply.content.contains("CHAT-UNKNOWN"))
         #expect(dialogue.summaryRequests.count == 1,
             "the pause policy completes one pre-send summary, then pauses on ordinary reply usage without in-turn compaction")
@@ -393,7 +395,7 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
         let nextEnded = await waitUntil { !chat.hasStreamingTasksForSafety }
         #expect(nextEnded)
         let nextCanonical = try #require(freshStore.loadSession(id: nextID.uuidString))
-        #expect(nextCanonical.messages.last?.content == "CURRENT_REPLY_2669")
+        #expect(nextCanonical.messages.last?.content == reply)
         #expect(!chat.hasUnsavedSessionChanges)
         #expect(try freshStore.loadLatestCompactionCheckpoint(sessionID: fixture.sessionID.uuidString) == checkpoint)
     }
@@ -401,7 +403,9 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
     @Test("an independent canonical write after our verified checkpoint still isolates without overwrite")
     func externalCanonicalChangeAfterOwnedCheckpointStillIsolatesWithoutOverwrite() async throws {
         let fixture = try Fixture()
-        let dialogue = Dialogue(replyUsage: LLMUsage(inputTokens: 1_200, outputTokens: 100))
+        // 流式显示会扣住尚未遇到边界的末尾词（防止半截密钥闪现），回复带空格边界才能在终止前上屏。
+        let reply = "CURRENT_REPLY_2669 streamed."
+        let dialogue = Dialogue(replyText: reply, replyUsage: LLMUsage(inputTokens: 1_200, outputTokens: 100))
         let chat = fixture.bridge.chat
         defer {
             chat.stopAllStreamingForSafety()
@@ -422,7 +426,7 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
         chat.draftText = "Continue comparing the previously supplied options."
         chat.submitComposer()
         let liveReply = await waitUntil {
-            chat.messages.last?.isStreaming == true && chat.messages.last?.content == "CURRENT_REPLY_2669"
+            chat.messages.last?.isStreaming == true && chat.messages.last?.content.hasPrefix("CURRENT_REPLY_2669 ") == true
         }
         try #require(liveReply, "the ordinary reply starts only after our checkpoint and full readback")
         let independent = SessionStore(directory: fixture.profile.sessionDirectory)
@@ -829,8 +833,8 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
         #expect(canonical.messages.filter { $0.content == prompt }.count == 1)
     }
 
-    @Test("ordinary summary errors propagate while a Compactor refusal below the hard block still sends", arguments: [false, true])
-    func ordinarySummaryFailureKeepsProviderAndSafetySemanticsDistinct(providerThrows: Bool) async throws {
+    @Test("a failed summary request and a Compactor refusal below the hard block both still send", arguments: [false, true])
+    func ordinarySummaryProviderErrorAndCompactorRefusalBothStillSend(providerThrows: Bool) async throws {
         let fixture = try Fixture()
         let providerError = LLMError.networkError(underlying: URLError(.timedOut))
         let summary = HeldSummary(lateFailure: providerThrows, summaryText: "   ", summaryFailure: providerError)
@@ -863,48 +867,23 @@ struct OrdinaryAutoCompactionCancellation2669Tests {
         summary.release(1)
         let ended = await waitUntil { summary.exits == 1 && !chat.hasStreamingTasksForSafety }
         #expect(ended)
-        if !providerThrows {
-            // C3 (user decision 1101:10, 11/9 contract change): an empty summary is the
-            // Compactor's own refusal (same shape as a media refusal), and a refusal below
-            // 95% of the window no longer stops the send. Old arm: failure card, no request.
-            // A provider error (the other arm) still propagates unchanged.
-            #expect(summary.calls == 1 && dialogue.requests.count == 1)
-            #expect(failure == nil)
-            #expect(chat.contextLimitReason == nil && !chat.canContinueAfterContextLimit)
-            #expect(!chat.messages.contains { $0.content.contains("自动压缩未完成") || $0.content.contains("**错误**") })
-            // 1101:10: the refusal is explained by one quiet line while the send goes on.
-            #expect(chat.messages.filter { $0.role == .system
-                && $0.content == ChatStore.compactionNotExecutedNoticeText }.count == 1)
-            #expect(try fixture.settings.sessionStore.loadLatestCompactionCheckpoint(sessionID: fixture.sessionID.uuidString) == nil)
-            let sent = try #require(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString))
-            #expect(Array(sent.messages.prefix(original.messages.count)) == original.messages)
-            #expect(sent.messages.filter { $0.content == prompt }.count == 1)
-            #expect(sent.messages.last?.content == "CURRENT_REPLY_2669")
-            return
-        }
-        #expect(summary.calls == 1 && dialogue.requests.isEmpty)
-        let reason = try #require(chat.contextLimitReason)
-        #expect(reason.contains("自动压缩未完成，本次未发送。原消息已保留，可以在新会话继续。"))
-        #expect(failure?.errorType == String(reflecting: LLMError.self))
-        #expect(reason.contains(ChatStore.userErrorMessage(providerError)))
-        #expect(!reason.contains("上下文含无法完整保留的内容，未压缩。"))
-        #expect(chat.messages.last?.content.contains(ChatStore.userErrorMessage(providerError)) == true)
-        #expect(chat.canContinueAfterContextLimit && !chat.budgetIsOverLimit)
-        #expect(chat.executionSnapshot(forSessionID: fixture.sessionID)?.state == .failed)
-        // The failed receipt remains failed; the card and error bubble
-        // retain the actual safe provider category or the empty-text refusal.
+        // C3 (user decision 1101:10, 11/9 contract change): an empty summary is the
+        // Compactor's own refusal (same shape as a media refusal), and a refusal below
+        // 95% of the window no longer stops the send. C3-05 (11/17): a failed summary
+        // request (here a typed timeout) is handled the same way instead of failing the
+        // turn; the old arm showed a failure card and made no request.
+        #expect(summary.calls == 1 && dialogue.requests.count == 1)
+        #expect(failure == nil)
+        #expect(chat.contextLimitReason == nil && !chat.canContinueAfterContextLimit)
+        #expect(!chat.messages.contains { $0.content.contains("自动压缩未完成") || $0.content.contains("**错误**") })
+        // 1101:10: the refusal is explained by one quiet line while the send goes on.
+        #expect(chat.messages.filter { $0.role == .system
+            && $0.content == ChatStore.compactionNotExecutedNoticeText }.count == 1)
         #expect(try fixture.settings.sessionStore.loadLatestCompactionCheckpoint(sessionID: fixture.sessionID.uuidString) == nil)
-        let failed = try #require(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString))
-        #expect(Array(failed.messages.prefix(original.messages.count)) == original.messages)
-        #expect(failed.messages.filter { $0.content == prompt }.count == 1)
-        #expect(await chat.budgetTracker.budget.usedTokens == 80_000)
-        let engine = try #require(chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.toolExecutionFactLedger.facts.isEmpty)
-        try await confirmEmptyContinuation(chat)
-        #expect(chat.activeSessionID != fixture.sessionID)
-        #expect(chat.messages.isEmpty && chat.contextLimitReason == nil)
-        #expect(chat.budgetUsedTokens == 0)
-        #expect(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString) == failed)
+        let sent = try #require(fixture.settings.sessionStore.loadSession(id: fixture.sessionID.uuidString))
+        #expect(Array(sent.messages.prefix(original.messages.count)) == original.messages)
+        #expect(sent.messages.filter { $0.content == prompt }.count == 1)
+        #expect(sent.messages.last?.content == "CURRENT_REPLY_2669")
     }
 
     @Test("a dialogue failure never becomes an automatic compaction reason", arguments: [false, true])

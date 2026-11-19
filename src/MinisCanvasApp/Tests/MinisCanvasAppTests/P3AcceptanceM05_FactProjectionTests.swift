@@ -39,7 +39,7 @@ struct P3AcceptanceM05FactProjectionTests {
             id: UUID(), commandID: "boundary", requiresPolicyApproval: false
         )
         #expect(center.evaluate(request: boundary, snapshot: snapshot, facts: facts) == .execute)
-        #expect(center.projection?.text.contains("事实未知") == true)
+        #expect(center.projection?.text == "暂时读不到当前的安全边界设置；本命令没有改动任何设置。")
         center.boundaryProjection = { _ in "已提交安全边界修订：test-revision" }
         #expect(center.evaluate(request: boundary, snapshot: snapshot, facts: facts) == .execute)
         #expect(center.projection?.text == "已提交安全边界修订：test-revision")
@@ -48,7 +48,7 @@ struct P3AcceptanceM05FactProjectionTests {
             id: UUID(), commandID: "provider", requiresPolicyApproval: false
         )
         #expect(center.evaluate(request: provider, snapshot: snapshot, facts: facts) == .execute)
-        #expect(center.projection?.text.contains("事实未知") == true)
+        #expect(center.projection?.text == "还没有选定可用的模型；本命令没有改动任何设置。")
         center.providerProjection = { _ in "已应用 Provider/Model：test-provider/test-model" }
         #expect(center.evaluate(request: provider, snapshot: snapshot, facts: facts) == .execute)
         #expect(center.projection?.text == "已应用 Provider/Model：test-provider/test-model")

@@ -77,3 +77,136 @@ struct SessionTodoProgressTests {
         #expect(SessionTodoProgress.latest(in: cleared)?.todos.isEmpty == true)
     }
 }
+
+struct SessionTodoReminderTests {
+    private func exchange(_ todos: [[String: String]], id: String) throws -> [LLMMessage] {
+        let input: [String: Any] = ["progress": ["todos": todos]]
+        return [LLMMessage(role: .assistant, content: "", toolCalls: [
+            LLMToolCall(id: id, name: "todo_write", rawArguments: "{}", arguments: input)
+        ]), LLMMessage(role: .tool, content: try SessionTodoProgress.execute(input: input), toolCallID: id)]
+    }
+
+    private let openList: [[String: String]] = [
+        ["content": "读取文件", "status": "completed"],
+        ["content": "写入报告", "status": "in_progress"],
+        ["content": "复核", "status": "pending"]
+    ]
+
+    @Test func remindsAfterThreeRoundsWithoutUpdateAndListsOnlyOpenItems() throws {
+        let history = try exchange(openList, id: "t1")
+        var reminder = SessionTodoReminder(history: history)
+        for _ in 0..<(SessionTodoReminder.roundsBeforeReminder - 1) {
+            reminder.recordRound(toolNames: ["file_read"], messages: history)
+            #expect(reminder.requestReminder() == nil)
+        }
+        reminder.recordRound(toolNames: ["file_read"], messages: history)
+        let textValue = reminder.requestReminder()
+        let text = try #require(textValue)
+        #expect(text.contains("写入报告") && text.contains("复核"))
+        #expect(!text.contains("读取文件"))
+        // Emitting restarts the window: no repeat on the very next request.
+        #expect(reminder.requestReminder() == nil)
+    }
+
+    @Test func todoWriteRoundResetsTheCount() throws {
+        let history = try exchange(openList, id: "t1")
+        var reminder = SessionTodoReminder(history: history)
+        for _ in 0..<2 { reminder.recordRound(toolNames: ["file_read"], messages: history) }
+        reminder.recordRound(toolNames: ["todo_write"], messages: history)
+        reminder.recordRound(toolNames: ["file_read"], messages: history)
+        #expect(reminder.requestReminder() == nil)
+    }
+
+    @Test func completedOrMissingChecklistNeverReminds() throws {
+        let done = try exchange([["content": "读取文件", "status": "completed"]], id: "t1")
+        var finished = SessionTodoReminder(history: done)
+        var none = SessionTodoReminder(history: [])
+        for _ in 0..<5 {
+            finished.recordRound(toolNames: ["file_read"], messages: done)
+            none.recordRound(toolNames: ["file_read"], messages: [])
+        }
+        #expect(finished.requestReminder() == nil)
+        #expect(none.requestReminder() == nil)
+    }
+
+    @Test func updateToAllCompletedStopsReminding() throws {
+        let open = try exchange(openList, id: "t1")
+        let finish = try exchange([["content": "读取文件", "status": "completed"]], id: "t2")
+        var reminder = SessionTodoReminder(history: open)
+        for _ in 0..<5 { reminder.recordRound(toolNames: ["file_read"], messages: open) }
+        reminder.recordRound(toolNames: ["todo_write"], messages: open + finish)
+        for _ in 0..<5 { reminder.recordRound(toolNames: ["file_read"], messages: open + finish) }
+        #expect(reminder.requestReminder() == nil)
+    }
+
+    private final class ScriptedProvider: LLMProvider {
+        let name = "Todo reminder fixture"
+        var model: LLMModel = .claudeHaiku45
+        let capabilities: Set<ProviderCapability> = [.tools]
+        var responses: [String]
+        private(set) var systemPrompts: [String?] = []
+        private(set) var receivedHistory: [[LLMMessage]] = []
+
+        init(responses: [String]) { self.responses = responses }
+
+        func sendMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int,
+                         temperature: Double?) async throws -> LLMResponse {
+            systemPrompts.append(systemPrompt)
+            receivedHistory.append(messages)
+            return LLMResponse(text: responses.isEmpty ? "done" : responses.removeFirst(),
+                               stopReason: nil, usage: nil)
+        }
+
+        func sendMessage(messages: [LLMMessage], systemPrompt: String?, tools: [AgentToolDefinition],
+                         maxTokens: Int, temperature: Double?) async throws -> LLMResponse {
+            try await sendMessage(messages: messages, systemPrompt: systemPrompt,
+                                  maxTokens: maxTokens, temperature: temperature)
+        }
+
+        func streamMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int,
+                           temperature: Double?) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
+            AsyncThrowingStream { $0.finish() }
+        }
+    }
+
+    private struct TodoAwareExecutor: ToolExecutor {
+        func execute(name: String, input: [String: Any]) async throws -> String {
+            name == SessionTodoProgress.toolName ? try SessionTodoProgress.execute(input: input) : "ok"
+        }
+    }
+
+    private func envelope(_ id: String, _ name: String, _ input: [String: Any]) -> String {
+        let object: [String: Any] = ["tool_calls": [["id": id, "name": name, "input": input]]]
+        return String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+    }
+
+    @Test func loopAddsReminderToRequestPromptOnlyAndKeepsItOutOfTranscript() async throws {
+        let base = "Trusted fixture instruction."
+        let provider = ScriptedProvider(responses: [
+            envelope("todo-1", "todo_write", ["progress": ["todos": openList]]),
+            envelope("p-1", "probe", [:]),
+            envelope("p-2", "probe", [:]),
+            envelope("p-3", "probe", [:]),
+            "done"
+        ])
+        let root = try minisCoreToolContractRoot("todo-reminder")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = try await AgentLoop(
+            maxIterations: 8,
+            toolExecutionFactLedger: try minisCoreToolContractLedger(at: root)
+        ).run(
+            messages: [LLMMessage(role: .user, content: "做三件事")],
+            systemPrompt: base,
+            provider: provider,
+            toolExecutor: TodoAwareExecutor(),
+            tools: minisCoreToolContractCatalog(["todo_write", "probe"]),
+            executionIdentity: minisCoreToolContractIdentity("todo-reminder")
+        )
+        #expect(provider.systemPrompts.count == 5)
+        #expect(provider.systemPrompts.prefix(4).allSatisfy { $0 == base })
+        let last = try #require(provider.systemPrompts.last ?? nil)
+        #expect(last.hasPrefix(base) && last.contains("[Todo reminder]") && last.contains("写入报告"))
+        #expect(!result.messages.contains { $0.content.contains("[Todo reminder]") })
+        #expect(!provider.receivedHistory.joined().contains { $0.content.contains("[Todo reminder]") })
+    }
+}

@@ -156,9 +156,24 @@ public final class ToolLoopDetector: @unchecked Sendable {
         return String(describing: value)
     }
 
+    /// 轮询类（后台命令状态）与只读查询类工具连续同参调用是正常工作方式，
+    /// 阈值按倍数放宽；写入、命令等其他工具仍按基础阈值判定。
+    private static let pollingTools: Set<String> = ["shell_output"]
+    private static let readOnlyQueryTools: Set<String> = [
+        "file_read", "file_grep", "file_glob", "web_fetch", "session_read"
+    ]
+
+    private func effectiveThreshold(for tool: String) -> Int {
+        let factor = Self.pollingTools.contains(tool) ? 4
+            : (Self.readOnlyQueryTools.contains(tool) ? 2 : 1)
+        return min(threshold * factor, limit)
+    }
+
     private var hasLoop: Bool {
-        guard records.count >= threshold, let latest = records.last?.signature else { return false }
-        return records.suffix(threshold).allSatisfy { $0.signature == latest }
+        guard let last = records.last else { return false }
+        let needed = effectiveThreshold(for: last.toolName)
+        guard records.count >= needed else { return false }
+        return records.suffix(needed).allSatisfy { $0.signature == last.signature }
     }
 
     @discardableResult

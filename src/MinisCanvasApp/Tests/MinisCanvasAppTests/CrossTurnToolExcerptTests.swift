@@ -188,10 +188,13 @@ struct CrossTurnToolExcerptTests {
     @Test func toolsOutsideTheExcerptScopeKeepDefaultExcerpt() async throws {
         let h = try ExcerptHarness(label: "d2-outside", capabilities: ["file_read", "file_grep"])
         defer { h.cleanup() }
-        let ordinary = h.root.appendingPathComponent("d2-anchor.txt")
+        // grep 现在会搜全部文本文件（含会话记录里的调用参数），所以只在单独的小目录里搜，匹配结果才稳定。
+        let scope = h.root.appendingPathComponent("d2-scope", isDirectory: true)
+        try FileManager.default.createDirectory(at: scope, withIntermediateDirectories: true)
+        let ordinary = scope.appendingPathComponent("d2-anchor.txt")
         try "ANCHOR-MARK-222 GREP-BODY-MARK-888".write(to: ordinary, atomically: true, encoding: .utf8)
         let read = try makeCall("d2-anchor-read", "file_read", ["path": ordinary.path])
-        let grep = try makeCall("d2-grep", "file_grep", ["path": h.root.path, "pattern": "GREP-BODY-MARK"])
+        let grep = try makeCall("d2-grep", "file_grep", ["path": scope.path, "pattern": "GREP-BODY-MARK"])
         let turn1 = ExcerptScriptProvider { ordinal, _ in
             switch ordinal {
             case 1: return [read]
@@ -211,42 +214,55 @@ struct CrossTurnToolExcerptTests {
         try expectPairsAreWellFormed(first)
     }
 
-    // MARK: T13 回合上限：同回合 20 次 file_read，落盘的摘录对恰为 12 对，配对完整，第 13–20 次的工具卡片照常出现
+    // MARK: T13 回合上限（T-08：留最新的）：同回合 20 次 file_read，落盘的摘录对恰为最后 12 对，配对完整，
+    // 第 1–8 次的工具卡片照常出现；穿插的两次 file_write（句柄类，不计入摘录预算）一对不少。
     // 触顶的是“条数上限 12”，不是“16 KiB”：每个文件只有约 300 字符（小于头尾窗口，整篇保留，不截），
     // 一对约 0.6–1 KiB（含路径），12 对远低于 16 KiB。下面用 totalBytes 推算第 13 对也放得下，
     // 证明挡住第 13 对的是条数。假设：路径长度在临时目录下约 100–200 字符。
+    // 旧口径是先到先得（留第 1–12 次，回合后半段丢掉），按用户 11/17 决定“继续”改为最新优先。
 
-    @Test func perTurnExcerptCapKeepsExactlyTwelvePairsAndStillConsumesTheRestCards() async throws {
-        let h = try ExcerptHarness(label: "d2-cap", capabilities: ["file_read"], maxIterations: 30)
+    @Test func perTurnExcerptCapKeepsTheNewestTwelvePairsAndLeavesHandlesAlone() async throws {
+        let h = try ExcerptHarness(label: "d2-cap", capabilities: ["file_read", "file_write"], maxIterations: 40)
         defer { h.cleanup() }
-        var calls: [LLMToolCall] = []
+        var reads: [LLMToolCall] = []
         for index in 1...20 {
             let file = h.root.appendingPathComponent("d2-cap-\(index).txt")
             let body = "CAP-HEAD-\(index) " + String(repeating: "small synthetic line ", count: 12) + "CAP-TAIL-\(index)"
             try body.write(to: file, atomically: true, encoding: .utf8)
-            calls.append(try makeCall("d2-cap-\(index)", "file_read", ["path": file.path]))
+            reads.append(try makeCall("d2-cap-\(index)", "file_read", ["path": file.path]))
         }
-        let ordered = calls
-        let turn1 = ExcerptScriptProvider { ordinal, _ in ordinal <= 20 ? [ordered[ordinal - 1]] : [] }
+        // 句柄类：一次在最前（会被挤出摘录窗口的那一段），一次在中间。
+        let writeEarly = try makeCall("d2-cap-w1", "file_write", [
+            "path": h.root.appendingPathComponent("d2-cap-w1.txt").path, "content": "SYNTH_BODY_CAP_001"])
+        let writeMiddle = try makeCall("d2-cap-w2", "file_write", [
+            "path": h.root.appendingPathComponent("d2-cap-w2.txt").path, "content": "SYNTH_BODY_CAP_002"])
+        // 调用顺序：w1，读 1–10，w2，读 11–20。
+        var sequence: [LLMToolCall] = [writeEarly]
+        sequence += reads[0..<10]
+        sequence.append(writeMiddle)
+        sequence += reads[10..<20]
+        let ordered = sequence
+        let turn1 = ExcerptScriptProvider { ordinal, _ in ordinal <= ordered.count ? [ordered[ordinal - 1]] : [] }
         try await h.run(turn1, "d2 read twenty files one after another")
-        try #require(turn1.requests.count == 21, "the fixture must have run all twenty reads")
+        try #require(turn1.requests.count == 23, "the fixture must have run all twenty-two calls")
 
-        // 第 13–20 次：摘录对被丢弃，但生命周期事实照常被消费（工具卡片在）。
-        for index in 1...20 {
-            let id = "d2-cap-\(index)"
+        // 第 1–8 次读取：摘录对被移除，但生命周期事实照常被消费（工具卡片在）。
+        for id in (1...20).map({ "d2-cap-\($0)" }) + ["d2-cap-w1", "d2-cap-w2"] {
             let card = h.chat.conversationEvents.contains {
                 $0.kind == .tool && $0.toolCallID == id && $0.status == .succeeded
             }
-            #expect(card, "the tool card of call \(index) must still be consumed")
+            #expect(card, "the tool card of \(id) must still be consumed")
         }
 
         let turn2 = ExcerptScriptProvider { _, _ in [] }
         try await h.run(turn2, "d2 second turn")
         let first = try #require(turn2.requests.first)
         let readCalls = toolCalls(in: first).filter { $0.name == "file_read" }
-        #expect(readCalls.count == 12)
-        let readResults = toolResults(in: first).filter { $0.id.hasPrefix("d2-cap-") }
-        #expect(readResults.count == 12)
+        #expect(readCalls.map(\.id) == (9...20).map { "d2-cap-\($0)" }, "the newest twelve pairs stay, in call order")
+        #expect(callIDs(in: first, named: "file_write") == ["d2-cap-w1", "d2-cap-w2"], "handle pairs do not count against the excerpt budget")
+        let readResults = toolResults(in: first).filter { $0.id.hasPrefix("d2-cap-") && !$0.id.hasPrefix("d2-cap-w") }
+        #expect(readResults.map(\.id) == (9...20).map { "d2-cap-\($0)" })
+        #expect(readResults.last?.content.contains("CAP-TAIL-20") == true, "the last call of the turn is the one that matters most")
         let totalBytes = readResults.reduce(0) { $0 + $1.content.utf8.count }
         #expect(totalBytes <= 16 * 1_024)
         // 条数先触顶：按平均每对大小，第 13 对放进去仍不超 16 KiB。
@@ -257,6 +273,31 @@ struct CrossTurnToolExcerptTests {
         let coldCalls = toolCalls(in: cold).filter { $0.name == "file_read" }
         #expect(coldCalls.count == 12)
         try expectPairsAreWellFormed(cold)
+    }
+
+    // MARK: T13b 摘录窗口纯函数：条数与字节两条线都留最新，整对进出
+
+    @Test func excerptWindowEvictsOldestWholePairsForTheCountAndByteCeilings() {
+        // 条数线：第 13 对进来，挤出最早的一对（两条消息一起）。
+        var byCount = CrossTurnExcerptWindow()
+        let ids = (1...13).map { _ in [UUID(), UUID()] }
+        var evicted: [[UUID]] = []
+        for pair in ids { evicted.append(byCount.add(messageIDs: pair, cost: 100)) }
+        #expect(evicted[0..<12].allSatisfy { $0.isEmpty })
+        #expect(evicted[12] == ids[0])
+
+        // 字节线：每对 6 KiB，第 3 对进来超 16 KiB，挤出最早的一对；留下的是第 2、3 对。
+        var byBytes = CrossTurnExcerptWindow()
+        let big = (1...3).map { _ in [UUID(), UUID()] }
+        let results = big.map { byBytes.add(messageIDs: $0, cost: 6 * 1_024) }
+        #expect(results[0].isEmpty && results[1].isEmpty)
+        #expect(results[2] == big[0])
+
+        // 单对自身就超过字节线：只丢它自己，较早的保留。
+        let single = [UUID(), UUID()]
+        #expect(byBytes.add(messageIDs: single, cost: 16 * 1_024 + 1) == single)
+        let next = [UUID(), UUID()]
+        #expect(byBytes.add(messageIDs: next, cost: 6 * 1_024) == big[1], "older pairs were kept; only now does the oldest leave")
     }
 
     // MARK: 摘录断言

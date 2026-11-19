@@ -261,6 +261,36 @@ public struct CompactionCheckpoint: Codable, Equatable, Sendable {
         ).withDigest()
     }
 
+    /// One message's size as the store counts it when it saves a checkpoint:
+    /// the canonical JSON encoding, so images and audio count as base64.
+    /// Anything already known to exceed `limit` returns a lower bound above
+    /// it without encoding the payload.
+    static func persistedByteCount(of message: LLMMessage, limit: Int) -> Int {
+        let lowerBound = message.content.utf8.count
+            + message.images.reduce(0) { $0 + ($1.data.count + 2) / 3 * 4 }
+            + message.audios.reduce(0) { $0 + $1.base64Data.utf8.count }
+        guard lowerBound <= limit else { return lowerBound }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(message))?.count ?? Int.max
+    }
+
+    /// Whether `replacementHistory` plus `facts` stay inside the bounds the
+    /// store enforces when it persists a checkpoint.
+    static func fitsPersistenceBounds(_ replacementHistory: [LLMMessage],
+                                      facts: [CompactionRetainedFact]) -> Bool {
+        guard replacementHistory.count <= maxReplacementHistoryCount,
+              factsAreBounded(facts) else { return false }
+        var total = 0
+        for message in replacementHistory {
+            let size = persistedByteCount(of: message, limit: maxMessageContentBytes)
+            guard size <= maxMessageContentBytes,
+                  total <= maxPersistedBytes - size else { return false }
+            total += size
+        }
+        return true
+    }
+
     static func digestOfSourcePrefix(_ messages: [LLMMessage]) -> String? {
         guard !messages.isEmpty else { return nil }
         let encoder = JSONEncoder()

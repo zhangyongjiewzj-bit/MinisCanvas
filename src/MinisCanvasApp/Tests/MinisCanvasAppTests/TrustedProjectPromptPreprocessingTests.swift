@@ -20,7 +20,7 @@ struct TrustedProjectPromptPreprocessingTests {
             trustedProjectRoot: root)
         let trusted = try #require(result.trustedProjectInstructions)
         #expect(result.systemPrompt == "base\n\n" + trusted.systemPromptPrefix)
-        #expect(trusted.loadedRelativePaths == ["CLAUDE.md"])
+        #expect(trusted.loadedRelativePaths.last == "CLAUDE.md")
         #expect(!trusted.systemPromptPrefix.contains("user material"))
         // Mapping itself is pure; the formal root is not required to live in
         // a system-alias subtree. Real loading below stays inside that root.
@@ -31,7 +31,7 @@ struct TrustedProjectPromptPreprocessingTests {
             memoryInjector: nil, memoryScope: MemoryScope(sessionID: "synthetic-session", projectID: "synthetic-project"),
             skillInjector: nil, legacySkillResult: .init(fragment: nil, receipts: []), pickerCatalog: [], steers: [],
             intentText: "user material", trustedProjectRoot: root))
-        #expect(ordinary?.trustedProjectInstructions?.loadedRelativePaths == ["CLAUDE.md"])
+        #expect(ordinary?.trustedProjectInstructions?.loadedRelativePaths.last == "CLAUDE.md")
         #expect(ordinary?.systemPrompt == result.systemPrompt)
         let absent = try ChatTurnPromptPreprocessor.preparePinnedPromptResult(
             basePrompt: "base", userMessage: "@untrusted.md user material",
@@ -71,4 +71,19 @@ struct TrustedProjectPromptPreprocessingTests {
         #expect(!withMemory.excludingProjectInstructions().systemPrompt.contains("weather later fact"))
         #expect(withMemory.excludingProjectInstructions().systemPrompt.contains("weather owned fact"))
     }
+    @Test @MainActor func projectWithoutInstructionFilesDoesNotShowNotLoadedNotice() throws {
+        let profile = try #require(RuntimeIsolationProfile.formalTestProfileForDefaultConsumer())
+        let configuredRoot = profile.rootDirectory
+            .appendingPathComponent("M01-empty-synthetic-" + UUID().uuidString, isDirectory: true)
+        let root = URL(fileURLWithPath: try DarwinSystemPathResolver.resolve(configuredRoot), isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = try ChatTurnPromptPreprocessor.preparePinnedPromptResult(
+            basePrompt: "base", userMessage: "hello",
+            memoryInjector: nil, memoryScope: MemoryScope(sessionID: "synthetic-session", projectID: "synthetic-project"),
+            skillInjector: nil, trustedProjectRoot: root)
+        #expect(!result.projectInstructionsUnavailable)
+        #expect(result.projectInstructionsUnavailableReason == nil)
+    }
+
 }

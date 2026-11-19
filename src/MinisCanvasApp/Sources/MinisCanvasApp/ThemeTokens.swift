@@ -43,7 +43,7 @@ struct Aj38Palette: Equatable, Sendable {
         borderSubtle: ThemeColor,
         accent: ThemeColor, accentHover: ThemeColor,
         success: ThemeColor, danger: ThemeColor,
-        statusWarning: ThemeColor = ThemeColor(r: 157.0 / 255.0, g: 98.0 / 255.0, b: 61.0 / 255.0)
+        statusWarning: ThemeColor = ThemeColor(r: 154.0 / 255.0, g: 91.0 / 255.0, b: 15.0 / 255.0)
     ) {
         self.backgroundPrimary = backgroundPrimary
         self.backgroundSecondary = backgroundSecondary
@@ -59,40 +59,42 @@ struct Aj38Palette: Equatable, Sendable {
 }
 
 extension Aj38Palette {
-    /// 亮色模式：米白底 + 深炭字 + 赭橙强调。
+    /// 亮色模式（第 1 套「暖中性 + 陶土橙」）：暖白底 + 近黑字 + 陶土橙强调。
     static let light = Aj38Palette(
-        // 背景：米白 #FAF9F6 / 米白·深一度 #F1EEE7
-        backgroundPrimary: hexColor(0xFAF9F6),
-        backgroundSecondary: hexColor(0xF1EEE7),
-        // 文本：深炭 #39342F / 橄榄灰 #636659
-        textPrimary: hexColor(0x39342F),
-        textSecondary: hexColor(0x636659),
-        // 描边：暖灰 #B4AEA4
-        borderSubtle: hexColor(0xB4AEA4),
-        // 强调：赭橙 #9D623D / hover #A0613C
-        accent: hexColor(0x9D623D),
-        accentHover: hexColor(0xA0613C),
-        // 状态：橄榄绿 #6B7F5E / 深赭红 #8C3A2B
-        success: hexColor(0x6B7F5E),
-        danger: hexColor(0x8C3A2B)
+        // 背景：底 #FAF9F5 / 侧栏 #F3F1EB
+        backgroundPrimary: hexColor(0xFAF9F5),
+        backgroundSecondary: hexColor(0xF3F1EB),
+        // 文本：正文 #1F1E1D / 次要字 #5E5D59
+        textPrimary: hexColor(0x1F1E1D),
+        textSecondary: hexColor(0x5E5D59),
+        // 描边：#E3E0D7
+        borderSubtle: hexColor(0xE3E0D7),
+        // 强调：陶土橙 #A84E2A
+        accent: hexColor(0xA84E2A),
+        accentHover: hexColor(0xA84E2A),
+        // 状态：成功 #2A7549 / 危险 #B3261E / 警告 #9A5B0F
+        success: hexColor(0x2A7549),
+        danger: hexColor(0xB3261E),
+        statusWarning: hexColor(0x9A5B0F)
     )
 
-    /// 暗色模式：极深冷灰底 + 米白字。
+    /// 暗色模式（第 1 套深色）：暖深灰底 + 暖白字。
     static let dark = Aj38Palette(
-        // 背景：极深冷灰 #14181C / 极深 #0A0D10
-        backgroundPrimary: hexColor(0x14181C),
-        backgroundSecondary: hexColor(0x0A0D10),
-        // 文本：米白 #FAF9F6 / 暖灰 #B4AEA4
-        textPrimary: hexColor(0xFAF9F6),
-        textSecondary: hexColor(0xB4AEA4),
-        // 描边：深炭 #39342F
-        borderSubtle: hexColor(0x39342F),
-        // 强调：赭橙·亮一档 #A0613C / hover #9C5F39
-        accent: hexColor(0xA0613C),
-        accentHover: hexColor(0x9C5F39),
-        // 状态：橄榄绿 / 深赭红（跨模式不变）
-        success: hexColor(0x6B7F5E),
-        danger: hexColor(0x8C3A2B)
+        // 背景：底 #1F1E1C / 侧栏 #262522
+        backgroundPrimary: hexColor(0x1F1E1C),
+        backgroundSecondary: hexColor(0x262522),
+        // 文本：正文 #ECEAE4 / 次要字 #B5B2A9
+        textPrimary: hexColor(0xECEAE4),
+        textSecondary: hexColor(0xB5B2A9),
+        // 描边：#3A3935
+        borderSubtle: hexColor(0x3A3935),
+        // 强调：#E08B68
+        accent: hexColor(0xE08B68),
+        accentHover: hexColor(0xE08B68),
+        // 状态：成功 #6FC08F / 危险 #F08072 / 警告 #E3A64F
+        success: hexColor(0x6FC08F),
+        danger: hexColor(0xF08072),
+        statusWarning: hexColor(0xE3A64F)
     )
 }
 
@@ -140,7 +142,7 @@ extension ThemeTokenProvider {
     var aj38: Aj38Palette {
         if center.themePreset.current == .system {
             let native = tokens
-            let accent = Self.nativeSystemAccent(for: mode)
+            let accent = Self.systemThemeAccent(for: mode)
             return Aj38Palette(
                 backgroundPrimary: native.background, backgroundSecondary: native.sidebarBackground,
                 textPrimary: native.textPrimary, textSecondary: native.textSecondary,
@@ -148,6 +150,7 @@ extension ThemeTokenProvider {
                 success: native.statusSuccess, danger: native.statusDanger, statusWarning: native.statusWarning
             )
         }
-        return Aj38Palette.readableLight.withAccent(ThemePreset.canonicalAccentTheme.accentRGB)
+        // 产品主题：浅/深两套都是预先算好的静态常量（readableLight/readableDark），不在读取时新建。
+        return mode == .dark ? Aj38Palette.readableDark : Aj38Palette.readableLight
     }
 }

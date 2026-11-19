@@ -9,17 +9,19 @@ import Testing
 struct DeepSeekMaxTokensField_R14_Tests {
     private let cap = 321
 
-    private func provider(base: String, router: Bool = false) -> OpenAICompatibleProvider {
-        let provider = OpenAICompatibleProvider(apiKey: "fixture-key", model: .deepSeekV4Flash,
+    private func provider(base: String, router: Bool = false,
+                          model: LLMModel = .deepSeekV4Flash) -> OpenAICompatibleProvider {
+        let provider = OpenAICompatibleProvider(apiKey: "fixture-key", model: model,
             customBaseURL: base, appendV1Suffix: false,
             session: R14CaptureURLProtocol.session(), providerName: "DeepSeek")
         provider.useOpenRouterCompat = router
         return provider
     }
 
-    private func sentBody(base: String, router: Bool = false, streaming: Bool = false) async throws -> [String: Any] {
+    private func sentBody(base: String, router: Bool = false, streaming: Bool = false,
+                          model: LLMModel = .deepSeekV4Flash) async throws -> [String: Any] {
         R14CaptureURLProtocol.reset(streaming: streaming)
-        let p = provider(base: base, router: router)
+        let p = provider(base: base, router: router, model: model)
         let messages = [LLMMessage(role: .user, content: "fixture")]
         if streaming {
             if let stream = try? await p.streamMessage(messages: messages, systemPrompt: nil,
@@ -72,9 +74,22 @@ struct DeepSeekMaxTokensField_R14_Tests {
         expectMaxCompletionTokens(try await sentBody(base: "https://api.openai.com"))
     }
 
-    @Test("unrelated proxy host with /api path keeps max_completion_tokens")
-    func proxyHost() async throws {
-        expectMaxCompletionTokens(try await sentBody(base: "https://proxy.example/api"))
+    // MC4-012：自定义 OpenAI 兼容端点默认用 max_tokens；官方端点与推理模型用 max_completion_tokens。
+    @Test("MC4-012 custom compatible host with a non-reasoning model sends max_tokens")
+    func customHostNonReasoning() async throws {
+        expectMaxTokens(try await sentBody(base: "https://proxy.example/api", model: .gpt4oMini))
+    }
+
+    @Test("MC4-012 custom compatible host with a reasoning model keeps max_completion_tokens")
+    func customHostReasoningModel() async throws {
+        expectMaxCompletionTokens(try await sentBody(base: "https://proxy.example/api", model: .gpt5))
+        expectMaxCompletionTokens(try await sentBody(base: "https://proxy.example/api",
+            model: LLMModel(id: "openai/o3-mini", displayName: "o3-mini", provider: "Custom")))
+    }
+
+    @Test("MC4-012 api.openai.com with a non-reasoning model still sends max_completion_tokens")
+    func officialHostNonReasoning() async throws {
+        expectMaxCompletionTokens(try await sentBody(base: "https://api.openai.com", model: .gpt4oMini))
     }
 
     @Test("OpenRouter compat keeps max_tokens")
@@ -82,14 +97,14 @@ struct DeepSeekMaxTokensField_R14_Tests {
         expectMaxTokens(try await sentBody(base: "https://openrouter.ai/api", router: true))
     }
 
-    @Test("lookalike host api.deepseek.com.evil.example is not DeepSeek")
+    @Test("lookalike host api.openai.com.evil.example is not the OpenAI official endpoint")
     func lookalikeSuffixHost() async throws {
-        expectMaxCompletionTokens(try await sentBody(base: "https://api.deepseek.com.evil.example"))
+        expectMaxTokens(try await sentBody(base: "https://api.openai.com.evil.example", model: .gpt4oMini))
     }
 
-    @Test("deepseek host name only in the path is not DeepSeek")
+    @Test("openai host name only in the path is not the OpenAI official endpoint")
     func hostInPathOnly() async throws {
-        expectMaxCompletionTokens(try await sentBody(base: "https://evil.example/api.deepseek.com"))
+        expectMaxTokens(try await sentBody(base: "https://evil.example/api.openai.com", model: .gpt4oMini))
     }
 }
 

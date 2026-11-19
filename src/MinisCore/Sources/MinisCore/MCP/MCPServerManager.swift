@@ -167,6 +167,59 @@ public struct MCPDiscoverySnapshot: Codable, Equatable, Sendable, Identifiable {
         return DeletionGate.fingerprint(data)
     }
 
+    /// 单个工具定义的摘要（名称、描述、入参 schema、元数据）。
+    public static func toolDigest(for tool: MCPTool) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(tool) else { return "invalid" }
+        return DeletionGate.fingerprint(data)
+    }
+
+    /// 把授权绑定到快照：只保留当前快照里仍存在、且定义与授权时一致的工具。
+    /// `previous` 为 nil（旧版授权）或某个工具没有记录摘要时，该工具视为不一致。
+    /// 返回绑定后的授权与被撤销的工具数；全部撤销时绑定摘要置 nil。
+    static func rebindGrant(
+        _ grant: MCPToolAuthorization,
+        to snapshot: MCPDiscoverySnapshot,
+        requireMatch: Bool
+    ) -> (grant: MCPToolAuthorization, revoked: Int) {
+        // 首次发现（requireMatch == false）：授权名单原样保留，只记录当前存在的工具摘要；
+        // 之后任何定义变化都会按逐工具规则撤销。
+        if !requireMatch {
+            var bound = grant
+            bound.schemaBindingDigest = snapshot.schemaDigest
+            let digests = Dictionary(
+                snapshot.tools.map { ($0.name, Self.toolDigest(for: $0)) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            bound.toolSchemaDigests = digests.filter { grant.authorizedToolNames.contains($0.key) }
+            return (bound, 0)
+        }
+        var result = grant
+        let current = Dictionary(
+            snapshot.tools.map { ($0.name, Self.toolDigest(for: $0)) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var kept: Set<String> = []
+        for name in grant.authorizedToolNames {
+            guard let digest = current[name] else { continue }
+            if requireMatch {
+                guard let recorded = grant.toolSchemaDigests?[name], recorded == digest else { continue }
+            }
+            kept.insert(name)
+        }
+        let revoked = grant.authorizedToolNames.count - kept.count
+        result.authorizedToolNames = kept
+        if kept.isEmpty {
+            result.schemaBindingDigest = nil
+            result.toolSchemaDigests = nil
+        } else {
+            result.schemaBindingDigest = snapshot.schemaDigest
+            result.toolSchemaDigests = current.filter { kept.contains($0.key) }
+        }
+        return (result, revoked)
+    }
+
     static func stableToolOrder(_ lhs: MCPTool, _ rhs: MCPTool) -> Bool {
         let lhsFolded = lhs.name.lowercased()
         let rhsFolded = rhs.name.lowercased()
@@ -186,6 +239,66 @@ public enum MCPDiscoveryError: Error, Equatable, Sendable {
     case toolConflict(serverID: String, toolName: String)
     case serverIdentityChanged(String)
     case transportEpochChanged(String)
+}
+
+/// 11/16：面向用户的 MCP 失败提示，只用固定中文，不拼接服务器/传输层的原始描述（可能含密钥）。
+public enum MCPFailureMessage {
+    public static func reconnect(_ error: Error) -> String {
+        if let oauth = error as? MCPOAuthError {
+            switch oauth {
+            case .loginRequired: return "需要登录：请点该服务器的“登录”。"
+            case .expired, .requestRejected: return "登录已过期：请点该服务器的“登录”重新登录。"
+            default: return oauth.localizedDescription
+            }
+        }
+        if let discovery = error as? MCPDiscoveryError {
+            switch discovery {
+            case .unauthorized: return "服务器未授权：请先打开该服务器的“授权”开关。"
+            case .serverDisabled: return "服务器已停用：请先启用该服务器。"
+            case .serverNotFound, .stale, .serverIdentityChanged, .transportEpochChanged:
+                return "配置已变化：请刷新后重试。"
+            default: return "工具列表不符合要求：请检查服务器返回的工具定义。"
+            }
+        }
+        if let client = error as? MCPClientError {
+            switch client {
+            case .timeout: return "连接超时：请确认服务器正在运行、网络可达，稍后重试。"
+            case .spawnFailed: return "进程启动失败：请检查命令路径、参数和环境变量。"
+            case .processExited, .transportNotStarted: return "服务器进程已退出：请检查命令与参数，并确认依赖已安装。"
+            case .permissionDenied: return "未授权：请先授权该服务器。"
+            case .invalidServer: return "服务器配置无效：请检查地址或命令。"
+            default: return "服务器返回了无法识别的响应：请检查服务器版本与配置。"
+            }
+        }
+        return "重连失败：请检查配置后重试。"
+    }
+
+    /// `error == nil` 表示保存在写入之前就被拒绝（目标配置已被其它地方改动）。
+    public static func save(_ error: Error?) -> String {
+        guard let error else { return "保存失败：配置已被其它地方修改，请刷新后重试。" }
+        if let conflict = error as? MCPPersistenceConflict {
+            switch conflict {
+            case .staleSnapshot, .needsReopen, .incompleteSnapshot, .writerBusy:
+                return "保存失败：配置已被其它地方修改，请刷新后重试。"
+            case .scopeUnavailable, .documentUnavailable, .documentTooLarge:
+                return "保存失败：写入失败，请检查磁盘空间或权限。"
+            }
+        }
+        return "保存失败：写入失败，请检查磁盘空间或权限。"
+    }
+
+    /// 启用、授权、删除等操作没有生效时的提示（开关会弹回，需要说明原因）。
+    public static func change(_ error: Error?) -> String {
+        if let conflict = error as? MCPPersistenceConflict {
+            switch conflict {
+            case .staleSnapshot, .needsReopen, .incompleteSnapshot, .writerBusy:
+                return "操作未生效：配置已被其它地方修改或状态不明，请刷新或重新打开设置后重试。"
+            case .scopeUnavailable, .documentUnavailable, .documentTooLarge:
+                return "操作未生效：写入失败，请检查磁盘空间或权限。"
+            }
+        }
+        return "操作未生效：请刷新后重试。"
+    }
 }
 
 /// Deterministic session identity derived from persisted server state. A
@@ -718,7 +831,7 @@ public final class MCPServerManager: @unchecked Sendable {
         } catch {
             client.disconnect()
             if ownsManagementClient(client) {
-                runtimeLock.withLock { runtimeMessages[serverID] = "重连失败；请检查配置后重试。" }
+                runtimeLock.withLock { runtimeMessages[serverID] = MCPFailureMessage.reconnect(error) }
                 publishRuntimeChange(serverID: serverID)
             }
             throw error
@@ -769,6 +882,8 @@ public final class MCPServerManager: @unchecked Sendable {
     /// live transport owner. Reload starts empty and cannot reuse old pages.
     private var transportGenerations: [String: UInt64] = [:]
     private var schemaEpochs: [String: UUID] = [:]
+    /// 工具定义摘要变化而被收窄（清空）的授权工具数，仅内存，重新授权后清除；设置页据此提示重新授权。
+    private var schemaNarrowedToolCounts: [String: Int] = [:]
     private var staleTempReceipts: [MCPStaleTempCleanupReceipt] = []
     private var issuedTempReceipts: Set<MCPStaleTempCleanupReceipt> = []
     private var tornTempRecoveryStages: [TornTempRecoveryStage] = []
@@ -1151,7 +1266,9 @@ public final class MCPServerManager: @unchecked Sendable {
         defer { endPersistentMutationLocked() }
         let before = servers[index]
         servers[index].name = change.next
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: change.serverID)
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         bl6NameCompletions[record.requestID] = BL6NameCompletion(
             record: record, serverID: change.serverID,
             previousName: change.previous, resultingName: change.next,
@@ -1283,11 +1400,13 @@ public final class MCPServerManager: @unchecked Sendable {
         let before = servers[index]
         servers[index].enabled = change.next
         let changedState = change.previous != change.next
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: change.serverID)
         if changedState {
             authorizations.removeValue(forKey: change.serverID)
             disconnectRuntime(serverID: change.serverID)
         }
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         bl6EnablementCompletions[record.requestID] = BL6EnablementCompletion(
             record: record, serverID: change.serverID,
             previousEnabled: change.previous, resultingEnabled: change.next,
@@ -1928,6 +2047,9 @@ public final class MCPServerManager: @unchecked Sendable {
                         serverID: serverID, digest: observedDigest
                     )
                     if grantChanged, var grant = authorizations[serverID] {
+                        if !grant.authorizedToolNames.isEmpty {
+                            schemaNarrowedToolCounts[serverID] = grant.authorizedToolNames.count
+                        }
                         grant.authorizedToolNames.removeAll()
                         grant.schemaBindingDigest = nil
                         authorizations[serverID] = grant
@@ -1970,7 +2092,7 @@ public final class MCPServerManager: @unchecked Sendable {
                !grant.authorizedToolNames.isEmpty {
                 if grant.schemaBindingDigest == "" {
                     let previousGrant = grant
-                    grant.schemaBindingDigest = snapshot.schemaDigest
+                    grant = MCPDiscoverySnapshot.rebindGrant(grant, to: snapshot, requireMatch: false).grant
                     authorizations[serverID] = grant
                     do {
                         try saveAuthorizationsLocked()
@@ -1979,9 +2101,23 @@ public final class MCPServerManager: @unchecked Sendable {
                         throw error
                     }
                 } else if let boundDigest = grant.schemaBindingDigest,
+                          boundDigest == snapshot.schemaDigest,
+                          grant.toolSchemaDigests == nil {
+                    // 旧版授权且列表未变：补记逐工具摘要，之后才能按工具撤销。
+                    let previousGrant = grant
+                    grant = MCPDiscoverySnapshot.rebindGrant(grant, to: snapshot, requireMatch: false).grant
+                    authorizations[serverID] = grant
+                    do {
+                        try saveAuthorizationsLocked()
+                    } catch {
+                        authorizations[serverID] = previousGrant
+                    }
+                } else if let boundDigest = grant.schemaBindingDigest,
                           boundDigest != snapshot.schemaDigest {
-                    grant.authorizedToolNames.removeAll()
-                    grant.schemaBindingDigest = nil
+                    // 只撤销定义变了或已消失的工具；新增工具默认未授权，其它工具保持授权。
+                    let rebound = MCPDiscoverySnapshot.rebindGrant(grant, to: snapshot, requireMatch: true)
+                    schemaNarrowedToolCounts[serverID] = rebound.revoked
+                    grant = rebound.grant
                     authorizations[serverID] = grant
                     do {
                         try saveAuthorizationsLocked()
@@ -2052,8 +2188,9 @@ public final class MCPServerManager: @unchecked Sendable {
               isValidDiscoverySnapshotLocked(serverID: serverID, snapshot: accepted) else {
             return nil
         }
-        var expectedAuthorization = context.authorization
-        expectedAuthorization.schemaBindingDigest = accepted.schemaDigest
+        let expectedAuthorization = MCPDiscoverySnapshot.rebindGrant(
+            context.authorization, to: accepted, requireMatch: false
+        ).grant
         return authorizations[serverID] == expectedAuthorization ? accepted : nil
     }
 
@@ -2093,7 +2230,8 @@ public final class MCPServerManager: @unchecked Sendable {
                 name: normalizedName,
                 description: tool.description,
                 inputSchema: tool.inputSchema,
-                _meta: tool._meta
+                _meta: tool._meta,
+                annotations: tool.annotations
             )
             if let existing = normalizedByName[normalizedName] {
                 guard existing == normalized else {
@@ -2193,24 +2331,44 @@ public final class MCPServerManager: @unchecked Sendable {
                 ? (existing?.authorizedToolNames ?? [])
                 : [],
             schemaBindingDigest: existing?.descriptorFingerprint == server.descriptorFingerprint
-                ? existing?.schemaBindingDigest : nil
+                ? existing?.schemaBindingDigest : nil,
+            toolSchemaDigests: existing?.descriptorFingerprint == server.descriptorFingerprint
+                ? existing?.toolSchemaDigests : nil
         )
         let oldAuthorizations = authorizations
+        let oldSnapshots = discoverySnapshots
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: id)
         let oldRevision = revision
         authorizations[id] = grant
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         do {
             try saveAuthorizationsLocked()
         } catch {
             authorizations = oldAuthorizations
+            discoverySnapshots = oldSnapshots
             revision = oldRevision
             throw error
         }
         return grant
     }
 
+    /// 因工具定义摘要变化而被收窄的已授权工具数（0 表示没有）。
+    public func schemaNarrowedToolCount(serverID: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return schemaNarrowedToolCounts[serverID] ?? 0
+    }
+
     @discardableResult
     public func authorizeTool(serverID: String, toolName: String) throws -> MCPToolAuthorization {
+        try authorizeTools(serverID: serverID, toolNames: [toolName])
+    }
+
+    /// 批量授权：一次校验、一次持久化，规则与单个授权完全一致。
+    @discardableResult
+    public func authorizeTools(serverID: String, toolNames: [String]) throws -> MCPToolAuthorization {
+        let toolName = toolNames.first ?? ""
         lock.lock()
         defer { lock.unlock() }
         try beginPersistentMutationLocked()
@@ -2235,15 +2393,28 @@ public final class MCPServerManager: @unchecked Sendable {
         }
         if updated.schemaBindingDigest != currentDigest {
             // A changed schema cannot inherit grants for any other tool.
-            updated.authorizedToolNames = [toolName]
+            updated.authorizedToolNames = Set(toolNames)
+            updated.toolSchemaDigests = nil
         } else {
-            updated.authorizedToolNames.insert(toolName)
+            updated.authorizedToolNames.formUnion(toolNames)
         }
         updated.schemaBindingDigest = currentDigest
+        if let discovery = acceptedSnapshots[serverID] {
+            // 记录每个已授权工具当前的定义摘要，供之后逐工具比对。
+            var digests = updated.toolSchemaDigests ?? [:]
+            for tool in discovery.tools where updated.authorizedToolNames.contains(tool.name) {
+                digests[tool.name] = MCPDiscoverySnapshot.toolDigest(for: tool)
+            }
+            updated.toolSchemaDigests = digests
+        } else {
+            updated.toolSchemaDigests = nil
+        }
         let oldAuthorizations = authorizations
         let oldSnapshots = discoverySnapshots
         let oldRevision = revision
         authorizations[serverID] = updated
+        let oldNarrowed = schemaNarrowedToolCounts[serverID]
+        schemaNarrowedToolCounts.removeValue(forKey: serverID)
         revision += 1
         restampAcceptedDiscoverySnapshotsLocked(acceptedSnapshots)
         do {
@@ -2251,6 +2422,7 @@ public final class MCPServerManager: @unchecked Sendable {
         } catch {
             authorizations = oldAuthorizations
             discoverySnapshots = oldSnapshots
+            schemaNarrowedToolCounts[serverID] = oldNarrowed
             revision = oldRevision
             throw error
         }
@@ -2260,6 +2432,17 @@ public final class MCPServerManager: @unchecked Sendable {
     /// Caller holds `lock`. Cache entries that are valid at this instant.
     private func validDiscoverySnapshotsLocked() -> [String: MCPDiscoverySnapshot] {
         discoverySnapshots.filter { isValidDiscoverySnapshotLocked(serverID: $0.key, snapshot: $0.value) }
+    }
+
+    /// Caller holds `lock`, before it advances `revision` for a mutation of
+    /// `serverID`. Snapshots of every other server that are valid right now:
+    /// their server, grant and descriptor are untouched, so they are
+    /// re-stamped to the new revision. The mutated server is excluded and
+    /// keeps the existing retire-on-revision-change behavior.
+    private func validSnapshotsOfOtherServersLocked(
+        excluding serverID: String
+    ) -> [String: MCPDiscoverySnapshot] {
+        validDiscoverySnapshotsLocked().filter { $0.key != serverID }
     }
 
     /// Caller holds `lock` and has just advanced `revision` for a tool-level
@@ -2294,24 +2477,46 @@ public final class MCPServerManager: @unchecked Sendable {
         try beginPersistentMutationLocked()
         defer { endPersistentMutationLocked() }
         let oldAuthorizations = authorizations
+        let oldSnapshots = discoverySnapshots
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: id)
         let oldRevision = revision
-        let removed = authorizations.removeValue(forKey: id)
-        if removed != nil {
+        // 保留工具名单与摘要绑定，只把服务器授权置为 false；重新授权服务器时
+        // authorizeServer 按指纹一致恢复原名单。isToolAuthorized / 发现 / 桥接
+        // 都先要求 serverAuthorized，所以保留名单不会被执行。
+        let removed = authorizations[id]
+        if let previous = removed, previous.serverAuthorized {
+            authorizations[id] = MCPToolAuthorization(
+                allowedFullNames: previous.allowedFullNames,
+                serverID: previous.serverID,
+                descriptorFingerprint: previous.descriptorFingerprint,
+                serverAuthorized: false,
+                authorizedToolNames: previous.authorizedToolNames,
+                schemaBindingDigest: previous.schemaBindingDigest,
+                toolSchemaDigests: previous.toolSchemaDigests
+            )
             revision += 1
+            restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         }
         do {
             try saveAuthorizationsLocked()
         } catch {
             authorizations = oldAuthorizations
+            discoverySnapshots = oldSnapshots
             revision = oldRevision
             throw error
         }
-        if removed != nil { disconnectRuntime(serverID: id) }
+        if let removed, removed.serverAuthorized { disconnectRuntime(serverID: id) }
         return removed
     }
 
     @discardableResult
     public func revokeTool(serverID: String, toolName: String) throws -> MCPToolAuthorization? {
+        try revokeTools(serverID: serverID, toolNames: [toolName])
+    }
+
+    /// 批量撤销：一次持久化。
+    @discardableResult
+    public func revokeTools(serverID: String, toolNames: [String]) throws -> MCPToolAuthorization? {
         lock.lock()
         defer { lock.unlock() }
         try beginPersistentMutationLocked()
@@ -2321,7 +2526,11 @@ public final class MCPServerManager: @unchecked Sendable {
         let oldSnapshots = discoverySnapshots
         let acceptedSnapshots = validDiscoverySnapshotsLocked()
         let oldRevision = revision
-        grant.authorizedToolNames.remove(toolName)
+        grant.authorizedToolNames.subtract(toolNames)
+        if var digests = grant.toolSchemaDigests {
+            for name in toolNames { digests.removeValue(forKey: name) }
+            grant.toolSchemaDigests = digests
+        }
         authorizations[serverID] = grant
         revision += 1
         restampAcceptedDiscoverySnapshotsLocked(acceptedSnapshots)
@@ -2355,9 +2564,13 @@ public final class MCPServerManager: @unchecked Sendable {
         let oldServers = servers
         let oldTrash = trashServers
         let oldAuthorizations = authorizations
+        let oldSnapshots = discoverySnapshots
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: server.id)
         let oldRevision = revision
         if let idx = servers.firstIndex(where: { $0.id == server.id }) {
-            if servers[idx].descriptorFingerprint != server.descriptorFingerprint {
+            // 启用状态变化（停用或再启用）与 enableServer 同口径：旧授权作废，须重新授权。
+            if servers[idx].descriptorFingerprint != server.descriptorFingerprint
+                || servers[idx].enabled != server.enabled {
                 authorizations.removeValue(forKey: server.id)
             }
             servers[idx] = server
@@ -2366,12 +2579,14 @@ public final class MCPServerManager: @unchecked Sendable {
         }
         trashServers.removeAll { $0.id == server.id }
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         do {
             try saveLocked()
         } catch {
             servers = oldServers
             trashServers = oldTrash
             authorizations = oldAuthorizations
+            discoverySnapshots = oldSnapshots
             revision = oldRevision
             throw error
         }
@@ -2454,15 +2669,19 @@ public final class MCPServerManager: @unchecked Sendable {
         }
         let oldServers = servers
         let oldTrash = trashServers
+        let oldSnapshots = discoverySnapshots
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: id)
         let oldRevision = revision
         let restored = trashServers.remove(at: idx)
         servers.append(restored)
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         do {
             try saveLocked()
         } catch {
             servers = oldServers
             trashServers = oldTrash
+            discoverySnapshots = oldSnapshots
             revision = oldRevision
             throw error
         }
@@ -2491,8 +2710,10 @@ public final class MCPServerManager: @unchecked Sendable {
         // Both disabling and later re-enabling require a fresh explicit grant.
         // Retire the old grant durably before publishing the new enabled bit:
         // mcps.json and its authorization document are separate files.
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: id)
         authorizations.removeValue(forKey: id)
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         do {
             try saveAuthorizationsLocked()
             try saveLocked(persistAuthorizations: false)
@@ -2551,18 +2772,22 @@ public final class MCPServerManager: @unchecked Sendable {
         let oldServers = servers
         let oldTrash = trashServers
         let oldAuthorizations = authorizations
+        let oldSnapshots = discoverySnapshots
         let oldRevision = revision
         let removed = servers.remove(at: idx)
+        let unaffectedSnapshots = validSnapshotsOfOtherServersLocked(excluding: removed.id)
         authorizations.removeValue(forKey: removed.id)
         trashServers.removeAll { $0.id == removed.id }
         trashServers.append(removed)
         revision += 1
+        restampAcceptedDiscoverySnapshotsLocked(unaffectedSnapshots)
         do {
             try saveLocked()
         } catch {
             servers = oldServers
             trashServers = oldTrash
             authorizations = oldAuthorizations
+            discoverySnapshots = oldSnapshots
             revision = oldRevision
             throw error
         }

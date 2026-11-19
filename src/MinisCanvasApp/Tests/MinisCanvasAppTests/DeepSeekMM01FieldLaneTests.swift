@@ -74,7 +74,7 @@ private final class MM01FakeOfficialWire: URLProtocol, @unchecked Sendable {
         Self.lock.lock()
         let forced = Self.forcedStatusDelay == 0 ? Self.forcedStatus : nil
         if Self.forcedStatusDelay > 0 { Self.forcedStatusDelay -= 1 }
-        let status = forced ?? (Self.rejectVisual && request.httpMethod == "POST" && payload?["max_tokens"] as? Int != 1 ? 503 : 200)
+        let status = forced ?? (Self.rejectVisual && request.httpMethod == "POST" && payload?["max_tokens"] as? Int != 16 ? 503 : 200)
         Self.responseStatuses.append(status); Self.lock.unlock()
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": streaming ? "text/event-stream" : "application/json"])!
@@ -345,7 +345,7 @@ struct DeepSeekMM01FieldLaneTests {
         try #require(MM01FakeOfficialWire.requests.count >= 4) // Preserve original expects, avoid secondary indexing SIGTRAP.
         let probe = try #require(try JSONSerialization.jsonObject(with: MM01FakeOfficialWire.requests[3].1) as? [String: Any])
         #expect(probe["model"] as? String == "deepseek-flash")
-        #expect(probe["max_tokens"] as? Int == 1)
+        #expect(probe["max_tokens"] as? Int == 16)
         f.chat.newSession()
         let boundRecord = f.center.providerRecords.first { $0.name == DeepSeekProviderContract.apiKeyEnvironmentVariable }
         let adapter = ChatStore.ChatModelPickerAdapter(store: f.center.providerReadinessStore)
@@ -1679,7 +1679,11 @@ extension DeepSeekMM01FieldLaneTests {
         #expect(result.state == .blocked)
         #expect(result != first)
         #expect(!f.center.providerReadinessStore.records.isEmpty)
-        #expect(f.center.providerReadinessStore.records.allSatisfy { $0.status == .unavailable && $0.readinessState == .blocked })
+        // 变更后旧的通过记录必须作废：不再带通过状态和旧证据。本地受控时请求没有发出去，
+        // 属于“暂时没验证成”（未验证、可重试），而不是沿用旧通过。
+        #expect(f.center.providerReadinessStore.records.allSatisfy {
+            $0.status != .passed && $0.readinessState != .live && $0.evidenceID == nil
+        })
         #expect(MM01FakeOfficialWire.requests.count == 4)
         let current = try #require(f.center.providerRecords.first { $0.id == record.id })
         #expect(f.center.providerReadinessLocalControlMessage(for: current) == nil)

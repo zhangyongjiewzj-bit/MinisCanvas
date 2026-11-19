@@ -55,6 +55,7 @@ private final class ChildQueueUserDelegate: ApprovalDelegate, @unchecked Sendabl
     func cancel(_ requestID: String) { lock.withLock { calls[requestID]?.2.cancel() } }
     func decision(_ requestID: String) -> ApprovalDecision? { lock.withLock { decisions[requestID] } }
     func origin(_ requestID: String) -> ApprovalExecutionOrigin? { lock.withLock { origins[requestID] } }
+    var debugSummary: String { lock.withLock { calls.map { "\($0.value.0.toolName):\(String(describing: decisions[$0.key]?.status))" }.joined(separator: ",") } }
     func duplicate(_ requestID: String) async -> ApprovalDecision {
         guard let call = lock.withLock({ calls[requestID] }) else { return .deny }
         return await AgentExecutionContext.$current.withValue(call.1) {
@@ -169,14 +170,14 @@ private final class ChildMutationUserProvider: LLMProvider, ProviderRuntimeConfi
                 return parallelCounts[key]!
             }
             if count == 1 {
-                let name = runtimeChild == nil ? OrchestrationToolExecutor.toolName : "file_read"
+                let name = runtimeChild == nil ? OrchestrationToolExecutor.toolName : effectTool
                 let payload: [String: Any]
                 if runtimeChild == nil {
-                    let readRoot = URL(fileURLWithPath: input["path"] as! String).deletingLastPathComponent().path
+                    let readRoot = URL(fileURLWithPath: input["path"] as? String ?? (input["command"] as! String).components(separatedBy: " ").last!).deletingLastPathComponent().path
                     payload = ["input_version": 2, "strategy": "parallel", "tasks": ["a", "b"].map { suffix in
                         ["id": childID + "-" + suffix, "title": childID + "-" + suffix,
                          "instructions": "read only the owned synthetic file once",
-                         "required_capabilities": ["tools"], "allowed_tool_names": ["file_read"],
+                         "required_capabilities": ["tools"], "allowed_tool_names": [effectTool],
                          "allowed_read_roots": [readRoot]] as [String: Any]
                     }]
                 } else { payload = input }
@@ -598,7 +599,9 @@ struct Goal18ChildAuthorityTests {
             ChildMutationUserProvider(label: label, tool: tool,
                 input: tool == "file_write"
                     ? ["path": root.appendingPathComponent(label + ".txt").path, "content": "owned-child-bytes"]
-                    : ["command": "echo CHILD_COMMAND_PROOF", "timeout": 10], gate: gate, readFullResult: readFullResult)
+                    // 只读命令按 PM-05 免问，这里加一个新建文件动作，保持“需要审批”的场景。
+                    : ["command": "echo CHILD_COMMAND_PROOF && touch " + root.appendingPathComponent(label + ".marker").path,
+                       "timeout": 10], gate: gate, readFullResult: readFullResult)
         }
         let off = provider("cold-off")
         let (offSession, offTask) = try start(off)
@@ -798,6 +801,8 @@ extension Goal18ChildAuthorityTests {
         let profile = try #require(RuntimeIsolationProfile.formalTestProfileForDefaultConsumer())
         let root = profile.rootDirectory.appendingPathComponent("child-queue-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        // 对齐 Claude Code：授权目录内的只读文件工具不再弹审批卡，所以两个子任务改用仍逐次审批的
+        // shell_execute（cat 读同一个文件），用来验证并行审批队列。
         let file = root.appendingPathComponent("owned.txt")
         let bytes = Data("CHILD_QUEUE_OWNED_BYTES\n".utf8)
         try bytes.write(to: file)
@@ -831,7 +836,7 @@ extension Goal18ChildAuthorityTests {
             defaults.removePersistentDomain(forName: suite)
             try? FileManager.default.removeItem(at: root)
         }
-        settings.childMutationsEnabled = false
+        settings.childMutationsEnabled = true
         settings.maxLoopIterations = 4
         settings.fallbackEnabled = false
         settings.approvalPolicy = .alwaysAsk
@@ -841,8 +846,9 @@ extension Goal18ChildAuthorityTests {
             approvalDelegateOverride: approval, enableOrchestration: true,
             childConcurrencySelection: try ChildConcurrencySelection(userSelected: 2, recommended: 2, effective: 2),
             externalNetworkAllowed: true).value
-        let provider = ChildMutationUserProvider(label: "queue-" + action, tool: "file_read",
-            input: ["path": file.path], parallelReads: true)
+        let provider = ChildMutationUserProvider(label: "queue-" + action, tool: "shell_execute",
+            input: ["command": "cat " + file.path + " && touch " + root.appendingPathComponent("queue-marker").path,
+                    "timeout": 10], parallelReads: true)
         let session = bridge.chat.applyNewSession(title: "parallel owned approval queue")
         bridge.chat.composerPolicySelection = .init(mode: .manual, approvalScope: .request,
             effort: .standard, bypassModeConfirmed: false)
@@ -850,10 +856,10 @@ extension Goal18ChildAuthorityTests {
         bridge.chat.draftText = "delegate the owned synthetic reads"
         bridge.chat.submitComposer()
         let parentTask = try #require(bridge.chat.turnTaskForTests(sessionID: session))
-        func wait(_ predicate: () -> Bool) async throws {
+        func wait(_ predicate: () -> Bool, line: UInt = #line) async throws {
             let deadline = Date().addingTimeInterval(10)
             while !predicate() && Date() < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            try #require(predicate())
+            try #require(predicate(), Comment(rawValue: "wait@\(line) pending=\(bridge.approvalCenter.pendingRequest?.toolName ?? "nil") queued=\(bridge.approvalCenter.approvalQueue.queuedRequests.map(\.toolName)) streaming=\(bridge.chat.isStreaming) approvals=[\(approval.debugSummary)] feedback=\(provider.parallelToolFeedback)"))
         }
         // The parent orchestrate request also receives its own explicit user
         // decision. The fixture never approves a child on the parent's behalf.
@@ -865,7 +871,7 @@ extension Goal18ChildAuthorityTests {
             && bridge.approvalCenter.approvalQueue.queuedRequests.count == 1 }
         let first = try #require(bridge.approvalCenter.pendingRequest)
         let second = try #require(bridge.approvalCenter.approvalQueue.queuedRequests.first)
-        #expect(first.toolName == "file_read" && second.toolName == "file_read")
+        #expect(first.toolName == "shell_execute" && second.toolName == "shell_execute")
         #expect(first.taskID != second.taskID && first.sessionID != second.sessionID)
         #expect(first.identityDigest != second.identityDigest && first.requestID != second.requestID)
         // This is the real Composer-specific branch admitted by Core, not

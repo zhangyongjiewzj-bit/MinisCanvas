@@ -32,7 +32,7 @@ struct EstimatedWindowLabel_C5_Tests {
     /// readiness store the way the Fixture adds its own (no new hook).
     private func occupancyAfterTurn(modelID: String, window: Int?) async throws -> ChatContextOccupancy {
         let fixture = try Fixture(initialHistory: [])
-        let dialogue = Dialogue(replyUsage: LLMUsage(inputTokens: 1_200, outputTokens: 100,
+        let dialogue = Dialogue(replyText: "CURRENT_REPLY_2669 streamed.", replyUsage: LLMUsage(inputTokens: 1_200, outputTokens: 100,
             cacheReadInputTokens: 0, cacheHitInputTokens: 1_200))
         dialogue.model = LLMModel(id: modelID, displayName: "C5 owned", provider: Dialogue.providerID,
                                   contextWindow: window)
@@ -56,7 +56,7 @@ struct EstimatedWindowLabel_C5_Tests {
         chat.draftText = "C5_ESTIMATED_WINDOW_SEND"
         chat.submitComposer()
         let live = await waitUntil {
-            chat.messages.last?.isStreaming == true && chat.messages.last?.content == "CURRENT_REPLY_2669"
+            chat.messages.last?.isStreaming == true && chat.messages.last?.content.hasPrefix("CURRENT_REPLY_2669 ") == true
         }
         try #require(live, "the turn must reach its streamed reply")
         dialogue.releaseReplyCompletion()

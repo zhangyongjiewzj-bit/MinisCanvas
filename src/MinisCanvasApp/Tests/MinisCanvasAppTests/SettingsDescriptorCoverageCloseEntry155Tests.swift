@@ -48,6 +48,7 @@ private let lane155ProxyPairings: [(key: String, proxies: [String])] = [
     ("__miniscanvas.safetyControl", ["safeModeEnabled", "killSwitchEnabled"]),
     ("agent.approvalPolicy", ["toolsDisabled"]),
     ("agent.terminalPolicy", ["terminalPolicySettings"]),
+    ("agent.approvalTimeoutSeconds", ["expirationInterval"]),
     ("privacy.logLevel", ["privacyLogLevel", "liveLogLevel"])
 ]
 
@@ -121,9 +122,11 @@ struct SettingsDescriptorCoverageCloseEntry155Tests {
             "modelShellNoninteractive": \.modelShellNoninteractive,
             "browserWriteEnabled": \.browserWriteEnabled,
             "fileCheckpointsEnabled": \.fileCheckpointsEnabled,
+            "backgroundAutoContinueEnabled": \.backgroundAutoContinueEnabled,
             "childMutationsEnabled": \.childMutationsEnabled,
             "childDeletionAutoReviewEnabled": \.childDeletionAutoReviewEnabled,
             "terminalPolicySettings": \.terminalPolicySettings,
+            "expirationInterval": \.approvalTimeoutSecondsSetting,
             "privacyLogLevel": \.privacyLogLevel,
             "liveLogLevel": \.liveLogLevel,
             "fileAccessAllowedRoot": \.fileAccessAllowedRoot,

@@ -547,6 +547,231 @@ public final class HookConfigStore: @unchecked Sendable {
     public func trustedProjectRoots() -> [String] {
         lock.lock()
         defer { lock.unlock() }
-        return loadTrustLocked().projects.keys.filter { $0 != userFileURL.path }.sorted()
+        return loadTrustLocked().projects.keys
+            .filter { $0 != userFileURL.path && !$0.hasPrefix(Self.claudeSettingsTrustPrefix) }.sorted()
+    }
+
+    // MARK: Claude Code 格式的 settings.json 钩子
+
+    // MARK: Claude settings 钩子引用的脚本
+
+    private static let maximumClaudeScriptFileBytes = 256 * 1024
+    private static let maximumClaudeScriptFiles = 20
+    private static let maximumClaudeScriptTotalBytes = 1024 * 1024
+
+    private struct ClaudeScriptScan {
+        var entries: [String: ScriptEntry] = [:]
+        var totalBytes = 0
+    }
+
+    /// 没有脚本入哈希时沿用只含命令的旧哈希（已有信任记录不失效）；有脚本时再叠加
+    /// 每个脚本的路径、大小、可执行位和内容摘要。
+    private static func claudeSettingsTrustHash(commandsHash: String, scripts: [ScriptEntry]) -> String {
+        var manifest = "miniscanvas-claude-settings-hooks-v2\n"
+        manifest += "commands \(commandsHash)\n"
+        for script in scripts {
+            manifest += "script \(script.path.utf8.count):\(script.path) \(script.size) "
+                + (script.isExecutable ? "x " : "- ") + script.digest + "\n"
+        }
+        return HookDigest.sha256Hex(Data(manifest.utf8))
+    }
+
+    /// 把 `<root>/<relative>` 这一个普通文件记入 `scan`；放不下（不存在、不是普通文件、
+    /// 项目级的符号链接、超过单文件/数量/总量上限、路径越出 root）返回 false。
+    private static func addClaudeScript(
+        relative: String, root: String, allowsSymlinks: Bool, scan: inout ClaudeScriptScan
+    ) -> Bool {
+        if scan.entries[relative] != nil { return true }
+        guard !relative.hasPrefix("/"), !relative.split(separator: "/").contains("..") else { return false }
+        let url = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(relative)
+        let manager = FileManager.default
+        guard let attributes = try? manager.attributesOfItem(atPath: url.path),
+              let type = attributes[.type] as? FileAttributeType else { return false }
+        var readURL = url
+        var mode = (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        if type == .typeSymbolicLink {
+            guard allowsSymlinks else { return false }
+            readURL = url.resolvingSymlinksInPath()
+            guard let resolved = try? manager.attributesOfItem(atPath: readURL.path),
+                  resolved[.type] as? FileAttributeType == .typeRegular else { return false }
+            mode = (resolved[.posixPermissions] as? NSNumber)?.intValue ?? 0
+        } else {
+            guard type == .typeRegular else { return false }
+            if !allowsSymlinks, url.resolvingSymlinksInPath().path != url.standardizedFileURL.path { return false }
+        }
+        guard scan.entries.count < maximumClaudeScriptFiles,
+              let data = try? Data(contentsOf: readURL),
+              data.count <= maximumClaudeScriptFileBytes,
+              scan.totalBytes + data.count <= maximumClaudeScriptTotalBytes else { return false }
+        scan.totalBytes += data.count
+        scan.entries[relative] = ScriptEntry(
+            path: relative, size: data.count, isExecutable: mode & 0o111 != 0,
+            digest: HookDigest.sha256Hex(data))
+        return true
+    }
+
+    /// 脚本放在 `.claude/hooks/`（用户级 `~/.claude/hooks/`）时整个目录入哈希，
+    /// 因为脚本常 source 同目录里的库。
+    private static func addClaudeScriptDirectory(
+        relative: String, root: String, allowsSymlinks: Bool, scan: inout ClaudeScriptScan
+    ) -> Bool {
+        let directory = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(relative, isDirectory: true)
+        let manager = FileManager.default
+        let resolved = directory.resolvingSymlinksInPath()
+        // 项目级目录本身不能是符号链接；用户级允许（与 settings.json 的处理一致）。
+        guard allowsSymlinks || resolved.path == directory.standardizedFileURL.path,
+              (try? manager.attributesOfItem(atPath: resolved.path))?[.type] as? FileAttributeType == .typeDirectory,
+              let subpaths = try? manager.subpathsOfDirectory(atPath: resolved.path),
+              subpaths.count <= 200 else { return false }
+        for subpath in subpaths.sorted() where !subpath.hasSuffix(".DS_Store") {
+            let entryRelative = relative + "/" + subpath
+            guard let entryAttributes = try? manager.attributesOfItem(
+                atPath: resolved.appendingPathComponent(subpath).path),
+                  let type = entryAttributes[.type] as? FileAttributeType else { return false }
+            if type == .typeDirectory { continue }
+            guard addClaudeScript(relative: entryRelative, root: root,
+                                  allowsSymlinks: allowsSymlinks, scan: &scan) else { return false }
+        }
+        return true
+    }
+
+    /// 信任记录里 Claude 设置文件的键前缀，避免和项目根路径混在一起。
+    static let claudeSettingsTrustPrefix = "claude-settings:"
+    public static let maximumClaudeSettingsBytes = 256 * 1024
+
+    /// 读取 ~/.claude/settings.json、<项目>/.claude/settings.json 与 settings.local.json
+    /// 里的 hooks 段。只返回存在且含钩子的文件。每份文件只读一次，哈希、钩子定义和信任
+    /// 都来自同一份字节；没有信任记录（或内容变了）的文件不会被执行，只供设置页审阅。
+    /// 只有 `.claude/hooks/`（用户级 `~/.claude/hooks/`）里的脚本会整个目录并入信任哈希；
+    /// 引用了该目录以外脚本的钩子，以及哈希放不下的引用（目录、过大、符号链接、不存在、
+    /// 数量或体积超限）所在的钩子，一律标记为不可执行，因为脚本再引用的文件无法覆盖。
+    public func claudeSettingsSnapshots(
+        projectRoot: URL?,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [ClaudeSettingsHooksSnapshot] {
+        lock.lock()
+        defer { lock.unlock() }
+        return claudeSettingsSnapshotsLocked(projectRoot: projectRoot, homeDirectory: homeDirectory)
+    }
+
+    private func claudeSettingsSnapshotsLocked(
+        projectRoot: URL?, homeDirectory: URL
+    ) -> [ClaudeSettingsHooksSnapshot] {
+        var sources: [(scope: ClaudeSettingsHooksSnapshot.Scope, url: URL, base: String, prefix: String)] = []
+        let userBase = homeDirectory.appendingPathComponent(".claude", isDirectory: true).standardizedFileURL
+        sources.append((.user, userBase.appendingPathComponent("settings.json"), userBase.path, "cc-user"))
+        if let projectRoot, let rootPath = Self.canonicalRootPath(projectRoot) {
+            let base = URL(fileURLWithPath: rootPath, isDirectory: true).appendingPathComponent(".claude", isDirectory: true)
+            if base.standardizedFileURL.path != userBase.path {
+                sources.append((.project, base.appendingPathComponent("settings.json"), rootPath, "cc-project"))
+                sources.append((.projectLocal, base.appendingPathComponent("settings.local.json"), rootPath, "cc-local"))
+            }
+        }
+        var result: [ClaudeSettingsHooksSnapshot] = []
+        let trustRecords = loadTrustLocked().projects
+        for source in sources {
+            let path = source.url.standardizedFileURL.path
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            let root = source.base
+            func snapshot(_ hooks: [HookDefinition], _ hash: String?, _ trust: ProjectHooksSnapshot.Trust,
+                          outside: [String: [String]] = [:], scripts: [String] = []) -> ClaudeSettingsHooksSnapshot {
+                ClaudeSettingsHooksSnapshot(scope: source.scope, path: path, snapshot: ProjectHooksSnapshot(
+                    projectRoot: root, contentHash: hash, hooks: hooks, trust: trust,
+                    protectedScriptFiles: scripts, outsideReferences: outside))
+            }
+            // 点文件常被符号链接到别处；信任绑定的是读到的内容哈希，所以允许链接。
+            let readURL = source.url.resolvingSymlinksInPath()
+            guard let values = try? readURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true, let size = values.fileSize,
+                  size <= Self.maximumClaudeSettingsBytes,
+                  let data = try? Data(contentsOf: readURL),
+                  data.count <= Self.maximumClaudeSettingsBytes else {
+                result.append(snapshot([], nil, .invalid("设置文件不是普通文件或过大")))
+                continue
+            }
+            guard let hooks = ClaudeSettingsHooksParser.parse(data, idPrefix: source.prefix) else {
+                result.append(snapshot([], nil, .invalid("设置文件不是有效的 JSON")))
+                continue
+            }
+            guard !hooks.isEmpty else {
+                // 文件里只有本 App 不支持的事件或钩子类型：仍列出一行，让设置页说明被忽略了什么。
+                if !ClaudeSettingsHooksParser.ignoredEventNames(in: data).isEmpty
+                    || !ClaudeSettingsHooksParser.ignoredHookTypes(in: data).isEmpty {
+                    result.append(snapshot([], nil, .noFile))
+                }
+                continue
+            }
+            let commandsHash = ClaudeSettingsHooksParser.contentHash(of: hooks)
+            // 钩子直接引用的脚本（项目内、~/.claude 内的普通文件）并入信任哈希：脚本改了，
+            // 哈希就变，需要重新信任。引用了哈希放不下的东西（目录、过大、符号链接、
+            // 不存在、数量或体积超限、项目外）的钩子仍不执行。
+            let isUserScope = source.scope == .user
+            let hooksDirectory = isUserScope ? "hooks" : ".claude/hooks"
+            var outside: [String: [String]] = [:]
+            var scan = ClaudeScriptScan()
+            for hook in hooks {
+                let references = HookScriptReferenceAnalyzer.outsideReferences(
+                    command: hook.command, projectRoot: root,
+                    allowsProjectDirectoryReferences: !isUserScope,
+                    protectsHooksDirectory: false, homeDirectory: homeDirectory.standardizedFileURL.path)
+                guard !references.isEmpty else { continue }
+                // 用户级钩子在项目目录（没有项目时在家目录）里执行，写成相对路径的引用
+                // 指向的不是 ~/.claude，不能按 ~/.claude 内的文件入哈希。
+                let relativeWritten: Set<String> = isUserScope
+                    ? Set(HookScriptReferenceAnalyzer.outsideReferences(
+                        command: hook.command, projectRoot: "/nonexistent-miniscanvas-hook-root",
+                        allowsProjectDirectoryReferences: false, protectsHooksDirectory: false,
+                        homeDirectory: homeDirectory.standardizedFileURL.path))
+                    : []
+                var unhashable: [String] = []
+                for reference in references {
+                    if relativeWritten.contains(reference) {
+                        unhashable.append(reference)
+                    } else if reference == hooksDirectory || reference.hasPrefix(hooksDirectory + "/") {
+                        let ok = Self.addClaudeScriptDirectory(
+                            relative: hooksDirectory, root: root, allowsSymlinks: isUserScope, scan: &scan)
+                            && (reference == hooksDirectory || scan.entries[reference] != nil)
+                        if !ok { unhashable.append(reference) }
+                    } else {
+                        // 不在 hooks 目录里的脚本，其引用的其它文件不在哈希里，不能执行。
+                        unhashable.append(reference)
+                    }
+                }
+                if !unhashable.isEmpty { outside[hook.id] = unhashable }
+            }
+            let scripts = scan.entries.values.sorted { $0.path.utf8.lexicographicallyPrecedes($1.path.utf8) }
+            let hash = scripts.isEmpty ? commandsHash : Self.claudeSettingsTrustHash(commandsHash: commandsHash, scripts: scripts)
+            let saved = trustRecords[Self.claudeSettingsTrustPrefix + path]
+            let trust: ProjectHooksSnapshot.Trust = saved?.sha256 == hash
+                ? .trusted : .untrusted(changedSinceTrust: saved != nil)
+            result.append(snapshot(hooks, hash, trust, outside: outside, scripts: scripts.map(\.path)))
+        }
+        return result
+    }
+
+    /// Settings-UI only：`expectedHash` 是用户审阅过的钩子哈希；文件在审阅后变了就什么都不信任。
+    public func trustClaudeSettingsHooks(
+        path: String,
+        expectedHash: String,
+        projectRoot: URL?,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = claudeSettingsSnapshotsLocked(projectRoot: projectRoot, homeDirectory: homeDirectory)
+            .first(where: { $0.path == path }),
+              let hash = entry.snapshot.contentHash else { throw HookConfigStoreError.noProjectFile }
+        guard hash == expectedHash else { throw HookConfigStoreError.contentChangedSinceReview }
+        var file = loadTrustLocked()
+        file.projects[Self.claudeSettingsTrustPrefix + path] = TrustRecord(sha256: hash, trustedAt: Date())
+        try writeTrustLocked(file)
+    }
+
+    public func revokeClaudeSettingsTrust(path: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        var file = loadTrustLocked()
+        guard file.projects.removeValue(forKey: Self.claudeSettingsTrustPrefix + path) != nil else { return }
+        try writeTrustLocked(file)
     }
 }

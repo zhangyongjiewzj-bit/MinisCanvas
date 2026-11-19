@@ -154,19 +154,20 @@ struct CATALOGContractTests {
         #expect(definition.name == " exact_binding ")
         #expect(definition.propertyOrdering == ["a", "z"])
         #expect(definition.required == ["z", "a"])
-        #expect(definition.parameters["z"]?.type == .integer)
+        #expect(definition.parameters["z"]?.type == .number)
         #expect(definition.parameters["a"]?.enumValues == ["second", "first"])
         #expect(definition.description.contains("synthetic-server"))
     }
 
-    @Test("One invalid MCP item rejects the whole batch")
-    func invalidMCPBatch() {
+    @Test("One malformed MCP schema only skips that tool")
+    func invalidMCPBatch() throws {
         let good = MCPBoundTool(fullName: "good", serverID: "synthetic", tool: MCPTool(name: "good"))
+        // 11/16：单个工具的 schema 损坏（properties 不是对象）只跳过该工具，其余照常可用。
         let invalid = MCPBoundTool(fullName: "bad", serverID: "synthetic", tool: MCPTool(name: "bad",
-            inputSchema: .object(["properties": .object(["nested": .object(["type": .string("object")])])])))
-        #expect(throws: MCPClientError.self) {
-            try AgentToolCatalog.makeMCPToolDefinitions([good, invalid])
-        }
+            inputSchema: .object(["properties": .string("not-an-object")])))
+        let result = try AgentToolCatalog.makeMCPToolDefinitionsReportingSkipped([good, invalid])
+        #expect(result.definitions.map(\.name) == ["good"])
+        #expect(result.skippedToolNames == ["bad"])
     }
 
     @Test("Local catalog has baseline prefix and does not expose unavailable speech")
@@ -177,7 +178,7 @@ struct CATALOGContractTests {
         #expect(AgentToolCatalog.implementedNativeToolNames == Set([
             "file_grep", "file_glob", "todo_write", "shell_execute", "shell_output", "shell_stop",
             "file_read", "file_write", "web_fetch",
-            "file_edit", "file_delete", "session_read", "external_session_read", "external_session_send", "context_compact", "browser", "speech",
+            "file_edit", "file_delete", "session_read", "external_session_read", "external_session_send", "session_send", "task_board", "context_compact", "browser", "speech",
             "skill_create", "skill_update", "skill_delete"
         ]))
         #expect(Array(tools.prefix(3).map(\.name)) == ["file_grep", "file_glob", "todo_write"])

@@ -210,6 +210,7 @@ struct W5048ResponsesAssistantStreamTests {
         for event in events {
             switch event {
             case .textDelta(let text): deltas.append(text)
+            case .thinkingDelta: break
             case .completed(let response): terminal = response
             }
         }
@@ -256,6 +257,7 @@ struct W5048ResponsesAssistantStreamTests {
         for event in events {
             switch event {
             case .textDelta(let text): deltas.append(text)
+            case .thinkingDelta: break
             case .completed(let response): terminal = response
             }
         }
@@ -394,6 +396,136 @@ struct W5048ResponsesAssistantStreamTests {
             #expect(!detail.contains("fixture-responses-secret"))
             // 037 typed-kind consumption unchanged on the migrated path.
             #expect(ProviderRequestFailureKind.classify(error) == .rateLimited)
+        }
+    }
+
+    // R3-02：流式请求的非 2xx 要读一段有上限的正文交给识别器（超窗、余额不足），
+    // 任何账号类型都一样；正文原文不进错误对象。
+    @Test("acquisition 400 with an overflow body maps to contextLengthExceeded without leaking text")
+    func acquisitionOverflowBodyMapsToContextLength() async throws {
+        defer { W5048ResponsesMockURLProtocol.reset() }
+        let isolation = try isolateCheckpointDirectory()
+        defer { restore(isolation) }
+        W5048ResponsesMockURLProtocol.handler = {
+            (400, Data(#"{"error":{"message":"fixture-overflow-secret","type":"invalid_request_error","code":"context_length_exceeded"}}"#.utf8),
+             ["Content-Type": "application/json"])
+        }
+        do {
+            _ = try await stream(makeProvider(session: W5048ResponsesMockURLProtocol.makeSession(), checkpointDirectory: isolation.directory))
+            Issue.record("expected acquisition overflow failure")
+        } catch let error as LLMError {
+            guard case .contextLengthExceeded = error else {
+                Issue.record("expected contextLengthExceeded, got \(error)")
+                return
+            }
+            #expect(!String(describing: error).contains("fixture-overflow-secret"))
+        }
+    }
+
+    @Test("acquisition 429 with an insufficient_quota body maps to the balance-insufficient error")
+    func acquisitionInsufficientQuotaBodyMapsToQuotaExhausted() async throws {
+        defer { W5048ResponsesMockURLProtocol.reset() }
+        let isolation = try isolateCheckpointDirectory()
+        defer { restore(isolation) }
+        W5048ResponsesMockURLProtocol.handler = {
+            (429, Data(#"{"error":{"message":"fixture-quota-secret","type":"insufficient_quota","code":"insufficient_quota"}}"#.utf8),
+             ["Content-Type": "application/json"])
+        }
+        do {
+            _ = try await stream(makeProvider(session: W5048ResponsesMockURLProtocol.makeSession(), checkpointDirectory: isolation.directory))
+            Issue.record("expected acquisition quota failure")
+        } catch let error as LLMError {
+            #expect(error.isQuotaExhausted)
+            #expect(!String(describing: error).contains("fixture-quota-secret"))
+            #expect(!error.userMessageZH.contains("fixture-quota-secret"))
+        }
+    }
+
+    @Test("in-stream failure events map known error codes and keep other codes payload-free")
+    func inStreamFailureEventsMapErrorCodes() async throws {
+        defer { W5048ResponsesMockURLProtocol.reset() }
+        let isolation = try isolateCheckpointDirectory()
+        defer { restore(isolation) }
+        let created = (event: "response.created",
+                       data: #"{"type":"response.created","response":{"id":"resp_fail_1","status":"in_progress"}}"#)
+        func failed(_ code: String) -> (event: String, data: String) {
+            (event: "response.failed",
+             data: #"{"type":"response.failed","response":{"id":"resp_fail_1","status":"failed","error":{"code":""# + code + #"","message":"fixture-stream-secret"}}}"#)
+        }
+        func errorEvent(_ code: String) -> (event: String, data: String) {
+            (event: "error", data: #"{"type":"error","code":""# + code + #"","message":"fixture-stream-secret"}"#)
+        }
+        let cases: [(event: String, data: String)] = [
+            failed("context_length_exceeded"), failed("insufficient_quota"), failed("server_error"),
+            errorEvent("context_length_exceeded"), errorEvent("insufficient_quota"), errorEvent("server_error"),
+        ]
+        var results: [LLMError] = []
+        for terminal in cases {
+            W5048ResponsesMockURLProtocol.handler = { responsesSSE([created, terminal]) }
+            do {
+                _ = try await collect(stream(makeProvider(session: W5048ResponsesMockURLProtocol.makeSession(), checkpointDirectory: isolation.directory)))
+                Issue.record("expected \(terminal.event) to throw")
+            } catch let error as LLMError {
+                results.append(error)
+            }
+        }
+        #expect(results.count == cases.count)
+        guard results.count == cases.count else { return }
+        for index in [0, 3] {
+            if case .contextLengthExceeded = results[index] {} else {
+                Issue.record("case \(index): expected contextLengthExceeded, got \(results[index])")
+            }
+        }
+        #expect(results[1].isQuotaExhausted)
+        #expect(results[4].isQuotaExhausted)
+        for index in [2, 5] {
+            guard case .providerError(let message) = results[index] else {
+                Issue.record("case \(index): expected providerError, got \(results[index])")
+                continue
+            }
+            #expect(!message.contains("fixture-stream-secret"))
+        }
+        for error in results {
+            #expect(!String(describing: error).contains("fixture-stream-secret"))
+        }
+    }
+
+    @Test("text-only stream maps response.failed and error event codes the same way")
+    func textOnlyStreamMapsFailureCodes() async throws {
+        defer { W5048ResponsesMockURLProtocol.reset() }
+        let isolation = try isolateCheckpointDirectory()
+        defer { restore(isolation) }
+        let created = (event: "response.created",
+                       data: #"{"type":"response.created","response":{"id":"resp_fail_2","status":"in_progress"}}"#)
+        let failedOverflow = (event: "response.failed",
+                              data: #"{"type":"response.failed","response":{"id":"resp_fail_2","status":"failed","error":{"code":"context_length_exceeded","message":"fixture-text-secret"}}}"#)
+        let errorQuota = (event: "error",
+                          data: #"{"type":"error","code":"insufficient_quota","message":"fixture-text-secret"}"#)
+        var results: [LLMError] = []
+        for terminal in [failedOverflow, errorQuota] {
+            W5048ResponsesMockURLProtocol.handler = { responsesSSE([created, terminal]) }
+            let provider = makeProvider(session: W5048ResponsesMockURLProtocol.makeSession(), checkpointDirectory: isolation.directory)
+            do {
+                let chunks = try await provider.streamMessage(
+                    messages: [LLMMessage(role: .user, content: "hi")],
+                    systemPrompt: nil,
+                    maxTokens: 64,
+                    temperature: nil
+                )
+                for try await _ in chunks {}
+                Issue.record("expected \(terminal.event) to throw")
+            } catch let error as LLMError {
+                results.append(error)
+            }
+        }
+        #expect(results.count == 2)
+        guard results.count == 2 else { return }
+        if case .contextLengthExceeded = results[0] {} else {
+            Issue.record("expected contextLengthExceeded, got \(results[0])")
+        }
+        #expect(results[1].isQuotaExhausted)
+        for error in results {
+            #expect(!String(describing: error).contains("fixture-text-secret"))
         }
     }
 

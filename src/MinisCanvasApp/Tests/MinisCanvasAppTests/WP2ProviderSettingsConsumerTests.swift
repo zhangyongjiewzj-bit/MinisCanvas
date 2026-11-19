@@ -165,7 +165,7 @@ struct WP2ProviderSettingsConsumerTests {
                 forProviderName: "WP2_PROVIDER_API_KEY"
             )
         )
-        #expect(report.modelChecks.count == 2)
+        #expect(report.modelChecks.count == 1)
 
         let projection = center.chatModelPickerProjection
         #expect(projection.items.map(\.modelID) == ["configured-model"])

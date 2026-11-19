@@ -45,6 +45,38 @@ struct CustomModelWindowReachesTurn_C8_Tests {
         #expect(provider.model.contextWindowTokens == 32_000)
     }
 
+    /// R3-05: background, project and scheduled turns are admitted against the running
+    /// model's window with the user's trigger, but never compact; the foreground keeps compaction.
+    @Test func admissionOfUnattendedTurnsUsesTheModelWindowAndDisallowsCompaction() throws {
+        let chat = ChatStore(preferencesDefaults: UserDefaults(suiteName: "c8-admission-\(UUID().uuidString)")!,
+            logManager: LogManager(directory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("c8-admission-\(UUID().uuidString)"), ringCapacity: 20))
+        var settings = AgentSettings.default
+        settings.autoCompactThreshold = 0.8
+        chat.configureBudget(from: settings)
+        let model = ChatStore.customProviderModel(record: record(), modelID: "small-local")
+        let unattended = try #require(chat.contextAdmissionConfig(
+            sessionID: nil, model: model, settings: nil, allowsCompaction: false))
+        #expect(unattended.windowTokens == 32_000)
+        #expect(unattended.triggerFraction == 0.8)
+        #expect(!unattended.allowsCompaction && !unattended.appliesReductionInLoop)
+        let foreground = try #require(chat.contextAdmissionConfig(sessionID: nil, model: model, settings: nil))
+        #expect(foreground.allowsCompaction)
+    }
+
+    /// R3-08: the max output the user entered for a custom model becomes the request ceiling;
+    /// models without one keep the default.
+    @Test func customProviderModelCarriesTheEnteredMaxOutput() {
+        var record = record()
+        record.modelMaxOutputTokens = ["small-local": 8_192]
+        let entered = ChatStore.customProviderModel(record: record, modelID: "small-local")
+        #expect(entered.maxOutputTokens == 8_192)
+        #expect(ChatStore.chatMaxOutputTokens(model: entered) == 8_192)
+        let unset = ChatStore.customProviderModel(record: record, modelID: "unset-local")
+        #expect(unset.maxOutputTokens == nil)
+        #expect(ChatStore.chatMaxOutputTokens(model: unset) == ChatStore.defaultChatMaxOutputTokens)
+    }
+
     /// The window of the model the turn runs with is the occupancy denominator and
     /// the base of the compaction threshold: 27_000 tokens is 84% of 32_000 (it
     /// would be 21% of the 128_000 fallback and never compact).

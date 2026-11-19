@@ -53,7 +53,9 @@ enum ThemeApprovalPackageFieldFixture {
     /// crosses into the exact BridgeStore-owned presentation center.
     nonisolated static func requestApproval(center: ApprovalPromptCenter) async -> Outcome {
         let input: [String: Any] = [
-            "command": "printf 'TASK2287 synthetic preview only'",
+            // 只有不可逆操作才有第二次确认（2026-11-16）：用 rm 命令文本让这张展示卡保持两步确认。
+            // 本夹具没有执行器，命令不会运行。
+            "command": "rm /tmp/TASK2287-synthetic-preview-only",
             "fixture": "THEME04: approval display only; no command will execute"
         ]
         guard let digest = ApprovalAuthorizationContext.payloadDigest(for: input)

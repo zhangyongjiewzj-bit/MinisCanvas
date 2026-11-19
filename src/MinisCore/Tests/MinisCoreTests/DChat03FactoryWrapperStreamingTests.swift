@@ -141,6 +141,7 @@ private actor WrapperEvents {
     func append(_ event: LLMAssistantStreamEvent) {
         switch event {
         case .textDelta(let delta): deltas.append(delta)
+        case .thinkingDelta: break
         case .completed: completed += 1
         }
     }
@@ -223,7 +224,9 @@ struct DChat03FactoryWrapperStreamingTests {
         let body = try #require(server.requestBodies.first)
         let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
         #expect(json["stream"] as? Bool == true)
-        #expect(json["max_completion_tokens"] as? Int == 64)
+        // MC4-012：非 OpenAI 官方、非推理模型的兼容端点（此处为本机回环桩）发 max_tokens。
+        #expect(json["max_tokens"] as? Int == 64)
+        #expect(json["max_completion_tokens"] == nil)
         #expect(json["temperature"] as? Double == 0.2)
         #expect((json["tools"] as? [[String: Any]])?.count == 1)
         #expect((json["messages"] as? [[String: Any]])?.first?["content"] as? String == "fixture-system")
@@ -233,6 +236,7 @@ struct DChat03FactoryWrapperStreamingTests {
         while let event = try await iterator.next() {
             switch event {
             case .textDelta(let text): deltas.append(text)
+            case .thinkingDelta: break
             case .completed(let response): terminals.append(response)
             }
         }

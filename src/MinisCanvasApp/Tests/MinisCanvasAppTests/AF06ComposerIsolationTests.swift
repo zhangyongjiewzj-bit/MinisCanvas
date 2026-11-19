@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 import Testing
 @testable import MinisCanvasApp
 
@@ -29,6 +30,28 @@ struct AF06ComposerIsolationTests {
         #expect(restored.id == attachmentID)
         #expect(restored.kind == .text)
         #expect(restored.data == Data("late attachment".utf8))
+    }
+
+    @Test("files the user attaches count as already read by the model in that session")
+    func attachedFilesAreMarkedRead() throws {
+        let chat = ChatStore()
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("attach-read-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("existing.txt")
+        try Data("old".utf8).write(to: fileURL)
+        let sessionID = try #require(chat.activeSessionID)
+        var marked: [(path: String, session: String)] = []
+        chat.fileReadMarker = { path, session in marked.append((path, session)) }
+
+        chat.addAttachments(urls: [fileURL])
+        #expect(marked.count == 1)
+        #expect(marked.first?.path == fileURL.path)
+        #expect(marked.first?.session == sessionID.uuidString)
+        // 不是本地文件的地址不登记。
+        chat.addAttachments(urls: [try #require(URL(string: "https://example.invalid/a.txt"))])
+        #expect(marked.count == 1)
     }
 
     @Test("editing target is isolated per session and restored on return")
@@ -102,5 +125,44 @@ struct AF06ComposerIsolationTests {
         #expect(!chat.hasSession(secondSessionID))
         #expect(chat.draftText == "A draft")
         #expect(chat.activePastedTextDraft == firstPastedDraft)
+    }
+
+    @Test("typing does not notify hasDraft observers except on empty/non-empty switches")
+    func hasDraftOnlyChangesOnEmptinessSwitch() {
+        let chat = ChatStore()
+        final class Counter: @unchecked Sendable { var value = 0 }
+        let counter = Counter()
+        func observe() {
+            withObservationTracking {
+                _ = chat.hasDraft
+                _ = chat.hasNonBlankDraft
+            } onChange: {
+                counter.value += 1
+            }
+        }
+        observe()
+        chat.draftText = "/"
+        #expect(counter.value == 1)
+        #expect(chat.hasDraft && chat.hasNonBlankDraft)
+        observe()
+        chat.draftText = "/g"
+        chat.draftText = "/go"
+        #expect(counter.value == 1)
+        chat.draftText = ""
+        #expect(counter.value == 2)
+        #expect(!chat.hasDraft)
+    }
+
+    @Test("hasDraft follows the active session when switching")
+    func hasDraftFollowsSessionSwitch() throws {
+        let chat = ChatStore()
+        let firstSessionID = try #require(chat.activeSessionID)
+        chat.draftText = "keep me"
+        let secondSessionID = chat.applyNewSession(title: "B")
+        #expect(chat.activeSessionID == secondSessionID)
+        #expect(!chat.hasDraft)
+        chat.switchSession(id: firstSessionID)
+        #expect(chat.hasDraft)
+        #expect(chat.draftText == "keep me")
     }
 }

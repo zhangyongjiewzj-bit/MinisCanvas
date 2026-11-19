@@ -74,7 +74,7 @@ struct ChatInspectorIsolationTests {
                 + "VStack(alignment: .leading, spacing: 6) { "
                 + "if let result = chat.compactionPresentation, let sessionID = result.sessionID, "
                 + "sessionID == chat.activeSessionID { Text(result.message) .font(.caption) "
-                + ".foregroundStyle(result.state == .failed ? Color.orange : Color.secondary) "
+                + ".foregroundStyle(result.state == .failed ? (theme?.statusWarningText ?? AppStatusColor.warning) : Color.secondary) "
                 + ".padding(.horizontal, 10) .accessibilityIdentifier(\"context.compaction.result\") } "
                 + "ChatInspectorView( snapshot: chatSnapshot,"
 

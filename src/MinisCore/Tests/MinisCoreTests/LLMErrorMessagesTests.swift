@@ -22,6 +22,12 @@ struct LLMErrorMessagesTests {
         #expect(!err.userMessageZH.contains("Unauthorized - bad key"))
     }
 
+    @Test func http413TellsToReduceAttachments() {
+        let err = LLMError.httpStatus(code: 413, detail: "413 Payload Too Large")
+        #expect(err.userMessageZH.contains("请求内容太大"))
+        #expect(err.userMessageZH.contains("路径引用"))
+    }
+
     @Test func http403Chinese() {
         let err = LLMError.httpStatus(code: 403, detail: "quota exceeded")
         #expect(err.userMessageZH.contains("欠费"))
@@ -322,8 +328,9 @@ struct LLMErrorMessagesTests {
             return
         }
         #expect(code == 403)
-        #expect(detail.contains("quota exceeded"))
-        #expect(err.userMessageZH.contains("欠费"))
+        #expect(detail.contains("reason=quota"))
+        #expect(err.userMessageZH.contains("余额或额度不足"))
+        #expect(!err.isRetryable)
     }
 
     // MARK: - 旧枚举 case 仍可用（兼容）

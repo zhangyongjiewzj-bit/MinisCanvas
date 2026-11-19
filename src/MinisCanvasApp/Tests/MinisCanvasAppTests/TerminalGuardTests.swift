@@ -44,7 +44,7 @@ struct TerminalGuardTests {
 
     @Test("classify 系统管理命令为 denied")
     func classifyDeniedCommands() {
-        for line in ["sudo ls", "open .", "osascript -e 'say hi'", "killall Dock", "shutdown now"] {
+        for line in ["shutdown now", "reboot", "halt", "dd x", "mkfs x"] {
             #expect(TerminalGuard.classify(line).kind == .denied, "\(line) 应为 denied")
         }
     }
@@ -56,10 +56,13 @@ struct TerminalGuardTests {
         }
     }
 
-    @Test("白名单边界：killall 不在 confirmation（避免与 denied 语义矛盾）")
+    @Test("对齐 Claude Code：killall、open、osascript、sudo 改为询问，不再硬拒绝")
     func whitelistBoundaryKillall() {
-        #expect(!TerminalGuard.confirmationCommands.contains("killall"))
-        #expect(TerminalGuard.deniedCommands.contains("killall"))
+        #expect(TerminalGuard.confirmationCommands.contains("killall"))
+        #expect(!TerminalGuard.deniedCommands.contains("killall"))
+        for line in ["open .", "osascript -e 'say hi'", "killall Dock", "sudo ls"] {
+            #expect(TerminalGuard.classify(line).kind == .confirmation, "\(line) 应为 confirmation")
+        }
     }
 
     @Test("白名单边界：python3/swift 在 confirmation（可用但需确认）")
@@ -71,7 +74,7 @@ struct TerminalGuardTests {
     @Test("自定义规则共享快照，用户拒绝和产品硬拒绝优先")
     func customPolicySnapshotPreservesDenialPrecedence() {
         let settings = TerminalPolicySettings(
-            automaticAllowCommands: ["echo", "sudo"],
+            automaticAllowCommands: ["echo", "halt"],
             confirmationCommands: ["git"],
             userDeniedCommands: ["echo"],
             explicitConfirmationCommands: ["git"],
@@ -82,10 +85,10 @@ struct TerminalGuardTests {
         // TerminalPolicySnapshot.classify checks explicit provenance before GitWorkflowPolicy.
         #expect(TerminalGuard.classify("git status").kind == .allowed)
         #expect(TerminalGuard.classify("echo hello", policy: snapshot).kind == .denied)
-        #expect(TerminalGuard.classify("sudo ls", policy: snapshot).kind == .denied)
+        #expect(TerminalGuard.classify("halt ls", policy: snapshot).kind == .denied)
         #expect(TerminalGuard.classify("git status", policy: snapshot).kind == .confirmation)
         #expect(TerminalGuard.classify("ls", policy: snapshot).kind == .unknown)
-        #expect(!snapshot.automaticAllowCommands.contains("sudo"))
+        #expect(!snapshot.automaticAllowCommands.contains("halt"))
     }
 }
 
@@ -264,7 +267,7 @@ struct TerminalStoreTests {
     @Test("denied 命令直接拒绝")
     func storeSubmitDeniedRejects() {
         let store = TerminalStore(contextSnapshot: contextSnapshot)
-        store.input = "killall Dock"
+        store.input = "shutdown now"
         store.submit()
         #expect(store.output.contains("拒绝"))
         #expect(!store.isRunning)

@@ -57,7 +57,7 @@ struct ChatStreamFrameCoalescerTests {
         display.append("首")
         display.append("待显")
         acceptsWriteback = false
-        try await Task.sleep(for: .milliseconds(50))
+        try await Task.sleep(for: ChatStreamFrameCoalescer.frameInterval + .milliseconds(150))
         #expect(rendered == ["首"])
         #expect(!display.append("迟到"))
     }

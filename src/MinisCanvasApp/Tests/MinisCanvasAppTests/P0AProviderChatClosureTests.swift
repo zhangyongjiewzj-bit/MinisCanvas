@@ -153,8 +153,9 @@ struct P0AProviderChatClosureTests {
             protocolType: .openaiCompatible
         )
         chat.providerRecordsSource = { [provider] }
+        // 已保存但还没检查过的手填模型也列在选择器里（标“未检查”），但仍不可选。
         #expect(chat.chatModelPickerModels(forProviderID: "LUNA").map(\.id) == [
-            "discovered-model"
+            "discovered-model", "manual-model"
         ])
         #expect(!chat.canSelectChatModel(
             providerID: "LUNA",

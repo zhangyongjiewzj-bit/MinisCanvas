@@ -1,20 +1,82 @@
 import Foundation
 import MinisCore
+import os
+
+/// Why a conversation settings read could not be served. `rawValue` is the
+/// stable log code; it never carries a setting value, path or credential.
+enum ConversationSettingsUnavailableReason: String, Equatable, Sendable {
+    case toolCatalogInvalid = "tool-catalog-invalid"
+    case ownerReleased = "owner-released"
+    case settingsSnapshotUnavailable = "settings-snapshot-unavailable"
+    case shortcutSnapshotFailed = "shortcut-snapshot-failed"
+    case sidebarSnapshotFailed = "sidebar-snapshot-failed"
+    case memoryScopeMismatch = "memory-scope-mismatch"
+    case memoryScopeInvalid = "memory-scope-invalid"
+    case mcpSnapshotUnavailable = "mcp-snapshot-unavailable"
+    case mcpRevisionUnavailable = "mcp-revision-unavailable"
+    case skillsProjectionMismatch = "skills-projection-mismatch"
+    case schedulerSnapshotFailed = "scheduler-snapshot-failed"
+    case sidebarRowConflict = "sidebar-row-conflict"
+    case safetyRowConflict = "safety-row-conflict"
+    case shortcutRowInvalid = "shortcut-row-invalid"
+    case memoryRowInvalid = "memory-row-invalid"
+    case mcpRowInvalid = "mcp-row-invalid"
+    case sessionRowConflict = "session-row-conflict"
+    case skillsRowInvalid = "skills-row-invalid"
+    case schedulerRowInvalid = "scheduler-row-invalid"
+    case extraRowConflict = "extra-row-conflict"
+    case providerRowInvalid = "provider-row-invalid"
+
+    var userMessage: String {
+        switch self {
+        case .toolCatalogInvalid: return "设置工具目录不完整或有重名"
+        case .ownerReleased: return "设置中心或会话存储已释放"
+        case .settingsSnapshotUnavailable: return "设置快照暂不可用（设置中心未激活、会话目录不一致、或设置快照正在切换）"
+        case .shortcutSnapshotFailed: return "快捷键设置读取失败"
+        case .sidebarSnapshotFailed: return "侧栏宽度设置读取失败"
+        case .memoryScopeMismatch: return "记忆范围与当前会话不一致"
+        case .memoryScopeInvalid: return "记忆范围无效或不属于当前会话"
+        case .mcpSnapshotUnavailable: return "MCP 服务器目录读取失败"
+        case .mcpRevisionUnavailable: return "MCP 服务器修订号不可用"
+        case .skillsProjectionMismatch: return "技能目录与启用状态不一致"
+        case .schedulerSnapshotFailed: return "定时任务目录读取失败"
+        case .sidebarRowConflict: return "侧栏宽度条目重复"
+        case .safetyRowConflict: return "安全开关条目重复"
+        case .shortcutRowInvalid: return "快捷键条目重复或格式无效"
+        case .memoryRowInvalid: return "记忆条目重复或格式无效"
+        case .mcpRowInvalid: return "MCP 条目重复或格式无效"
+        case .sessionRowConflict: return "会话条目重复"
+        case .skillsRowInvalid: return "技能条目重复或格式无效"
+        case .schedulerRowInvalid: return "定时任务条目重复或格式无效"
+        case .extraRowConflict: return "用量或偏好条目重复"
+        case .providerRowInvalid: return "模型供应商记录重复或无法投影"
+        }
+    }
+}
 
 enum ConversationSettingsToolError: Error, Equatable {
-    case ownerUnavailable
+    case ownerUnavailable(ConversationSettingsUnavailableReason)
     case approvalRequired
     case invalidInput
     case undoReceiptStale(String)
     case sessionChangeRejected(String)
     case unsupportedApprovalPolicy
+
+    private static let log = Logger(
+        subsystem: "com.miniscanvas.settings", category: "conversation-settings")
+
+    /// Builds the error and records only its reason code.
+    static func unavailable(_ reason: ConversationSettingsUnavailableReason) -> ConversationSettingsToolError {
+        log.error("conversation settings unavailable: \(reason.rawValue, privacy: .public)")
+        return .ownerUnavailable(reason)
+    }
 }
 
 extension ConversationSettingsToolError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .undoReceiptStale(let message), .sessionChangeRejected(let message): return message
-        case .ownerUnavailable: return "设置所有者不可用。"
+        case .ownerUnavailable(let reason): return "设置暂时不可读：" + reason.userMessage + "。"
         case .approvalRequired: return "此设置改动需要先经用户批准。"
         case .invalidInput: return "设置请求参数无效。"
         case .unsupportedApprovalPolicy: return BL6SettingsApprovedInput.unsupportedApprovalPolicyMessage
@@ -272,9 +334,17 @@ extension ChatStore {
                 guard sessions.contains(where: { $0.id == id }) else {
                     return .failure(.invalidIntent("session not found"))
                 }
+                if let reason = backgroundArchiveBlockReason(sessionID: id.uuidString) {
+                    return .failure(.invalidIntent(reason))
+                }
+                let wasGenerating = isSessionGenerating(id)
                 archiveSession(id: id)
                 guard archivedSessions.contains(where: { $0.id == id }) else {
-                    return .failure(.invalidIntent("归档失败，会话保持原状"))
+                    // 写盘前已先检查过目录；若仍失败，回复可能已被停掉，要如实说。
+                    let stopped = wasGenerating && !isSessionGenerating(id)
+                    return .failure(.invalidIntent(stopped
+                        ? "归档失败，会话仍在活动列表；本轮回复已被停止，需要的话请重新发送"
+                        : "归档失败，会话保持原状"))
                 }
             } else {
                 guard archivedSessions.contains(where: { $0.id == id }) else {
@@ -302,7 +372,7 @@ extension ChatStore {
                         _ = try deleteSession(id: id, intent: confirmed)
                     }
                 } catch {
-                    return .failure(.invalidIntent("移入回收站失败：\(error.localizedDescription)"))
+                    return .failure(.invalidIntent("移入回收站失败：\(UserFacingErrorText.describe(error))"))
                 }
             } else {
                 guard let entry = sessionTrashEntries.first(where: { $0.receipt.targetID == id.uuidString }),
@@ -369,7 +439,7 @@ final class ConversationSettingsToolExecutor:
         let exposedSettings = names.intersection(Self.toolNames)
         guard (exposedSettings.isEmpty || exposedSettings == Self.toolNames),
               names.count == tools.count else {
-            throw ConversationSettingsToolError.ownerUnavailable
+            throw ConversationSettingsToolError.unavailable(.toolCatalogInvalid)
         }
         try (base as? any ToolCatalogValidatingExecutor)?.validateToolCatalog(
             tools.filter { !Self.toolNames.contains($0.name) }
@@ -405,7 +475,7 @@ final class ConversationSettingsToolExecutor:
         guard Self.toolNames.contains(name) else {
             return try await base.execute(name: name, input: input)
         }
-        guard let center, let chat else { throw ConversationSettingsToolError.ownerUnavailable }
+        guard let center, let chat else { throw ConversationSettingsToolError.unavailable(.ownerReleased) }
         if name == BL6SettingsToolApproval.catalogToolName {
             guard input.isEmpty else { throw ConversationSettingsToolError.invalidInput }
             // The Core Composer wrapper supplies a one-use, delegated read
@@ -418,7 +488,7 @@ final class ConversationSettingsToolExecutor:
             let (snapshot, sidebarRevision, sidebarValue, shortcutRevision, mcpRevision, memoryRevision, skillsRevision, shortcutValues, memoryValues, mcpValues, skillsValues, mutableSkillIDs, schedulerValues, providerValues, safety) = try await MainActor.run {
                 guard let snapshot = chat.conversationSettingsSnapshot(
                     from: center, sessionDirectory: sessionDirectory
-                ) else { throw ConversationSettingsToolError.ownerUnavailable }
+                ) else { throw ConversationSettingsToolError.unavailable(.settingsSnapshotUnavailable) }
                 let shortcutRevision: String?
                 let shortcuts: [String: BL6SettingValue]
                 if let shortcutStore {
@@ -429,7 +499,7 @@ final class ConversationSettingsToolExecutor:
                         shortcutRevision = projection.revision
                         shortcuts = projection.values
                     case .failure:
-                        throw ConversationSettingsToolError.ownerUnavailable
+                        throw ConversationSettingsToolError.unavailable(.shortcutSnapshotFailed)
                     }
                 } else {
                     shortcutRevision = nil
@@ -438,17 +508,17 @@ final class ConversationSettingsToolExecutor:
                 let sidebar: (revision: String, value: BL6SettingValue)
                 switch sidebarWidthSetting.bl6Snapshot(profileID: center.settingsStore.directory.standardizedFileURL.path) {
                 case .success(let live): sidebar = live
-                case .failure: throw ConversationSettingsToolError.ownerUnavailable
+                case .failure: throw ConversationSettingsToolError.unavailable(.sidebarSnapshotFailed)
                 }
                 let activeMemoryScope = chat.activeMemoryScope
                 guard center.memoryScopeProvider?() == activeMemoryScope else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.memoryScopeMismatch)
                 }
                 let memory: [String: BL6SettingValue]
                 let memoryRevision: String?
                 if let scope = activeMemoryScope {
                     guard scope.isValid, scope.sessionID == readReceipt.sessionID else {
-                        throw ConversationSettingsToolError.ownerUnavailable
+                        throw ConversationSettingsToolError.unavailable(.memoryScopeInvalid)
                     }
                     memory = try MemoryStoreTypedCatalogAdapter.snapshot(from: center)
                     memoryRevision = try center.memoryStore.bl6MemoryRevision(within: scope)
@@ -458,8 +528,11 @@ final class ConversationSettingsToolExecutor:
                 }
                 guard let mcp = MCPServerStoreTypedCatalogAdapter.snapshot(
                     from: center, sessionDirectory: sessionDirectory
-                ), let mcpRevision = center.mcpManager.bl6NameRevision() else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                ) else {
+                    throw ConversationSettingsToolError.unavailable(.mcpSnapshotUnavailable)
+                }
+                guard let mcpRevision = center.mcpManager.bl6NameRevision() else {
+                    throw ConversationSettingsToolError.unavailable(.mcpRevisionUnavailable)
                 }
                 // The App root injects its exact SkillsStore. A scan that has
                 // not completed has no admitted entries to project yet.
@@ -475,7 +548,7 @@ final class ConversationSettingsToolExecutor:
                         let admitted = try SkillsStoreTypedCatalogAdapter.approvedSnapshot(
                             from: skillsStore, boundTo: center.skillStore, visibleTo: scope)
                         guard admitted.values.allSatisfy({ skills[$0.key] == .toggle($0.value) }) else {
-                            throw ConversationSettingsToolError.ownerUnavailable
+                            throw ConversationSettingsToolError.unavailable(.skillsProjectionMismatch)
                         }
                         skillsRevision = admitted.revision
                         mutableSkillIDs = Set(admitted.values.keys)
@@ -497,7 +570,7 @@ final class ConversationSettingsToolExecutor:
                         from: schedulerStore
                     ) {
                     case .success(let values): scheduler = values
-                    case .failure: throw ConversationSettingsToolError.ownerUnavailable
+                    case .failure: throw ConversationSettingsToolError.unavailable(.schedulerSnapshotFailed)
                     }
                 } else {
                     scheduler = [:]
@@ -524,7 +597,7 @@ final class ConversationSettingsToolExecutor:
             }
             var values = snapshot.values
             let sidebarID = SessionSidebarWidthContract.typedCatalogID
-            guard values[sidebarID] == nil else { throw ConversationSettingsToolError.ownerUnavailable }
+            guard values[sidebarID] == nil else { throw ConversationSettingsToolError.unavailable(.sidebarRowConflict) }
             values[sidebarID] = sidebarValue
             entries.append(ConversationSettingsCatalogEntry(
                 id: sidebarID, kind: .decimal, agentMutable: true, secret: false
@@ -536,7 +609,7 @@ final class ConversationSettingsToolExecutor:
                 ("safety.safe-mode-enabled", safety.safeModeEnabled),
                 ("safety.kill-switch-enabled", safety.killSwitchEnabled)
             ] {
-                guard values[id] == nil else { throw ConversationSettingsToolError.ownerUnavailable }
+                guard values[id] == nil else { throw ConversationSettingsToolError.unavailable(.safetyRowConflict) }
                 values[id] = .toggle(enabled)
                 entries.append(ConversationSettingsCatalogEntry(
                     id: id, kind: .toggle, agentMutable: false, secret: false
@@ -545,7 +618,7 @@ final class ConversationSettingsToolExecutor:
             for id in shortcutValues.keys.sorted() {
                 guard let value = shortcutValues[id], values[id] == nil,
                       case .object = value else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.shortcutRowInvalid)
                 }
                 values[id] = value
                 entries.append(ConversationSettingsCatalogEntry(
@@ -555,7 +628,7 @@ final class ConversationSettingsToolExecutor:
             for id in memoryValues.keys.sorted() {
                 guard let value = memoryValues[id], values[id] == nil,
                       case .object = value else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.memoryRowInvalid)
                 }
                 values[id] = value
                 entries.append(ConversationSettingsCatalogEntry(
@@ -564,13 +637,13 @@ final class ConversationSettingsToolExecutor:
             }
             for id in mcpValues.keys.sorted() {
                 guard let value = mcpValues[id], values[id] == nil else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.mcpRowInvalid)
                 }
                 let kind: BL6SettingValueKind
                 switch value {
                 case .text: kind = .text
                 case .toggle: kind = .toggle
-                default: throw ConversationSettingsToolError.ownerUnavailable
+                default: throw ConversationSettingsToolError.unavailable(.mcpRowInvalid)
                 }
                 values[id] = value
                 entries.append(ConversationSettingsCatalogEntry(
@@ -581,13 +654,13 @@ final class ConversationSettingsToolExecutor:
                 ))
             }
             for id in ["mcp.servers.add", "mcp.servers.remove"] {
-                guard values[id] == nil else { throw ConversationSettingsToolError.ownerUnavailable }
+                guard values[id] == nil else { throw ConversationSettingsToolError.unavailable(.mcpRowInvalid) }
                 entries.append(ConversationSettingsCatalogEntry(
                     id: id, kind: .object, agentMutable: true, secret: false
                 ))
             }
             for row in sessionRows {
-                guard values[row.id] == nil else { throw ConversationSettingsToolError.ownerUnavailable }
+                guard values[row.id] == nil else { throw ConversationSettingsToolError.unavailable(.sessionRowConflict) }
                 values[row.id] = row.value
                 entries.append(ConversationSettingsCatalogEntry(
                     id: row.id, kind: row.kind, agentMutable: row.mutable, secret: false
@@ -596,7 +669,7 @@ final class ConversationSettingsToolExecutor:
             for id in skillsValues.keys.sorted() {
                 guard let value = skillsValues[id], values[id] == nil,
                       case .toggle = value else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.skillsRowInvalid)
                 }
                 values[id] = value
                 entries.append(ConversationSettingsCatalogEntry(
@@ -605,13 +678,13 @@ final class ConversationSettingsToolExecutor:
             }
             for id in schedulerValues.keys.sorted() {
                 guard let value = schedulerValues[id], values[id] == nil else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.schedulerRowInvalid)
                 }
                 let kind: BL6SettingValueKind
                 switch value {
                 case .text: kind = .text
                 case .toggle: kind = .toggle
-                default: throw ConversationSettingsToolError.ownerUnavailable
+                default: throw ConversationSettingsToolError.unavailable(.schedulerRowInvalid)
                 }
                 values[id] = value
                 entries.append(ConversationSettingsCatalogEntry(
@@ -638,7 +711,7 @@ final class ConversationSettingsToolExecutor:
                                  false))
                 }
                 if let occupancy = chat.contextOccupancy {
-                    rows.append(("context.reported", .toggle, .toggle(true), false))
+                    rows.append(("context.reported", .toggle, .toggle(!occupancy.isLocalEstimate), false))
                     rows.append(("context.used-tokens", .integer, .integer(occupancy.inputTokens), false))
                     rows.append(("context.window-tokens", .integer, .integer(occupancy.windowTokens), false))
                     rows.append(("context.percent", .text, .text(occupancy.percentage), false))
@@ -661,7 +734,7 @@ final class ConversationSettingsToolExecutor:
                 }
             }
             for row in extraRows {
-                guard values[row.id] == nil else { throw ConversationSettingsToolError.ownerUnavailable }
+                guard values[row.id] == nil else { throw ConversationSettingsToolError.unavailable(.extraRowConflict) }
                 values[row.id] = row.value
                 entries.append(ConversationSettingsCatalogEntry(
                     id: row.id, kind: row.kind, agentMutable: row.mutable, secret: false
@@ -670,7 +743,7 @@ final class ConversationSettingsToolExecutor:
             for id in providerValues.keys.sorted() {
                 guard let value = providerValues[id], values[id] == nil,
                       case .object = value else {
-                    throw ConversationSettingsToolError.ownerUnavailable
+                    throw ConversationSettingsToolError.unavailable(.providerRowInvalid)
                 }
                 values[id] = value
                 entries.append(ConversationSettingsCatalogEntry(
@@ -772,7 +845,7 @@ final class ConversationSettingsToolExecutor:
         if let scope = try SessionReadTool.authorizeSessionLevel(
             input: input, authorization: authorization, context: context, now: now
         ) {
-            guard let center, let chat else { throw ConversationSettingsToolError.ownerUnavailable }
+            guard let center, let chat else { throw ConversationSettingsToolError.unavailable(.ownerReleased) }
             let query = input["query"] as? String
             return try await MainActor.run {
                 let redactor = ChatTranscriptRedactor(store: center.envStore)

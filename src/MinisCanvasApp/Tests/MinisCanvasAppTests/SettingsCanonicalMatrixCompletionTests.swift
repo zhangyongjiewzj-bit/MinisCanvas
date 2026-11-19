@@ -97,7 +97,7 @@ struct SettingsCanonicalMatrixCompletionTests {
         )
         center.themePreset = .light
         #expect(center.themePreset == .light)
-        #expect(center.appearance == .light)
+        #expect(center.appearance == .system)   // 产品主题跟随系统明暗
         #expect(center.accentTheme == ThemePreset.canonicalAccentTheme)
         #expect(SettingsCenter(
             settingsStore: SettingsStore(directory: directory),

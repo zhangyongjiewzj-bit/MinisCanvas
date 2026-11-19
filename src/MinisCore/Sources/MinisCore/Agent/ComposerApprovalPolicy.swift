@@ -394,45 +394,100 @@ extension ComposerAuthorizationError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .unknownCapability(let capability):
-            return "Unknown Composer capability '\(capability)' is blocked"
+            return "未知的工具「\(capability)」已被拦截。请确认该工具已启用后重试。"
         case .missingCapabilityGrant(let capability):
-            return "Composer capability '\(capability)' has no grant"
+            return "当前会话没有授予工具「\(capability)」的权限。请在输入框齿轮里调整权限模式，或重新发送消息后再试。"
         case .scopeMismatch:
-            return "Composer approval scope does not match this workspace"
+            return "这次授权对应的是另一个工作区，不能用在当前工作区。请在当前工作区重新发送消息。"
         case .policyRevisionMismatch:
-            return "Composer policy facts changed after submission"
+            return "发送之后权限设置发生了变化，本次操作已取消。请重新发送消息。"
         case .grantEpochMismatch:
-            return "Composer grants changed after submission"
+            return "发送之后授权发生了变化，本次操作已取消。请重新发送消息。"
         case .leaseIdentityMissing:
-            return "Composer authorization lease has no stable identity"
+            return "本次授权缺少有效标识，无法继续。请重新发送消息。"
         case .factsExpired:
-            return "Composer policy facts expired"
+            return "本次任务的授权已过期（单个任务最长 4 小时）。请发送一条新消息继续，授权会自动续上。"
         case .autonomyCeilingMissing:
-            return "Composer user autonomy ceiling is missing"
+            return "未设置运行安全上限，无法继续。请到 设置 → 智能体运行 → 运行安全上限 设置后重试。"
         case .autonomyCeilingMismatch:
-            return "Composer turn autonomy ceiling does not match its policy facts"
+            return "本轮的最高模式与当前权限设置不一致。请重新发送消息。"
         case .modeExceedsAutonomyCeiling(let required, let maximum):
-            return "当前模式需要自主权上限 L\(required.rawValue)，而你的上限是 L\(maximum.rawValue)。请把输入框齿轮里的模式改为手动审批，或到 设置 → 智能体运行 → 运行安全上限 调高上限。"
+            _ = (required, maximum)
+            return "当前模式超出了你设置的运行安全上限。请把输入框齿轮里的模式改为手动审批，或到 设置 → 智能体运行 → 运行安全上限 调高上限。"
         case .authorizationRevoked:
-            return "Composer authorization was revoked"
+            return "本次授权已被撤销。请重新发送消息，或重新授权后再试。"
         case .invalidInput:
-            return "Composer tool input is not a supported immutable value"
+            return "工具参数含有不支持的内容，已拒绝执行。请换一种方式描述任务后重试。"
         case .invalidPath(let path):
-            return "Invalid Composer file path: \(path)"
+            return "文件路径无效：\(path)。请检查路径是否为空或含有无法解析的部分后重试。"
         case .pathOutsideAllowedRoots(let path):
-            return "Composer file path is outside allowed roots: \(path)"
+            return "该路径不在当前会话允许访问的目录内：\(path)。当前会话没有项目目录时：请先新建项目会话，或用 /add-dir 授权目录后再试。"
         case .approvalRequired(let capability):
-            return "Composer approval is required for '\(capability)'"
+            return "「\(capability)」需要你的批准才能执行。请在审批卡上选择允许，或在输入框齿轮里调整权限模式。"
         case .approvalDenied(let reason):
-            return reason ?? "Composer approval was denied"
+            guard let reason else { return "这次操作已被拒绝。" }
+            return Self.localizedDenialReason(reason)
         case .bypassConfirmationRequired:
-            return "Bypass permission mode requires explicit second confirmation"
+            return "这项操作需要你先确认。不可逆操作请在审批卡上再点一次确认；绕过模式请先在输入框齿轮里确认开启。"
         case .authorizationBindingMismatch:
-            return "Composer authorization does not match this exact tool call"
+            return "这次批准与实际要执行的操作不一致，已拒绝。请重新发起操作。"
         case .hookDecisionDenied(let reason):
-            return "Composer hook blocked this tool call: \(reason.rawValue)"
+            return "钩子拦截了这次工具调用（\(reason.rawValue)）。可到 设置 → 钩子 查看是哪条规则。"
         case .hookRejected(let reason):
-            return "Composer hook blocked this tool call: " + reason
+            return "钩子拦截了这次工具调用：" + reason
+        }
+    }
+}
+
+extension ComposerAuthorizationError {
+    /// 内部拒绝原因（英文，保持原值供审计与测试比较）在展示给用户时转成中文。
+    static func localizedDenialReason(_ reason: String) -> String {
+        switch reason {
+        case "Capability is blocked by approval policy":
+            return "该工具已被审批策略禁用。如需使用，请到 设置 → 权限 调整审批策略。"
+        case "Composer approval was denied":
+            return "这次操作已被拒绝。"
+        default:
+            return reason
+        }
+    }
+}
+
+/// 被策略在执行前拦截的固定分类。只给出分类，不带路径、参数或模型原文。
+public enum ToolBlockCategory: Sendable, Equatable {
+    case needsApproval, denied, notGranted, pathNotAllowed, authorizationInvalid
+    case autonomyCeiling, invalidInput, hook, sessionRead
+
+    /// 展示给用户的固定中文原因。
+    public var displayText: String {
+        switch self {
+        case .needsApproval: return "需要你的批准"
+        case .denied: return "操作已被拒绝"
+        case .notGranted: return "当前会话未授予该工具权限"
+        case .pathNotAllowed: return "路径无效或不在允许访问的目录内"
+        case .authorizationInvalid: return "授权已变化、过期或被撤销"
+        case .autonomyCeiling: return "超出运行安全上限"
+        case .invalidInput: return "工具参数不被支持"
+        case .hook: return "被钩子规则拦截"
+        case .sessionRead: return "读取其他会话未获授权"
+        }
+    }
+}
+
+extension ComposerAuthorizationError {
+    var blockCategory: ToolBlockCategory {
+        switch self {
+        case .approvalRequired, .bypassConfirmationRequired: return .needsApproval
+        case .approvalDenied: return .denied
+        case .unknownCapability, .missingCapabilityGrant: return .notGranted
+        case .invalidPath, .pathOutsideAllowedRoots: return .pathNotAllowed
+        case .scopeMismatch, .policyRevisionMismatch, .grantEpochMismatch, .leaseIdentityMissing,
+             .factsExpired, .authorizationRevoked, .authorizationBindingMismatch,
+             .autonomyCeilingMismatch:
+            return .authorizationInvalid
+        case .autonomyCeilingMissing, .modeExceedsAutonomyCeiling: return .autonomyCeiling
+        case .invalidInput: return .invalidInput
+        case .hookDecisionDenied, .hookRejected: return .hook
         }
     }
 }
@@ -484,6 +539,11 @@ public struct ComposerToolInput: Codable, Equatable, Sendable {
     fileprivate func stringValue(for key: String) -> String? {
         guard case .string(let value) = values[key] else { return nil }
         return value
+    }
+
+    /// shell 的 cwd：空字符串按没给处理（与 ShellToolInput.explicitWorkingDirectory 一致）。
+    fileprivate var shellWorkingDirectory: String? {
+        stringValue(for: "cwd").flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
     }
 
     private static func freeze(_ value: Any) throws -> ComposerInputValue {
@@ -1107,7 +1167,13 @@ public actor ComposerAuthorizationController {
     public func persistentAllowOffer(
         capability: String, input: ComposerToolInput
     ) -> ApprovalPersistentAllowOffer? {
-        grants.persistentRules.offer(
+        // 会话目标工具：规则键 = 工具名 + 目标会话标识，不绑定项目（用户 2026-11-16）。
+        if SessionTargetApprovalRules.isSessionTargetCapability(capability) {
+            return grants.persistentRules.offerSessionTarget(
+                capability: capability, input: input.foundationDictionary,
+                initiatorSessionID: snapshot.sessionID)
+        }
+        return grants.persistentRules.offer(
             capability: capability, input: input.foundationDictionary, facts: facts)
     }
 
@@ -1124,6 +1190,22 @@ public actor ComposerAuthorizationController {
     func persistAllowRule(
         capability: String, input: ComposerToolInput, expectedProjectKey: String?
     ) -> PersistentApprovalRule? {
+        if SessionTargetApprovalRules.isSessionTargetCapability(capability) {
+            guard !revoked, !facts.revoked,
+                  let rule = grants.persistentRules.makePersistentSessionTargetRule(
+                    capability: capability, input: input.foundationDictionary,
+                    initiatorSessionID: snapshot.sessionID, now: now()),
+                  grants.persistentRules.add(rule) else { return nil }
+            return rule
+        }
+        // 复合命令：每个子命令各存一条前缀规则，全部命中才免审批。
+        if capability == "shell_execute", expectedProjectKey == nil, !revoked, !facts.revoked {
+            let rules = grants.persistentRules.makeShellRules(
+                input: input.foundationDictionary, facts: facts, now: now())
+            var saved: PersistentApprovalRule?
+            for rule in rules where grants.persistentRules.add(rule) { saved = saved ?? rule }
+            return saved
+        }
         guard !revoked, !facts.revoked,
               let rule = grants.persistentRules.makeRule(
                 capability: capability, input: input.foundationDictionary, facts: facts, now: now())
@@ -1135,6 +1217,52 @@ public actor ComposerAuthorizationController {
         }
         guard grants.persistentRules.add(rule) else { return nil }
         return rule
+    }
+
+    /// MCP 工具的“以后都允许”：提示、保存、命中（键 = 项目 + 服务器配置指纹 + 工具名）。
+    func mcpPersistentAllowOffer(identity: MCPToolRuleIdentity) -> ApprovalPersistentAllowOffer? {
+        grants.persistentRules.offerMCP(identity: identity, facts: facts)
+    }
+
+    @discardableResult
+    func persistMCPAllowRule(identity: MCPToolRuleIdentity) -> PersistentApprovalRule? {
+        guard !revoked, !facts.revoked,
+              let rule = grants.persistentRules.makeMCPRule(identity: identity, facts: facts, now: now()),
+              grants.persistentRules.add(rule) else { return nil }
+        return rule
+    }
+
+    func matchingMCPRule(identity: MCPToolRuleIdentity) -> PersistentApprovalRule? {
+        guard !revoked, !facts.revoked else { return nil }
+        return grants.persistentRules.matchMCP(identity: identity, facts: facts, sessionID: snapshot.sessionID)
+    }
+
+    /// 会话目标工具的“本对话内都允许（对此目标会话）”：只在内存里记到本会话。
+    func recordSessionTargetRule(capability: String, input: ComposerToolInput) {
+        guard !revoked, !facts.revoked else { return }
+        grants.persistentRules.addSessionTargetSessionRule(
+            sessionID: snapshot.sessionID, capability: capability,
+            input: input.foundationDictionary, now: now())
+    }
+
+    /// 网页搜索的"本对话内都允许"：只在内存里记到本会话。
+    func recordSessionWebSearchRule() {
+        guard !revoked, !facts.revoked else { return }
+        grants.persistentRules.addSessionWebSearchRule(
+            sessionID: snapshot.sessionID, facts: facts, now: now())
+    }
+
+    /// shell 的"本对话内都允许"：把命令前缀只在内存里记到本会话，不写入规则文件。
+    func recordSessionShellRules(input: ComposerToolInput) {
+        guard !revoked, !facts.revoked else { return }
+        // 绕过档下看不清内容的 osascript：只记"本对话内不再询问这类脚本"，不按命令前缀存规则。
+        if hasConfirmedBypass, let command = input.stringValue(for: "command"),
+           ShellNestedCommandInspector.hasOpaqueScript(command: command) {
+            grants.persistentRules.allowOpaqueScript(sessionID: snapshot.sessionID)
+            return
+        }
+        grants.persistentRules.addSessionShellRules(
+            sessionID: snapshot.sessionID, input: input.foundationDictionary, facts: facts, now: now())
     }
 
     /// `authorize`, additionally reporting a persistent rule that turned a
@@ -1152,6 +1280,12 @@ public actor ComposerAuthorizationController {
             capability: capability, input: input, policyRequiresApproval: policyRequiresApproval,
             mandatoryHuman: mandatoryHuman, excludingScopedGrant: excludingScopedGrant)
         if requiresExternalInputSkillReview(capability) { return (decision, nil) }
+        // "每次询问"规则：本来免问的调用也要弹卡，已有的允许规则、本会话授权都不能替它跳过。
+        // 计划模式的演练结果和绕过档不受影响。
+        if matchingAskRule(capability: capability, input: input) != nil {
+            if case .execute = decision { return (.requestApproval(requiresSecondConfirmation: false), nil) }
+            return (decision, nil)
+        }
         if SkillMaintenanceTool.names.contains(capability), hasConfirmedBypass {
             if let rule = grants.persistentRules.match(
                 capability: capability, input: input.foundationDictionary, facts: facts,
@@ -1161,10 +1295,20 @@ public actor ComposerAuthorizationController {
             }
             return (decision, nil)
         }
+        // 会话目标规则（用户 2026-11-16：一次审批后，后续不需要审批）：只对“同一工具 + 同一目标会话”命中，
+        // 只替换弹卡；回执、长度上限、脱敏、外部数据标注仍照旧，绕过档在上面已直接放行、不经这里。
+        if case .requestApproval = decision, !mandatoryHuman, !revoked, !facts.revoked,
+           SessionTargetApprovalRules.isSessionTargetCapability(capability),
+           let rule = grants.persistentRules.matchSessionTarget(
+               capability: capability, input: input.foundationDictionary, sessionID: snapshot.sessionID) {
+            return (.execute, rule)
+        }
         guard case .requestApproval = decision,
               !mandatoryHuman,
               !Self.isAlwaysHuman(capability),
-              !(try requiresOutsideReadApproval(capability: capability, input: input)),
+              // 目录规则对 file_read、file_grep、file_glob 都有效；授权根外写入每次都问。
+              !(try requiresOutsideReadApproval(capability: capability, input: input) && !ApprovedFileReadScope.isRead(capability)),
+              !requiresOutsideWriteApproval(capability: capability, input: input),
               !requiresProtectedGitWriteApproval(capability: capability, input: input),
               !Self.isMCPServerManagement(capability: capability, input: input),
               capability != SessionReadTool.toolName,
@@ -1172,7 +1316,7 @@ public actor ComposerAuthorizationController {
                 tool: capability, input: input.foundationDictionary),
               let rule = grants.persistentRules.match(
                 capability: capability, input: input.foundationDictionary, facts: facts,
-                bypassConfirmed: await liveSkillBypassConfirmed())
+                bypassConfirmed: await liveSkillBypassConfirmed(), sessionID: snapshot.sessionID)
         else { return (decision, nil) }
         return (.execute, rule)
     }
@@ -1222,8 +1366,15 @@ public actor ComposerAuthorizationController {
     ) async throws -> ComposerAuthorizationDecision {
         try validate(capability: capability, input: input)
 
-        if snapshot.mode == .plan, Self.hasSideEffect(capability) {
+        if snapshot.mode == .plan, Self.hasSideEffect(capability),
+           !Self.planModeAllowsReadOnly(capability: capability, input: input),
+           !(capability == "shell_execute" && shellMayRunWithoutPrompt(input: input)) {
             return .dryRun
+        }
+        // 当前会话读自己的 messages / metadata 免卡（对齐 Claude Code：读自己的对话不需要批准）。
+        // 只限 session_id 等于当前会话、scope 为 messages 或 metadata；跨会话、list、export 照旧询问。
+        if capability == SessionReadTool.toolName, isCurrentSessionOwnRead(input) {
+            return .execute
         }
         if hasConfirmedBypass {
             if requiresExternalInputSkillReview(capability) {
@@ -1243,12 +1394,33 @@ public actor ComposerAuthorizationController {
                 if let denial = SensitiveFilePolicy.protectedStateShellViolation(command: command)
                     ?? BypassSystemFloor.shellViolation(command: command)
                     ?? SensitiveFilePolicy.credentialShellViolation(command: command)
-                    ?? BypassAppDataFloor.shellMentionViolation(command: command) {
+                    ?? BypassAppDataFloor.shellMentionViolation(command: command)
+                    ?? ShellNestedCommandInspector.violation(command: command) {
                     throw ComposerAuthorizationError.approvalDenied(denial)
                 }
                 if BypassSystemFloor.requiresIrreversibleDeletionApproval(command: command) {
                     return .requestApproval(requiresSecondConfirmation: true)
                 }
+                // 静态看不清内容的 osascript（脚本文件、含 $ 的脚本等）：绕过档下也要问；本对话内问过一次并选了"都允许"就不再问。
+                if ShellNestedCommandInspector.hasOpaqueScript(command: command),
+                   !grants.persistentRules.isOpaqueScriptAllowed(sessionID: snapshot.sessionID) {
+                    return .requestApproval(requiresSecondConfirmation: false)
+                }
+                // 绕过档下 shell 读写密钥文件（.env、*.pem 等）：任一操作数命中敏感判据就弹卡（批准后只执行这一次）。
+                if SensitiveFilePolicy.credentialProtectionEnabled,
+                   ShellEffectGuard.sensitiveOperandViolation(
+                    command: command,
+                    workingDirectory: input.shellWorkingDirectory
+                        ?? ChildToolWorkspaceScope.current?.workingDirectory ?? facts.trustedProjectRoot) != nil {
+                    return .requestApproval(requiresSecondConfirmation: false)
+                }
+            }
+            // 绕过档读 .env、密钥文件名：不再直接拒绝，改弹卡询问（批准后只读这一个文件）。
+            // 凭据目录（~/.ssh 等）仍在 validatePath 里直接拒绝。
+            if capability == "file_read", SensitiveFilePolicy.credentialProtectionEnabled,
+               let path = input.stringValue(for: "path"),
+               SensitiveFilePolicy.credentialDenial(for: path) != nil {
+                return .requestApproval(requiresSecondConfirmation: false)
             }
             return .execute
         }
@@ -1263,14 +1435,16 @@ public actor ComposerAuthorizationController {
         if BrowserSideEffectPolicy.inputRequiresApproval(tool: capability, input: input.foundationDictionary) {
             return .requestApproval(requiresSecondConfirmation: false)
         }
-        if requiresProtectedGitWriteApproval(capability: capability, input: input) {
+        if requiresProtectedGitWriteApproval(capability: capability, input: input)
+            || requiresAutoModeConfigWriteApproval(capability: capability, input: input) {
             return .requestApproval(requiresSecondConfirmation: false)
         }
         if mandatoryHuman || Self.isAlwaysHuman(capability) {
             return .requestApproval(requiresSecondConfirmation: false)
         }
         let outsideRead = try requiresOutsideReadApproval(capability: capability, input: input)
-        if mandatoryHuman || outsideRead {
+        let outsideWrite = requiresOutsideWriteApproval(capability: capability, input: input)
+        if mandatoryHuman || outsideRead || outsideWrite {
             return .requestApproval(requiresSecondConfirmation: false)
         }
         // Consent may cover the selected turn/session/workspace, while each
@@ -1298,8 +1472,19 @@ public actor ComposerAuthorizationController {
         let browserSideEffect = BrowserSideEffectPolicy.inputRequiresApproval(
             tool: capability, input: input.foundationDictionary
         )
+        // 查看后台输出、停止后台命令、浏览器只读动作不需要审批卡（浏览器副作用已在上面单独判定）。
+        var approvalFreeHelper = !browserSideEffect
+            && ApprovalGate.approvalFreeHelperToolNames.contains(capability)
+        // 手动、自动编辑档：只读命令（与计划模式同一套判定，逐子命令过效果检查器）免问。
+        // 联网搜索（用户 2026-11-19）与 web_fetch 一致：搜索词会发给第三方，自动编辑档也要问。
+        if !approvalFreeHelper, !browserSideEffect {
+            if capability == "shell_execute", snapshot.mode == .manual || snapshot.mode == .autoEdit,
+               shellMayRunWithoutPrompt(input: input) {
+                approvalFreeHelper = true
+            }
+        }
         guard browserSideEffect || policyRequiresApproval
-                || Self.requiresApproval(mode: snapshot.mode, capability: capability) else {
+                || (!approvalFreeHelper && Self.requiresApproval(mode: snapshot.mode, capability: capability)) else {
             return .execute
         }
         // Reading another session asks on every call: a scoped consent has no
@@ -1315,6 +1500,15 @@ public actor ComposerAuthorizationController {
         return .requestApproval(
             requiresSecondConfirmation: false
         )
+    }
+
+    /// `session_read` 读的是当前会话自己，且只读 messages 或 metadata。
+    func isCurrentSessionOwnRead(_ input: ComposerToolInput) -> Bool {
+        guard let scope = input.stringValue(for: "scope"), scope == "messages" || scope == "metadata",
+              let target = input.stringValue(for: "session_id")?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !target.isEmpty, !snapshot.sessionID.isEmpty else { return false }
+        return target == snapshot.sessionID
     }
 
     static func isMCPServerManagement(capability: String, input: ComposerToolInput) -> Bool {
@@ -1348,6 +1542,8 @@ public actor ComposerAuthorizationController {
               snapshot.mode != .bypassPermission,
               ApprovalGate.inputRiskLevel(tool: capability, input: input.foundationDictionary) != .high,
               !requiresProtectedGitWriteApproval(capability: capability, input: input),
+              !requiresAutoModeConfigWriteApproval(capability: capability, input: input),
+              !requiresOutsideWriteApproval(capability: capability, input: input),
               !(try requiresOutsideReadApproval(capability: capability, input: input))
         else { return false }
         return true
@@ -1363,6 +1559,17 @@ public actor ComposerAuthorizationController {
               current.id == receipt.persistentRuleID else {
             throw ComposerAuthorizationError.approvalRequired(capability)
         }
+    }
+
+    /// 目录读规则在执行前仍命中同一条（规则可能刚被删除）。
+    func fileReadRuleStillMatches(
+        _ receipt: ComposerApprovalReceipt, input: ComposerToolInput, capability: String = "file_read"
+    ) -> Bool {
+        guard let id = receipt.persistentRuleID,
+              let current = grants.persistentRules.match(capability: capability,
+                  input: input.foundationDictionary, facts: facts, sessionID: snapshot.sessionID)
+        else { return false }
+        return current.id == id
     }
 
     func revalidateSkillBypass(capability: String, input: ComposerToolInput) async throws {
@@ -1391,6 +1598,23 @@ public actor ComposerAuthorizationController {
         try Task.checkCancellation()
         return try BypassOpenScope.$isActive.withValue(true) {
             try store.restore(id, sessionID: sessionID, expectedPath: summary.path)
+        }
+    }
+
+    /// 绕过模式下"恢复到此检查点之前"：每个路径单独按文件写入底线校验，
+    /// 整体预检失败则一条都不动。
+    public func restoreFileCheckpointsBefore(
+        _ plan: FileCheckpointStore.RewindPlan, store: FileCheckpointStore, sessionID: String,
+        overwriteConflicts: Bool = false
+    ) throws -> [UUID] {
+        guard snapshot.sessionID == sessionID, snapshot.mode == .bypassPermission,
+              snapshot.bypassModeConfirmed else { throw ComposerAuthorizationError.authorizationBindingMismatch }
+        try Task.checkCancellation()
+        return try BypassOpenScope.$isActive.withValue(true) {
+            try store.restoreBefore(plan, sessionID: sessionID, overwriteConflicts: overwriteConflicts) { path in
+                guard let input = try? ComposerToolInput(["path": path]) else { return false }
+                return (try? self.validate(capability: "file_write", input: input)) != nil
+            }
         }
     }
 
@@ -1428,7 +1652,22 @@ public actor ComposerAuthorizationController {
         if snapshot.mode == .bypassPermission, !snapshot.bypassModeConfirmed {
             throw ComposerAuthorizationError.bypassConfirmationRequired
         }
+        // 用户设置的"拒绝"规则：所有档位（包括绕过档）都生效，优先级最高，不弹卡。授权判定、
+        // 执行前复检和各处 revalidate 都经过这里，所以规则刚加上时，已经批准但还没执行的调用也会被拦下。
+        if let rule = grants.persistentRules.matchRestriction(
+            .deny, capability: capability, input: input.foundationDictionary, facts: facts,
+            sessionID: snapshot.sessionID) {
+            throw ComposerAuthorizationError.approvalDenied(PersistentApprovalRuleStore.denialMessage(rule))
+        }
         try validatePath(capability: capability, input: input)
+    }
+
+    /// 命中的"每次询问"规则：绕过档不受影响；命中时一定弹卡，卡上不提供"以后都允许"。
+    func matchingAskRule(capability: String, input: ComposerToolInput) -> PersistentApprovalRule? {
+        guard !hasConfirmedBypass, !revoked, !facts.revoked else { return nil }
+        return grants.persistentRules.matchRestriction(
+            .ask, capability: capability, input: input.foundationDictionary, facts: facts,
+            sessionID: snapshot.sessionID)
     }
 
     private func validateIdentity() throws {
@@ -1471,14 +1710,46 @@ public actor ComposerAuthorizationController {
     }
 
     func matchingWebHostRule(input: ComposerToolInput) -> PersistentApprovalRule? {
-        grants.persistentRules.match(capability: WebFetchToolContract.toolName, input: input.foundationDictionary, facts: facts)
+        grants.persistentRules.match(
+            capability: WebFetchToolContract.toolName, input: input.foundationDictionary, facts: facts,
+            sessionID: snapshot.sessionID)
     }
 
     func requiresProtectedGitWriteApproval(capability: String, input: ComposerToolInput) -> Bool {
         guard ["file_write", "file_edit", "file_delete"].contains(capability),
               let raw = input.stringValue(for: "path") else { return false }
+        let canonical = PolicyRuntimePathBoundary.canonicalPath(raw)
         return SensitiveFilePolicy.isProtectedGitWritePath(raw)
-            || PolicyRuntimePathBoundary.canonicalPath(raw).map(SensitiveFilePolicy.isProtectedGitWritePath) == true
+            || canonical.map(SensitiveFilePolicy.isProtectedGitWritePath) == true
+            // 工具/命令行配置（.vscode、.husky、.mcp.json、.claude/settings*.json、shell 启动文件）：
+            // 本函数只在绕过模式的提前返回之后使用，所以绕过模式不受影响（A-04）。
+            || SensitiveFilePolicy.isProtectedToolConfigWritePath(raw)
+            || canonical.map(SensitiveFilePolicy.isProtectedToolConfigWritePath) == true
+    }
+
+    /// 自动档：改构建配置（Package.swift、package.json、Makefile 等，以 BuildConfigExclusions 为准）、
+    /// .claude/、.mcp.json、.git 等位置仍然弹卡（用户 2026-11-16 夜）。
+    func requiresAutoModeConfigWriteApproval(capability: String, input: ComposerToolInput) -> Bool {
+        guard snapshot.mode == .auto, capability == "file_write" || capability == "file_edit",
+              let raw = input.stringValue(for: "path") else { return false }
+        return Self.isBuildOrToolConfigPath(raw, roots: facts.allowedWriteRoots)
+    }
+
+    nonisolated static func isBuildOrToolConfigPath(_ raw: String, roots: [String]) -> Bool {
+        let rootCandidates = roots + roots.compactMap(PolicyRuntimePathBoundary.canonicalPath)
+        let home = NSHomeDirectory()
+        let paths = [raw] + [PolicyRuntimePathBoundary.canonicalPath(raw)].compactMap { $0 }
+        return paths.contains {
+            PersistentApprovalRuleMatcher.isExcludedLocation($0, relativeTo: rootCandidates, home: home)
+        }
+    }
+
+    /// 本会话改过构建配置：记下来，之后自动档的构建、测试命令不再免问。
+    func noteBuildConfigChange(capability: String, input: ComposerToolInput) {
+        guard capability == "file_write" || capability == "file_edit",
+              let raw = input.stringValue(for: "path"),
+              Self.isBuildOrToolConfigPath(raw, roots: facts.allowedWriteRoots) else { return }
+        grants.persistentRules.markBuildConfigTouched(sessionID: snapshot.sessionID)
     }
 
     func requiresOutsideReadApproval(capability: String, input: ComposerToolInput) throws -> Bool {
@@ -1516,7 +1787,9 @@ public actor ComposerAuthorizationController {
         // 底线对规范化后的真实路径判断（解析符号链接），只约束改写/删除。
         if snapshot.mode == .bypassPermission, snapshot.bypassModeConfirmed {
             let isMutation = capability == "file_write" || capability == "file_edit" || capability == "file_delete"
-            if let denial = SensitiveFilePolicy.credentialDenial(for: rawPath, forWrite: isMutation) {
+            // file_read 读 .env、密钥文件名改为弹卡（见 baseAuthorize），这里只拒绝凭据目录与登录文件。
+            if let denial = SensitiveFilePolicy.credentialDenial(
+                for: rawPath, forWrite: isMutation || capability == "file_read") {
                 throw ComposerAuthorizationError.approvalDenied(denial)
             }
             if isMutation,
@@ -1551,14 +1824,89 @@ public actor ComposerAuthorizationController {
             roots: facts.allowedWriteRoots
         ) else {
             let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            // 对齐 Claude Code：授权根外的写/改不再直接拒绝，改为逐次审批（批准则本次可写）。
+            // 敏感文件、应用自身数据、系统路径仍然直接拒绝；删除仍只限授权根内。
+            if Self.outsideWriteMayAskApproval(capability: capability, rawPath: rawPath) { return }
             throw ComposerAuthorizationError.pathOutsideAllowedRoots(path)
         }
+    }
+
+    /// 授权根外的 file_write / file_edit 能否走审批：路径必须可规范化，且不是敏感文件、
+    /// MinisCanvas 自身数据/状态目录或系统文件。
+    static func outsideWriteMayAskApproval(capability: String, rawPath: String) -> Bool {
+        guard ApprovedFileWriteScope.isWrite(capability),
+              let canonical = PolicyRuntimePathBoundary.canonicalPath(rawPath) else { return false }
+        if SensitiveFilePolicy.contains(rawPath) || SensitiveFilePolicy.contains(canonical)
+            || SensitiveFilePolicy.isProtectedStatePath(canonical) { return false }
+        if BypassSystemFloor.violation(path: rawPath, operation: .modify) != nil { return false }
+        if BypassAppDataFloor.violation(path: rawPath, access: .modify) != nil { return false }
+        return true
+    }
+
+    /// 授权根外的写/改：每次都要用户批准，不进入规则、本对话授权或"以后都允许"。
+    func requiresOutsideWriteApproval(capability: String, input: ComposerToolInput) -> Bool {
+        guard ApprovedFileWriteScope.isWrite(capability), !hasConfirmedBypass,
+              let path = input.stringValue(for: "path") else { return false }
+        return !PolicyRuntimePathBoundary.isWithinRoots(path: path, roots: facts.allowedWriteRoots)
     }
 
     /// Tools that need a fresh human decision on every call, in every mode
     /// including bypass, decided here so no caller can forget the argument.
     static func isAlwaysHuman(_ capability: String) -> Bool {
-        capability == ExternalSessionToolNames.send
+        capability == ExternalSessionToolNames.send || capability == SessionMessagingTool.toolName
+    }
+
+    /// 对齐 Claude Code：计划模式下只读工具照常可用——只读 shell（git status/diff/log、
+    /// ls、cat、grep、find 等现有只读判定）、网页读取、浏览器的只读动作；写操作仍然只预演。
+    /// shell 的只读判定不在这里：它要看授权根和工作目录，由 `shellMayRunWithoutPrompt`
+    /// 经 `ShellEffectGuard` 逐命令、逐参数、逐路径检查。
+    static func planModeAllowsReadOnly(capability: String, input: ComposerToolInput) -> Bool {
+        if capability == WebFetchToolContract.toolName { return true }
+        // 联网搜索、查看后台命令输出只读，计划模式下照常可用。
+        if capability == "web_search" || capability == "shell_output" { return true }
+        if BrowserSideEffectPolicy.browserToolNames.contains(capability) {
+            return !BrowserSideEffectPolicy.inputRequiresApproval(
+                tool: capability, input: input.foundationDictionary)
+        }
+        return false
+    }
+
+    /// 计划模式的只读 shell、自动档的只读与项目内构建测试 shell：不弹卡，但这条具体命令的
+    /// 每个子命令都要先过 `ShellEffectGuard`（路径、敏感文件、授权根、参数形态）。
+    func shellMayRunWithoutPrompt(input: ComposerToolInput) -> Bool {
+        guard !revoked, !facts.revoked else { return false }
+        let mode: ShellEffectGuard.Mode
+        switch snapshot.mode {
+        case .plan, .manual, .autoEdit: mode = .readOnly
+        case .auto: mode = .auto
+        default: return false
+        }
+        let context = shellEffectContext(requireDefaultCWD: false)
+        // 本会话改过构建配置：自动档只对只读命令免问，构建、测试命令改为弹卡。
+        if mode == .auto, grants.persistentRules.buildConfigTouched(sessionID: snapshot.sessionID),
+           ShellEffectGuard.violation(input: input.foundationDictionary, context: context, mode: .readOnly) != nil {
+            return false
+        }
+        return ShellEffectGuard.violation(
+            input: input.foundationDictionary, context: context, mode: mode) == nil
+    }
+
+    /// 规则命中、免问放行后，执行前复检用的冻结信息。
+    nonisolated func shellEffectContext(requireDefaultCWD: Bool) -> ShellEffectGuard.Context {
+        ShellEffectGuard.Context(
+            roots: facts.allowedWriteRoots,
+            baseDirectory: ChildToolWorkspaceScope.current?.workingDirectory ?? facts.trustedProjectRoot,
+            requireDefaultCWD: requireDefaultCWD)
+    }
+
+    /// 免问放行时执行前要用哪种模式复检；nil 表示这次调用不属于免问放行。
+    nonisolated func shellRecheckMode(hasRuleReceipt: Bool) -> ShellEffectGuard.Mode? {
+        if hasRuleReceipt { return .rule }
+        switch snapshot.mode {
+        case .plan, .manual, .autoEdit: return .readOnly
+        case .auto: return .auto
+        default: return nil
+        }
     }
 
     private static func hasSideEffect(_ capability: String) -> Bool {
@@ -1574,6 +1922,8 @@ public actor ComposerAuthorizationController {
             && capability != SessionTodoProgress.toolName
             && capability != ContextCompactTool.toolName
             && capability != SkillMaintenanceTool.readName
+            // 共享任务看板只改应用自己的本地 JSON（会话之间的协作，用户 2026-11-16）。
+            && capability != TaskBoardTool.toolName
     }
 
     private static func requiresApproval(
@@ -1875,6 +2225,13 @@ public final class ComposerPolicyEnforcedToolExecutor:
         await preToolHookCache.remove(digest)
     }
 
+    /// 当前回合 MCP 工具的规则身份（服务器配置指纹 + 工具全名 + 只读提示）；非 MCP 或未授权返回 nil。
+    private func mcpRuleIdentity(_ capability: String) -> MCPToolRuleIdentity? {
+        guard capability.hasPrefix("mcp_") else { return nil }
+        let bridge = MCPToolBridgeTaskContext.current ?? (base as? BuiltinToolExecutor)?.mcpBridge
+        return (bridge as? any MCPToolBridgeRuleIdentityResolving)?.ruleIdentity(forFullName: capability)
+    }
+
     private func mcpRequiresUserInteraction(_ capability: String) -> Bool {
         let bridge = MCPToolBridgeTaskContext.current ?? (base as? BuiltinToolExecutor)?.mcpBridge
         return (bridge as? any MCPToolBridgeInteractionResolving)?.requiresUserInteraction(capability) ?? false
@@ -2026,11 +2383,8 @@ public final class ComposerPolicyEnforcedToolExecutor:
     private func requiresFreshShellApproval(capability: String, input: ComposerToolInput) -> Bool {
         capability == "shell_execute" && (NestedShellExecutionScope.requiresFreshApproval
             || (controller.snapshot.mode != .bypassPermission
-                && (approvalGate?.requiresExplicitShellConfirmation(
-                    tool: capability, input: input.foundationDictionary) == true
-                    || input.stringValue(for: "command").map {
-                        (approvalGate?.terminalPolicySnapshot ?? .default).classify(command: $0) == .unknown
-                    } == true)))
+                && approvalGate?.requiresExplicitShellConfirmation(
+                    tool: capability, input: input.foundationDictionary) == true))
     }
 
     /// A `.confirmation` shell command is approved per call: the scoped grant key
@@ -2042,12 +2396,27 @@ public final class ComposerPolicyEnforcedToolExecutor:
         } == true
     }
 
+    /// 子任务里的自动编辑免卡只限子任务自己的写根；顶层会话不受影响。
+    private static func childFileWriteStaysInOwnRoots(_ input: ComposerToolInput) -> Bool {
+        let context = AgentExecutionContext.current
+        guard context?.childRuntimeSnapshot != nil || context?.childToolRuntimeBinding != nil else { return true }
+        guard let scope = ChildToolWorkspaceScope.current,
+              let path = input.stringValue(for: "path") else { return false }
+        return PolicyRuntimePathBoundary.isWithinRoots(path: path, roots: scope.writeRoots)
+    }
+
     func authorizationDecision(
         callID: String,
         capability: String,
         input: ComposerToolInput,
         bypassApprovalGate: Bool = false
     ) async throws -> (decision: ComposerAuthorizationDecision, rule: PersistentApprovalRule?) {
+        // 审批卡必须完整显示将要执行的命令：超过 64KB 的命令不弹卡也不执行，改为先写成脚本文件。
+        if capability == "shell_execute", !controller.hasConfirmedBypass,
+           let longCommand = input.stringValue(for: "command"), longCommand.utf8.count > 64 * 1024 {
+            throw ComposerAuthorizationError.approvalDenied(
+                "命令过长（超过 64KB），审批卡无法完整显示，不会执行。请先用 file_write 把内容写成脚本文件（写入前可看到差异预览），再执行该脚本。")
+        }
         let mandatoryMCPInteraction = mcpRequiresUserInteraction(capability)
         let outsideRead = try await controller.requiresOutsideReadApproval(capability: capability, input: input)
         let protectedGitWrite = await controller.requiresProtectedGitWriteApproval(capability: capability, input: input)
@@ -2058,31 +2427,76 @@ public final class ComposerPolicyEnforcedToolExecutor:
             && (snapshot.mode == .autoEdit || snapshot.mode == .auto)
             && (capability == "file_write" || capability == "file_edit")
             && !HookPayload.touchesSensitivePath(input)
-            && AgentExecutionContext.current?.childRuntimeSnapshot == nil
-            && AgentExecutionContext.current?.childToolRuntimeBinding == nil
+            && Self.childFileWriteStaysInOwnRoots(input)
+        var policyRequiresApproval = bypassApprovalGate
+            ? false
+            : (approvalGate?.shouldAsk(
+                tool: capability, input: input.foundationDictionary,
+                deferringGlobalFilePromptToComposer: deferGlobalFilePrompt
+            ) ?? false)
+        // 只读 git 被判为低风险免问，不会再走完整的效果检查：能读出敏感文件内容的形式
+        // （git show HEAD:.env、不限文件的 git log -p / git show 等）在自动档也要弹卡。
+        if !policyRequiresApproval, !bypassApprovalGate, capability == "shell_execute", !controller.hasConfirmedBypass,
+           let command = input.stringValue(for: "command"),
+           ShellEffectGuard.gitSensitiveReadViolation(
+            command: command,
+            workingDirectory: input.shellWorkingDirectory
+                ?? ChildToolWorkspaceScope.current?.workingDirectory ?? controller.facts.trustedProjectRoot) != nil {
+            policyRequiresApproval = true
+        }
+        // 计划模式的只读命令、自动档的只读与项目内构建测试命令：不弹卡，但先过效果检查器。
+        // 终端策略拒绝的命令、用户设为"必须确认"的命令照旧弹卡。
+        if policyRequiresApproval, capability == "shell_execute", !unknownShell,
+           let command = input.stringValue(for: "command"),
+           (approvalGate?.terminalPolicySnapshot ?? .default).classify(command: command) != .denied,
+           await controller.shellMayRunWithoutPrompt(input: input) {
+            policyRequiresApproval = false
+        }
         var resolved = try await controller.authorizeResolvingRule(
             capability: capability,
             input: input,
-            policyRequiresApproval: bypassApprovalGate
-                ? false
-                : (approvalGate?.shouldAsk(
-                    tool: capability, input: input.foundationDictionary,
-                    deferringGlobalFilePromptToComposer: deferGlobalFilePrompt
-                ) ?? false),
+            policyRequiresApproval: policyRequiresApproval,
             mandatoryHuman: unknownShell,
             excludingScopedGrant: requiresPerCallShellApproval(capability: capability, input: input)
         )
-        if case .dryRun = resolved.decision { return resolved }
+        if case .dryRun = resolved.decision {
+            // 计划模式：服务器自述只读（readOnlyHint）的 MCP 工具不再被直接拦下，但仍要逐次审批，
+            // readOnlyHint 只是服务器的自述，绝不用来免审批。
+            guard snapshot.mode == .plan, mcpRuleIdentity(capability)?.readOnlyHint == true else { return resolved }
+            resolved = (.requestApproval(requiresSecondConfirmation: false), nil)
+        }
+        // "每次询问"规则命中：下面几处会把"要问"改成"免问"的捷径（MCP 规则、网站规则、钩子放行）都不能用。
+        let askRule = await controller.matchingAskRule(capability: capability, input: input)
+        // MCP 工具的“以后都允许”规则：命中则本次不弹卡（键 = 项目 + 服务器配置指纹 + 工具名）。
+        if capability.hasPrefix("mcp_"), snapshot.mode != .plan, !controller.hasConfirmedBypass,
+           !mandatoryMCPInteraction, askRule == nil, case .requestApproval = resolved.decision,
+           let identity = mcpRuleIdentity(capability),
+           let rule = await controller.matchingMCPRule(identity: identity) {
+            resolved = (.execute, rule)
+        }
+        // 终端策略已经拒绝的命令直接拒绝，不再弹一张只能点“拒绝”的卡（对齐 Claude Code）。
+        // 绕过模式有自己的底线，照旧由执行层判定。
+        if capability == "shell_execute", !controller.hasConfirmedBypass,
+           let deniedCommand = input.stringValue(for: "command"),
+           (approvalGate?.terminalPolicySnapshot ?? .default).classify(command: deniedCommand) == .denied {
+            throw ComposerAuthorizationError.approvalDenied(
+                "该命令被终端策略拒绝，不会执行。如需运行，请到 设置 → 终端策略 调整拒绝表。")
+        }
+        // 对齐 Claude Code：访问未允许的网站时弹审批卡（本次允许 / 以后都允许 / 拒绝），
+        // 不再直接拒绝。无人值守时没有人可问，仍按原来的方式拒绝。
         if BrowserSideEffectPolicy.browserToolNames.contains(capability),
            input.stringValue(for: "action") == "navigate",
            let raw = input.stringValue(for: "url")?.trimmingCharacters(in: .whitespacesAndNewlines),
            let destination = URL(string: raw), BrowserNavigationPolicy.isValidWebURL(destination),
            let host = destination.host,
            (base as? any BrowserDestinationPolicyChecking)?.permitsBrowserDestination(host: host) == false {
-            throw ComposerAuthorizationError.approvalDenied(BrowserNavigationPolicy.allowedWebsitesSettingsGuidance)
+            if ApprovalExecutionOriginContext.current.isUnattended {
+                throw ComposerAuthorizationError.approvalDenied(BrowserNavigationPolicy.allowedWebsitesSettingsGuidance)
+            }
+            resolved = (.requestApproval(requiresSecondConfirmation: false), nil)
         }
         if pinnedWeb && !controller.hasConfirmedBypass {
-            if let rule = await controller.matchingWebHostRule(input: input) {
+            if askRule == nil, let rule = await controller.matchingWebHostRule(input: input) {
                 resolved = (.execute, rule)
             } else {
                 let second: Bool
@@ -2118,7 +2532,7 @@ public final class ComposerPolicyEnforcedToolExecutor:
                     || BrowserSideEffectPolicy.inputRequiresApproval(tool: capability, input: input.foundationDictionary)
                     || HookPayload.touchesSensitivePath(input)
                     || ApprovalGate.inputRiskLevel(tool: capability, input: input.foundationDictionary) == .high
-                if !mandatoryHuman, case .requestApproval(let second) = resolved.decision, !second {
+                if !mandatoryHuman, askRule == nil, case .requestApproval(let second) = resolved.decision, !second {
                     return (.execute, nil)
                 }
             }
@@ -2157,11 +2571,16 @@ public final class ComposerPolicyEnforcedToolExecutor:
         _ pending: ComposerPendingApproval, name: String, input: ComposerToolInput
     ) async throws {
         guard !requiresFreshShellApproval(capability: name, input: input),
-              !(try await controller.requiresOutsideReadApproval(capability: name, input: input)),
+              !(try await controller.requiresOutsideReadApproval(capability: name, input: input) && !ApprovedFileReadScope.isRead(name)),
+              !(await controller.requiresOutsideWriteApproval(capability: name, input: input)),
               !(await controller.requiresProtectedGitWriteApproval(capability: name, input: input)) else { return }
         guard !SkillMaintenanceTool.names.contains(name) || pending.decision.skillRiskConfirmed else { return }
         guard !mcpRequiresUserInteraction(name), !pending.request.isHookAsk, pending.decision.persistAllow, pending.decision.approved,
               let offer = pending.request.persistentAllowOffer, offer.isAvailable else { return }
+        if name.hasPrefix("mcp_") {
+            if let identity = mcpRuleIdentity(name) { _ = await controller.persistMCPAllowRule(identity: identity) }
+            return
+        }
         _ = await controller.persistAllowRule(
             capability: name, input: input, expectedProjectKey: offer.projectKey)
     }
@@ -2388,8 +2807,15 @@ public final class ComposerPolicyEnforcedToolExecutor:
             guard capability == "file_read" || capability == "file_write" else {
                 throw ToolExecutorError.invalidParameter("browser transfer capability")
             }
-            try await boundController.revalidate(capability: capability,
-                input: ComposerToolInput(["path": url.path]))
+            let transferInput = try ComposerToolInput(["path": url.path])
+            // 浏览器下载到授权根外：不再直接拒绝，改由浏览器动作自己的审批卡决定（卡上显示最终目标路径，
+            // 批准才写）。敏感文件、应用自身数据、系统路径等底线仍然拒绝。
+            if await boundController.requiresOutsideWriteApproval(capability: capability, input: transferInput),
+               !ComposerAuthorizationController.outsideWriteMayAskApproval(
+                   capability: "file_write", rawPath: url.path) {
+                throw ComposerAuthorizationError.pathOutsideAllowedRoots(url.standardizedFileURL.path)
+            }
+            try await boundController.revalidate(capability: capability, input: transferInput)
         }
         return try await BrowserTransferFileAccessContext.$current.withValue(fileAccess) {
             try await operation()
@@ -2462,7 +2888,7 @@ public final class ComposerPolicyEnforcedToolExecutor:
         case .revoked:
             throw ComposerAuthorizationError.authorizationBindingMismatch
         case .dryRun:
-            return #"{"status":"dry-run","capability":"\#(name)"}"#
+            return #"{"status":"dry-run","capability":"\#(name)","message":"计划模式下不能修改，请先给出计划，等用户确认后再执行。"}"#
         case .execute:
             return try await runAction(callID: callID, name: name, input: input, action: action)
         case .approvedSettings(let receipt, let approvedCall, let facts):
@@ -2521,7 +2947,7 @@ public final class ComposerPolicyEnforcedToolExecutor:
         let resolved = try await authorizationDecision(callID: callID, capability: name, input: policyInput)
         switch resolved.decision {
         case .dryRun:
-            return #"{"status":"dry-run","capability":"\#(name)"}"#
+            return #"{"status":"dry-run","capability":"\#(name)","message":"计划模式下不能修改，请先给出计划，等用户确认后再执行。"}"#
         case .execute:
             try await controller.revalidate(capability: name, input: policyInput)
             let hitReceipt = resolved.rule.map {
@@ -2637,6 +3063,18 @@ public final class ComposerPolicyEnforcedToolExecutor:
                                 try await action(value)
                             }
                         }
+                        // 绕过档读 .env、密钥文件名：用户在卡上批准的这一个文件才放行。
+                        if name == "file_read", let (receipt, pending) = approved,
+                           let raw = value.stringValue(for: "path"),
+                           let path = PolicyRuntimePathBoundary.canonicalPath(raw),
+                           pending.decision.approved, pending.decision.status == .approved,
+                           pending.request.callID == callID, receipt.callID == callID,
+                           receipt.inputDigest == value.digest, path == pending.approvedReadPath {
+                            let scope = ApprovedFileReadScope(tool: name, path: path, receipt: receipt)
+                            return try await ApprovedFileReadScope.$current.withValue(scope) {
+                                try await action(value)
+                            }
+                        }
                         return try await action(value)
                     }
                 }
@@ -2644,6 +3082,21 @@ public final class ComposerPolicyEnforcedToolExecutor:
             if name == "shell_execute", let (receipt, _) = approved {
                 return try await ApprovedShellCallScope.$currentComposerReceipt.withValue(receipt) {
                     try await action(value)
+                }
+            }
+            // 规则命中、计划模式或自动档免问：没有用户当场批准。回执（规则命中时）让"未登记"命令
+            // 能执行；runShell 在真正执行前再对同一条命令过一次效果检查器。
+            if name == "shell_execute", approved == nil,
+               let recheckMode = controller.shellRecheckMode(hasRuleReceipt: ruleReceipt != nil),
+               ruleReceipt != nil
+                || controller.snapshot.mode == .manual || controller.snapshot.mode == .autoEdit
+                || (approvalGate?.shouldAsk(tool: name, input: value.foundationDictionary) ?? false) {
+                let recheck = ShellEffectRecheck(
+                    mode: recheckMode, context: controller.shellEffectContext(requireDefaultCWD: false))
+                return try await ApprovedShellCallScope.$currentComposerReceipt.withValue(ruleReceipt) {
+                    try await ApprovedShellCallScope.$effectRecheck.withValue(recheck) {
+                        try await action(value)
+                    }
                 }
             }
             if ApprovedFileReadScope.isRead(name), let (_, pending) = approved {
@@ -2665,6 +3118,37 @@ public final class ComposerPolicyEnforcedToolExecutor:
                 return try await ApprovedFileReadScope.$current.withValue(scope) {
                     try await withIndependentFileEffect(kind: .freshRead, callID: callID,
                         name: name, input: value) { try await action(value) }
+                }
+            }
+            // "以后都允许读取此目录"：规则命中的 file_read 只放行这一个文件，
+            // 并在执行前再核对一次规则仍然命中同一条。
+            if ApprovedFileReadScope.isRead(name), approved == nil, let receipt = ruleReceipt,
+               let raw = value.stringValue(for: "path"),
+               let path = PolicyRuntimePathBoundary.canonicalPath(raw),
+               receipt.callID == callID, receipt.inputDigest == value.digest,
+               try await controller.requiresOutsideReadApproval(capability: name, input: value) {
+                guard await controller.fileReadRuleStillMatches(receipt, input: value, capability: name) else {
+                    throw ComposerAuthorizationError.approvalRequired(name)
+                }
+                let scope = ApprovedFileReadScope(tool: name, path: path, receipt: receipt)
+                return try await ApprovedFileReadScope.$current.withValue(scope) {
+                    try await withIndependentFileEffect(kind: .freshRead, callID: callID,
+                        name: name, input: value) { try await action(value) }
+                }
+            }
+            // 授权根外写/改：刚批准的这一次调用只放行这一个路径。
+            if ApprovedFileWriteScope.isWrite(name), let (receipt, pending) = approved,
+               let raw = value.stringValue(for: "path"),
+               let path = PolicyRuntimePathBoundary.canonicalPath(raw),
+               pending.decision.approved, pending.decision.status == .approved,
+               pending.request.callID == callID, receipt.callID == callID,
+               receipt.inputDigest == value.digest,
+               pending.decision.requestID == pending.request.requestID,
+               pending.decision.bindingDigest == pending.request.identityDigest,
+               await controller.requiresOutsideWriteApproval(capability: name, input: value) {
+                let scope = ApprovedFileWriteScope(tool: name, path: path, receipt: receipt)
+                return try await ApprovedFileWriteScope.$current.withValue(scope) {
+                    try await action(value)
                 }
             }
             return try await action(value)
@@ -2799,10 +3283,25 @@ public final class ComposerPolicyEnforcedToolExecutor:
                 }
             }
             let result = try await scopedAction(input)
+            await controller.noteBuildConfigChange(capability: name, input: input)
             // A cancelled/denied/stale approval must never leave a reusable
             // file grant. Publish scoped consent only after a real success.
             // A later revocation only prevents grant insertion; it must not
             // turn a completed file mutation into a reported failure.
+            if let (_, pending) = approved, !pending.request.isHookAsk, name == "shell_execute",
+               pending.request.sessionScopeEligible && pending.decision.allowInSession {
+                await controller.recordSessionShellRules(input: input)
+            }
+            if let (_, pending) = approved, !pending.request.isHookAsk, name == "web_search",
+               pending.request.sessionScopeEligible && pending.decision.allowInSession {
+                await controller.recordSessionWebSearchRule()
+            }
+            // “本对话内都允许（对此目标会话）”：成功之后只在内存里记到本会话。
+            if let (_, pending) = approved, !pending.request.isHookAsk,
+               SessionTargetApprovalRules.isSessionTargetCapability(name),
+               pending.request.sessionScopeEligible && pending.decision.allowInSession {
+                await controller.recordSessionTargetRule(capability: name, input: input)
+            }
             if let (_, pending) = approved, !pending.request.isHookAsk,
                ["file_write", "file_edit", "file_delete"].contains(name) {
                 try? await controller.recordApproval(
@@ -2949,7 +3448,12 @@ public final class ComposerPolicyEnforcedToolExecutor:
               ObjectIdentifier(owner) == ownerID else {
             throw ApprovalFileChangedError()
         }
-        let preview = try await owner.prepareFileApprovalPreview(tool: tool, input: input)
+        // 授权根外的写/改：只在生成审批预览（只读）这一步，让下游按这一个路径读出旧内容。
+        let outsidePath: String? = await controller.requiresOutsideWriteApproval(capability: tool, input: input)
+            ? input.stringValue(for: "path").flatMap(PolicyRuntimePathBoundary.canonicalPath) : nil
+        let preview = try await ApprovedFileWriteScope.$previewPath.withValue(outsidePath) {
+            try await owner.prepareFileApprovalPreview(tool: tool, input: input)
+        }
         try Task.checkCancellation()
         try await controller.revalidate(capability: tool, input: input)
         guard let owner = (base as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner,
@@ -3052,6 +3556,7 @@ public final class ComposerPolicyEnforcedToolExecutor:
         request.browserInteractionInput = baseRequest.browserInteractionInput
         request.webFetchAuthority = baseRequest.webFetchAuthority
         request.displayTargetPath = baseRequest.displayTargetPath
+        request.displayTaskTitles = baseRequest.displayTaskTitles
         if name == WebFetchToolContract.toolName,
            let raw = input.stringValue(for: "url"), let url = URL(string: raw) {
             request.webFetchAuthority = try WebFetchApprovalDisplay.authority(for: url)
@@ -3064,11 +3569,65 @@ public final class ComposerPolicyEnforcedToolExecutor:
         }
         let outsideRead = try await controller.requiresOutsideReadApproval(capability: name, input: input)
         let protectedGitWrite = await controller.requiresProtectedGitWriteApproval(capability: name, input: input)
+        let outsideWrite = await controller.requiresOutsideWriteApproval(capability: name, input: input)
+        // 读、写、搜索敏感文件（.env、密钥等）都必须点击批准：回车不批准（旅程测试 11/17 发现读取卡只看了写入预览）。
+        let sensitivePathArgument = input.stringValue(for: "path").map { raw in
+            SensitiveFilePolicy.contains(raw)
+                || PolicyRuntimePathBoundary.canonicalPath(raw).map(SensitiveFilePolicy.contains) == true
+        } ?? false
+        // shell 命令的操作数（含重定向目标）碰到密钥/凭据文件时同样必须点击，回车不批准。
+        let shellSensitiveOperand: Bool = {
+            guard name == "shell_execute", let command = input.stringValue(for: "command") else { return false }
+            return ShellEffectGuard.sensitiveOperandViolation(
+                command: command,
+                workingDirectory: input.shellWorkingDirectory
+                    ?? ChildToolWorkspaceScope.current?.workingDirectory ?? controller.facts.trustedProjectRoot) != nil
+        }()
+        request.requiresExplicitClick = outsideWrite || filePreview?.isSensitive == true || sensitivePathArgument
+            || shellSensitiveOperand
         request.sessionScopeEligible = try await controller.scopedGrantEligible(capability: name, input: input)
             && !request.isHookAsk && !mcpRequiresUserInteraction(name) && filePreview?.isSensitive != true
-        if !controller.hasConfirmedBypass && !request.isHookAsk && !mcpRequiresUserInteraction(name) && !outsideRead && !protectedGitWrite
+        if !controller.hasConfirmedBypass && !request.isHookAsk && !mcpRequiresUserInteraction(name) && (!outsideRead || ApprovedFileReadScope.isRead(name))
+            && !outsideWrite && !protectedGitWrite
             && !requiresFreshShellApproval(capability: name, input: input) {
             request.persistentAllowOffer = await controller.persistentAllowOffer(capability: name, input: input)
+            // 对齐 Claude Code：shell 也提供"本对话内都允许"（按命令前缀，仅内存）。
+            // 会话目标工具（读/发给某个目标会话）同样提供“本对话内都允许（对此目标会话）”。
+            // 只能“本对话内”允许的目标（外部会话、run 模式）：永久允许不可用，但目标明确时仍提供本对话内。
+            let sessionTargetOnly = SessionTargetApprovalRules.isSessionTargetCapability(name)
+                && request.persistentAllowOffer?.isAvailable == false
+                && SessionTargetApprovalRules.persistenceRestriction(
+                    capability: name, input: input.foundationDictionary) != nil
+                && request.persistentAllowOffer?.unavailableReason
+                    == SessionTargetApprovalRules.persistenceRestriction(
+                        capability: name, input: input.foundationDictionary)
+            if name == "shell_execute" || SessionTargetApprovalRules.isSessionTargetCapability(name),
+               request.persistentAllowOffer?.isAvailable == true || sessionTargetOnly,
+               !ApprovalExecutionOriginContext.current.isUnattended {
+                request.sessionScopeEligible = true
+            }
+            // 网页搜索：手动档的卡片提供"本对话内都允许"（仅内存）和"以后都允许"。
+            if name == "web_search", !ApprovalExecutionOriginContext.current.isUnattended {
+                request.sessionScopeEligible = true
+            }
+        }
+        // 绕过档下看不清内容的 osascript 弹的卡：提供"本对话内都允许"（只在内存里记到本会话，不提供永久允许）。
+        if controller.hasConfirmedBypass, name == "shell_execute", !request.isHookAsk,
+           !ApprovalExecutionOriginContext.current.isUnattended,
+           let command = input.stringValue(for: "command"),
+           ShellNestedCommandInspector.hasOpaqueScript(command: command) {
+            request.sessionScopeEligible = true
+        }
+        if name.hasPrefix("mcp_"), !controller.hasConfirmedBypass, !request.isHookAsk,
+           !mcpRequiresUserInteraction(name), snapshot.mode != .plan,
+           !ApprovalExecutionOriginContext.current.isUnattended,
+           let identity = mcpRuleIdentity(name) {
+            request.persistentAllowOffer = await controller.mcpPersistentAllowOffer(identity: identity)
+        }
+        // 命中"每次询问"规则的卡：不提供"以后都允许"，也不提供"本对话内都允许"。
+        if await controller.matchingAskRule(capability: name, input: input) != nil {
+            request.persistentAllowOffer = nil
+            request.sessionScopeEligible = false
         }
         let originalRequestID = request.requestID
         let readPath = ApprovedFileReadScope.isRead(name)

@@ -62,7 +62,8 @@ struct A7AChatLayoutConsumerTests {
             ".accessibilityIdentifier(\"composer.model\")",
             ".accessibilityIdentifier(\"composer.attachments\")",
             ".accessibilityIdentifier(\"composer.plugins\")",
-            ".accessibilityValue(composerAccessibilityValue)"
+            ".modifier(ComposerDraftAccessibilityValue(chat: chat) { composerAccessibilityValue })",
+            "return content.accessibilityValue(value())"
         ] {
             #expect(composer.contains(contract), "Missing composer contract: \(contract)")
         }

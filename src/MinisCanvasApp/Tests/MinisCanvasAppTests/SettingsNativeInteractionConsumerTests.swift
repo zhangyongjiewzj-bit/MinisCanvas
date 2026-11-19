@@ -351,9 +351,7 @@ struct SettingsNativeInteractionConsumerTests {
         let open = try #require(findSettingsAX(in: host.window, identifier: disclosureID))
         let role = (open as? NSAccessibilityProtocol)?.accessibilityRole() ?? NativeConsumerOwnedAX.role(open)
         #expect(role == .button)
-        #expect(try disclosureValue(disclosureID) == "已收起")
-        #expect(findSettingsAX(in: host.window, identifier: prefix + ".tools.refresh") == nil)
-        try press(disclosureID)
+        // 11/16：工具授权区默认展开；第一次按下是收起。
         #expect(try disclosureValue(disclosureID) == "已展开")
         let refresh = try #require(findSettingsAX(in: host.window, identifier: prefix + ".tools.refresh"))
         let refreshRole = (refresh as? NSAccessibilityProtocol)?.accessibilityRole() ?? NativeConsumerOwnedAX.role(refresh)

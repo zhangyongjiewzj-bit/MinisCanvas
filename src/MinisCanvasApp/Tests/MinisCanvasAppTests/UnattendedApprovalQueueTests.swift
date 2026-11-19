@@ -123,6 +123,42 @@ struct UnattendedApprovalQueueTests {
         _ = await background?.value
     }
 
+    @Test func differentSessionInteractiveRequestQueuesInsteadOfBeingRejected() async {
+        let center = ApprovalPromptCenter()
+        let queue = ApprovalQueue()
+        func sessionRequest(_ id: String, _ session: String) -> ApprovalRequest {
+            ApprovalRequest(id: id, toolName: "shell", inputSummary: "synthetic command",
+                riskLevel: .high, requiresApproval: true, sessionID: session)
+        }
+        var first: Task<ApprovalDecision, Never>?
+        await withCheckedContinuation { continuation in
+            center.onPendingRequestChanged = { id, _ in if id == "session-a" { continuation.resume() } }
+            first = Task { await queue.present(sessionRequest("session-a", "A"), in: center) }
+        }
+        var second: Task<ApprovalDecision, Never>?
+        await withCheckedContinuation { continuation in
+            withObservationTracking { _ = queue.queuedRequests } onChange: { continuation.resume() }
+            second = Task { await queue.present(sessionRequest("session-b", "B"), in: center) }
+        }
+        #expect(queue.queuedRequests.map(\.id) == ["session-b"])
+        #expect(center.pendingRequest?.id == "session-a")
+        // 同一会话的重复请求仍直接拒绝。
+        let duplicate = await queue.present(sessionRequest("session-a-again", "A"), in: center)
+        #expect(!duplicate.approved && duplicate.reason == "已有审批请求在处理中")
+        let duplicateOfQueued = await queue.present(sessionRequest("session-b-again", "B"), in: center)
+        #expect(!duplicateOfQueued.approved && duplicateOfQueued.reason == "已有审批请求在处理中")
+        #expect(queue.queuedRequests.map(\.id) == ["session-b"])
+
+        await withCheckedContinuation { continuation in
+            center.onPendingRequestChanged = { id, _ in if id == "session-b" { continuation.resume() } }
+            center.resolve(approved: false, confirmed: false, requestID: "session-a")
+        }
+        _ = await first?.value
+        #expect(center.pendingRequest?.id == "session-b")
+        center.resolve(approved: true, confirmed: true, requestID: "session-b")
+        #expect(await second?.value.approved == true)
+    }
+
     @Test func displayOnlyChildSourceCannotBypassInteractiveOverlapRejection() async {
         let center = ApprovalPromptCenter()
         let queue = ApprovalQueue()

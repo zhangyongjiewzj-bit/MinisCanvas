@@ -52,6 +52,41 @@ struct R27WP2BProviderReadinessFailClosedTests {
         #expect(!center.chatModelPickerProjection.items.contains { $0.isSelectable })
     }
 
+    @Test("错 Key：服务端回 401 算可达，归为鉴权失败并提示替换 Key（11/16 现场 F4）")
+    func wrongKeyIsAuthenticationFailureNotUnreachable() async throws {
+        let transport = R27WP2BTransport(
+            responses: [
+                .reachability: [
+                    .response(.init(statusCode: 401, errorCategory: .unauthorized))
+                ],
+                .authentication: [
+                    .response(.init(statusCode: 401, errorCategory: .unauthorized))
+                ]
+            ]
+        )
+        let center = try makeCenter(transport: transport)
+        #expect(center.saveProvider(
+            name: "R27_WRONG_KEY_API_KEY",
+            apiKey: "r27-wrong-key",
+            baseURL: "https://mock.example/v1",
+            modelNames: ["luna-model"],
+            protocolType: .openaiCompatible
+        ))
+
+        let report = try #require(
+            await center.checkProviderReadiness(forProviderName: "R27_WRONG_KEY_API_KEY")
+        )
+
+        #expect(report.reachability.status == .passed)
+        #expect(report.authentication.status == .failed)
+        #expect(report.authentication.statusCode == 401)
+        let provider = try #require(center.providerRecords.first { $0.name == "R27_WRONG_KEY_API_KEY" })
+        let summary = center.providerLocalReadinessSummary(for: provider)
+        #expect(summary.action == .replaceAPIKey)
+        #expect(summary.message.contains("鉴权失败"))
+        #expect(!summary.message.contains("不可达"))
+    }
+
     @Test("不可达会失效旧记录且不泄露 key")
     func unreachableProviderInvalidatesPreviousPass() async throws {
         let transport = R27WP2BTransport(
@@ -88,8 +123,10 @@ struct R27WP2BProviderReadinessFailClosedTests {
         )
 
         #expect(report.reachability.status == .failed)
-        #expect(center.providerReadinessStore.records.first?.status == .unavailable)
-        #expect(center.chatModelPickerProjection.items.first?.isSelectable == false)
+        // 2026-11-16：不可达这类暂时性失败不再把之前已通过的模型直接作废——保留旧的通过记录，
+        // 报告里照实标出“本次不可达”；401/403/404/400 这类确定性失败仍阻断（见上一个用例）。
+        #expect(center.providerReadinessStore.records.first?.status == .passed)
+        #expect(center.chatModelPickerProjection.items.first?.isSelectable == true)
         let persisted = try Data(
             contentsOf: center.memoryStore.directory.appendingPathComponent(
                 ProviderReadinessStore.fileName

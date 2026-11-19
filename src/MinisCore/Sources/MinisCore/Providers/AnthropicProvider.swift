@@ -11,8 +11,11 @@ private struct AnthropicReplyAssembly {
     private var deltaUsage: LLMUsage?
     private(set) var stopReason: String?
     private(set) var stopped = false
+    /// 最近一次 accept 产生的思考增量（显示用），每次调用开头清空。
+    private(set) var pendingThinking: String?
 
     mutating func accept(_ object: [String: Any], argumentByteLimit: Int) throws -> String? {
+        pendingThinking = nil
         guard !stopped else { return nil }
         guard let type = object["type"] as? String else { throw badShape() }
         switch type {
@@ -29,6 +32,14 @@ private struct AnthropicReplyAssembly {
             var block = AnthropicProvider.AssistantStreamBlock(type: kind,
                 text: value["text"] as? String ?? "", toolID: value["id"] as? String,
                 toolName: value["name"] as? String)
+            if kind == "thinking" {
+                block.thinking = value["thinking"] as? String ?? ""
+                block.signature = value["signature"] as? String ?? ""
+                if !block.thinking.isEmpty { pendingThinking = block.thinking }
+            } else if kind == "redacted_thinking" {
+                block.redactedData = value["data"] as? String
+                pendingThinking = "（思考内容已加密）"
+            }
             if let input = value["input"] as? [String: Any],
                let encoded = try? JSONSerialization.data(withJSONObject: input) {
                 block.toolInputJSON = String(decoding: encoded, as: UTF8.self)
@@ -53,14 +64,31 @@ private struct AnthropicReplyAssembly {
                 block.text += text
                 blocks[index] = block
                 return text
+            case "thinking_delta":
+                guard let piece = delta["thinking"] as? String else { throw badShape() }
+                var block = blocks[index] ?? AnthropicProvider.AssistantStreamBlock(type: "thinking")
+                guard block.type == "thinking" else { throw badShape() }
+                if blocks[index] == nil { blockOrder.append(index) }
+                block.thinking += piece
+                blocks[index] = block
+                if !piece.isEmpty { pendingThinking = piece }
+            case "signature_delta":
+                guard var block = blocks[index], block.type == "thinking",
+                      let piece = delta["signature"] as? String else { throw badShape() }
+                block.signature += piece
+                blocks[index] = block
             case "input_json_delta":
                 guard var block = blocks[index], block.type == "tool_use",
                       let piece = delta["partial_json"] as? String else { throw badShape() }
                 if fragmentedInputs.insert(index).inserted { block.toolInputJSON = "" }
-                guard piece.utf8.count <= argumentByteLimit - block.toolInputJSON.utf8.count else {
-                    throw LLMError.providerError(message: "Tool arguments exceed the supported size.")
+                if block.toolInputOversized { break }
+                if piece.utf8.count > argumentByteLimit - block.toolInputJSON.utf8.count {
+                    // V-6：不整轮失败；丢掉已累计的参数并标记，收尾时回给模型固定的工具错误。
+                    block.toolInputJSON = ""
+                    block.toolInputOversized = true
+                } else {
+                    block.toolInputJSON += piece
                 }
-                block.toolInputJSON += piece
                 blocks[index] = block
             default: break
             }
@@ -72,7 +100,7 @@ private struct AnthropicReplyAssembly {
             if let value = object["usage"] as? [String: Any] { deltaUsage = AnthropicProvider.parseMessagesUsage(value) }
         case "message_stop": stopped = true
         case "error":
-            throw LLMError.providerError(message: ProviderAnthropicErrorProjectionPolicy.projectStreamError(object))
+            throw ProviderAnthropicErrorProjectionPolicy.streamLLMError(object)
         default: break
         }
         return nil
@@ -197,30 +225,10 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
         Self.modelRejectsTemperature(model.id) ? nil : temperature
     }
 
-    public static func anthropicMessageDict(_ msg: LLMMessage,
-                                            mediaCapabilities: ModelCapabilities? = nil) -> [String: Any] {
-        var envelope: [String: Any] = ["role": msg.role.rawValue]
-        switch msg.role {
-        case .tool:
-            let resultBlock: [String: Any] = [
-                "content": msg.content,
-                "tool_use_id": msg.toolCallID ?? "unknown_tool_call",
-                "type": "tool_result"
-            ]
-            envelope["role"] = "user"
-            envelope["content"] = [resultBlock]
-            return envelope
-        case .user, .assistant:
-            break
-        }
-        guard !(msg.images.isEmpty && msg.toolCalls.isEmpty && (mediaCapabilities == nil || msg.audios.isEmpty)) else {
-            envelope["content"] = msg.content
-            return envelope
-        }
-
+    private static func anthropicImageBlocks(_ images: [LLMMessage.ImageAttachment],
+                                             mediaCapabilities: ModelCapabilities?) -> [[String: Any]] {
         func textBlock(_ text: String) -> [String: Any] { ["text": text, "type": "text"] }
-
-        let imageBlocks: [[String: Any]] = msg.images.map { attachment in
+        return images.map { (attachment) -> [String: Any] in
             let kind = MediaPartKind.classify(mimeType: attachment.mimeType)
             let admission: MediaGateDecision?
             switch (kind, mediaCapabilities) {
@@ -249,6 +257,36 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
             ]
             return ["source": source, "type": "image"]
         }
+    }
+
+    public static func anthropicMessageDict(_ msg: LLMMessage,
+                                            mediaCapabilities: ModelCapabilities? = nil) -> [String: Any] {
+        var envelope: [String: Any] = ["role": msg.role.rawValue]
+        switch msg.role {
+        case .tool:
+            // 工具返回的图片放进 tool_result 的内容数组（文字块 + 图片块）。
+            let resultContent: Any = msg.images.isEmpty ? msg.content
+                : ([["text": msg.content, "type": "text"] as [String: Any]]
+                   + anthropicImageBlocks(msg.images, mediaCapabilities: mediaCapabilities))
+            let resultBlock: [String: Any] = [
+                "content": resultContent,
+                "tool_use_id": msg.toolCallID ?? "unknown_tool_call",
+                "type": "tool_result"
+            ]
+            envelope["role"] = "user"
+            envelope["content"] = [resultBlock]
+            return envelope
+        case .user, .assistant:
+            break
+        }
+        guard !(msg.images.isEmpty && msg.toolCalls.isEmpty && (mediaCapabilities == nil || msg.audios.isEmpty)) else {
+            envelope["content"] = msg.content
+            return envelope
+        }
+
+        func textBlock(_ text: String) -> [String: Any] { ["text": text, "type": "text"] }
+
+        let imageBlocks = anthropicImageBlocks(msg.images, mediaCapabilities: mediaCapabilities)
         let audioBlocks = msg.audios.map { attachment in
             let mime: String
             switch attachment.format.lowercased() {
@@ -266,14 +304,16 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
             return ["input": admitted.arguments, "name": admitted.name,
                 "id": admitted.id, "type": "tool_use"]
         }
-        envelope["content"] = imageBlocks + audioBlocks + proseBlocks + invocationBlocks
+        let thinkingBlocks: [[String: Any]] = msg.role == .assistant
+            ? (msg.toolCalls.first?.thinkingBlocks ?? []) : []
+        envelope["content"] = thinkingBlocks + imageBlocks + audioBlocks + proseBlocks + invocationBlocks
         return envelope
     }
 
     public static func parseNativeToolCalls(from json: [String: Any]) -> [LLMToolCall] {
         let items = (json["content"] as? [[String: Any]] ?? []).filter { $0["type"] as? String == "tool_use" }
         guard items.count <= ProviderToolCallBoundary.maximumCalls else { return [] }
-        let calls = items.compactMap(ProviderToolCallBoundary.parseAnthropic)
+        let calls = items.compactMap(ProviderToolCallBoundary.parseAnthropicAdmittingOversized)
         return ProviderToolCallBoundary.hasUniqueIdentifiers(calls) ? calls : []
     }
     public static func parseMessagesUsage(_ usage: [String: Any]) -> LLMUsage {
@@ -287,6 +327,22 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
         parseMessagesResult(json, offeredNames: nil)
     }
 
+    /// 本轮可原样回传的思考块（thinking 需带 signature；redacted_thinking 需带 data）。
+    static func replayableThinkingBlocks(_ content: [[String: Any]]) -> [[String: Any]] {
+        content.compactMap { block -> [String: Any]? in
+            switch block["type"] as? String {
+            case "thinking":
+                guard let thought = block["thinking"] as? String,
+                      let signature = block["signature"] as? String, !signature.isEmpty else { return nil }
+                return ["type": "thinking", "thinking": thought, "signature": signature]
+            case "redacted_thinking":
+                guard let data = block["data"] as? String, !data.isEmpty else { return nil }
+                return ["type": "redacted_thinking", "data": data]
+            default: return nil
+            }
+        }
+    }
+
     private static func parseMessagesResult(_ json: [String: Any], offeredNames: [String]?) -> LLMResponse {
         let content = json["content"] as? [[String: Any]] ?? []
         let text = content.compactMap { block -> String? in
@@ -295,10 +351,12 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
         let stopReason = json["stop_reason"] as? String
         let items = content.filter { $0["type"] as? String == "tool_use" }
         let withinCallLimit = items.count <= ProviderToolCallBoundary.maximumCalls
-        let parsed = withinCallLimit ? items.map(ProviderToolCallBoundary.parseAnthropic) : []
+        let parsed = withinCallLimit ? items.map(ProviderToolCallBoundary.parseAnthropicAdmittingOversized) : []
         let parsedCalls = parsed.compactMap { $0 }
         let uniqueIdentifiers = ProviderToolCallBoundary.hasUniqueIdentifiers(parsedCalls)
-        let calls = uniqueIdentifiers ? parsedCalls : []
+        var calls = uniqueIdentifiers ? parsedCalls : []
+        let replay = replayableThinkingBlocks(content)
+        if !replay.isEmpty, !calls.isEmpty { calls[0].thinkingBlocks = replay }
         let ids = items.compactMap { $0["id"] as? String }
         let discarded = stopReason == "max_tokens" && withinCallLimit
             && Set(ids).count == ids.count ? max(0, items.count - calls.count) : 0
@@ -337,6 +395,8 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
         let state = lock.withLock { configuration }
         let observer = AssistantThinkingParameters.reportApplication
         let key = key, probe = probe
+        // Task-local hints do not cross `Task.detached`: read the caller's value here.
+        let promptCaching = LLMRequestHints.promptCaching
         let worker = Task.detached { () throws -> URLRequest in
             try Task.checkCancellation()
             probe?()
@@ -357,13 +417,19 @@ public final class AnthropicProvider: LLMProvider, AssistantStreamingLLMProvider
             if let temperature, !Self.modelRejectsTemperature(state.model.id) { body["temperature"] = temperature }
             if !tools.isEmpty { body["tools"] = tools.map(\.providerAnthropicToolDict) }
             AssistantThinkingParameters.apply(thinking, modelID: state.model.id, wire: .anthropic, body: &body, report: observer)
+            // 只给 Claude 模型打缓存断点：非 Claude 模型走 Anthropic 兼容网关时，不给网关多带它可能不认的字段和结构。
+            // 压缩的摘要请求只发一次，调用方用 `LLMRequestHints.promptCaching` 关掉断点（省一次缓存写入加价）。
+            if promptCaching, AnthropicModelPolicy.version(in: state.model.id) != nil {
+                Self.addPromptCacheBreakpoints(to: &body)
+            }
             var request = URLRequest(url: endpoint)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue(key, forHTTPHeaderField: "x-api-key")
             request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             for (field, value) in state.headers { request.setValue(value, forHTTPHeaderField: field) }
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            // 键顺序固定：缓存按请求前缀的字节匹配，字典遍历顺序不稳会让命中随机落空。
+            request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
             try Task.checkCancellation()
             return request
         }
@@ -441,6 +507,11 @@ extension AnthropicProvider {
         var toolID: String? = nil
         var toolName: String? = nil
         var toolInputJSON: String = ""
+        /// 工具参数累计超过边界上限（V-6）：参数已丢弃，收尾时作为超限调用回给模型固定错误。
+        var toolInputOversized = false
+        var thinking: String = ""
+        var signature: String = ""
+        var redactedData: String? = nil
     }
 
     static func mergedAssistantStreamUsage(messageUsage: LLMUsage?, deltaUsage: LLMUsage?) -> LLMUsage? {
@@ -467,11 +538,17 @@ extension AnthropicProvider {
                 var candidate: [String: Any] = ["type": "tool_use"]
                 if let id = block.toolID { candidate["id"] = id }
                 if let name = block.toolName { candidate["name"] = name }
+                if block.toolInputOversized { candidate[ProviderToolCallBoundary.oversizedMarkerKey] = true }
                 if let data = block.toolInputJSON.data(using: .utf8),
                    let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
                     candidate["input"] = object
                 }
                 return candidate
+            case "thinking":
+                return block.signature.isEmpty ? nil
+                    : ["type": "thinking", "thinking": block.thinking, "signature": block.signature]
+            case "redacted_thinking":
+                return block.redactedData.map { ["type": "redacted_thinking", "data": $0] }
             default: return nil
             }
         }
@@ -487,6 +564,47 @@ extension AnthropicProvider {
 }
 
 extension AnthropicProvider {
+    /// 流在 message_stop 之前就结束：瞬时故障，可由上层按"还没有任何输出"重试。
+    static func prematureStreamEnd() -> LLMError {
+        .transientError(message: "Provider stream ended before a complete response was received.")
+    }
+
+    /// 提示缓存（对齐 Claude Code）：在最后一个工具定义、系统提示、最后一条消息的最后一个可缓存块
+    /// 各打一个 `cache_control: ephemeral` 断点，共 3 个，不超过 Anthropic 允许的 4 个。
+    /// 缓存按 工具 → 系统 → 消息 的顺序做前缀匹配，所以下一步请求只多出末尾新增的内容。
+    /// 低于模型最小可缓存长度时服务端会忽略断点，不报错。
+    static func addPromptCacheBreakpoints(to body: inout [String: Any]) {
+        let marker: [String: Any] = ["type": "ephemeral"]
+        if var tools = body["tools"] as? [[String: Any]], !tools.isEmpty {
+            tools[tools.count - 1]["cache_control"] = marker
+            body["tools"] = tools
+        }
+        if let system = body["system"] as? String, !system.isEmpty {
+            body["system"] = [["type": "text", "text": system, "cache_control": marker] as [String: Any]]
+        }
+        guard var messages = body["messages"] as? [[String: Any]], let last = messages.indices.last else { return }
+        var message = messages[last]
+        if let text = message["content"] as? String {
+            // 空文本块不能带 cache_control。
+            guard !text.isEmpty else { return }
+            message["content"] = [["type": "text", "text": text, "cache_control": marker] as [String: Any]]
+        } else if var blocks = message["content"] as? [[String: Any]],
+                  let index = blocks.lastIndex(where: { block in
+                      switch block["type"] as? String {
+                      case "text": return !((block["text"] as? String) ?? "").isEmpty
+                      case "image", "tool_use", "tool_result", "document": return true
+                      default: return false  // thinking / redacted_thinking 不能打缓存标记
+                      }
+                  }) {
+            blocks[index]["cache_control"] = marker
+            message["content"] = blocks
+        } else {
+            return
+        }
+        messages[last] = message
+        body["messages"] = messages
+    }
+
     public nonisolated(nonsending) func streamMessage(messages: [LLMMessage], systemPrompt: String?,
         maxTokens: Int, temperature: Double?) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
         let (assembledRequest, revision) = try await request(messages: messages, system: systemPrompt, tools: [],
@@ -521,7 +639,7 @@ extension AnthropicProvider {
                             try ProviderStreamCancellationPolicy.yield(.finished(stopReason: stopReason), to: continuation)
                             return true
                         case .error:
-                            throw LLMError.providerError(message: ProviderAnthropicErrorProjectionPolicy.projectStreamError(object))
+                            throw ProviderAnthropicErrorProjectionPolicy.streamLLMError(object)
                         default: break
                         }
                         return false
@@ -552,8 +670,15 @@ extension AnthropicProvider {
                     if !done && !budgetLine.isEmpty {
                         try budget.consume(line: String(decoding: budgetLine, as: UTF8.self))
                     }
-                    if !done, let event = parser.flushPending() { _ = try publish(event) }
+                    if !done, let event = parser.flushPending() { done = try publish(event) }
                     try ProviderStreamCancellationPolicy.check()
+                    // 已收到结束原因（message_delta）却没有 message_stop 就关连接：回答已经完整，按正常结束处理；
+                    // 两者都没有才是提前断流。
+                    if !done, let stopReason {
+                        try ProviderStreamCancellationPolicy.yield(.finished(stopReason: stopReason), to: continuation)
+                        done = true
+                    }
+                    guard done else { throw Self.prematureStreamEnd() }
                     continuation.finish()
                 } catch { continuation.finish(throwing: self.mapError(error)) }
             }
@@ -592,13 +717,20 @@ extension AnthropicProvider {
                         }
                         try ProviderAnthropicResponseShapePolicy.validate(object)
                         if object["type"] as? String == "error" {
-                            throw LLMError.providerError(message: ProviderAnthropicErrorProjectionPolicy.projectStreamError(object))
+                            throw ProviderAnthropicErrorProjectionPolicy.streamLLMError(object)
                         }
                         if let text = try result.accept(object, argumentByteLimit: ProviderToolCallBoundary.maximumArgumentsBytes), !text.isEmpty {
                             try ProviderStreamCancellationPolicy.yield(.textDelta(text), to: continuation)
                         }
+                        if let thought = result.pendingThinking, !thought.isEmpty {
+                            try ProviderStreamCancellationPolicy.yield(.thinkingDelta(thought), to: continuation)
+                        }
                         if result.stopped { break }
                     }
+                    // 既没收到 message_stop 也没收到结束原因就断流（网关超时后正常关连接等）：半截回答不能当完整回答。
+                    // 已收到结束原因（message_delta）只是没发 message_stop 的网关，回答是完整的，照常结束。
+                    try ProviderStreamCancellationPolicy.check()
+                    guard result.stopped || result.stopReason != nil else { throw Self.prematureStreamEnd() }
                     try ProviderStreamCancellationPolicy.yield(.completed(result.completedResponse(offeredNames: tools.map(\.name))), to: continuation)
                     continuation.finish()
                 } catch { continuation.finish(throwing: self.mapError(error)) }

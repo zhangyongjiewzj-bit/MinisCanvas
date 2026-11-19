@@ -285,7 +285,9 @@ struct ResponsiveComposerNativeConsumer2408Tests {
         #expect(displayed.contains("保留最近 3 条"))
         // This fixture is an idle current session in manual/request mode;
         // the expectation is not a claim that every mode requires approval.
-        #expect(value.contains("需审批"))
+        // 2026-11-16：菜单层把 /compact 显示为“可用”（对齐 Claude Code），不再标“需审批”；
+        // 命令本身的策略判定不变。
+        #expect(value.contains("可用") && !value.contains("需审批"))
         #expect(chat.activeSessionID == sessionID)
         #expect(chat.draftText == "/compact")
         #expect(chat.pendingComposerCommand == nil && !chat.isActiveSessionStreaming)

@@ -179,7 +179,7 @@ struct MemoryClassifiedInjectorTests {
             "回答用中文 personal-b", memoryScope: scopeA, ownerUserID: "user-b",
             visibility: .personal, trustedPrincipal: principalB
         )
-        _ = try writer.addFact("晴天 project-a", memoryScope: scopeA, visibility: .project)
+        let projectA = try writer.addFact("晴天 project-a", memoryScope: scopeA, visibility: .project)
         _ = try writer.addFact("晴天 project-b", memoryScope: otherProject, visibility: .project)
         _ = try writer.addFact(
             "晴天 temporary-a", memoryScope: scopeA, visibility: .temporary,
@@ -198,7 +198,8 @@ struct MemoryClassifiedInjectorTests {
             )
         )
         // 本人偏好与本项目已批准记忆都常驻；他人、外项目、临时仍不注入。
-        #expect(projectTurn.injectedFactIDs.first == personalA.id)
+        // 长05：本项目记忆排在前，个人偏好在后。
+        #expect(projectTurn.injectedFactIDs == [projectA.id, personalA.id])
         #expect(projectTurn.injectedFactIDs.count == 2)
         #expect(projectTurn.prompt.contains("GLOBAL_STANDING"))
         #expect(projectTurn.prompt.contains("personal-a"))
@@ -249,8 +250,8 @@ struct CCRound2MemoryLimitTests {
     @Test func defaultRecallLimits() {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("cc2-memory-unused-" + UUID().uuidString)
         let injector = MemoryInjector(store: MemoryStore(directory: root))
-        #expect(injector.maxFacts == 10)
-        #expect(injector.maxFactLength == 400)
-        #expect(injector.maxTotalCharacters == 4000)
+        #expect(injector.maxFacts == 30)
+        #expect(injector.maxFactLength == 1000)
+        #expect(injector.maxTotalCharacters == 8000)
     }
 }

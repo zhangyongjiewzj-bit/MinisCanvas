@@ -446,7 +446,7 @@ struct Policy599ProductionConsumerTests {
             return
         }
         try #require(trustedRoot.path == expectedRoot)
-        let fact = scenario == "oversized" ? String(repeating: "x", count: 513) : "The draft title is Blue Garden."
+        let fact = scenario == "oversized" ? String(repeating: "x", count: 3201) : "The draft title is Blue Garden."
         let instruction = "Please remember this fact: " + fact
         let draft = scenario == "repeat" || scenario == "pasted" ? "Continue discussing the draft." : instruction
         if scenario == "pasted" {
@@ -597,19 +597,19 @@ struct Policy599ProductionConsumerTests {
             replies: [call("outside599", "file_write", ["path": outside.path, "content": "changed599"])],
             mode: .autoEdit)
         let result = try terminal(request, id: "outside599")
+        // 2026-11-16（对齐 Claude Code）：授权根外的写不再被直接拒绝，而是走逐次审批；
+        // 这里没有人批准，所以写入没有发生，工具结果是错误，账本里是一条失败（不是成功）的记录。
         #expect(result.1)
-        #expect(result.0.contains("outside allowed roots"))
         #expect(try String(contentsOf: outside, encoding: .utf8) == "sentinel599")
         #expect(await approval.requests.isEmpty)
         let engine = try #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.toolExecutionFactLedger.facts.isEmpty)
+        #expect(engine.toolExecutionFactLedger.facts.count == 1)
+        #expect(engine.toolExecutionFactLedger.facts.first?.toolCallID == "outside599")
+        #expect(engine.toolExecutionFactLedger.facts.first?.status == .failed)
         #expect(engine.toolExecutionFactLedger.pendingReceipts.isEmpty)
         #expect(bridge.composerApprovalReceipts.isEmpty)
         let restored = try reopened(bridge)
         #expect(restored.messages == bridge.chat.messages.map { $0.asLLMMessage() })
-        #expect(restored.messages.contains {
-            $0.role == .assistant && $0.content.contains("执行前拦截：1 项工具调用未执行")
-        })
         #expect(!restored.messages.contains { $0.content.contains(outside.path) })
     }
 
@@ -1256,9 +1256,31 @@ extension Policy599ProductionConsumerTests {
         try await waitUntil { run.provider.requests().count == 1 }
         _ = try run.chat.controlConversationGoal(sessionID: run.sessionID, goalID: run.goal.id, action: action)
         try await waitForGoalQuiet(run)
-        #expect(run.provider.requests().count == 2)
+        // B2-14：暂停会中断正在跑的回合（不再发第二次请求）；停止仍沿用原行为。
+        #expect(run.provider.requests().count == (action == .pause ? 1 : 2))
+        #expect(!run.chat.isStreaming)
         #expect(userTexts(run) == ["开始推进目标"])
         #expect(try storedGoal(run).status == (action == .pause ? .paused : .stopped))
+    }
+
+    // B2-22：目标受阻时，用户直接回复会把目标恢复为进行中。
+    @Test func userReplyResumesABlockedGoal() async throws {
+        let run = try goalRun()
+        defer { run.chat.stopAllStreamingForSafety(); try? FileManager.default.removeItem(at: run.root) }
+        _ = try run.chat.setConversationGoalAutoContinue(sessionID: run.sessionID, goalID: run.goal.id, enabled: false)
+        let store = try #require(run.chat.sessionStore)
+        let blocker = try #require(ConversationGoalBlocker(
+            summary: "选方案", reason: "需要你决定", options: ["A": "方案一"], userAction: "回复选择"))
+        _ = try store.recordConversationGoalReport(
+            sessionID: run.sessionID, goalID: run.goal.id, report: .blocker(blocker))
+        _ = try store.recordConversationGoalReport(
+            sessionID: run.sessionID, goalID: run.goal.id, report: .allRemainingWorkBlocked(reason: "等你选择"))
+        #expect(try storedGoal(run).status == .blocked)
+        _ = try sendUserGoalTurn(run, text: "选方案 A")
+        try await waitForGoalQuiet(run)
+        let saved = try storedGoal(run)
+        #expect(saved.status == .active)
+        #expect(saved.budget.usedTurns == 1)
     }
 
     @Test func reviewedCompletionAndExhaustedBudgetDoNotContinueAndNotifyOnce() async throws {
@@ -1595,6 +1617,38 @@ extension Policy599ProductionConsumerTests {
         #expect(chat.pastedTextActionFeedback == "当前目标：整理本周报告")
         #expect(chat.conversationGoal(for: id)?.objective == "整理本周报告")
     }
+
+    // B2-12：/goal pause、resume、clear 是控制子命令，不会被当成目标内容。
+    @Test func goalSubcommandsControlTheGoalInsteadOfCreatingOne() async throws {
+        let root = try makeRoot(), provider = Policy599Provider(), approval = Policy599Approval(approvals: 0)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeBridge(root: root, provider: provider, approval: approval)
+        let chat = fixture.bridge.chat
+        defer { chat.stopAllStreamingForSafety(); withExtendedLifetime(fixture) {} }
+        let id = try #require(chat.activeSessionID)
+        #expect(chat.installComposerCommandRegistry(AppCommandCatalog.assembled(bridge: fixture.bridge).registry))
+
+        func submit(_ text: String) async throws {
+            chat.draftText = text
+            chat.sendDraft()
+            for _ in 0..<300 where !chat.draftText.isEmpty {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+
+        try await submit("/goal pause")
+        #expect(chat.pastedTextActionFeedback == "当前会话还没有目标。")
+        #expect(chat.conversationGoal(for: id) == nil)
+
+        try await submit("/goal 整理本周报告")
+        let goal = try #require(chat.conversationGoal(for: id))
+        _ = try chat.setConversationGoalAutoContinue(sessionID: id, goalID: goal.id, enabled: false)
+        try await submit("/goal pause")
+        #expect(chat.conversationGoal(for: id)?.status == .paused)
+        #expect(chat.conversationGoal(for: id)?.objective == "整理本周报告")
+        try await submit("/goal clear")
+        #expect(chat.conversationGoal(for: id)?.status == .stopped)
+    }
 }
 
 
@@ -1736,17 +1790,19 @@ extension Policy599ProductionConsumerTests {
         defer { bridge.chat.stopAllStreamingForSafety(); withExtendedLifetime(fixture) {} }
         try fixture.settings.provisionBuiltInMemoryCandidateSubmissions()
 
-        _ = try await submit(bridge, provider, replies: ["好的。"], mode: .manual,
-                             requiresFinalProviderRequest: false,
-                             interactive: true, draft: "请记住：我偏好简洁的中文回答。")
+        let before = provider.requests().count
+        bridge.chat.composerPolicySelection = ComposerPolicySelection(mode: .manual, approvalScope: .request,
+            effort: .standard, bypassModeConfirmed: false)
+        bridge.chat.draftText = "请记住：我偏好简洁的中文回答。"
+        bridge.chat.selectInteractiveComposerMode(.manual)
+        bridge.chat.submitInteractiveComposer()
+        for _ in 0..<10 { try await Task.sleep(for: .milliseconds(20)) }
 
-        let expected = "当前会话未归入项目，这条没有保存为记忆。可先把会话归入项目再说一次，或在 设置 › 记忆 编辑全局记忆。"
-        #expect(bridge.chat.pastedTextActionFeedback == expected)
-        let prompt = try #require(provider.lastPrompt())
-        #expect(prompt.contains("本回合用户要求记住的内容没有被保存"))
-        #expect(prompt.contains("不要声称已经记住"))
+        // 本人键入的“请记住…”不再发给模型：无项目的会话直接存为个人记忆，并如实提示。
+        #expect(provider.requests().count == before)
+        #expect(bridge.chat.pastedTextActionFeedback?.hasPrefix("已记住（个人记忆") == true)
         #expect(try fixture.settings.pendingMemoryProposals().isEmpty)
-        #expect(try fixture.settings.memoryStore.activeFacts().isEmpty)
+        #expect(try fixture.settings.memoryStore.activeFacts().map(\.text) == ["我偏好简洁的中文回答。"])
     }
 }
 
@@ -1782,6 +1838,21 @@ extension Policy599ProductionConsumerTests {
         // "请记住：…"剥前缀；"以后都…"整句就是事实。
         let fact = scenario == "remember" ? "草稿标题是蓝色花园。" : "以后都用中文回答"
         let draft = scenario == "remember" ? "请记住：" + fact : fact
+        if scenario == "remember" {
+            // 本人键入的“请记住…”由 App 直接写入项目记忆，不发给模型、不进待审。
+            let before = provider.requests().count
+            bridge.chat.composerPolicySelection = ComposerPolicySelection(mode: .autoEdit, approvalScope: .request,
+                effort: .standard, bypassModeConfirmed: false)
+            bridge.chat.draftText = draft
+            bridge.chat.selectInteractiveComposerMode(.autoEdit)
+            bridge.chat.submitInteractiveComposer()
+            for _ in 0..<10 { try await Task.sleep(for: .milliseconds(20)) }
+            #expect(provider.requests().count == before)
+            #expect(bridge.chat.pastedTextActionFeedback?.hasPrefix("已记住（项目记忆）") == true)
+            #expect(try fixture.settings.pendingMemoryProposals().isEmpty)
+            #expect(try fixture.settings.memoryStore.activeFacts().map(\.text) == [fact])
+            return
+        }
         let response = try call("rememberAuto599", "memory_propose_fact", ["fact": fact])
         _ = try await submit(bridge, provider, replies: [response], mode: .autoEdit,
                              requiresFinalProviderRequest: false, interactive: true, draft: draft)

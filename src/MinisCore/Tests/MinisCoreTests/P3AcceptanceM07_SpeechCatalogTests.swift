@@ -7,7 +7,9 @@ struct P3AcceptanceM07SpeechCatalogTests {
     // Approved N-02 adds the session-local todo_write tool; speech evidence rules stay unchanged.
     private let ordinaryNames = [
         "file_grep", "file_glob", "todo_write", "shell_execute", "shell_output", "shell_stop", "file_read", "file_write", "file_edit", "file_delete",
-        "session_read", "external_session_read", "external_session_send", "context_compact", "browser",
+        "session_read", "external_session_read", "external_session_send",
+        // 会话之间的协作（用户 2026-11-16）：给其它会话发消息、共享任务看板。
+        "session_send", "task_board", "context_compact", "browser",
     ]
 
     private func availability(voiceAvailable: Bool?) -> SpeechToolAvailabilitySnapshot {

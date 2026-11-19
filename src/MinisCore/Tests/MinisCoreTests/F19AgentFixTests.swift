@@ -169,8 +169,10 @@ struct RequestBudgetEnforcementTests {
             LLMMessage(role: .assistant, content: "旧回答1"),
             LLMMessage(role: .user, content: "旧问题2")
         ]
+        // web_search 默认要问（11/19）；本测试与审批无关，显式设为自动通过。
         var loop = AgentLoop(
             maxIterations: 5,
+            approvalGate: ApprovalGate(policyByTool: ["web_search": .autoApprove]),
             loopDetector: nil,
             requestBudget: tracker,
             compactor: compactor,
@@ -335,8 +337,10 @@ struct LoopDetectorDefaultWiringTests {
         let root = try minisCoreToolContractRoot("loop-explicit-nil")
         defer { try? FileManager.default.removeItem(at: root) }
         let identity = minisCoreToolContractIdentity("loop-explicit-nil")
+        // web_search 默认要问（11/19）；本测试与审批无关，显式设为自动通过。
         let loop = AgentLoop(
             maxIterations: 6,
+            approvalGate: ApprovalGate(policyByTool: ["web_search": .autoApprove]),
             loopDetector: nil,
             toolExecutionFactLedger: try minisCoreToolContractLedger(at: root)
         )

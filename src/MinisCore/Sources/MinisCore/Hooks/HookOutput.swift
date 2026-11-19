@@ -40,6 +40,14 @@ public enum HookOutputParser {
             return .parsed(HookParsedOutput(verdict: nil, reason: nil, additionalContext: nil))
         }
         guard let object = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else {
+            // 对齐 Claude Code：会话开始、提交前、工具后的钩子，纯文本 stdout 直接作为附加上下文。
+            // 以 { 或 [ 开头的视为写坏的 JSON，仍按无效输出处理。
+            let looksLikeJSON = text.hasPrefix("{") || text.hasPrefix("[")
+            if !looksLikeJSON, event == .sessionStart || event == .userPromptSubmit || event == .postToolUse {
+                return .parsed(HookParsedOutput(
+                    verdict: nil, reason: nil,
+                    additionalContext: clean(text, limit: maximumContextLength)))
+            }
             return .invalid("stdout 不是 JSON 对象")
         }
         let specific = object["hookSpecificOutput"] as? [String: Any]
@@ -65,7 +73,11 @@ public enum HookOutputParser {
                 verdict = .deny
                 reason = reason ?? (object["stopReason"] as? String)
             }
-        case .postToolUse, .sessionStart, .stop:
+        case .stop:
+            // 对齐 Claude Code：Stop 钩子返回 {"decision":"block","reason":"…"} 表示要求继续，
+            // reason 就是给模型的下一步指示。
+            if (object["decision"] as? String) == "block" { verdict = .deny }
+        case .postToolUse, .sessionStart, .notification, .subagentStop, .preCompact, .sessionEnd:
             break
         }
 
@@ -139,7 +151,32 @@ enum HookPayload {
     }
 
     static func toolInput(_ input: ComposerToolInput) -> [String: Any] {
-        input.values.mapValues { jsonValue(from: $0) }
+        var result = input.values.mapValues { jsonValue(from: $0) }
+        // 对齐 Claude Code：文件类工具的路径字段叫 file_path；本 App 叫 path，两个都给。
+        if result["file_path"] == nil, let path = result["path"] as? String {
+            result["file_path"] = path
+        }
+        return result
+    }
+
+    /// Claude Code 风格的工具名：Bash、Edit、Read……；本 App 的 MCP 工具名
+    /// `mcp_<服务器>_<工具>` 转成 `mcp__<服务器>__<工具>`（服务器名含下划线时为尽力对应）。
+    /// 没有对应名字的工具原样返回。
+    static func claudeToolName(_ appName: String) -> String {
+        if let mapped = HookDefinition.claudeCodeToolNames[appName]?.first { return mapped }
+        if appName.hasPrefix("mcp_"), !appName.hasPrefix("mcp__") {
+            let rest = appName.dropFirst("mcp_".count)
+            if let split = rest.firstIndex(of: "_") {
+                return "mcp__" + rest[..<split] + "__" + rest[rest.index(after: split)...]
+            }
+        }
+        return appName
+    }
+
+    /// 写进钩子 stdin 的工具名字段：tool_name 用 Claude Code 名，原名放 app_tool_name。
+    static func addToolNames(_ object: inout [String: Any], appName: String) {
+        object["tool_name"] = claudeToolName(appName)
+        object["app_tool_name"] = appName
     }
 
     enum PayloadEncodingError: Error { case invalidJSONObject }

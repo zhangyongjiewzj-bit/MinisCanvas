@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import MinisCore
 @testable import MinisCanvasApp
 
 @MainActor
@@ -31,7 +32,12 @@ final class O15MarkdownPresentationTests: XCTestCase {
         let webRange = (safe.string as NSString).range(of: "网页")
         let fileRange = (safe.string as NSString).range(of: "本地")
         XCTAssertEqual((safe.attribute(.link, at: webRange.location, effectiveRange: nil) as? URL)?.scheme, "https")
-        XCTAssertNil(safe.attribute(.link, at: fileRange.location, effectiveRange: nil))
+        // 11/16 用户要求"链接都能点开"：本地 file 链接也保留为可点链接（打开前另有确认与可执行拦截）。
+        XCTAssertEqual((safe.attribute(.link, at: fileRange.location, effectiveRange: nil) as? URL)?.scheme, "file")
+        let custom = ReadOnlyAttributedTextView.sanitized(MarkdownAttributedTextBuilder.build(
+            content: "[自定义](x-custom://open)", isMarkdown: true))
+        let customRange = (custom.string as NSString).range(of: "自定义")
+        XCTAssertNil(custom.attribute(.link, at: customRange.location, effectiveRange: nil))
         XCTAssertNil(TranscriptExternalLink.allowedURL("https://user:password@example.com"))
         let sessionID = UUID()
         let original = ReadOnlyAttributedTextView.Coordinator()
@@ -76,8 +82,13 @@ final class O15MarkdownPresentationTests: XCTestCase {
         let web = MarkdownAttributedTextBuilder.renderState(
             content: "[同名](https://example.com/safe)", isMarkdown: true)
         XCTAssertEqual(web.status, .rendered)
-        let unsafe = MarkdownAttributedTextBuilder.renderState(
+        // 11/16：本地 file 链接改为可点，不再计为被清洗；自定义 scheme 仍被清洗。
+        let local = MarkdownAttributedTextBuilder.renderState(
             content: "[同名](file:///tmp/perf-assessment-private)", isMarkdown: true)
+        XCTAssertEqual(local.status, .rendered)
+        XCTAssertEqual(local.attributedString.string.trimmingCharacters(in: .whitespacesAndNewlines), "同名")
+        let unsafe = MarkdownAttributedTextBuilder.renderState(
+            content: "[同名](x-custom://perf-assessment-private)", isMarkdown: true)
         XCTAssertEqual(unsafe.status, .sanitized)
         XCTAssertEqual(unsafe.attributedString.string.trimmingCharacters(in: .whitespacesAndNewlines), "同名")
         let malformed = "[同名](file:///tmp/perf-assessment-private) `未闭合"
@@ -94,6 +105,33 @@ final class O15MarkdownPresentationTests: XCTestCase {
         let freshWeb = MarkdownAttributedTextBuilder.renderState(
             content: "[同名](https://example.com/safe)", isMarkdown: true)
         XCTAssertEqual(freshWeb, web)
+    }
+
+    /// MC4-030：白字用户气泡里的引用、代码标签、列表标记、表格尾部提示不得再叠透明度，
+    /// 否则在深色气泡底色（刚好 4.5:1）上低于项目文字对比度门槛。
+    func testUserBubbleSecondaryTextStaysOpaqueWhiteMeetingContrast() {
+        let source = "> 引用文字\n\n- 项目\n\n```swift\nlet a = 1\n```\n\n| A |\n| --- |\n"
+            + (1...201).map { "| r\($0) |" }.joined(separator: "\n")
+        let rendered = MarkdownAttributedTextBuilder.build(content: source, isMarkdown: true, baseColor: .white)
+        let full = NSRange(location: 0, length: rendered.length)
+        var checked = 0
+        rendered.enumerateAttribute(.foregroundColor, in: full) { value, range, _ in
+            guard let color = (value as? NSColor)?.usingColorSpace(.sRGB) else { return }
+            let text = (rendered.string as NSString).substring(with: range)
+            guard text.contains("引用文字") || text.contains("•") || text.contains("swift")
+                || text.contains("还有 1 行") else { return }
+            checked += 1
+            XCTAssertEqual(color.alphaComponent, 1.0, accuracy: 0.001, "次级文字不应带透明度：\(text)")
+            let bubble = ThemeContrast.fillMeetingWhiteText(ThemeColor(hex: 0xE08B68))
+            XCTAssertGreaterThanOrEqual(
+                ThemeContrast.contrastRatio(ThemeColor(r: 1, g: 1, b: 1), bubble), 4.5 - 0.001)
+        }
+        XCTAssertGreaterThanOrEqual(checked, 4)
+    }
+
+    func testSecondaryColorStillDimsNonWhiteBase() {
+        let dimmed = MarkdownAttributedTextBuilder.secondaryColor(.black, alpha: 0.7)
+        XCTAssertEqual(dimmed.alphaComponent, 0.7, accuracy: 0.001)
     }
 
 }

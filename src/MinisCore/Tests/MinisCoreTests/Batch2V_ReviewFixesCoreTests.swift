@@ -164,7 +164,9 @@ struct Batch2V_LossySummaryBoundTests {
         #expect(request.content.count <= budgetCharacters + 600)
         #expect(request.content.contains("更早内容已省略"))
         #expect(request.content.contains("MSG_55_"))
-        #expect(!request.content.contains("MSG_0_"))
+        // 第一条用户消息（任务目标）固定放在请求开头；其余更早的消息按预算省略。
+        #expect(request.content.contains("MSG_0_"))
+        #expect(!request.content.contains("MSG_2_"))
         // Facts come from the store-side list, not from the bounded transcript.
         let summary = try #require(result.messages.first?.content)
         for index in stride(from: 1, to: 56, by: 2) {
@@ -211,5 +213,73 @@ struct Batch2V_LossySummaryBoundTests {
         let request = try #require(provider.requests.first?.first)
         #expect(!request.content.contains("更早内容已省略"))
         #expect(request.content.contains("SHORT_0") && request.content.contains("SHORT_7"))
+    }
+}
+
+// MARK: - PF4 压缩事实继承、交接模式、429 误判、换供应商清思考块
+
+@Suite("PF4 压缩与供应商错误")
+struct PF4CompactionAndProviderTests {
+    @Test("第二次压缩继承上一份摘要里的事实清单行")
+    func secondCompactionKeepsEarlierFactList() async throws {
+        let provider = SummaryRecordingProvider(window: 200_000)
+        let previous = LLMMessage(role: .user, content: """
+            \(LossySummaryCompaction.summaryOpen)
+            摘要正文
+            事实清单 · 执行过的工具：file_read（/old.txt）；shell（ls）
+            事实清单 · 出现过的附件：old.png
+            \(LossySummaryCompaction.summaryClose)
+            """)
+        let middle = LLMMessage(role: .assistant, content: "新的一步", toolCalls: [
+            LLMToolCall(id: "n1", name: "file_edit", rawArguments: "{}", arguments: ["path": "/new.txt"])])
+        let tool = LLMMessage(role: .tool, content: "ok", toolCallID: "n1")
+        let recent = LLMMessage(role: .user, content: "最近一句")
+        let result = try await LossySummaryCompaction.compact(
+            messages: [previous, middle, tool, recent], keepRecent: 1, provider: provider)
+        let summary = try #require(result.messages.first?.content)
+        #expect(summary.contains("file_read（/old.txt）") && summary.contains("shell（ls）"))
+        #expect(summary.contains("file_edit（/new.txt）"))
+        #expect(summary.contains("old.png"))
+    }
+
+    @Test("交接模式只返回摘要正文，不带续做提示、原话块和事实清单")
+    func handoverSummaryHasNoContinuationInstruction() async throws {
+        let provider = SummaryRecordingProvider(window: 200_000)
+        let history = (0..<6).map { LLMMessage(role: $0 % 2 == 0 ? .user : .assistant, content: "内容\($0)") }
+        let result = try await LossySummaryCompaction.compact(
+            messages: history, keepRecent: 0, provider: provider, handover: true)
+        let summary = try #require(result.summary)
+        #expect(summary == "SYNTHETIC_SUMMARY")
+        #expect(!summary.contains(LossySummaryCompaction.continuationNotice))
+        #expect(!summary.contains(LossySummaryCompaction.userQuotesOpen))
+    }
+
+    @Test("429 的 Gemini 免费额度限速不算余额不足，计费类正文仍算")
+    func rateLimitedFreeTierIsNotQuotaExhausted() {
+        let gemini = #"{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}"#
+        #expect(!ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: 429, body: gemini))
+        #expect(!ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: 429, body: "quota exceeded"))
+        #expect(ProviderHTTPErrorAdapter.indicatesQuotaExhausted(
+            statusCode: 429, body: #"{"error":{"code":"insufficient_quota"}}"#))
+        #expect(ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: 429, body: "账户余额不足"))
+    }
+
+    @Test("429 限速正文里只出现 balance 或 余额 字样，不算余额不足")
+    func bareBalanceWordIsNotQuotaExhausted() {
+        #expect(!ProviderHTTPErrorAdapter.indicatesQuotaExhausted(
+            statusCode: 429, body: "Rate limit reached while rebalancing the load balancer, retry later"))
+        #expect(!ProviderHTTPErrorAdapter.indicatesQuotaExhausted(
+            statusCode: 429, body: "请求过于频繁，请查看账户余额与速率限制说明后稍后再试"))
+        #expect(ProviderHTTPErrorAdapter.indicatesQuotaExhausted(
+            statusCode: 429, body: #"{"error":{"message":"Insufficient balance"}}"#))
+    }
+
+    @Test("换供应商重试时清掉历史里的思考块，首次尝试保持原样")
+    func fallbackAttemptDropsThinkingBlocks() {
+        var call = LLMToolCall(id: "c1", name: "file_read", rawArguments: "{}", arguments: [:])
+        call.thinkingBlocks = [["type": "thinking", "thinking": "x", "signature": "sig"]]
+        let messages = [LLMMessage(role: .assistant, content: "", toolCalls: [call])]
+        #expect(FallbackRouter.messagesForAttempt(messages, afterFailure: false)[0].toolCalls[0].thinkingBlocks.count == 1)
+        #expect(FallbackRouter.messagesForAttempt(messages, afterFailure: true)[0].toolCalls[0].thinkingBlocks.isEmpty)
     }
 }

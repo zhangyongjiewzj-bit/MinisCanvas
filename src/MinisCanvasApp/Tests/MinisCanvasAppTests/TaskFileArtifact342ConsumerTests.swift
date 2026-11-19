@@ -177,6 +177,8 @@ struct TaskFileArtifact342ConsumerTests {
         f.consumer.bindFileArtifacts(ledger: f.ledger, facts: f.facts,
             targetValidator: f.executor.fileArtifactTargetValidator(), projectValidator: { projectID, directory in
                 handler.isTaskFileProjectAuthorized(projectID: projectID, workingDirectory: directory)
+            }, grantCurrent: { projectID, producedAt in
+                handler.isTaskFileGrantCurrent(projectID: projectID, producedAt: producedAt)
             })
         let output = f.project.appendingPathComponent("generic-child.txt")
         try await Self.produceGenericChild(executor: f.executor, project: f.project, output: output,
@@ -200,7 +202,8 @@ struct TaskFileArtifact342ConsumerTests {
         if scenario == "regrant" {
             try handler.revokeProject(id: projectID)
             let replacement = try handler.authorizeFolderFromNativePicker(f.project)
-            #expect(replacement != projectID)
+            // 同一文件夹重新授权复用原项目；旧导航绑定因授权版本更新而失效。
+            #expect(replacement == projectID)
             #expect(handler.isTaskFileProjectAuthorized(projectID: replacement, workingDirectory: f.project.path))
             #expect(!f.consumer.fileArtifactPresentationAuthorized(navigation: navigation, target: output))
             #expect(await AgentFileOutputActionConsumer.performTaskArtifactInApp(

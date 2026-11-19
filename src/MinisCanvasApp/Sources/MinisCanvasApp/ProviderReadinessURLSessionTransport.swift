@@ -41,13 +41,32 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
     }
 
     func send(
-        _ request: ProviderReadinessTransportRequest
+        _ incoming: ProviderReadinessTransportRequest
     ) async throws -> ProviderReadinessTransportResponse {
         // A cancelled readiness task is a stale request after a retry,
         // configuration change, or process re-entry. Reject it before the
         // credential ever reaches URLSession and re-check after the async
         // boundary before accepting provider data.
         try Task.checkCancellation()
+        // ChatGPT account record: its stored "key" is a placeholder; probe with the live
+        // access token against the official host only.
+        let usesChatGPTAccount = incoming.apiKey == ChatGPTAccountSession.credentialPlaceholder
+        let request: ProviderReadinessTransportRequest
+        if usesChatGPTAccount {
+            guard incoming.baseURL.host?.lowercased() == ChatGPTAccountEndpoints.responsesHost,
+                  let account = ChatGPTAccountSessions.shared else {
+                throw SettingsProviderReadinessTransportError.missingCredential
+            }
+            let token: String
+            do { token = try await account.accessToken() }
+            catch { throw SettingsProviderReadinessTransportError.missingCredential }
+            request = ProviderReadinessTransportRequest(
+                ownedMMAction: incoming.ownedMMAction, operation: incoming.operation,
+                providerID: incoming.providerID, baseURL: incoming.baseURL, apiKey: token,
+                modelID: incoming.modelID, protocolType: incoming.protocolType)
+        } else {
+            request = incoming
+        }
         guard !request.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw SettingsProviderReadinessTransportError.missingCredential
         }
@@ -58,7 +77,7 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
             throw SettingsProviderReadinessTransportError.invalidResponse
         }
 
-        let assembledRequest = try makeURLRequest(for: request)
+        let assembledRequest = try makeURLRequest(for: request, account: usesChatGPTAccount)
         let urlRequest = try requestURLPolicy?(assembledRequest) ?? assembledRequest
         let ownedPermit = try ownedMMOutboundLedger?.beforeSend(action: request.ownedMMAction,
             phase: Self.ownedPhase(request.operation))
@@ -97,7 +116,7 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
 
         if case .minimalModelRequest = request.operation,
            (200..<300).contains(httpResponse.statusCode) {
-            let adapter = ProviderReadinessWireAdapterFactory.make(for: request.protocolType, baseURL: request.baseURL)
+            let adapter = wireAdapter(for: request, account: usesChatGPTAccount)
             do {
                 try adapter.validateModelRequestResponse(from: data)
             } catch {
@@ -116,9 +135,24 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
         let modelIDs: [String]
         if request.operation == .modelDiscovery,
            (200..<300).contains(httpResponse.statusCode) {
-            let adapter = ProviderReadinessWireAdapterFactory.make(for: request.protocolType, baseURL: request.baseURL)
+            let adapter = wireAdapter(for: request, account: usesChatGPTAccount)
             do {
-                let decodedModelIDs = try adapter.decodeModelCatalog(from: data).map(\.id)
+                var decodedModelIDs = try adapter.decodeModelCatalog(from: data).map(\.id)
+                if request.protocolType == .anthropic {
+                    // Anthropic 模型目录分页：沿游标继续拉取，最多 20 页。
+                    var cursor = adapter.nextCatalogPageCursor(from: data)
+                    var pageCount = 1
+                    while let afterID = cursor, pageCount < 20 {
+                        pageCount += 1
+                        guard let pageData = try await fetchCatalogPage(
+                            adapter: adapter,
+                            request: request,
+                            afterID: afterID
+                        ) else { break }
+                        decodedModelIDs += try adapter.decodeModelCatalog(from: pageData).map(\.id)
+                        cursor = adapter.nextCatalogPageCursor(from: pageData)
+                    }
+                }
                 guard let safeModelIDs = safeModelIDs(
                     decodedModelIDs,
                     excludingCredential: request.apiKey
@@ -156,8 +190,17 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
             // consumers receive only status, typed category and model IDs.
             body: "",
             modelIDs: modelIDs,
-            errorCategory: failureCategory(for: httpResponse.statusCode)
+            errorCategory: quotaExhausted(statusCode: httpResponse.statusCode, data: data)
+                ? .permissionDenied : failureCategory(for: httpResponse.statusCode)
         )
+    }
+
+    /// 余额或额度用尽（只按固定白名单关键词判断，正文不保留）：归入“无访问权限/额度”类，
+    /// 不按限流重试，提示里写明去检查账户额度。
+    private func quotaExhausted(statusCode: Int, data: Data) -> Bool {
+        guard !(200..<300).contains(statusCode), statusCode != 401, !data.isEmpty else { return false }
+        let body = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
+        return ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: statusCode, body: body)
     }
 
     private static func ownedPhase(_ operation: ProviderReadinessOperation) -> OwnedMMPhase {
@@ -166,6 +209,38 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
         case .authentication: .authentication
         case .modelDiscovery: .modelDiscovery
         case .minimalModelRequest: .minimalText
+        }
+    }
+
+    /// 拉取目录的后续一页；非 2xx 或网络失败时返回 nil，沿用已取得的前几页。
+    private func fetchCatalogPage(
+        adapter: any ProviderReadinessWireAdapter,
+        request: ProviderReadinessTransportRequest,
+        afterID: String
+    ) async throws -> Data? {
+        try Task.checkCancellation()
+        let assembled = try adapter.makeCatalogPageRequest(
+            baseURL: request.baseURL,
+            apiKey: request.apiKey,
+            afterID: afterID
+        )
+        let urlRequest = try requestURLPolicy?(assembled) ?? assembled
+        let redirectDelegate = ReadinessRedirectDelegate(audit: nil)
+        do {
+            let (pageData, pageResponse) = try await session.data(
+                for: urlRequest,
+                delegate: redirectDelegate
+            )
+            try Task.checkCancellation()
+            guard !redirectDelegate.rejectedRedirect,
+                  let http = pageResponse as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else { return nil }
+            return pageData
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            return nil
         }
     }
 
@@ -191,10 +266,20 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
         return safe.isEmpty ? nil : safe
     }
 
+    private func wireAdapter(
+        for request: ProviderReadinessTransportRequest,
+        account: Bool
+    ) -> any ProviderReadinessWireAdapter {
+        account
+            ? ChatGPTAccountReadinessAdapter()
+            : ProviderReadinessWireAdapterFactory.make(for: request.protocolType, baseURL: request.baseURL)
+    }
+
     private func makeURLRequest(
-        for request: ProviderReadinessTransportRequest
+        for request: ProviderReadinessTransportRequest,
+        account: Bool
     ) throws -> URLRequest {
-        let adapter = ProviderReadinessWireAdapterFactory.make(for: request.protocolType, baseURL: request.baseURL)
+        let adapter = wireAdapter(for: request, account: account)
         let operation: ProviderReadinessTransportCall
         switch request.operation {
         case .reachability:
@@ -222,7 +307,7 @@ struct URLSessionProviderReadinessTransport: SettingsProviderReadinessTransport 
             return .invalidConfiguration
         case 401:
             return .unauthorized
-        case 403:
+        case 402, 403:
             return .permissionDenied
         case 404:
             return .notFound

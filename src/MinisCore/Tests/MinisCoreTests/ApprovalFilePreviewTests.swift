@@ -281,16 +281,17 @@ extension ApprovalFilePreviewTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
         let target = root.appendingPathComponent("note.txt")
-        let old = String(repeating: "synthetic old line\n", count: 5000)
+        // 超过 256KiB 的旧文件不再出内容对比（≤256KiB 的 UTF-8 文件才出 diff），也不在预览里留正文。
+        let old = String(repeating: "synthetic old line\n", count: 15000)
         let oldData = Data(old.utf8)
-        #expect(oldData.count > 64 * 1024)
+        #expect(oldData.count > 256 * 1024)
         try oldData.write(to: target)
         let input = try ComposerToolInput(["path": target.path, "content": "new\ntext\n"])
         let preview = try await BuiltinToolExecutor(allowedRoot: root).prepareFileApprovalPreview(tool: "file_write", input: input)
         #expect(preview.text.contains(target.path))
         #expect(preview.text.contains("拟写入大小：9 bytes"))
         #expect(preview.text.contains("将覆盖"))
-        #expect(preview.text.contains("5000 → 2（差 -4998）"))
+        #expect(preview.text.contains("15000 → 2（差 -14998）"))
         #expect(!preview.text.contains("synthetic old line"))
         #expect(preview.deletionContentDigest == ApprovalFilePreview.digest(oldData))
         #expect(throws: ApprovalFileChangedError.self) {

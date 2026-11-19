@@ -35,9 +35,53 @@ private final class TruncatingProjectProvider: LLMProvider, @unchecked Sendable 
     }
 }
 
-@Suite("R4 project task truncation failure copy")
+@Suite("R4 project task truncation failure copy", .serialized)
 @MainActor
 struct ProjectTaskTruncationCopyR4Tests {
+    /// N-1：项目任务不经过 beginTurn，必须自己把已信任的项目根登记给 HookRuntime，
+    /// 否则项目 hooks 对它既不执行也不 fail-closed。回退 runProjectTask 里的登记会红。
+    @Test("project task registers its trusted project root with HookRuntime")
+    func projectTaskRegistersTrustedRootForHooks() async throws {
+        let instruction = "project hook root input"
+        let fixture = try ScheduledTargetFixture(command: instruction, projectChildTarget: true)
+        let project = fixture.root.appendingPathComponent("n1-project-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        let previouslyInstalled = HookRuntime.installed
+        defer {
+            fixture.cleanup()
+            HookRuntime.install(previouslyInstalled)
+        }
+        let hooks = HookRuntime(store: HookConfigStore(
+            directory: fixture.root.appendingPathComponent("hook-state")), environment: { [:] })
+        HookRuntime.install(hooks)
+        let projectID = fixture.projectID
+        fixture.chat.trustedProjectRootProvider = { scope in
+            scope.projectID == projectID ? project : nil
+        }
+        fixture.chat.restoreSpeedTier(.fast)
+        fixture.chat.agentEngine = AgentLoopChatEngine(
+            toolExecutor: BuiltinToolExecutor(allowedRoot: fixture.root),
+            requestBudget: fixture.chat.budgetTracker,
+            composerPolicyFacts: fixture.chat.composerPolicyFacts)
+        let skills = SkillStore(skillsRoot: fixture.root.appendingPathComponent("skills"))
+        fixture.chat.turnRuntimeSnapshotFactory = { turn, _ in
+            ChatTurnRuntimeSnapshot(turn: turn,
+                skillInjector: SkillInjector(store: skills).snapshotForTurn(), mcpBridge: nil)
+        }
+        fixture.chat.streamingProviderOverride = TruncatingProjectProvider()
+        let store = AgentTaskStore()
+        _ = try store.enqueue(taskID: "n1-task", parentID: "n1-parent", providerID: nil, modelID: nil)
+        _ = try store.startRun(taskID: "n1-task", runID: "n1-run")
+        let started = fixture.chat.startProjectTask(targetID: fixture.targetID.uuidString,
+            projectID: fixture.projectID, instruction: instruction, runID: "n1-run",
+            taskStore: store, authorization: { true }, onFinished: {})
+        try #require(started)
+        let running = try #require(fixture.chat.turnTaskForTests(sessionID: fixture.targetID))
+        await running.value
+        let expected = project.standardizedFileURL.resolvingSymlinksInPath().path
+        #expect(hooks.knownProjectRoots().map(\.path).contains(expected))
+    }
+
     @Test("truncated project task fails with a truthful reason and saves no partial text")
     func truncatedProjectTaskReasonIsTruthful() async throws {
         let instruction = "project truncation input"

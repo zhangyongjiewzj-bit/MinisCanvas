@@ -25,6 +25,22 @@ struct ProviderChatResponseShapePolicySecurityTests {
         try ProviderChatResponseShapePolicy.validate(Self.validResponse())
     }
 
+    @Test("MC4-004：只有 error 没有 choices 的帧被拒绝，带 choices 或 error 为 null 的帧照常通过")
+    func upstreamErrorFrameIsRejected() throws {
+        #expect(throws: ProviderChatResponseShapePolicyError.upstreamErrorFrame) {
+            try ProviderChatResponseShapePolicy.validate(["error": ["message": "synthetic upstream failure"]])
+        }
+        #expect(throws: ProviderChatResponseShapePolicyError.upstreamErrorFrame) {
+            try ProviderChatResponseShapePolicy.validate(["error": "boom"])
+        }
+        var withNull = Self.validResponse()
+        withNull["error"] = NSNull()
+        try ProviderChatResponseShapePolicy.validate(withNull)
+        var withChoices = Self.validResponse()
+        withChoices["error"] = ["message": "finish_reason 形态由原有分支处理"]
+        try ProviderChatResponseShapePolicy.validate(withChoices)
+    }
+
     @Test("choice content and tool-call counts fail closed")
     func countLimits() {
         var tooManyChoices = Self.validResponse()

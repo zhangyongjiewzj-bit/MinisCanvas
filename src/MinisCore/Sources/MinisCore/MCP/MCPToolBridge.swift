@@ -4,7 +4,7 @@ import Foundation
 
 /// A tool bound to a concrete MCP server, exposed to the agent loop under a
 /// flat, unique name: `mcp_<serverID>_<toolName>` (server/tool ids are
-/// sanitized via `sanitizeToolId` so the name stays `[a-zA-Z0-9_-]+`).
+/// made ASCII-only and at most 64 characters).
 public struct MCPBoundTool: Sendable, Equatable {
     public var fullName: String
     public var serverID: String
@@ -17,10 +17,30 @@ public struct MCPBoundTool: Sendable, Equatable {
     }
 
     /// Build `mcp_<server>_<tool>` from a server id and tool name.
+    ///
+    /// 11/16：接口要求工具名匹配 `^[a-zA-Z0-9_-]{1,64}$`。非 ASCII 字符一律换成 `-`；
+    /// 含非 ASCII 字符或总长超过 64 时，截断并追加 8 位短哈希（取自原始 serverID+toolName），
+    /// 保证不同原名不会撞成同一个名字。名字到原工具的对应关系由注册表的正查表保存。
     public static func makeFullName(serverID: String, toolName: String) -> String {
-        let server = sanitizeToolId(serverID)
-        let tool = sanitizeToolId(toolName)
-        return "mcp_\(server)_\(tool)"
+        let full = "mcp_\(asciiToolID(serverID))_\(asciiToolID(toolName))"
+        let lossy = !serverID.utf8.allSatisfy { $0 < 0x80 } || !toolName.utf8.allSatisfy { $0 < 0x80 }
+        guard full.utf8.count > maxToolNameLength || lossy else { return full }
+        var hash: UInt32 = 2_166_136_261
+        for byte in (serverID + "\u{0}" + toolName).utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16_777_619
+        }
+        let suffix = String(format: "%08x", hash)
+        return String(full.prefix(maxToolNameLength - suffix.count - 1)) + "_" + suffix
+    }
+
+    private static let maxToolNameLength = 64
+
+    private static func asciiToolID(_ value: String) -> String {
+        String(value.unicodeScalars.map { scalar -> Character in
+            let v = scalar.value
+            let ok = (48...57).contains(v) || (65...90).contains(v) || (97...122).contains(v) || v == 95 || v == 45
+            return ok ? Character(scalar) : "-"
+        })
     }
 
     /// Split a bridged full name back into (serverID, toolName). Returns nil
@@ -55,6 +75,10 @@ public struct MCPToolAuthorization: Codable, Sendable, Equatable {
     /// nil is an unbound legacy grant (deny), "" is an explicit grant waiting
     /// for its first discovery, and a digest binds the granted names exactly.
     public var schemaBindingDigest: String?
+    /// 每个已授权工具各自的定义摘要（工具名 -> 摘要）。服务器的工具列表变化时，
+    /// 只撤销自己定义变了或已消失的工具；新增工具默认未授权，也不连累其它工具。
+    /// nil 表示旧版授权（无逐工具摘要），摘要不一致时整体撤销。
+    public var toolSchemaDigests: [String: String]?
 
     public init(
         allowedFullNames: Set<String> = [],
@@ -62,8 +86,10 @@ public struct MCPToolAuthorization: Codable, Sendable, Equatable {
         descriptorFingerprint: String? = nil,
         serverAuthorized: Bool = false,
         authorizedToolNames: Set<String> = [],
-        schemaBindingDigest: String? = nil
+        schemaBindingDigest: String? = nil,
+        toolSchemaDigests: [String: String]? = nil
     ) {
+        self.toolSchemaDigests = toolSchemaDigests
         self.allowedFullNames = allowedFullNames
         self.serverID = serverID
         self.descriptorFingerprint = descriptorFingerprint
@@ -124,6 +150,14 @@ public enum MCPToolInvocationFenceError: Error, Equatable, Sendable {
     case duplicate(MCPToolInvocationIdentity)
     case capacityExhausted(MCPToolInvocationIdentity)
     case runtimeRetired(MCPToolInvocationIdentity)
+}
+
+extension MCPToolInvocationFenceError: LocalizedError {
+    /// 模型收到的报错：只有"配置被改动、结果被丢弃"这一种需要说清楚，其余沿用系统默认文案。
+    public var errorDescription: String? {
+        guard case .runtimeRetired = self else { return nil }
+        return "MCP 配置在调用期间被改动，这次调用的结果已被丢弃；该操作可能已经在服务器上生效，请先核实结果，再决定是否重试。"
+    }
 }
 
 /// Identity of the bridge runtime that owns an agent-turn invocation.  A
@@ -204,6 +238,30 @@ public protocol MCPToolBridgeLiveCapabilityResolving: MCPToolBridge {
 
 public protocol MCPToolBridgeInteractionResolving: MCPToolBridge {
     func requiresUserInteraction(_ fullName: String) -> Bool
+}
+
+/// 一个 MCP 工具在“以后都允许”规则里的身份：所属服务器的配置指纹 + 工具全名。
+/// 服务器的命令、参数、地址或超时一变，指纹就变，旧规则自然失效。
+public struct MCPToolRuleIdentity: Sendable, Equatable {
+    public let serverID: String
+    public let serverFingerprint: String
+    public let fullName: String
+    /// 服务器自述只读（annotations.readOnlyHint）。只用于计划模式放行，不用来免审批。
+    public let readOnlyHint: Bool
+
+    /// 规则里保存的匹配串：服务器配置指纹 + 工具全名，不含通配。
+    public var rulePattern: String { "\(serverFingerprint):\(fullName)" }
+
+    public init(serverID: String, serverFingerprint: String, fullName: String, readOnlyHint: Bool) {
+        self.serverID = serverID
+        self.serverFingerprint = serverFingerprint
+        self.fullName = fullName
+        self.readOnlyHint = readOnlyHint
+    }
+}
+
+public protocol MCPToolBridgeRuleIdentityResolving: MCPToolBridge {
+    func ruleIdentity(forFullName fullName: String) -> MCPToolRuleIdentity?
 }
 
 /// Capability boundary for callers that must supply a unique turn/attempt
@@ -338,7 +396,7 @@ public enum MCPToolBridgeTaskContext {
     @TaskLocal public static var current: (any MCPToolBridge)?
 }
 
-public final class TurnScopedMCPToolBridge: MCPToolBridgeInteractionResolving, MCPToolBridge, MCPToolBridgeLiveCapabilityResolving, MCPToolBridgeInvocationFencing, MCPToolBridgeRuntimeFencing, MCPToolBridgeTurnSnapshotting, @unchecked Sendable {
+public final class TurnScopedMCPToolBridge: MCPToolBridgeInteractionResolving, MCPToolBridgeRuleIdentityResolving, MCPToolBridge, MCPToolBridgeLiveCapabilityResolving, MCPToolBridgeInvocationFencing, MCPToolBridgeRuntimeFencing, MCPToolBridgeTurnSnapshotting, @unchecked Sendable {
     public let base: any MCPToolBridge
 
     public init(base: any MCPToolBridge) {
@@ -359,6 +417,10 @@ public final class TurnScopedMCPToolBridge: MCPToolBridgeInteractionResolving, M
 
     public func requiresUserInteraction(_ fullName: String) -> Bool {
         (resolved as? any MCPToolBridgeInteractionResolving)?.requiresUserInteraction(fullName) ?? false
+    }
+
+    public func ruleIdentity(forFullName fullName: String) -> MCPToolRuleIdentity? {
+        (resolved as? any MCPToolBridgeRuleIdentityResolving)?.ruleIdentity(forFullName: fullName)
     }
 
     public func snapshotForTurn() throws -> any MCPToolBridge {
@@ -456,12 +518,16 @@ private final class MCPBackgroundDiscoveryCoordinator: @unchecked Sendable {
 
 /// Default `MCPToolBridge` implementation backed by an `MCPServerManager` and
 /// a per-server `MCPClient` factory (injectable for tests).
-public final class MCPToolRegistry: MCPToolBridgeInteractionResolving, MCPToolBridge, MCPToolBridgeLiveCapabilityResolving, MCPToolBridgeInvocationFencing, MCPToolBridgeRuntimeFencing, MCPToolBridgeTurnSnapshotting, MCPToolBridgeTurnPreparing, @unchecked Sendable {
+public final class MCPToolRegistry: MCPToolBridgeInteractionResolving, MCPToolBridgeRuleIdentityResolving, MCPToolBridge, MCPToolBridgeLiveCapabilityResolving, MCPToolBridgeInvocationFencing, MCPToolBridgeRuntimeFencing, MCPToolBridgeTurnSnapshotting, MCPToolBridgeTurnPreparing, @unchecked Sendable {
 
     private struct ToolRoute: Sendable {
         let serverID: String
         let toolName: String
         let snapshotID: String
+        /// Revision-independent identity of the tools/list publication. A
+        /// change to another server restamps this server's snapshot (new
+        /// `snapshotID`) without changing the publication.
+        let publicationID: UUID?
         let schemaDigest: String
         let authorization: MCPToolAuthorization
     }
@@ -746,6 +812,15 @@ public final class MCPToolRegistry: MCPToolBridgeInteractionResolving, MCPToolBr
         return bound.tool.requiresUserInteraction
     }
 
+    /// 规则身份：只对用户已授权的服务器里、已授权的工具返回；服务器配置指纹取当前值。
+    public func ruleIdentity(forFullName fullName: String) -> MCPToolRuleIdentity? {
+        guard let bound = authorizedTools().first(where: { $0.fullName == fullName }),
+              let server = manager.server(id: bound.serverID) else { return nil }
+        return MCPToolRuleIdentity(
+            serverID: bound.serverID, serverFingerprint: server.descriptorFingerprint,
+            fullName: fullName, readOnlyHint: bound.tool.readOnlyHint)
+    }
+
     // MARK: Invocation
 
     public func callMCPTool(fullName: String, arguments: [String: Any]?) async throws -> String {
@@ -877,7 +952,9 @@ public final class MCPToolRegistry: MCPToolBridgeInteractionResolving, MCPToolBr
                 invocation ?? MCPToolInvocationIdentity(correlationID: "anonymous", attemptID: "anonymous")
             )
         }
-        return MCPOutputLimiter.project(output)
+        // 图片标记不参与限长与脱敏，正文处理完再接回。
+        let split = ToolResultImageChannel.splitTrailingMarkers(output)
+        return MCPOutputLimiter.project(split.body) + split.markers
     }
 
     public func callMCPTool(
@@ -1046,7 +1123,10 @@ public final class MCPToolRegistry: MCPToolBridgeInteractionResolving, MCPToolBr
               let discovery = snapshot.discoverySnapshots[route.serverID],
               discovery.revision == snapshot.revision,
               discovery.descriptorFingerprint == server.descriptorFingerprint,
-              discovery.id == route.snapshotID,
+              // Same snapshot (the original rule), or the same tools/list
+              // publication re-stamped because another server changed.
+              discovery.id == route.snapshotID
+                || (route.publicationID != nil && route.publicationID == discovery.publicationID),
               discovery.schemaDigest == route.schemaDigest,
               grant.schemaBindingDigest == route.schemaDigest,
               manager.discoverySnapshot(serverID: route.serverID)?.schemaDigest == route.schemaDigest else {
@@ -1235,6 +1315,7 @@ public final class MCPToolRegistry: MCPToolBridgeInteractionResolving, MCPToolBr
                     serverID: serverID,
                     toolName: toolName,
                     snapshotID: discovery.id,
+                    publicationID: discovery.publicationID,
                     schemaDigest: discovery.schemaDigest,
                     authorization: grant
                 )

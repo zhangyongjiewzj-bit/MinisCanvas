@@ -108,7 +108,7 @@ enum ChatAttachmentPersistence {
     struct MessageRecord: Codable, Equatable, Sendable {
         let messageIndex: Int
         let contentDigest: String
-        let attachments: [ChatAttachment]
+        var attachments: [ChatAttachment]
         /// Composer-produced text/reference item count; absent on legacy history.
         var producerTextAttachmentCount: Int? = nil
         /// Exact Composer-produced attachment spans; absent on legacy history.
@@ -129,9 +129,28 @@ enum ChatAttachmentPersistence {
         var sessionReferenceCard: SessionReferenceCard? = nil
     }
 
+    /// R3-09：每条消息的真实时间。`MinisCore.LLMMessage` 没有时间槽，重启后
+    /// 全部消息会被当成“启动时刻”创建，“回退会话并恢复文件”按下一条消息的
+    /// 时间找文件检查点就会漏恢复。时间与消息位置+内容摘要绑定（同
+    /// `MessageRecord` 的围栏），摘要对不上就不回填。独立于 `messages`：
+    /// 没有附件/回合元数据的普通消息也要有时间，却不能因此产生附件记录。
+    struct MessageTimeRecord: Codable, Equatable, Sendable {
+        let messageIndex: Int
+        let contentDigest: String
+        let timestamp: Date
+    }
+
     struct SessionRecord: Codable, Equatable, Sendable {
         let sessionID: String
-        let messages: [MessageRecord]
+        var messages: [MessageRecord]
+        /// 可选键：旧文件没有，按空处理；旧版本读新文件会忽略它。
+        var messageTimes: [MessageTimeRecord]? = nil
+    }
+
+    /// 时间绑定用的内容指纹。只用于本文件的 `MessageTimeRecord`，
+    /// 采用 base64 以免启动时对每条消息做逐字节格式化。
+    private static func timeBindingDigest(_ content: String) -> String {
+        Data(SHA256.hash(data: Data(content.utf8))).base64EncodedString()
     }
 
     private struct Envelope: Codable {
@@ -149,8 +168,18 @@ enum ChatAttachmentPersistence {
     /// transcript.
     static func records(for session: ChatThread) -> SessionRecord {
         var records: [MessageRecord] = []
+        var times: [MessageTimeRecord] = []
         var persistedIndex = 0
         for message in session.messages where message.role != .system {
+            // R3-09：只写可信时间。重启后拿不到时间、被临时记成“启动时刻”的
+            // 消息不写，免得把假时间固化成真时间。
+            if !message.hasUnverifiedTimestamp {
+                times.append(MessageTimeRecord(
+                    messageIndex: persistedIndex,
+                    contentDigest: timeBindingDigest(
+                        message.attachments.isEmpty ? message.content : message.asLLMMessage().content),
+                    timestamp: message.timestamp))
+            }
             let card = message.referenceCard.flatMap {
                 message.role == .user && validReference($0, sessionID: session.id.uuidString, content: message.content, attachments: message.attachments) ? $0 : nil
             }
@@ -189,7 +218,8 @@ enum ChatAttachmentPersistence {
             }
             persistedIndex += 1
         }
-        return SessionRecord(sessionID: session.id.uuidString, messages: records)
+        return SessionRecord(sessionID: session.id.uuidString, messages: records,
+                             messageTimes: times.isEmpty ? nil : times)
     }
 
     private static func ownershipForProjectedContent(
@@ -250,16 +280,69 @@ enum ChatAttachmentPersistence {
         var sessionRecords = sessions.map(records(for:))
         if !retainingTrashedSessionIDs.isEmpty {
             let activeIDs = Set(sessionRecords.map(\.sessionID))
-            let prior = try load(from: directory)
+            // 旧文件读一次、解码一次；保留的记录连消息时间一起带上，不然回收站里的会话
+            // 恢复后所有消息都会变成“时间未核实”。
+            let priorEnvelope = try readSidecar(at: url(in: directory)).map {
+                try JSONDecoder().decode(Envelope.self, from: $0)
+            }
+            let prior = try priorEnvelope.map { try decodeSidecar($0) } ?? [:]
+            let priorTimes = Dictionary(
+                (priorEnvelope?.sessions ?? []).compactMap { record in
+                    record.messageTimes.map { (record.sessionID, $0) }
+                }, uniquingKeysWith: { first, _ in first })
             for id in retainingTrashedSessionIDs.subtracting(activeIDs) {
                 if let messages = prior[id] {
-                    sessionRecords.append(SessionRecord(sessionID: id, messages: messages))
+                    sessionRecords.append(
+                        SessionRecord(sessionID: id, messages: messages, messageTimes: priorTimes[id]))
                 }
             }
         }
         let sidecar = url(in: directory)
-        let data = try encode(sessionRecords.sorted { $0.sessionID < $1.sessionID })
+        var ordered = sessionRecords.sorted { $0.sessionID < $1.sessionID }
+        var data = try encode(ordered)
+        if data.count > maxSidecarBytes {
+            ordered = try degradingLargestTextAttachments(ordered)
+            data = try encode(ordered)
+        }
         try writeBoundedSidecar(data, to: sidecar, expectedIdentity: try sidecarIdentity(at: sidecar))
+    }
+
+    /// 元数据超过 8MB 上限时，把最大的文本附件降级为只存引用（文件名、大小、路径、
+    /// 原文字数）：全文仍在会话正文里，附件的 data 只服务界面预览，丢掉不影响发给模型的内容。
+    /// 只降级有原路径、且所在消息没有粘贴引用卡的附件（引用卡校验要用附件全文）。
+    /// 降级后仍超限就原样返回，由写入处按原有规则报错。
+    static func degradingLargestTextAttachments(_ records: [SessionRecord]) throws -> [SessionRecord] {
+        var result = records
+        while true {
+            let excess = try encode(result).count - maxSidecarBytes
+            if excess <= 0 { return result }
+            var candidates: [(record: Int, message: Int, attachment: Int, bytes: Int)] = []
+            for (r, record) in result.enumerated() {
+                for (m, message) in record.messages.enumerated() where message.referenceCard == nil {
+                    for (a, attachment) in message.attachments.enumerated()
+                    where attachment.kind == .text && attachment.status == .ready
+                        && attachment.fileURL != nil {
+                        if let data = attachment.data { candidates.append((r, m, a, data.count)) }
+                    }
+                }
+            }
+            guard !candidates.isEmpty else { return result }
+            candidates.sort { ($0.bytes, $1.record, $1.message, $1.attachment) > ($1.bytes, $0.record, $0.message, $0.attachment) }
+            var saved = 0
+            for candidate in candidates {
+                let old = result[candidate.record].messages[candidate.message].attachments[candidate.attachment]
+                result[candidate.record].messages[candidate.message].attachments[candidate.attachment] =
+                    ChatAttachment(
+                        id: old.id, kind: old.kind, fileName: old.fileName, fileType: old.fileType,
+                        mimeType: old.mimeType, size: old.size, data: nil, fileURL: old.fileURL,
+                        status: old.status, failureReason: old.failureReason,
+                        deliveryQuarantined: old.deliveryQuarantined,
+                        originalTextCharacterCount: old.originalTextCharacterCount)
+                // JSON 里 Data 是 base64，约 4/3 倍。
+                saved += candidate.bytes / 3 * 4
+                if saved >= excess { break }
+            }
+        }
     }
 
     /// Save only metadata for a transcript already committed by the caller.
@@ -268,12 +351,20 @@ enum ChatAttachmentPersistence {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let sidecar = sessionSidecarURL(for: session.id, in: directory)
         let expectedIdentity = try sidecarIdentity(at: sidecar)
-        let record = records(for: session)
+        var record = records(for: session)
+        var prior: (messages: [MessageRecord], times: [MessageTimeRecord])?
         if expectedIdentity != nil {
-            let prior = try loadSessionSidecar(sessionID: session.id, at: sidecar)
-            if prior == record.messages { return }
+            // 同一个分片只读一次、解码一次。
+            prior = try loadSessionShard(sessionID: session.id, at: sidecar)
+            if prior?.messages == record.messages && (prior?.times ?? []) == (record.messageTimes ?? []) { return }
         }
-        let data = try encode([record])
+        var data = try encode([record])
+        if data.count > maxSidecarBytes {
+            // 超上限：最大的文本附件降级为只存引用（已降级过的会话不必每次重写）。
+            record = try degradingLargestTextAttachments([record])[0]
+            if prior?.messages == record.messages && (prior?.times ?? []) == (record.messageTimes ?? []) { return }
+            data = try encode([record])
+        }
         try writeBoundedSidecar(data, to: sidecar, expectedIdentity: expectedIdentity)
     }
 
@@ -349,12 +440,38 @@ enum ChatAttachmentPersistence {
         return try load(from: directory)[sessionID]
     }
 
-    static func sessionSidecarURL(for sessionID: UUID, in directory: URL) -> URL {
-        directory.appendingPathComponent("chat-attachment-ownership.\(sessionID.uuidString).json", isDirectory: false)
+    /// R3-09：读取某会话分片里保存的消息时间。分片不存在（或只有旧版内容）
+    /// 返回空数组，调用方据此把消息保持为“时间未核实”。
+    static func loadMessageTimes(forSessionID sessionID: String, from directory: URL) throws -> [MessageTimeRecord] {
+        guard let id = UUID(uuidString: sessionID) else { return [] }
+        return try loadSessionMessageTimes(sessionID: id, at: sessionSidecarURL(for: id, in: directory))
     }
 
-    private static func loadSessionSidecar(sessionID: UUID, at sidecar: URL) throws -> [MessageRecord]? {
-        guard let records = try loadSidecar(at: sidecar) else { return nil }
+    private static func loadSessionMessageTimes(sessionID: UUID, at sidecar: URL) throws -> [MessageTimeRecord] {
+        try loadSessionShard(sessionID: sessionID, at: sidecar)?.times ?? []
+    }
+
+    /// 启动时每个会话恢复附件归属和消息时间：分片只读一次、解码一次（原来各读各的，读两遍）。
+    /// 分片不存在时归属记录再按旧版合并文件查（`legacy` 为启动时已读好的那一份），时间为空。
+    static func loadSessionRecordsAndTimes(
+        forSessionID sessionID: String, from directory: URL,
+        legacy: Result<[String: [MessageRecord]], Error>? = nil
+    ) throws -> (records: [MessageRecord]?, times: [MessageTimeRecord]) {
+        if let id = UUID(uuidString: sessionID),
+           let shard = try loadSessionShard(sessionID: id, at: sessionSidecarURL(for: id, in: directory)) {
+            return (shard.messages, shard.times)
+        }
+        if let legacy { return (try legacy.get()[sessionID], []) }
+        return (try load(from: directory)[sessionID], [])
+    }
+
+    /// 读一次、解码一次，同时给出该会话的归属记录和消息时间。分片不存在返回 nil。
+    private static func loadSessionShard(
+        sessionID: UUID, at sidecar: URL
+    ) throws -> (messages: [MessageRecord], times: [MessageTimeRecord])? {
+        guard let data = try readSidecar(at: sidecar) else { return nil }
+        let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+        let records = try decodeSidecar(envelope)
         guard records.count == 1, let messages = records[sessionID.uuidString] else {
             throw NSError(
                 domain: "ChatAttachmentPersistence",
@@ -362,7 +479,16 @@ enum ChatAttachmentPersistence {
                 userInfo: [NSLocalizedDescriptionKey: "附件归属与会话不匹配"]
             )
         }
-        return messages
+        let times = envelope.sessions.first { $0.sessionID == sessionID.uuidString }?.messageTimes ?? []
+        return (messages, times)
+    }
+
+    static func sessionSidecarURL(for sessionID: UUID, in directory: URL) -> URL {
+        directory.appendingPathComponent("chat-attachment-ownership.\(sessionID.uuidString).json", isDirectory: false)
+    }
+
+    private static func loadSessionSidecar(sessionID: UUID, at sidecar: URL) throws -> [MessageRecord]? {
+        try loadSessionShard(sessionID: sessionID, at: sidecar)?.messages
     }
 
     private static func encode(_ sessions: [SessionRecord]) throws -> Data {
@@ -602,7 +728,11 @@ enum ChatAttachmentPersistence {
     }
 
     private static func decodeSidecar(_ data: Data) throws -> [String: [MessageRecord]] {
-        let envelope = try JSONDecoder().decode(Envelope.self, from: data)
+        try decodeSidecar(try JSONDecoder().decode(Envelope.self, from: data))
+    }
+
+    /// 已解码的文件内容按同一套校验转成各会话的归属记录（调用方需要时间记录时共用同一次解码）。
+    private static func decodeSidecar(_ envelope: Envelope) throws -> [String: [MessageRecord]] {
         guard envelope.schemaVersion <= schemaVersion else {
             throw NSError(
                 domain: "ChatAttachmentPersistence",
@@ -668,9 +798,19 @@ enum ChatAttachmentPersistence {
     /// digest match. A mismatch is intentionally a no-op (fail closed).
     static func restoreAttachments(
         from persisted: MinisCore.ChatSession,
-        records: [MessageRecord]?
+        records: [MessageRecord]?,
+        messageTimes: [MessageTimeRecord] = []
     ) -> ChatThread {
         var thread = persisted.asThread()
+        // R3-09：回填消息真实时间（位置+内容摘要都对得上才回填）；没有的
+        // 保持 `asChatMessageUI` 给的“时间未核实”标记。
+        for time in messageTimes
+        where thread.messages.indices.contains(time.messageIndex)
+            && persisted.messages.indices.contains(time.messageIndex)
+            && time.contentDigest == timeBindingDigest(persisted.messages[time.messageIndex].content) {
+            thread.messages[time.messageIndex].timestamp = time.timestamp
+            thread.messages[time.messageIndex].hasUnverifiedTimestamp = false
+        }
         guard let records, !records.isEmpty,
               Set(records.map(\.messageIndex)).count == records.count else { return thread }
         for index in thread.messages.indices {
@@ -680,19 +820,23 @@ enum ChatAttachmentPersistence {
             else { continue }
             thread.messages[index].producerTextAttachmentCount = record.producerTextAttachmentCount
                 .flatMap { $0 >= 0 ? $0 : nil }
+            // 新格式 sidecar 的图片/音频只有摘要：先按顺序与哈希从 Core 绑回字节。
+            let recordAttachments = rebindDigestMedia(
+                record.attachments, to: persisted.messages[index]
+            )
             let ordinaryAudio = rebindOrdinaryAudio(
-                record.attachments, to: persisted.messages[index].audios
+                recordAttachments, to: persisted.messages[index].audios
             )
             // The Core transcript is the byte owner for every video PNG. The
             // sidecar records only frame order, times and digests; rebind only
             // if each image still occupies the exact expected payload slot.
             // On mismatch the video frame attachments become failed metadata;
             // their PNGs are not replayed with a fabricated timecode binding.
-            if record.attachments.contains(where: { $0.videoFrames != nil }) {
+            if recordAttachments.contains(where: { $0.videoFrames != nil }) {
                 let ownedParts = thread.messages[index].role == .user
                     ? record.composedContentOwnership.flatMap {
                     validatedOwnedParts($0, content: persisted.messages[index].content,
-                        attachments: record.attachments)
+                        attachments: recordAttachments)
                     } : nil
                 // Valid ownership can remove only exact generated spans if a
                 // later frame check fails. Missing/invalid legacy ownership
@@ -700,7 +844,7 @@ enum ChatAttachmentPersistence {
                 thread.messages[index].composedContentOwnership = ownedParts == nil
                     ? nil : record.composedContentOwnership
                 if let attachments = rebindVideoFrames(
-                    record.attachments,
+                    recordAttachments,
                     to: persisted.messages[index].images, audios: persisted.messages[index].audios,
                     ownedParts: ownedParts
                 ) {
@@ -708,7 +852,7 @@ enum ChatAttachmentPersistence {
                         attachment.kind == .audio ? ordinaryAudio[position] : attachment
                     }
                 } else {
-                    thread.messages[index].attachments = record.attachments.enumerated().map { position, attachment in
+                    thread.messages[index].attachments = recordAttachments.enumerated().map { position, attachment in
                         if attachment.kind == .audio { return ordinaryAudio[position] }
                         guard attachment.fileType == .video,
                               attachment.videoFrames != nil else { return attachment }
@@ -747,6 +891,12 @@ enum ChatAttachmentPersistence {
                 thread.messages[index].turnProviderName = turn.providerName
                 thread.messages[index].turnProviderDisplayLabel = ProviderDisplayLabel.safeDisplayText(turn.providerDisplayLabel)
                 thread.messages[index].turnModelID = turn.modelID
+                // R3-09：旧档没有逐条时间，但终态回合带着回合创建时刻，
+                // 它就是该助手消息的创建时间，可作为可信时间。
+                if thread.messages[index].hasUnverifiedTimestamp {
+                    thread.messages[index].timestamp = turn.timing.startedAt
+                    thread.messages[index].hasUnverifiedTimestamp = false
+                }
             }
             if thread.messages[index].role == .assistant, let anchors = record.inlineToolAnchors {
                 thread.messages[index].inlineToolAnchors = ChatInlineToolAnchor.validated(
@@ -765,6 +915,71 @@ enum ChatAttachmentPersistence {
         return thread
     }
 
+    /// 新格式 sidecar 对图片/音频只存 SHA-256 摘要，字节归 Core 转写所有。
+    /// 按与发送时相同的槽位顺序（普通图片 1 槽、视频每帧 1 个图片槽并可带 1 个音频槽、
+    /// 普通音频 1 槽）取 Core 字节，哈希与类型都对得上才绑回；对不上的图片标为失败。
+    /// 旧格式（sidecar 自带字节、无摘要）原样通过。
+    private static func rebindDigestMedia(
+        _ attachments: [ChatAttachment], to message: LLMMessage
+    ) -> [ChatAttachment] {
+        guard attachments.contains(where: { $0.payloadDigest != nil }) else { return attachments }
+        var imageSlot = 0
+        var audioSlot = 0
+        return attachments.map { attachment in
+            if let frames = attachment.videoFrames {
+                // 与发送时同一套判定：校验不过的视频发送时不占槽位，这里也不计数。
+                if attachment.occupiesVideoPayloadSlots {
+                    imageSlot += frames.count
+                    if attachment.videoContext?.audio != nil { audioSlot += 1 }
+                }
+                return attachment
+            }
+            guard attachment.status == .ready, let digest = attachment.payloadDigest,
+                  attachment.data == nil else {
+                if attachment.kind == .image, attachment.data != nil { imageSlot += 1 }
+                // 无效音频发送时不占槽位。
+                if attachment.kind == .audio, let data = attachment.data,
+                   MediaPayloadValidation.audioFormat(data) != nil { audioSlot += 1 }
+                return attachment
+            }
+            func rebuilt(data: Data?, failed: Bool) -> ChatAttachment {
+                var copy = ChatAttachment(
+                    id: attachment.id, kind: attachment.kind,
+                    fileName: attachment.fileName, fileType: attachment.fileType,
+                    mimeType: attachment.mimeType, size: attachment.size,
+                    data: data, fileURL: attachment.fileURL,
+                    status: failed ? .failed : .ready,
+                    failureReason: failed ? "图片历史字节与正史记录校验失败；未附加该图片" : attachment.failureReason,
+                    deliveryQuarantined: attachment.deliveryQuarantined,
+                    originalTextCharacterCount: attachment.originalTextCharacterCount
+                )
+                copy.audioTranscript = attachment.audioTranscript
+                return copy
+            }
+            if attachment.kind == .image {
+                defer { imageSlot += 1 }
+                guard imageSlot < message.images.count,
+                      ChatVideoFrame.digest(message.images[imageSlot].data) == digest else {
+                    return rebuilt(data: nil, failed: true)
+                }
+                return rebuilt(data: message.images[imageSlot].data, failed: false)
+            }
+            if attachment.kind == .audio {
+                defer { audioSlot += 1 }
+                guard audioSlot < message.audios.count,
+                      let data = Data(base64Encoded: message.audios[audioSlot].base64Data),
+                      ChatVideoFrame.digest(data) == digest else {
+                    // 留空字节但保留摘要，交给 rebindOrdinaryAudio 统一标记失败并占住槽位。
+                    var pending = rebuilt(data: nil, failed: false)
+                    pending.payloadDigest = digest
+                    return pending
+                }
+                return rebuilt(data: data, failed: false)
+            }
+            return attachment
+        }
+    }
+
     /// The sidecar owns names and UI metadata, never ordinary audio bytes.
     /// Match each ready audio to its exact Core payload slot, including slots
     /// occupied by a video's extracted track. A content digest alone cannot
@@ -775,9 +990,8 @@ enum ChatAttachmentPersistence {
         var slot = 0
         var rejected = Set<Int>()
         for (index, attachment) in attachments.enumerated() {
-            if attachment.kind == .file, attachment.fileType == .video,
-               attachment.videoContext?.audio != nil {
-                slot += 1
+            if attachment.kind == .file, attachment.fileType == .video {
+                if attachment.occupiesVideoPayloadSlots, attachment.videoContext?.audio != nil { slot += 1 }
                 continue
             }
             guard attachment.kind == .audio else { continue }
@@ -790,6 +1004,9 @@ enum ChatAttachmentPersistence {
                     || (format == "mp3" && (declared == "audio/mpeg" || declared == "audio/mp3"))
             else {
                 if attachment.status == .ready { rejected.insert(index) }
+                // 摘要对不上 Core 字节的音频发送时占过一个槽位，后面的音频不能错位。
+                if attachment.status == .ready, attachment.data == nil,
+                   attachment.payloadDigest != nil { slot += 1 }
                 continue
             }
             if slot >= audios.count || audios[slot].format.lowercased() != format
@@ -890,7 +1107,12 @@ enum ChatAttachmentPersistence {
         var rebound: [ChatAttachment] = []
         rebound.reserveCapacity(attachments.count)
         for (attachmentIndex, attachment) in attachments.enumerated() {
-            if attachment.kind == .audio, attachment.audioAttachment != nil { audioIndex += 1 }
+            // 摘要对不上 Core 字节的音频（data 为空但保留摘要）发送时同样占过一个音频槽位。
+            if attachment.kind == .audio,
+               attachment.audioAttachment != nil
+                || (attachment.status == .ready && attachment.data == nil && attachment.payloadDigest != nil) {
+                audioIndex += 1
+            }
             if attachment.kind == .image {
                 guard imageIndex < images.count,
                       let existing = attachment.imageAttachment,
@@ -903,6 +1125,11 @@ enum ChatAttachmentPersistence {
             guard attachment.kind == .file,
                   attachment.fileType == .video,
                   let frameMetadata = attachment.videoFrames else {
+                rebound.append(attachment)
+                continue
+            }
+            // 发送时校验不过的视频不占槽位：不绑回字节，原样保留。
+            guard attachment.occupiesVideoPayloadSlots else {
                 rebound.append(attachment)
                 continue
             }
@@ -1057,7 +1284,7 @@ enum ChatSessionBridge {
         taskStore: AgentTaskStore?, effectLedger: ToolExecutionFactLedger?
     ) throws -> CompactionCheckpoint? {
         guard CompactionFactCapture.verifyStores(result.retentionFacts ?? [],
-            taskStore: taskStore, effectLedger: effectLedger, atCommit: true) else {
+            taskStore: taskStore, effectLedger: effectLedger) else {
             throw SessionStoreError.invalidCompactionCheckpoint(expectedSession.id)
         }
         return try sessionStore.compareAndSaveCompactionPrefix(
@@ -1088,7 +1315,7 @@ enum ChatSessionBridge {
             throw SessionStoreError.compactionCheckpointBoundaryMismatch(sessionID)
         }
         guard CompactionFactCapture.verifyStores(result.retentionFacts ?? [],
-            taskStore: taskStore, effectLedger: effectLedger, atCommit: true) else {
+            taskStore: taskStore, effectLedger: effectLedger) else {
             throw SessionStoreError.invalidCompactionCheckpoint(sessionID)
         }
         guard result.compactedCount > 0 else { return nil }
@@ -1173,12 +1400,14 @@ enum ChatSessionBridge {
             || checkpoint?.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion {
             let facts = checkpoint?.retentionFacts ?? []
             guard CompactionFactCapture.verifyStores(facts, taskStore: taskStore,
-                effectLedger: effectLedger, atCommit: false) else {
+                effectLedger: effectLedger) else {
                 throw SessionStoreError.invalidCompactionCheckpoint(sessionID)
             }
             // Use the old block solely to locate the derived context. Facts for
             // the next request are read afresh, so a completed task cannot stay
-            // presented as unfinished and new settled receipts are visible.
+            // presented as unfinished. The background lists only unfinished
+            // tasks and receipts that did not succeed; a succeeded receipt is
+            // never listed (the summary records what was done).
             // The background block follows the last projected span; a lossy
             // summary is one message, so it follows that message.
             let backgroundPosition = checkpoint?.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion
@@ -1195,7 +1424,7 @@ enum ChatSessionBridge {
                 }
                 let current = CompactionFactCapture.capture(sessionID: sessionID,
                     revision: canonical.transcriptRevision, messages: canonical.messages,
-                    taskStore: taskStore, effectLedger: effectLedger, includeTerminalTasks: true)
+                    taskStore: taskStore, effectLedger: effectLedger)
                 if let background = CompactionFactCapture.backgroundMessage(current) {
                     refreshed.insert(background, at: position)
                 }
@@ -1204,7 +1433,7 @@ enum ChatSessionBridge {
             return messages
         }
         let summaryCount = messages.reduce(into: 0) { count, message in
-            if message.content.contains("<context-summary>") {
+            if LossySummaryCompaction.isProgramSummary(message) {
                 count += 1
             }
         }
@@ -1212,6 +1441,24 @@ enum ChatSessionBridge {
             throw SessionStoreError.invalidCompactionCheckpoint(sessionID)
         }
         return messages
+    }
+
+    /// 回合内压缩提交后重读的比对：摘要和尾部（连同其后的实时消息）逐条相等即可。
+    /// 背景（未完成的任务、未成功的回执）每轮按库里现状重建，摘要请求期间有任务换了状态，
+    /// 重建出来的背景和检查点里存的不同，这不算不一致。
+    static func resumedMatchesCheckpoint(
+        _ resumed: [LLMMessage], checkpoint: CompactionCheckpoint, live: [LLMMessage]
+    ) -> Bool {
+        let stored = checkpoint.replacementHistory
+        guard let recent = checkpoint.projectionRecentCount else { return resumed == stored + live }
+        guard recent < stored.count, resumed.first == stored.first else { return false }
+        let tail = Array(stored.suffix(recent)) + live
+        let backgroundCount = resumed.count - 1 - tail.count
+        guard backgroundCount == 0
+                || (backgroundCount == 1 && resumed[1].content.hasPrefix("<retained-store-facts>")) else {
+            return false
+        }
+        return Array(resumed.suffix(tail.count)) == tail
     }
 }
 
@@ -1268,7 +1515,13 @@ extension MinisCore.ChatSession {
             title: title.isEmpty ? "新会话" : title,
             createdAt: createdAt,
             updatedAt: updatedAt,
-            messages: messages.map { $0.asChatMessageUI() },
+            // 从磁盘读出的消息没有保存过时间（创建时刻取的是读盘时刻）：先标成未核实，
+            // 附件元数据里存有可信时间的再回填。回合中现场转换的消息不经这里，时间可信。
+            messages: messages.map { stored in
+                var message = stored.asChatMessageUI()
+                message.hasUnverifiedTimestamp = true
+                return message
+            },
             pinned: pinned,
             unread: unread,
             projectID: projectID,
@@ -1341,6 +1594,7 @@ extension ChatMessageUI {
 
 extension LLMMessage {
     /// LLMMessage → UI 消息（无流式标记，timestamp 取当前时间）。
+    /// 时间不是消息的真实时间，标为“未核实”；由 sidecar 的消息时间回填后才可信。
     func asChatMessageUI() -> ChatMessageUI {
         let imageAttachments = images.enumerated().map { index, image in
             ChatAttachment(

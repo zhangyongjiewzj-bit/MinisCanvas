@@ -229,7 +229,8 @@ struct CancelledToolProjection3299Tests {
             chat.stopAllStreamingForSafety()
         }
         let result = root.appendingPathComponent("native-approval-effect")
-        let command = "printf %s approved > " + quote(result.path)
+        // 只有不可逆命令才有第二次确认（2026-11-16）：加一个 rm 子命令，让这张卡保持两步确认。
+        let command = "rm -f " + quote(result.path + ".stale") + "; printf %s approved > " + quote(result.path)
         provider.configure([try calls([("native-approve", "shell_execute", ["command": command, "timeout": 6])])])
         chat.composerPolicySelection.mode = .autoEdit
         chat.draftText = "Start the owned tool request"

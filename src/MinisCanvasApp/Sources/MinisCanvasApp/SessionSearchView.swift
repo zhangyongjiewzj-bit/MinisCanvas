@@ -78,13 +78,33 @@ struct ChatTranscriptScrollTarget: Equatable, Identifiable, Sendable {
 /// values never enter a user-visible result.
 enum SessionSearchSafeText {
     static func displayText(for message: ChatMessageUI) -> String? {
-        guard message.role == .user || message.role == .assistant,
-              message.toolCalls.isEmpty else { return nil }
-        let value = sanitized(message.displayContent)
+        // 带工具调用的助手回复也要能搜到：工具参数在 toolCalls 里，不在正文，
+        // 正文里的工具信封标记仍由 sanitizedFull 整条拒绝。
+        guard message.role == .user || message.role == .assistant else { return nil }
+        // 全文（不截断）用于匹配，命中位置再由 snippet(around:in:) 截取。
+        let value = sanitizedFull(message.displayContent)
         return value.isEmpty ? nil : value
     }
 
+    /// 命中处附近约 limit 字的片段；命中在开头之后时前面加省略号。
+    static func snippet(around needle: String, in text: String, limit: Int = 160) -> String {
+        guard text.count > limit,
+              let range = text.range(of: needle, options: [.caseInsensitive, .diacriticInsensitive]) else {
+            return text.count > limit ? String(text.prefix(limit)) + "…" : text
+        }
+        let hit = text.distance(from: text.startIndex, to: range.lowerBound)
+        let start = max(0, hit - 40)
+        let from = text.index(text.startIndex, offsetBy: start)
+        let to = text.index(from, offsetBy: min(limit, text.count - start))
+        return (start > 0 ? "…" : "") + String(text[from..<to]) + (to < text.endIndex ? "…" : "")
+    }
+
     static func sanitized(_ value: String) -> String {
+        let text = sanitizedFull(value)
+        return text.count > 160 ? String(text.prefix(160)) + "…" : text
+    }
+
+    static func sanitizedFull(_ value: String) -> String {
         var text = value
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
@@ -116,7 +136,7 @@ enum SessionSearchSafeText {
                 )
             }
         }
-        return text.count > 160 ? String(text.prefix(160)) + "…" : text
+        return text
     }
 }
 
@@ -149,13 +169,15 @@ enum SessionSearchState: Equatable, Sendable {
 final class SessionSearchModel {
     private let chat: ChatStore
 
-    static let resultLimit = 20
+    static let resultLimit = 100
     var reachedResultLimit: Bool { results.count >= Self.resultLimit }
 
     private(set) var query = ""
     private(set) var results: [SessionSearchResult] = []
     private(set) var state: SessionSearchState = .ready
     private(set) var selectedResultID: String?
+    /// 后台重搜进行中：旧结果仍显示，但暂不可点（点了也无法对上新结果），界面置灰并提示。
+    private(set) var isUpdating = false
 
     private var searchEpoch: UInt64 = 0
     private var pendingSearch: Task<Void, Never>?
@@ -171,19 +193,58 @@ final class SessionSearchModel {
         let epoch = searchEpoch
         pendingSearch?.cancel()
         selectedResultID = nil
+        isUpdating = false
         results = []
 
         guard state == .ready, !Self.normalized(value).isEmpty else { return }
         pendingSearch = Task { @MainActor [weak self] in
-            await Task.yield()
+            // 输入防抖：连续输入时只检索最后一次。
+            try? await Task.sleep(for: Self.debounce)
             guard !Task.isCancelled,
                   let self,
                   self.searchEpoch == epoch,
                   self.query == value,
                   self.state == .ready else { return }
-            let found = self.chat.searchMessageResults(query: value, limit: Self.resultLimit)
+            let found = await self.searchInBackground(value)
             guard !Task.isCancelled, self.searchEpoch == epoch else { return }
             self.results = found.map { $0.with(searchEpoch: epoch) }
+        }
+    }
+
+    static let debounce: Duration = .milliseconds(200)
+
+    /// 主线程只取会话快照；检索在后台完成，结果回主线程。
+    private func searchInBackground(_ value: String) async -> [SessionSearchResult] {
+        let snapshot = chat.sessionSearchSnapshot()
+        let limit = Self.resultLimit
+        return await Task.detached(priority: .userInitiated) {
+            ChatStore.searchMessageResults(in: snapshot, query: value, limit: limit)
+        }.value
+    }
+
+    /// 会话列表变化后的后台重搜：保留旧结果直到新结果回来，不阻塞主线程。
+    func refreshInBackground() {
+        pendingSearch?.cancel()
+        searchEpoch &+= 1
+        selectedResultID = nil
+        isUpdating = false
+        guard state == .ready else {
+            results = []
+            return
+        }
+        let value = Self.normalized(query)
+        guard !value.isEmpty else {
+            results = []
+            return
+        }
+        let epoch = searchEpoch
+        isUpdating = !results.isEmpty
+        pendingSearch = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let found = await self.searchInBackground(value)
+            guard !Task.isCancelled, self.searchEpoch == epoch else { return }
+            self.results = found.map { $0.with(searchEpoch: epoch) }
+            self.isUpdating = false
         }
     }
 
@@ -193,6 +254,7 @@ final class SessionSearchModel {
         pendingSearch?.cancel()
         searchEpoch &+= 1
         selectedResultID = nil
+        isUpdating = false
         guard state == .ready else {
             results = []
             return
@@ -229,6 +291,7 @@ final class SessionSearchModel {
         pendingSearch?.cancel()
         state = .rebuilding
         searchEpoch &+= 1
+        isUpdating = false
         results = []
         selectedResultID = nil
     }
@@ -242,6 +305,7 @@ final class SessionSearchModel {
         pendingSearch?.cancel()
         state = .corrupt
         searchEpoch &+= 1
+        isUpdating = false
         results = []
         selectedResultID = nil
     }
@@ -263,6 +327,7 @@ final class SessionSearchModel {
 /// Reusable production input used by the sidebar and direct consumer surface.
 struct SessionSearchInput: View {
     let model: SessionSearchModel
+    @Environment(\.themeTokens) private var theme
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -294,15 +359,18 @@ struct SessionSearchInput: View {
         .padding(.vertical, 4)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
+                .fill((theme?.stroke.opacity(0.5)) ?? Color(nsColor: .quaternaryLabelColor).opacity(0.18))
         )
     }
 }
 
 struct SessionSearchResultRow: View {
+    @Environment(\.themeTokens) private var theme
     let result: SessionSearchResult
     let isSelected: Bool
     let onSelect: () -> Void
+    /// 后台正在更新结果：整行置灰、不可点。
+    var isUpdating = false
 
     var body: some View {
         Button(action: onSelect) {
@@ -332,6 +400,8 @@ struct SessionSearchResultRow: View {
             )
         }
         .buttonStyle(.plain)
+        .disabled(isUpdating)
+        .opacity(isUpdating ? 0.5 : 1)
         .accessibilityIdentifier("session.search.result.\(result.id)")
         .accessibilityLabel(result.title)
         .accessibilityValue(result.snippet)
@@ -366,6 +436,12 @@ struct SessionSearchView: View {
                         .padding(.vertical, 12)
                 } else {
                     LazyVStack(spacing: 3) {
+                        if model.isUpdating {
+                            Text("正在更新结果…")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                                .accessibilityIdentifier("session-search.updating")
+                        }
                         if model.reachedResultLimit {
                             Text("仅显示前\(SessionSearchModel.resultLimit)条匹配消息，请缩小关键词。")
                                 .foregroundStyle(.secondary)
@@ -375,7 +451,8 @@ struct SessionSearchView: View {
                             SessionSearchResultRow(
                                 result: result,
                                 isSelected: model.selectedResultID == result.id,
-                                onSelect: { _ = model.select(result) }
+                                onSelect: { _ = model.select(result) },
+                                isUpdating: model.isUpdating
                             )
                         }
                     }

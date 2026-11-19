@@ -304,20 +304,21 @@ struct SettingsDescriptorOrphanGate148Tests {
         // bindings this is the full described surface at head 23cf25e+155.
         // A drift here is a matrix change the next intake must review, so it
         // fails closed in BOTH directions.
+        // 11/18：隐私页两个未启用的开关（collectAnalytics、redactEnvValues）从界面移除，不再是界面绑定。
         #expect(
             described == [
-                "allowLocalAgentSessionRead", "approvalPolicy", "autoCompactThreshold", "autoDeleteOldSessions",
-                "availableModelWhitelist", "browserViewportMode", "browserWriteEnabled", "chatOutputMode",
+                "allowLocalAgentSessionRead", "appearance", "approvalPolicy", "autoCompactThreshold", "autoDeleteOldSessions",
+                "availableModelWhitelist", "backgroundAutoContinueEnabled", "browserViewportMode", "browserWriteEnabled", "chatOutputMode",
                 "childConcurrencyEnabledSessionCount", "childConcurrencyUserSelected", "childDeletionAutoReviewEnabled",
                 "childModelOverridesEnabled", "childModelThinkingLevelCeiling",
                 "childMutationsEnabled",
-                "collectAnalytics", "composerPolicy",
+                "composerPolicy",
                 "concurrentToolLimit", "contextLengthTokens", "customUserAgent", "customViewportHeight",
                 "customViewportWidth", "defaultModelID", "defaultProviderID",
-                "fallbackEnabled", "fileCheckpointsEnabled", "historyTurnLimit", "idleTabTimeoutMinutes", "killSwitchEnabled",
+                "expirationInterval", "fallbackEnabled", "fileCheckpointsEnabled", "historyTurnLimit", "idleTabTimeoutMinutes", "killSwitchEnabled",
                 "language", "liveLogLevel", "maxLoopIterations", "maxTokensPerSession", "tokenBudgetUnlimited", "memoryEnabled", "globalInstructionsEnabled",
                 "memoryLimitMB", "modelSpeedTier", "newMessageInterruptsGeneration",
-                "persona", "personaEnabled", "privacyLogLevel", "redactEnvValues",
+                "persona", "personaEnabled", "privacyLogLevel",
                 "safeModeEnabled", "sessionRetentionDays", "subModelID",
                 "stripModelShellCredentials", "modelShellNoninteractive",
                 "terminalPolicySettings", "themePreset", "shellCommandTimeoutSeconds",

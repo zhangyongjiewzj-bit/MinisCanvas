@@ -66,15 +66,19 @@ public enum ContextWindowPolicy {
     /// estimate (characters / 4, same rule as `AgentContextTokenBudget`) of the
     /// messages added after the anchored reply. Without one, or when the
     /// transcript is shorter than the anchor (it was replaced), the pure local
-    /// estimate. Local estimates under-count CJK text and ignore images, which
-    /// is why the anchor is preferred. Returns nil only on integer overflow.
+    /// estimate (CJK-aware, plus the tool definitions). Local estimates ignore
+    /// images, which is why the anchor is preferred. Returns nil only on integer overflow.
     public static func estimateInput(
         messages: [LLMMessage],
         systemPrompt: String,
-        anchor: Anchor?
+        anchor: Anchor?,
+        toolSchemaTokens: Int = 0
     ) -> Int? {
+        // A provider-reported anchor already includes the tool definitions;
+        // only the pure local estimate has to add them.
         guard let anchor, messages.count >= anchor.sentMessageCount else {
-            return AgentContextTokenBudget.estimatedInputCost(messages, systemPrompt: systemPrompt)
+            return AgentContextTokenBudget.estimatedInputCost(
+                messages, systemPrompt: systemPrompt, toolSchemaTokens: toolSchemaTokens)
         }
         let tail = messages.dropFirst(min(messages.count, anchor.sentMessageCount + 1))
         guard let tailCost = AgentContextTokenBudget.estimatedMessagesCost(Array(tail)) else { return nil }
@@ -109,6 +113,23 @@ public struct ContextAdmissionConfig: Sendable {
     /// be delivered), not on its raw messages. Runs inside the loop's execution
     /// context, like the App's delivery projection. nil = messages are delivered as is.
     public let deliveryProjection: (@Sendable ([LLMMessage]) throws -> [LLMMessage])?
+    /// Output tokens each request may ask for (`max_tokens`). Many OpenAI-style
+    /// endpoints reject "input + max_tokens > window", so admission measures the
+    /// input against the window minus this reserve (capped at a quarter of the
+    /// window, like the summary request). 0 = no reserve.
+    public let outputReserveTokens: Int
+    /// False for a run that must not rewrite its history (a sub-agent has no session
+    /// checkpoint; background, project and scheduled turns fence on the transcript
+    /// revision): only reduction, overflow retry and the 95% refusal remain.
+    public let allowsCompaction: Bool
+    /// True when no App delivery projection sits in front of the Provider (a
+    /// sub-agent): the loop then applies the reduction to the request copy itself.
+    public let appliesReductionInLoop: Bool
+
+    /// The window left for input once the output reserve is set aside.
+    public var inputWindowTokens: Int {
+        windowTokens - min(max(0, outputReserveTokens), windowTokens / 4)
+    }
 
     /// nil when the window is not positive or the trigger is not in (0, 1].
     public init?(
@@ -117,9 +138,15 @@ public struct ContextAdmissionConfig: Sendable {
         initialAnchor: ContextWindowPolicy.Anchor? = nil,
         reduction: ContextReductionState = ContextReductionState(),
         compactionAlreadyJudged: Bool = false,
-        deliveryProjection: (@Sendable ([LLMMessage]) throws -> [LLMMessage])? = nil
+        deliveryProjection: (@Sendable ([LLMMessage]) throws -> [LLMMessage])? = nil,
+        outputReserveTokens: Int = 0,
+        allowsCompaction: Bool = true,
+        appliesReductionInLoop: Bool = false
     ) {
         guard windowTokens > 0, triggerFraction > 0, triggerFraction <= 1 else { return nil }
+        self.outputReserveTokens = outputReserveTokens
+        self.allowsCompaction = allowsCompaction
+        self.appliesReductionInLoop = appliesReductionInLoop
         self.windowTokens = windowTokens
         self.triggerFraction = triggerFraction
         self.initialAnchor = initialAnchor
@@ -148,7 +175,19 @@ struct ContextAdmissionRun {
     init(config: ContextAdmissionConfig) {
         self.config = config
         self.anchor = config.initialAnchor
-        self.compactionJudged = config.compactionAlreadyJudged
+        self.compactionJudged = config.compactionAlreadyJudged || !config.allowsCompaction
+    }
+
+    /// Whether the loop may still compact the history.
+    var mayCompact: Bool {
+        config.allowsCompaction && compactionsPerformed < Self.maximumCompactionsPerRun
+    }
+
+    /// The messages the loop hands to the Provider. With `appliesReductionInLoop`
+    /// the reduction is applied here (identity until activated); otherwise the
+    /// App's delivery projection applies it after the loop.
+    func deliveryCopy(_ messages: [LLMMessage]) -> [LLMMessage] {
+        config.appliesReductionInLoop ? config.reduction.apply(messages) : messages
     }
 
     /// Messages as the Provider would receive them before the reduction stage.
@@ -172,14 +211,37 @@ struct ContextAdmissionRun {
 
     /// Occupancy of the request the loop would deliver now, activating the
     /// reduction once the unreduced occupancy reaches the trigger.
-    mutating func decide(messages: [LLMMessage], systemPrompt: String) throws -> ContextWindowPolicy.Decision {
+    ///
+    /// Before a request is refused at the hard block, the reduction protects
+    /// fewer of the newest tool results (see `ContextReductionState`) and the
+    /// occupancy is measured again. Only the request copy changes.
+    mutating func decide(messages: [LLMMessage], systemPrompt: String,
+                         toolSchemaTokens: Int = 0) throws -> ContextWindowPolicy.Decision {
+        var decision = try decideOnce(messages: messages, systemPrompt: systemPrompt,
+                                      toolSchemaTokens: toolSchemaTokens)
+        while case .blocked = decision, config.reduction.lowerToolResultProtection() {
+            decision = try decideOnce(messages: messages, systemPrompt: systemPrompt,
+                                      toolSchemaTokens: toolSchemaTokens)
+        }
+        return decision
+    }
+
+    private mutating func decideOnce(messages: [LLMMessage], systemPrompt: String,
+                                     toolSchemaTokens: Int) throws -> ContextWindowPolicy.Decision {
         let view = try projected(messages)
         // An anchor counts positions in the loop's own messages and only adds
         // what follows them; without a usable anchor the projected view is estimated.
         let anchored = anchor.flatMap { messages.count >= $0.sentMessageCount ? $0 : nil }
         let base = ContextWindowPolicy.estimateInput(
-            messages: anchored == nil ? view : messages, systemPrompt: systemPrompt, anchor: anchored) ?? Int.max
-        let trigger = min(config.triggerFraction, ContextWindowPolicy.hardBlockFraction)
+            messages: anchored == nil ? view : messages, systemPrompt: systemPrompt, anchor: anchored,
+            toolSchemaTokens: toolSchemaTokens) ?? Int.max
+        // The user's trigger keeps its literal meaning (a fraction of the whole window); the
+        // output reserve only caps it, so the input never grows past window - reserve before
+        // compaction starts (like Claude Code's auto-compact). The 95% hard block stays
+        // measured against the whole window, same as the App's pre-send gate, so a refused
+        // compaction below it still sends.
+        let trigger = min(config.triggerFraction, ContextWindowPolicy.hardBlockFraction,
+                          Double(config.inputWindowTokens) / Double(config.windowTokens))
         var occupancy = base
         if config.reduction.isActive || Double(base) / Double(config.windowTokens) >= trigger {
             config.reduction.activate()
@@ -187,9 +249,11 @@ struct ContextAdmissionRun {
         }
         let decision = ContextWindowPolicy.decide(
             occupancyTokens: occupancy, windowTokens: config.windowTokens,
-            threshold: config.triggerFraction,
+            threshold: trigger,
             compactionAlreadyJudgedForThisTranscript: compactionJudged)
-        if case .proceed = decision, !config.compactionAlreadyJudged { compactionJudged = false }
+        if case .proceed = decision, !config.compactionAlreadyJudged, config.allowsCompaction {
+            compactionJudged = false
+        }
         return decision
     }
 

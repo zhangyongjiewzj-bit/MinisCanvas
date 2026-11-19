@@ -425,7 +425,7 @@ final class DeepSeekMM01FieldLane {
               executionIdentity.turn.sessionID == id.uuidString,
               executionIdentity.operationID == "chat:\(executionIdentity.turn.sessionID):\(executionIdentity.turn.turnID):\(executionIdentity.turn.messageID)",
               UUID(uuidString: executionIdentity.turn.messageID)?.uuidString == executionIdentity.turn.messageID,
-              chat.messages.allSatisfy({ $0.role == .assistant && $0.content == ChatStore.welcomeText && $0.attachments.isEmpty }),
+              chat.messages.allSatisfy({ $0.role == .assistant && ChatStore.isWelcomeText($0.content) && $0.attachments.isEmpty }),
               let receipt = currentVisualReceipt(for: chat),
               receipt.evidenceID.hasPrefix("live-settings:"), !receipt.applyReceiptID.isEmpty else { throw Refusal.admission }
         try outboundAudit?.validate(OwnedMMOutboundContext.action, phase: .visual)
@@ -489,7 +489,7 @@ final class DeepSeekMM01FieldLane {
         guard users.count == 1, [Self.prompt, Self.assembledPrompt].contains(users[0].content), users[0].images.count == 1,
               messages.allSatisfy({ $0.audios.isEmpty && $0.toolCalls.isEmpty && $0.role != .tool
                 && ($0.role == .user || $0.images.isEmpty)
-                && ($0.role == .user || ($0.role == .assistant && $0.content == ChatStore.welcomeText)) }),
+                && ($0.role == .user || ($0.role == .assistant && ChatStore.isWelcomeText($0.content))) }),
               let image = users[0].images.first, image.mimeType == "image/png",
               SHA256.hash(data: image.data).map({ String(format: "%02x", $0) }).joined() == Self.imageSHA256,
               MediaPayloadValidation.decision(data: image.data, mimeType: image.mimeType,

@@ -211,13 +211,13 @@ final class ThemePresetCatalogConsumerWiring290Tests: XCTestCase {
         XCTAssertEqual(ThemePresetCatalogPickerGate.selectableThemePresets, [.light, .system])
     }
 
-    func testDarkAndSystemBranchAdjudicationStaysPending() {
-        // 不发明豁免：接线后目录的 dark/System 分支裁决记录仍是唯一合法值。
-        XCTAssertEqual(ThemePresetCatalog.darkBranchAdjudication, .pending)
+    func testDarkBranchApprovedAndSystemBranchStaysPending() {
+        // 用户 11/17 选定第 1 套（含深色）：暗侧裁决放开并带 #E08B68；System 分支仍是原生色，裁决保持 pending。
+        XCTAssertEqual(ThemePresetCatalog.darkBranchAdjudication, .approved)
         XCTAssertEqual(ThemePresetCatalog.systemBranchAdjudication, .pending)
-        XCTAssertNil(
+        XCTAssertNotNil(
             ThemePresetCatalog.entry(for: .keylineOrangeA7A)?.accent(for: .dark),
-            "暗侧色值在裁决前保持失败关闭（nil），本线未填充"
+            "产品主题暗侧强调色 #E08B68 已批准"
         )
     }
 }

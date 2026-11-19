@@ -19,6 +19,16 @@ public protocol ProviderReadinessWireAdapter: Sendable {
 
     func decodeModelCatalog(from data: Data) throws -> [ProviderReadinessModel]
 
+    /// 目录请求：`afterID` 是上一页返回的游标。不分页的协议忽略它。
+    func makeCatalogPageRequest(
+        baseURL: URL,
+        apiKey: String,
+        afterID: String?
+    ) throws -> URLRequest
+
+    /// 目录还有下一页时返回游标（Anthropic：`has_more` 为真时的 `last_id`），否则 nil。
+    func nextCatalogPageCursor(from data: Data) -> String?
+
     /// Inspect a successful minimal model response before readiness accepts it.
     /// Failures must be typed; provider response content never enters a report.
     func validateModelRequestResponse(from data: Data) throws
@@ -28,6 +38,16 @@ public extension ProviderReadinessWireAdapter {
     // Existing Chat Completions and Anthropic callers retain their prior
     // status-only behavior until their response contracts are separately scoped.
     func validateModelRequestResponse(from data: Data) throws {}
+
+    func makeCatalogPageRequest(
+        baseURL: URL,
+        apiKey: String,
+        afterID: String?
+    ) throws -> URLRequest {
+        try makeRequest(operation: .modelCatalog, baseURL: baseURL, modelID: nil, apiKey: apiKey)
+    }
+
+    func nextCatalogPageCursor(from data: Data) -> String? { nil }
 }
 
 public enum ProviderReadinessWireAdapterFactory {
@@ -85,7 +105,7 @@ private struct OpenAIResponsesReadinessAdapter: ProviderReadinessWireAdapter {
                     "role": "user",
                     "content": [["type": "input_text", "text": deepSeek ? "Reply with only OK." : "ping"]]
                 ]],
-                "max_output_tokens": deepSeek ? 32 : 1,
+                "max_output_tokens": deepSeek ? 32 : readinessMinimalOutputTokens,
                 "stream": false
             ]
             if deepSeek { body["reasoning"] = ["effort": "none"] }
@@ -131,8 +151,12 @@ private struct OpenAIResponsesReadinessAdapter: ProviderReadinessWireAdapter {
     }
 }
 
-private let maxProviderModelCatalogBytes = 1_048_576
-private let maxProviderModelCatalogEntries = 256
+// 真实中转站的模型目录可以很大（聚合类服务常有上千条），放宽到 16 MB / 5000 条。
+private let maxProviderModelCatalogBytes = 16 * 1_048_576
+private let maxProviderModelCatalogEntries = 5_000
+private let maxProviderModelCatalogObjectKeys = 10_000
+/// 就绪检查的最小对话请求：OpenAI Responses 要求输出上限不小于 16，三种协议统一用 16。
+private let readinessMinimalOutputTokens = 16
 
 public struct ProviderReadinessHTTPFailure: Error, Equatable, Sendable {
     public let statusCode: Int
@@ -207,7 +231,9 @@ private struct OpenAICompatibleReadinessAdapter: ProviderReadinessWireAdapter {
                 body: [
                     "model": modelID,
                     "messages": [["role": "user", "content": "ping"]],
-                    "max_tokens": 1,
+                    // 与对话请求同一规则（MC4-012）：OpenAI 官方端点与推理模型用 max_completion_tokens，其余兼容端点用 max_tokens。
+                    OpenAIOutputCapField.name(endpointHost: baseURL.host, scheme: baseURL.scheme,
+                        modelID: modelID): readinessMinimalOutputTokens,
                     "stream": false
                 ]
             )
@@ -242,13 +268,26 @@ private func normalizedOpenAICompatibleReadinessBaseURL(_ baseURL: URL) -> URL {
     // not require the conventional `/v1` prefix for its readiness/chat paths.
     // An explicitly supplied path (including `/v1`) remains authoritative.
     guard !isDeepSeekBareHost(baseURL) else { return baseURL }
-    guard baseURL.path.isEmpty || baseURL.path == "/" else { return baseURL }
+    guard OpenAICompatibleVersionPath.needsV1(baseURL.path) else { return baseURL }
     guard var components = URLComponents(
         url: baseURL,
         resolvingAgainstBaseURL: false
     ) else { return baseURL }
-    components.path = "/v1"
+    var path = components.path
+    while path.hasSuffix("/") { path.removeLast() }
+    components.path = path + "/v1"
     return components.url ?? baseURL
+}
+
+/// OpenAI 兼容地址是否需要补 `/v1`：路径里没有任何版本段（v1、v1beta、v4、v2alpha…）时才补。
+/// `https://host`、`https://openrouter.ai/api` → 补；`/v1`、`/v1beta/openai`（Gemini）、`/api/paas/v4`（智谱）→ 原样。
+/// 对话请求与连接检查共用这一条规则。
+enum OpenAICompatibleVersionPath {
+    static func needsV1(_ path: String) -> Bool {
+        !path.split(separator: "/").contains { segment in
+            segment.range(of: "^v[0-9]+([a-z]+[0-9]*)?$", options: [.regularExpression, .caseInsensitive]) != nil
+        }
+    }
 }
 
 private func isDeepSeekBareHost(_ baseURL: URL) -> Bool {
@@ -301,30 +340,78 @@ private struct AnthropicReadinessAdapter: ProviderReadinessWireAdapter {
             "x-api-key": apiKey,
             "anthropic-version": anthropicVersion
         ]
+        // 与对话路径（AnthropicProvider）同一条规则：路径最后一段不是 v1 就补 /v1。
+        let versionedBase = deepSeek ? baseURL : anthropicVersionedBaseURL(baseURL)
 
         switch operation {
         case .reachability:
             endpoint = baseURL
-        case .authentication, .modelCatalog:
-            endpoint = baseURL.appendingPathComponent("models")
+        case .authentication:
+            endpoint = versionedBase.appendingPathComponent("models")
+        case .modelCatalog:
+            endpoint = anthropicCatalogEndpoint(baseURL: versionedBase, afterID: nil)
         case .modelRequest(let requestedModelID):
             guard let modelID = normalizedModelID(modelID ?? requestedModelID) else {
                 throw ProviderReadinessWireAdapterError.missingModelID
             }
-            endpoint = (deepSeek ? normalizedResponsesReadinessBaseURL(baseURL) : baseURL)
+            endpoint = (deepSeek ? normalizedResponsesReadinessBaseURL(baseURL) : versionedBase)
                 .appendingPathComponent("messages")
             return try makePOSTRequest(
                 endpoint: endpoint,
                 headers: headers,
                 body: [
                     "model": modelID,
-                    "max_tokens": 1,
+                    "max_tokens": readinessMinimalOutputTokens,
                     "messages": [["role": "user", "content": "ping"]]
                 ]
             )
         }
 
         return makeGETRequest(endpoint: endpoint, headers: headers)
+    }
+
+    func makeCatalogPageRequest(
+        baseURL: URL,
+        apiKey: String,
+        afterID: String?
+    ) throws -> URLRequest {
+        guard !(usesDeepSeekCatalog && isDeepSeekAnthropicBaseURL(baseURL)) else {
+            return try makeRequest(operation: .modelCatalog, baseURL: baseURL, modelID: nil, apiKey: apiKey)
+        }
+        return makeGETRequest(
+            endpoint: anthropicCatalogEndpoint(baseURL: anthropicVersionedBaseURL(baseURL), afterID: afterID),
+            headers: ["x-api-key": apiKey, "anthropic-version": anthropicVersion]
+        )
+    }
+
+    /// 对话路径（AnthropicProvider）的同一规则：去掉末尾斜杠后，最后一段不是 `v1` 就补 `/v1`。
+    private func anthropicVersionedBaseURL(_ baseURL: URL) -> URL {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { return baseURL }
+        while components.path.hasSuffix("/") { components.path.removeLast() }
+        guard var url = components.url else { return baseURL }
+        if url.lastPathComponent != "v1" { url.appendPathComponent("v1") }
+        return url
+    }
+
+    func nextCatalogPageCursor(from data: Data) -> String? {
+        guard !usesDeepSeekCatalog,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              root["has_more"] as? Bool == true,
+              let lastID = (root["last_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !lastID.isEmpty else { return nil }
+        return lastID
+    }
+
+    /// 带 `limit=1000`（官方上限）拉模型列表；后续页用 `after_id` 翻页。
+    private func anthropicCatalogEndpoint(baseURL: URL, afterID: String?) -> URL {
+        let modelsURL = baseURL.appendingPathComponent("models")
+        guard var components = URLComponents(url: modelsURL, resolvingAgainstBaseURL: false) else {
+            return modelsURL
+        }
+        var items = [URLQueryItem(name: "limit", value: "1000")]
+        if let afterID { items.append(URLQueryItem(name: "after_id", value: afterID)) }
+        components.queryItems = items
+        return components.url ?? modelsURL
     }
 
     func decodeModelCatalog(from data: Data) throws -> [ProviderReadinessModel] {
@@ -382,8 +469,8 @@ private struct OpenAIModelCatalog: Decodable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: AnyCodingKey.self)
         let keys = Set(container.allKeys.map(\.stringValue))
+        // 中转站常在根上多带 success、code 等键，忽略即可，只要有 data 数组。
         guard keys.contains("data"),
-              keys.isSubset(of: ["data", "object"]),
               let dataKey = AnyCodingKey(stringValue: "data") else {
             throw DecodingError.dataCorrupted(.init(
                 codingPath: decoder.codingPath,
@@ -412,7 +499,6 @@ private struct AnthropicModelCatalog: Decodable {
         let container = try decoder.container(keyedBy: AnyCodingKey.self)
         let keys = Set(container.allKeys.map(\.stringValue))
         guard keys.contains("data"),
-              keys.isSubset(of: ["data", "first_id", "has_more", "last_id"]),
               let dataKey = AnyCodingKey(stringValue: "data") else {
             throw DecodingError.dataCorrupted(.init(
                 codingPath: decoder.codingPath,
@@ -454,7 +540,10 @@ private func validateWireCatalogEnvelope(_ data: Data) throws {
         throw ProviderReadinessWireAdapterError.malformedModelCatalog
     }
 
-    var validator = JSONDuplicateKeyValidator(bytes: Array(data))
+    var validator = JSONDuplicateKeyValidator(
+        bytes: Array(data),
+        maxObjectKeys: maxProviderModelCatalogObjectKeys
+    )
     try validator.validate()
 }
 
@@ -671,13 +760,30 @@ struct JSONDuplicateKeyValidator {
     }
 }
 
+/// 连接检查的超时：本机和局域网的本地大模型冷启动常常很慢，放宽到 90 秒；远端服务约 30 秒。
+func readinessTimeoutSeconds(for endpoint: URL) -> TimeInterval {
+    guard let host = endpoint.host?.lowercased() else { return 30 }
+    if host == "localhost" || host == "::1" || host == "[::1]" || host.hasSuffix(".local") || host.hasSuffix(".localhost") {
+        return 90
+    }
+    let parts = host.split(separator: ".").compactMap { Int($0) }
+    if parts.count == 4 {
+        if parts[0] == 127 || parts[0] == 10
+            || (parts[0] == 192 && parts[1] == 168)
+            || (parts[0] == 172 && (16...31).contains(parts[1])) {
+            return 90
+        }
+    }
+    return 30
+}
+
 private func makeGETRequest(
     endpoint: URL,
     headers: [String: String]
 ) -> URLRequest {
     var request = URLRequest(url: endpoint)
     request.httpMethod = "GET"
-    request.timeoutInterval = 15
+    request.timeoutInterval = readinessTimeoutSeconds(for: endpoint)
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     for (name, value) in headers {
         request.setValue(value, forHTTPHeaderField: name)
@@ -707,10 +813,11 @@ private func normalizedModels(_ rawIDs: [String]) throws -> [ProviderReadinessMo
     var models: [ProviderReadinessModel] = []
     models.reserveCapacity(rawIDs.count)
 
+    // 重复 ID 去重、空 ID 跳过；只有一个有效 ID 都没有才算目录异常。
     for rawID in rawIDs {
         guard let modelID = normalizedModelID(rawID),
               seen.insert(Data(modelID.utf8)).inserted else {
-            throw ProviderReadinessWireAdapterError.malformedModelCatalog
+            continue
         }
 
         models.append(ProviderReadinessModel(id: modelID))

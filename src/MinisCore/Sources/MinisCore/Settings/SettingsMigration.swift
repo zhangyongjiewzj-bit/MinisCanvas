@@ -41,7 +41,7 @@ public enum SettingsMigrationError: Error, Sendable, Equatable {
 /// 再按 `settingsVersion` 逐版本补齐新字段默认值并提升版本号。
 ///
 /// - v1 → v2：新增 `agent.concurrentToolLimit`（4）、
-///   `agent.autoCompactThreshold`（0.8）、`agent.fallbackEnabled`（true）、
+///   `agent.autoCompactThreshold`（0.8）、`agent.fallbackEnabled`（默认 false）、
 ///   `storage.memoryLimitMB`（nil）、`storage.autoDeleteOldSessions`（false）。
 ///   （E19 `general.modelSpeedTier` 由宽容解码兜底默认值，无需 bump 版本。）
 /// - v2 → v3：新增 `typography.uiBaseFontSize`（14）。
@@ -138,10 +138,9 @@ public enum SettingsMigration {
             // 唯一真值，并把两个旧字段重投影成该预设的派生值。重投影是
             // 幂等的：再次执行只会写回同一组值，因此同一 payload 重复迁移
             // 不会继续漂移。未验收预设（高对比）永不成为迁移目标。
-            result.general.setThemePreset(ThemePreset.nearest(
-                for: result.general.appearance,
-                accentTheme: result.general.accentTheme
-            ))
+            // 第 1 套配色起「产品主题」也投影为 system 外观（明暗跟随系统），
+            // 不能再用投影出的 appearance 反推预设，直接固化已解码的预设。
+            result.general.setThemePreset(result.general.themePreset)
             version = 4
         }
 

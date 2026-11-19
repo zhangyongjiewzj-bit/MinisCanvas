@@ -25,7 +25,9 @@ struct ExternalSessionReadAutoApproveR13Tests {
     func alwaysAskStillAsksOthers() {
         let overrides = ApprovalGate.policyOverrides(for: .alwaysAsk)
         #expect(overrides[send] == .alwaysAsk)
-        #expect(overrides["browser"] == .alwaysAsk)
+        #expect(overrides["web_fetch"] == .alwaysAsk)
+        // 用户 2026-11-16：浏览器只读动作、后台输出查看/停止免卡；副作用动作仍按输入风险询问。
+        #expect(overrides["browser"] == .autoApprove)
         // 用户 2026-11-16：授权目录内只读文件工具不弹卡。
         #expect(overrides["file_read"] == .autoApprove)
         #expect(overrides[SessionTodoProgress.toolName] == .autoApprove)

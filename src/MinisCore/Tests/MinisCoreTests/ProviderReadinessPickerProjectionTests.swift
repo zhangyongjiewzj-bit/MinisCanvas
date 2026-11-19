@@ -420,6 +420,35 @@ struct ProviderReadinessPickerProjectionTests {
         #expect(item.evidenceID == nil)
     }
 
+    @Test("applied but never checked models are flagged unchecked without becoming ready")
+    func appliedUncheckedModelIsNotReadyEvidence() {
+        let projection = ChatModelPickerProjection(records: [
+            record(providerID: "p", modelID: "never", status: .discovered,
+                   readinessState: .unverified, evidenceID: nil),
+            record(providerID: "p", modelID: "failed", status: .unavailable,
+                   readinessState: .blocked, errorCategory: .unauthorized, evidenceID: nil),
+            record(providerID: "p", modelID: "ok", status: .passed,
+                   readinessState: .mock, evidenceID: "fixture"),
+            record(providerID: "p", modelID: "pending", status: .discovered,
+                   readinessState: .unverified, evidenceID: nil, isApplied: false)
+        ])
+        let never = projection.item(providerID: "p", modelID: "never")
+        #expect(never?.isUncheckedApplied == true)
+        #expect(never?.isSelectable == false)
+        #expect(projection.item(providerID: "p", modelID: "failed")?.isUncheckedApplied == false)
+        #expect(projection.item(providerID: "p", modelID: "ok")?.isUncheckedApplied == false)
+        #expect(projection.item(providerID: "p", modelID: "pending")?.isUncheckedApplied == false)
+    }
+
+    @Test("only transient failure categories keep earlier passed evidence")
+    func transientCategoriesAreRetryableNotBlocking() {
+        let transient: [ProviderReadinessFailureCategory] = [.timeout, .rateLimited, .server, .unavailable, .transport]
+        for category in transient { #expect(category.isTransient) }
+        for category in ProviderReadinessFailureCategory.allCases where !transient.contains(category) {
+            #expect(!category.isTransient, "\(category) must stay blocking")
+        }
+    }
+
     private func record(
         providerID: String,
         modelID: String,

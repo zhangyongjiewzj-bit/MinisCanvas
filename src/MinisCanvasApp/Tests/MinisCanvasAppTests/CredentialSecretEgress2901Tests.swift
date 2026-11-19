@@ -42,7 +42,7 @@ private final class Credential2901Wire: URLProtocol, @unchecked Sendable {
         }
         do {
             let argument = String(decoding: try JSONSerialization.data(
-                withJSONObject: ["command": "echo ordinary2901 api_key=" + value],
+                withJSONObject: ["command": "echo ordinary2901 api_key=" + value + " && touch ordinary2901-marker"],
                 options: [.sortedKeys]), as: UTF8.self)
             let tool: [String: Any] = ["index": 0, "id": "credential2901-shell", "type": "function",
                 "function": ["name": "shell_execute", "arguments": argument]]

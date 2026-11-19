@@ -85,7 +85,7 @@ final class SessionQuestionCenter {
         let result = UserQuestionResult(status: status, request: value.request, answers: value.answers,
             reason: status == .cancelled ? "用户取消澄清；未授权选项中提到的任何操作。" : nil)
         do { _ = try result.encoded() } catch {
-            pending[sessionID]?.feedback = error.localizedDescription
+            pending[sessionID]?.feedback = UserFacingErrorText.describe(error)
             return
         }
         finish(value, result: result)

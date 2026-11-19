@@ -14,6 +14,23 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
     case httpStatus(code: Int, detail: String)
     case contextLengthExceeded
 
+    /// 供应商明确表示余额或额度不足（只看固定标签，不看响应正文）。
+    public var isQuotaExhausted: Bool {
+        if case .httpStatus(_, let detail) = self {
+            return detail.contains(ProviderHTTPErrorAdapter.quotaReasonLabel)
+        }
+        return false
+    }
+
+    /// 授权类失败：API Key 无效、过期或没有权限（401/403，不含额度不足）。界面据此给“检查 API Key”入口。
+    public var isAuthorizationFailure: Bool {
+        switch self {
+        case .invalidAPIKey: return true
+        case .httpStatus(let code, _): return (code == 401 || code == 403) && !isQuotaExhausted
+        default: return false
+        }
+    }
+
     public var isNetworkError: Bool {
         if case .networkError = self { return true }
         return false
@@ -36,7 +53,7 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
             switch code {
             case 400, 422: return .invalidConfiguration
             case 401: return .unauthorized
-            case 403: return .permissionDenied
+            case 402, 403: return .permissionDenied
             case 404: return .notFound
             case 408: return .timeout
             case 429: return .rateLimited
@@ -50,7 +67,7 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
     public var isRetryable: Bool {
         switch self {
         case .networkError, .transientError: return true
-        case .httpStatus(let code, _): return HTTPStatusMessages.isTransient(code)
+        case .httpStatus(let code, _): return !isQuotaExhausted && HTTPStatusMessages.isTransient(code)
         default: return false
         }
     }
@@ -58,7 +75,7 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
     public var isFallbackable: Bool {
         switch self {
         case .invalidAPIKey, .rateLimited, .providerError: return true
-        case .httpStatus(let code, _): return [401, 403, 404, 429].contains(code)
+        case .httpStatus(let code, _): return isQuotaExhausted || [401, 403, 404, 429].contains(code)
         default: return false
         }
     }
@@ -138,6 +155,7 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
         case .unsupportedCapability: return ("能力不支持", "Unsupported Capability", "capability")
         case .unknown: return ("未知错误", "Unknown Error", "unknown")
         case .httpStatus(let code, _):
+            if isQuotaExhausted { return ("余额或额度不足", "Insufficient balance or quota", String(code)) }
             let message = HTTPStatusMessages.message(for: code)
             return (message.zh, message.en, String(code))
         case .contextLengthExceeded: return ("上下文超长", "Context Too Long", "context")
@@ -157,6 +175,7 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
         case .unknown: return "发生未知错误，请稍后重试。"
         case .contextLengthExceeded: return "对话内容超出了模型的上下文窗口，请压缩对话或精简内容后重发。"
         case .httpStatus(let code, _):
+            if isQuotaExhausted { return "账户余额或额度不足，请到供应商处充值，或更换 API Key 后重试。" }
             let value = HTTPStatusMessages.message(for: code)
             return value.zh + (value.suggestionZH.isEmpty ? "" : " " + value.suggestionZH)
         }
@@ -175,6 +194,7 @@ public enum LLMError: Error, LocalizedError, Sendable, CustomStringConvertible {
         case .unknown: return "An unknown error occurred. Try again later."
         case .contextLengthExceeded: return "The conversation exceeds the model context window. Compact the conversation or shorten the input, then resend."
         case .httpStatus(let code, _):
+            if isQuotaExhausted { return "The account balance or quota is insufficient. Top up at the provider or switch API keys, then retry." }
             let value = HTTPStatusMessages.message(for: code)
             return value.en + (value.suggestionEN.isEmpty ? "" : " " + value.suggestionEN)
         }

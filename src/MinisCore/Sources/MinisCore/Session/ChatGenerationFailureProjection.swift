@@ -22,6 +22,8 @@ public enum ChatGenerationRecoveryAction: String, Codable, CaseIterable, Sendabl
     case waitAndRetry
     case checkNetwork
     case selectModel
+    /// 上下文超长：先压缩当前对话（等同 /compact），再重发上一条消息。
+    case compactAndRetry
     case none
 
     /// Stable copy for a user-facing recovery control. No action is triggered
@@ -29,10 +31,11 @@ public enum ChatGenerationRecoveryAction: String, Codable, CaseIterable, Sendabl
     public var title: String {
         switch self {
         case .retry: return "重试"
-        case .reauthenticate: return "检查配置"
+        case .reauthenticate: return "检查 API Key"
         case .waitAndRetry: return "稍后重试"
         case .checkNetwork: return "检查网络"
         case .selectModel: return "选择模型"
+        case .compactAndRetry: return "压缩后重试"
         case .none: return ""
         }
     }
@@ -44,6 +47,7 @@ public enum ChatGenerationRecoveryAction: String, Codable, CaseIterable, Sendabl
         case .waitAndRetry: return "等待限流窗口结束后再明确发起一次请求"
         case .checkNetwork: return "检查网络连接后重新发送"
         case .selectModel: return "选择可用模型后重新发送"
+        case .compactAndRetry: return "先压缩当前对话，再由你明确发起一次重新发送"
         case .none: return "当前没有可执行的恢复动作"
         }
     }
@@ -68,11 +72,13 @@ public struct ChatGenerationFailureProjection: Codable, Equatable, Sendable {
         self.fallbackable = facts.fallbackable
         self.httpStatus = facts.httpStatus
         self.errorCategory = Self.conversationErrorCategory(for: facts.category)
-        self.message = Self.message(
-            category: facts.category,
-            httpStatus: facts.httpStatus,
-            retryable: facts.retryable
-        )
+        self.message = facts.quotaExhausted
+            ? "账户余额或额度不足，请到供应商处充值或更换 API Key（HTTP \(facts.httpStatus ?? 0)）"
+            : Self.message(
+                category: facts.category,
+                httpStatus: facts.httpStatus,
+                retryable: facts.retryable
+            )
     }
 
     /// Safe failure text suitable for `ChatRetryEnvelope.failureMessage`.
@@ -86,13 +92,23 @@ public struct ChatGenerationFailureProjection: Codable, Equatable, Sendable {
         switch recoveryAction {
         case .retry, .waitAndRetry:
             return retryable ? recoveryAction : .none
-        case .reauthenticate, .selectModel:
+        case .reauthenticate, .selectModel, .compactAndRetry:
             return fallbackable ? recoveryAction : .none
         case .checkNetwork:
             return .checkNetwork
         case .none:
             return .none
         }
+    }
+
+    /// 结合会话情况得出最终恢复动作与文案：上下文超长但会话里没有可压缩的历史时，
+    /// 不提供“压缩后重试”，改为提示精简内容或换窗口更大的模型。
+    public func recovery(conversationHasHistory: Bool) -> (action: ChatGenerationRecoveryAction, message: String) {
+        let action = actionableRecoveryAction
+        guard action == .compactAndRetry, !conversationHasHistory else {
+            return (action, userFacingMessage)
+        }
+        return (.none, "这条内容本身就超出了模型的上下文窗口，没有可压缩的历史。请精简内容或换用窗口更大的模型后重发。")
     }
 
     public var isRecoverable: Bool {
@@ -118,12 +134,23 @@ public struct ChatGenerationFailureProjection: Codable, Equatable, Sendable {
         let retryable: Bool
         let fallbackable: Bool
         let httpStatus: Int?
+        var quotaExhausted: Bool = false
     }
 
     private static func facts(for error: Error) -> Facts {
         if let llmError = error as? LLMError {
             switch llmError {
             case .httpStatus(let code, _):
+                if llmError.isQuotaExhausted {
+                    return Facts(
+                        category: .authorization,
+                        recoveryAction: .reauthenticate,
+                        retryable: false,
+                        fallbackable: true,
+                        httpStatus: code,
+                        quotaExhausted: true
+                    )
+                }
                 let classification = ProviderHTTPErrorAdapter.classify(statusCode: code)
                 switch classification.category {
                 case .unauthorized, .permissionDenied:
@@ -219,9 +246,9 @@ public struct ChatGenerationFailureProjection: Codable, Equatable, Sendable {
             case .contextLengthExceeded:
                 return Facts(
                     category: .contextLength,
-                    recoveryAction: .none,
+                    recoveryAction: .compactAndRetry,
                     retryable: false,
-                    fallbackable: false,
+                    fallbackable: true,
                     httpStatus: nil
                 )
             case .cancelled:
@@ -306,7 +333,7 @@ public struct ChatGenerationFailureProjection: Codable, Equatable, Sendable {
         case .server: retryable ? "服务暂时不可用，请稍后重试" : "服务商请求失败，请检查服务商或模型设置"
         case .transport: "网络连接失败，请检查网络后重试"
         case .model: "模型不可用，请选择其他模型"
-        case .contextLength: "上下文超出模型窗口，请压缩对话或精简内容后重发"
+        case .contextLength: "上下文超出模型窗口，可以压缩对话后重试"
         case .cancelled: "请求已取消"
         }
         guard let httpStatus else { return base }

@@ -119,7 +119,7 @@ struct PrivacyFreshTurn362Tests {
         do {
             try await AgentExecutionContext.$current.withValue(firstContext) {
                 let engine = try #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
-                #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path]) == "mounted-before-unmount")
+                #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path]) == "     1\tmounted-before-unmount")
             }
             await first.finish()
         } catch {
@@ -141,8 +141,8 @@ struct PrivacyFreshTurn362Tests {
                 let engine = try #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
                 // A valid same-route positive control distinguishes a revoked
                 // path from rejection due to a malformed new parent identity.
-                #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": local.path]) == "local-control")
-                let refusal = ToolExecutorError.invalidParameter("Policy violation: fileRootNotAllowed")
+                #expect(try await engine.composedExecutor.execute(name: "file_read", input: ["path": local.path]) == "     1\tlocal-control")
+                let refusal = ToolExecutorError.invalidParameter(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription)
                 await #expect(throws: refusal) {
                     _ = try await engine.composedExecutor.execute(name: "file_read", input: ["path": external.path])
                 }

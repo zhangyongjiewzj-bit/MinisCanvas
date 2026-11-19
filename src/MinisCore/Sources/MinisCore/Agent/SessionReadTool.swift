@@ -11,7 +11,7 @@ public enum SessionReadTool {
 
     private static let defaultLimit = 20
     private static let maxLimit = 50
-    private static let defaultMaxChars = 4_000
+    private static let defaultMaxChars = 8_000
     private static let minMaxChars = 200
     private static let maxMaxChars = 8_000
 

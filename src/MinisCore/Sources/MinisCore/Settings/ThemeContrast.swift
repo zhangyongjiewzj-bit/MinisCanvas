@@ -205,6 +205,23 @@ public enum ThemeContrast {
         return shade(high)
     }
 
+    /// 白字气泡底色：已满足 `minimum` 就原样返回，否则向黑色移动到刚好达标。
+    /// 用于深色下浅陶土强调色（#E08B68 叠白字约 2.6:1）；不改任何调色板常量。
+    public static func fillMeetingWhiteText(_ source: ThemeColor, minimum: Double = 4.5) -> ThemeColor {
+        let white = ThemeColor(r: 1, g: 1, b: 1)
+        guard contrastRatio(white, source) + ratioTolerance < minimum else { return source }
+        var low = 0.0
+        var high = 1.0
+        func shade(_ fraction: Double) -> ThemeColor {
+            ThemeColor(r: source.r * (1 - fraction), g: source.g * (1 - fraction), b: source.b * (1 - fraction))
+        }
+        for _ in 0..<32 {
+            let midpoint = (low + high) / 2
+            if contrastRatio(white, shade(midpoint)) >= minimum { high = midpoint } else { low = midpoint }
+        }
+        return shade(high)
+    }
+
     /// Resolve only foreground roles; palette and all surfaces remain unchanged.
     /// The three inputs are opaque token surfaces, not measurements of a window.
     public static func resolvingPresetContrast(_ source: ThemeSemanticTokens) -> ThemeSemanticTokens {

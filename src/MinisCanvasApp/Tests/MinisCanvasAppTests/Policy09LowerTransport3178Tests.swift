@@ -56,9 +56,14 @@ private final class Policy09Provider3178: LLMProvider, ProviderRuntimeConfigurat
     var childTaskIDs: [String] { lock.withLock { observedChildTaskIDs } }
     let callID: String
     private let returnsToolCall: Bool
-    init(callID: String, returnsToolCall: Bool = true) {
+    private let action: String
+    private let url: String
+    init(callID: String, returnsToolCall: Bool = true, action: String = "navigate",
+         url: String = "https://allowed.example.com/owned3178") {
+        self.url = url
         self.callID = callID
         self.returnsToolCall = returnsToolCall
+        self.action = action
     }
     nonisolated(nonsending) func sendMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int,
                                             temperature: Double?) async throws -> LLMResponse {
@@ -71,7 +76,8 @@ private final class Policy09Provider3178: LLMProvider, ProviderRuntimeConfigurat
         guard returnsToolCall && index == 1 else {
             return LLMResponse(text: "owned3178 tool result received", stopReason: "stop", usage: nil)
         }
-        let arguments: [String: Any] = ["tool_title": "Owned mode boundary", "action": "navigate", "url": "https://allowed.example.com/owned3178"]
+        var arguments: [String: Any] = ["tool_title": "Owned mode boundary", "action": action, "url": url]
+        if action == "click" { arguments["selector"] = "#owned3178" }
         // This consumer observes the production legacy tool_result envelope's
         // explicit is_error. Native tool-role wire has no such field. Supply the
         // real supported text-call format rather than interpreting native text
@@ -312,7 +318,13 @@ struct Policy09LowerTransport3178Tests {
             f.center.composerPolicy = setting
             #expect(SettingsStore(directory: f.profile.settingsDirectory).settings.agent.composerPolicy.mode == mode)
             #expect(chat.composerPolicySelection.mode == mode)
-            let provider = Policy09Provider3178(callID: "mode3178-\(mode.rawValue)")
+            // 浏览器只读动作（navigate）现在在计划/自动编辑模式下也免审批直接执行（2026-11-16，对齐 Claude Code）；
+            // 所以计划模式的预演、自动编辑模式的询问改用会改页面的 click 来证明，自动档仍用 navigate 证明能执行。
+            // 没有真实页面时，click 在取不到目标处就被拒绝、不会弹审批；自动编辑档改用访问未登记网站来触发询问。
+            let provider = Policy09Provider3178(callID: "mode3178-\(mode.rawValue)",
+                action: mode == .plan ? "click" : "navigate",
+                url: mode == .autoEdit ? "https://unlisted.example.org/owned3178"
+                                       : "https://allowed.example.com/owned3178")
             try admit(provider, fixture: f)
             let gate = Policy09PreparationGate3178()
             chat.turnPromptPreprocessPauseForTests = { await gate.pause() }

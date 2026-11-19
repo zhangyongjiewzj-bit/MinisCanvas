@@ -474,6 +474,45 @@ struct MCPDisableBoundaryFenceTests {
         registry.disconnectAll()
     }
 
+    @Test("in-flight call on server A survives disable, re-add and delete of unrelated server B")
+    func unrelatedServerChangeKeepsInFlightResult() async throws {
+        let manager = try dmcp05MakeManager("DMCP05-UnrelatedChange")
+        let serverA = try makeReadyServer(manager, id: "dmcp05-a")
+        let serverB = try makeReadyServer(manager, id: "dmcp05-b")
+        let entered = DMCP05AsyncSignal()
+        let release = DMCP05AsyncSignal()
+        let factory = DMCP05ClientFactory(
+            tools: [MCPTool(name: "greet")],
+            callEntered: entered,
+            callRelease: release
+        )
+        let registry = MCPToolRegistry(manager: manager, clientFactory: factory.make)
+        let fullName = MCPBoundTool.makeFullName(serverID: serverA.id, toolName: "greet")
+        let identity = MCPToolInvocationIdentity(correlationID: "dmcp05-unrelated", attemptID: "attempt-1")
+
+        let pending = Task {
+            try await registry.callMCPTool(
+                fullName: fullName,
+                arguments: nil,
+                invocation: identity
+            )
+        }
+        await entered.wait()
+        // Every kind of change to B bumps the manager revision; A's grant,
+        // descriptor and tools/list publication are untouched.
+        try manager.enableServer(id: serverB.id, enabled: false)
+        try manager.addServer(MCPServer(id: "dmcp05-c", name: "c", type: .http, url: "http://127.0.0.1:2"))
+        _ = try manager.deleteServer(dmcp05Confirmed(try manager.deletionIntent(id: "dmcp05-c")))
+        await release.signal()
+
+        let output = try await pending.value
+        #expect(output.hasSuffix(":1"))
+        // A is still current, so its new calls keep working too.
+        #expect(try await registry.mcpBoundTools().map(\.fullName) == [fullName])
+
+        registry.disconnectAll()
+    }
+
     @Test("stable session reuses one client across consecutive calls")
     func fenceDoesNotOverEvictStableSessions() async throws {
         let manager = try dmcp05MakeManager("DMCP05-Stable")

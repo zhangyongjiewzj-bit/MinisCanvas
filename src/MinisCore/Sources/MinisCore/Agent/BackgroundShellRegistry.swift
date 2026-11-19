@@ -155,8 +155,10 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
     public static let shared = BackgroundShellRegistry()
     public static let didChangeNotification = Notification.Name("MinisCanvas.BackgroundShellRegistry.didChange")
     private let persistence: BackgroundShellPersistence
-    public static let defaultTimeoutSeconds: TimeInterval = 1800
-    public static let defaultMaximumTimeoutSeconds: TimeInterval = 3600
+    /// 0 means no wall-clock limit: a background command runs until it exits, is
+    /// stopped, or the app quits. A limit applies only when the model passes `timeout`.
+    public static let defaultTimeoutSeconds: TimeInterval = 0
+    public static let defaultMaximumTimeoutSeconds: TimeInterval = 86_400
     /// Absolute ceiling for any configured maximum (24 hours).
     public static let hardMaximumTimeoutSeconds: TimeInterval = 86_400
     public static let defaultMaximumRunning = 8
@@ -252,7 +254,7 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
         configuredMaximumRunning = max(1, maximumRunning)
         let maximum = Self.clampMaximum(maximumTimeoutSeconds)
         configuredMaximumTimeout = maximum
-        configuredDefaultTimeout = min(max(1, defaultTimeoutSeconds), maximum)
+        configuredDefaultTimeout = defaultTimeoutSeconds > 0 ? min(max(1, defaultTimeoutSeconds), maximum) : 0
     }
 
     // MARK: Configuration
@@ -269,7 +271,7 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
         }
     }
 
-    /// Timeout used when the model passes none.
+    /// Timeout used when the model passes none (0 = no limit).
     public var defaultTimeoutSeconds: TimeInterval {
         lock.withLock { configuredDefaultTimeout }
     }
@@ -284,6 +286,15 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
     /// registry synchronously.
     public func setEventSink(_ sink: (@Sendable (BackgroundShellEvent) -> Void)?) {
         lock.withLock { self.sink = sink }
+    }
+
+    /// 某条命令结束时只调用一次（在登记里的状态已写好之后，任意线程；不得同步回调登记）。
+    /// 用于结束时登记命令生成的产物。命令已结束或不存在则不登记。
+    private var finishHooks: [String: @Sendable () -> Void] = [:]
+    func addFinishHook(id: String, _ hook: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            if records[id]?.state == .running { finishHooks[id] = hook }
+        }
     }
 
     private static func clampMaximum(_ value: TimeInterval) -> TimeInterval {
@@ -339,6 +350,28 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
                 let bytes = try file.read(upToCount: max(0, maxBytes)) ?? Data()
                 return (Self.redactedTail(bytes, maxBytes), "")
             } catch { return ("后台输出读取失败：\(error.localizedDescription)", "") }
+        }
+    }
+
+    /// 任务中心展示用：标准输出和标准错误分开，各取最后 `maxBytes`（默认 64KB），已脱敏。
+    /// 应用重启后恢复登记的记录没有分流缓冲，退回合并日志（全部放在 stdout 里）。
+    /// `logPath` 是合并日志文件，供“在访达中显示”；输出已清除时为 nil。
+    public func displayOutput(id: String, maxBytes: Int = 64 * 1024)
+        -> (stdout: String, stderr: String, logPath: String?)? {
+        lock.withLock {
+            guard let record = records[id] else { return nil }
+            if record.outputDiscarded { return ("", "", nil) }
+            let path = persistence.outputURL(id).path
+            if !record.stdout.data.isEmpty || !record.stderr.data.isEmpty {
+                return (Self.redactedTail(record.stdout.data, maxBytes),
+                        Self.redactedTail(record.stderr.data, maxBytes), path)
+            }
+            guard let file = try? FileHandle(forReadingFrom: persistence.outputURL(id)) else { return ("", "", nil) }
+            defer { try? file.close() }
+            guard let end = try? file.seekToEnd() else { return ("", "", path) }
+            try? file.seek(toOffset: end > UInt64(max(0, maxBytes)) ? end - UInt64(max(0, maxBytes)) : 0)
+            let bytes = (try? file.read(upToCount: max(0, maxBytes))) ?? Data()
+            return (Self.redactedTail(bytes, maxBytes), "", path)
         }
     }
 
@@ -574,7 +607,7 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
         }
 
         let timeout = lock.withLock { records[id]?.timeoutSeconds ?? 0 }
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline: Date? = timeout > 0 ? Date().addingTimeInterval(timeout) : nil
         var ending: Ending = .timedOut
         while true {
             do {
@@ -594,7 +627,7 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
             }
             if lock.withLock({ records[id]?.outputError != nil }) { ending = .stopRequested(.user); break }
             if let reason = lock.withLock({ records[id]?.stopReason }) { ending = .stopRequested(reason); break }
-            if Date() >= deadline { ending = .timedOut; break }
+            if let deadline, Date() >= deadline { ending = .timedOut; break }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         var exitStatus: Int32?
@@ -662,8 +695,10 @@ public final class BackgroundShellRegistry: @unchecked Sendable {
             evictFinishedLocked()
             return (event, sink)
         }
+        let hook = lock.withLock { finishHooks.removeValue(forKey: id) }
         NotificationCenter.default.post(name: Self.didChangeNotification, object: self)
         if let pending { pending.sink?(pending.event) }
+        if pending != nil { hook?() }
     }
 
     private func recordOutputFailure(id: String, message: String) {

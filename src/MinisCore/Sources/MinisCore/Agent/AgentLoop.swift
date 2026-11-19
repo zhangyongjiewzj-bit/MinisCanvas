@@ -138,7 +138,7 @@ public enum AgentLoopError: LocalizedError, Equatable, Sendable {
         switch self {
         case .maxIterationsExceeded(let n):
             return isChinese
-                ? "已达到最大迭代次数（\(n)），请简化任务或拆分步骤后重试"
+                ? "本回合的工具调用已达上限（\(n) 次），已先停下。点「继续」可接着做，也可以把任务拆小后再试"
                 : "Max iterations exceeded (\(n)) — please simplify the task or split it into steps"
         case .emptyResponse:
             return isChinese
@@ -213,38 +213,102 @@ public enum AgentLoopError: LocalizedError, Equatable, Sendable {
         case .contextWindowFull(let fraction):
             let percent = Int((fraction * 100).rounded())
             return isChinese
-                ? "上下文已占模型窗口的 \(percent)%，且无法压缩或缩减；请新开会话继续，原会话保留"
-                : "The context fills \(percent)% of the model window and cannot be compacted or reduced; continue in a new session (this one is kept)"
+                ? "上下文已占模型窗口的 \(percent)%，本回合内无法压缩或缩减；可点“压缩后重试”，或新开会话继续，原会话保留"
+                : "The context fills \(percent)% of the model window and cannot be compacted or reduced within this turn; use Compact and retry, or continue in a new session (this one is kept)"
         }
+    }
+}
+
+extension AgentLoopError {
+    /// 窗口已满（`contextWindowFull`）在没有“压缩后重试”按钮的路径上的失败说明：
+    /// 子智能体（`subagent == true`）由主智能体重派；后台、项目这类无人值守回合由用户重新运行。
+    /// 前台对话仍用 `errorDescription` 里的“压缩后重试 / 新开会话继续”。
+    public static func contextWindowFullDelegatedDescription(subagent: Bool, isChinese: Bool? = nil) -> String {
+        let chinese = isChinese
+            ?? (Locale.current.language.languageCode?.identifier.lowercased().hasPrefix("zh") ?? false)
+        if subagent {
+            return chinese
+                ? "子任务的上下文已满，无法继续；请缩小任务范围后重派"
+                : "The sub-task's context is full and cannot continue; narrow its scope and delegate it again"
+        }
+        return chinese
+            ? "这个后台任务的上下文已满，无法继续；请缩小任务范围，或新开会话后重新运行"
+            : "This background task's context is full and cannot continue; narrow its scope or start a new session and run it again"
+    }
+
+    /// 是否是前台的“窗口已满”说明文字（被包装成只带文案的失败信封后，只能按文字识别）。
+    public static func isContextWindowFullForegroundDescription(_ text: String) -> Bool {
+        text.contains("压缩后重试") && text.contains("新开会话继续")
+            || text.contains("Compact and retry") && text.contains("continue in a new session")
     }
 }
 
 /// The same local text estimate used at the App context handoff and
 /// before each Provider request. Actual tokenization remains Provider-owned.
 public enum AgentContextTokenBudget {
+    /// `toolSchemaTokens` is the estimated size of the offered tool definitions
+    /// (see `estimatedToolSchemaTokens`); they are part of every request.
     public static func estimatedInputCost(
         _ messages: [LLMMessage],
-        systemPrompt: String
+        systemPrompt: String,
+        toolSchemaTokens: Int = 0
     ) -> Int? {
         guard let messagesCost = estimatedMessagesCost(messages) else { return nil }
-        let (total, overflow) = max(1, systemPrompt.count / 4).addingReportingOverflow(messagesCost)
-        return overflow ? nil : total
+        let (partial, overflow) = max(1, estimatedTextTokens(systemPrompt)).addingReportingOverflow(messagesCost)
+        let (total, overflow2) = partial.addingReportingOverflow(max(0, toolSchemaTokens))
+        return overflow || overflow2 ? nil : total
     }
 
-    /// Local estimate (characters / 4, at least 1 per message) of the messages
+    /// Local token estimate of a text: CJK characters (Han, kana, Hangul and
+    /// their punctuation) count about one token each, everything else about
+    /// four characters per token. Actual tokenization remains Provider-owned.
+    public static func estimatedTextTokens(_ text: String) -> Int {
+        var cjk = 0
+        var other = 0
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x3000...0x303F, 0x3040...0x30FF, 0x3400...0x4DBF, 0x4E00...0x9FFF,
+                 0xAC00...0xD7AF, 0xF900...0xFAFF, 0xFF00...0xFFEF, 0x20000...0x2FA1F:
+                cjk += 1
+            default:
+                other += 1
+            }
+        }
+        return cjk + other / 4
+    }
+
+    /// Estimated tokens of the tool definitions sent with every request.
+    public static func estimatedToolSchemaTokens(_ tools: [AgentToolDefinition]) -> Int {
+        tools.reduce(0) { total, tool in
+            var tokens = 12 + estimatedTextTokens(tool.name) + estimatedTextTokens(tool.description)
+            for (key, param) in tool.parameters {
+                tokens += 8 + estimatedTextTokens(key) + estimatedTextTokens(param.description)
+                    + (param.enumValues ?? []).reduce(0) { $0 + 2 + estimatedTextTokens($1) }
+            }
+            return total + tokens
+        }
+    }
+
+    /// 每张图片的本地估值（约 1500 个 token）。
+    public static let estimatedImageTokens = 1_500
+
+    /// Local estimate (CJK-aware, at least 1 per message) of the messages
     /// alone, without a system prompt. Nil on integer overflow.
     public static func estimatedMessagesCost(_ messages: [LLMMessage]) -> Int? {
         var total = 0
         for message in messages {
-            var toolBytes = 0
-            for call in message.toolCalls {
-                let (next, overflow) = toolBytes.addingReportingOverflow(call.rawArguments.count)
-                guard !overflow else { return nil }
-                toolBytes = next
+            var cost = estimatedTextTokens(message.content)
+            // 图片按固定估值、音频按数据量折算计入（本地估算只用于显示和压缩触发）。
+            cost += message.images.count * estimatedImageTokens
+            for audio in message.audios {
+                cost += max(50, audio.base64Data.utf8.count * 3 / 4 / 640)
             }
-            let (textBytes, overflow) = message.content.count.addingReportingOverflow(toolBytes)
-            guard !overflow else { return nil }
-            let cost = max(1, textBytes / 4)
+            for call in message.toolCalls {
+                let (next, overflow) = cost.addingReportingOverflow(estimatedTextTokens(call.rawArguments))
+                guard !overflow else { return nil }
+                cost = next
+            }
+            cost = max(1, cost)
             let (next, sumOverflow) = total.addingReportingOverflow(cost)
             guard !sumOverflow else { return nil }
             total = next
@@ -370,8 +434,11 @@ public struct AgentLoop: Sendable {
     /// Optional App limit on non-shell, non-browser tool effects.
     public var otherToolTimeout: TimeInterval?
 
-    private func toolTimeout(for name: String) -> TimeInterval? {
+    func toolTimeout(for name: String) -> TimeInterval? {
         if name == AskUserQuestionTool.toolName { return nil }
+        // 子智能体派发与 MCP 工具各有自己的时限（子任务 2 小时上限、MCP 服务器配置的调用超时），
+        // 不受"其它工具超时"和父回合时钟约束。
+        if name == OrchestrationToolExecutor.toolName || name.hasPrefix("mcp_") { return nil }
         guard name != "shell_execute",
               !BrowserSideEffectPolicy.browserToolNames.contains(name.lowercased()),
               let otherToolTimeout, otherToolTimeout > 0 else { return timeout }
@@ -413,6 +480,9 @@ public struct AgentLoop: Sendable {
         _ delta: String
     ) async -> Void
     public var onAssistantTextDelta: AssistantTextDeltaHandler?
+    /// 模型思考过程增量（仅显示用，不属于正文，也不进入后续请求历史）。
+    /// 仅在 provider 流式返回思考内容时触发；不影响缓冲路径。
+    public var onAssistantThinkingDelta: AssistantTextDeltaHandler?
 
     /// Reports an admitted truncated response so the App can reconcile its
     /// partial text with provider deltas already displayed for this iteration.
@@ -427,6 +497,10 @@ public struct AgentLoop: Sendable {
     /// authorization rejection before executor dispatch, or this request's
     /// first-Provider policy preflight. No tool input/output crosses this seam.
     public var onToolNonExecution: (@Sendable (String, ToolNonExecutionReason) -> Void)?
+
+    /// 前台命令（shell_execute）的实时输出：参数是工具调用 ID 与一批已脱敏的新输出文本。
+    /// 只给界面显示，不进入工具结果和模型历史，也不会触发新一轮。
+    public var onToolLiveOutput: (@Sendable (String, String) -> Void)?
 
     /// The exact trusted child scope is shared by pre-Gate preparation and
     /// actual execution. App/model inputs cannot construct or widen this value.
@@ -1010,7 +1084,11 @@ public struct AgentLoop: Sendable {
             // exhausted the budget are in `messages` (summarized whole).
             var budgetCompactionDue = false
             var admissionRun = contextAdmission.map(ContextAdmissionRun.init(config:))
+            let toolSchemaTokens = AgentContextTokenBudget.estimatedToolSchemaTokens(tools)
             var continuationTruncationNotice: String?
+            // Only runs that actually offer todo_write nudge about its checklist.
+            var todoReminder = SessionTodoReminder(
+                history: tools.contains { $0.name == SessionTodoProgress.toolName } ? initialMessages : [])
 
         for iteration in 1...maxIterations {
             if let childBoundary {
@@ -1042,8 +1120,10 @@ public struct AgentLoop: Sendable {
             }
 
             let requestSystemPrompt: String?
-            if let notice = continuationTruncationNotice {
-                requestSystemPrompt = [systemPrompt, notice].compactMap { $0 }.filter { !$0.isEmpty }
+            let todoNotice = todoReminder.requestReminder()
+            if continuationTruncationNotice != nil || todoNotice != nil {
+                requestSystemPrompt = [systemPrompt, continuationTruncationNotice, todoNotice]
+                    .compactMap { $0 }.filter { !$0.isEmpty }
                     .joined(separator: "\n\n")
             } else {
                 requestSystemPrompt = systemPrompt
@@ -1052,7 +1132,8 @@ public struct AgentLoop: Sendable {
             // Window admission (C10): decided here and nowhere else.
             // Reduction (free) -> compaction -> send / refuse at >= 95%.
             if var run = admissionRun {
-                var decision = try run.decide(messages: messages, systemPrompt: requestSystemPrompt ?? "")
+                var decision = try run.decide(messages: messages, systemPrompt: requestSystemPrompt ?? "",
+                                              toolSchemaTokens: toolSchemaTokens)
                 if case .compact = decision {
                     if run.compactionsPerformed < ContextAdmissionRun.maximumCompactionsPerRun,
                        let compacted = try await attemptContextCompaction(
@@ -1064,7 +1145,8 @@ public struct AgentLoop: Sendable {
                         run.transcriptReplaced()
                     }
                     run.compactionJudged = true
-                    decision = try run.decide(messages: messages, systemPrompt: requestSystemPrompt ?? "")
+                    decision = try run.decide(messages: messages, systemPrompt: requestSystemPrompt ?? "",
+                                              toolSchemaTokens: toolSchemaTokens)
                 }
                 run.overflowRecoveriesInIteration = 0
                 admissionRun = run
@@ -1115,10 +1197,11 @@ public struct AgentLoop: Sendable {
                     throw InterruptedError()
                 }
                 try Task.checkCancellation()
+                let requestMessages = admissionRun?.deliveryCopy(messages) ?? messages
                 let attempt = try await UsageTelemetryContext.$servedRouteCapture.withValue(usageRouteCapture) {
                     try await sendProvider(
                         provider: provider,
-                        messages: messages,
+                        messages: requestMessages,
                         systemPrompt: requestSystemPrompt,
                         tools: tools,
                         maxTokens: requestMaxTokens,
@@ -1134,6 +1217,15 @@ public struct AgentLoop: Sendable {
                 if let tracker = requestBudget, let lease {
                     await tracker.failRequest(lease)
                 }
+                // C3-11: the newest message's own media already fills the whole history
+                // media budget, so every older image is gone from the request and neither
+                // compaction nor reduction can make it smaller. Do not summarize for nothing:
+                // surface the plain "request too large" error (reduce the images), not
+                // "compress the conversation".
+                if let llmError = error as? LLMError, case .contextLengthExceeded = llmError,
+                   HistoryMediaBudget.protectedMediaBytes(messages) >= HistoryMediaBudget.defaultMaxBytes {
+                    throw LLMError.httpStatus(code: 413, detail: "")
+                }
                 // Provider "context too long": compact once (or reduce the
                 // request copy) and resend. At most 1 per iteration, 2 per run;
                 // the next overflow surfaces as the typed error.
@@ -1144,7 +1236,7 @@ public struct AgentLoop: Sendable {
                     run.overflowRecoveriesInIteration += 1
                     run.overflowRecoveriesInRun += 1
                     var progressed = false
-                    if run.compactionsPerformed < ContextAdmissionRun.maximumCompactionsPerRun,
+                    if run.mayCompact,
                        let compacted = try await attemptContextCompaction(
                         messages: messages, currentConversationID: currentConversationID, turn: turn) {
                         if let turn, await turn.isCancelled() { throw InterruptedError() }
@@ -1161,6 +1253,13 @@ public struct AgentLoop: Sendable {
                     }
                     admissionRun = run
                     if progressed { continue }
+                }
+                // 压缩或缩减已经做过一次仍然超长，而最新一条用户消息自己带着图片或音频：
+                // 还能减的只有这条消息的媒体，提示“请求内容太大”，不再让用户去“压缩对话”。
+                if let llmError = error as? LLMError, case .contextLengthExceeded = llmError,
+                   (admissionRun?.overflowRecoveriesInRun ?? 0) > 0,
+                   HistoryMediaBudget.newestUserMessageHasMedia(messages) {
+                    throw LLMError.httpStatus(code: 413, detail: "")
                 }
                 throw error
             }
@@ -1298,6 +1397,11 @@ public struct AgentLoop: Sendable {
                 historyCalls.reserveCapacity(nativeCalls.count)
                 for call in nativeCalls {
                     let projectedRaw = await toolResultProjection(call.rawArguments)
+                    // 回传给服务商的 reasoning_content 与正文、参数一样要先过已知敏感值保护。
+                    var projectedReasoning: String?
+                    if let reasoning = call.reasoningContent {
+                        projectedReasoning = await toolResultProjection(reasoning)
+                    }
                     let projectedArguments: [String: Any]
                     if projectedRaw == call.rawArguments {
                         projectedArguments = call.arguments
@@ -1308,16 +1412,22 @@ public struct AgentLoop: Sendable {
                     } else {
                         // If projection altered the JSON shape, do not echo the
                         // original argument dictionary or malformed raw payload.
-                        historyCalls.append(LLMToolCall(
+                        var emptyCall = LLMToolCall(
                             id: call.id, name: call.name,
                             rawArguments: "{}", arguments: [:]
-                        ))
+                        )
+                        emptyCall.thinkingBlocks = call.thinkingBlocks
+                        emptyCall.reasoningContent = projectedReasoning
+                        historyCalls.append(emptyCall)
                         continue
                     }
-                    historyCalls.append(LLMToolCall(
+                    var projectedCall = LLMToolCall(
                         id: call.id, name: call.name,
                         rawArguments: projectedRaw, arguments: projectedArguments
-                    ))
+                    )
+                    projectedCall.thinkingBlocks = call.thinkingBlocks
+                    projectedCall.reasoningContent = projectedReasoning
+                    historyCalls.append(projectedCall)
                 }
             }
             let truncationNotice = truncation?.errorDescription
@@ -1387,7 +1497,7 @@ public struct AgentLoop: Sendable {
                 }
                 await turn?.finish()
                 return AgentLoopResult(
-                    messages: messages,
+                    messages: Self.withoutToolImages(messages),
                     iterationCount: iteration,
                     toolCallsExecuted: toolCallsExecuted,
                     executionIdentity: executionIdentity,
@@ -1501,7 +1611,20 @@ public struct AgentLoop: Sendable {
                 if let fatal { throw fatal }
             }
             do {
+            // V-6：参数超过边界上限的调用不执行、不审批，给模型回一条固定的工具错误，让它分段重试。
+            let oversizedCallIDs: Set<String> = isNative
+                ? Set(nativeCalls.filter(\.argumentsExceedLimit).map(\.id)) : []
             for parsedCall in calls {
+                if oversizedCallIDs.contains(parsedCall.id) {
+                    try await drainPreparedReads()
+                    resultParts.append([
+                        "type": "tool_result",
+                        "tool_use_id": parsedCall.id,
+                        "content": ProviderToolCallBoundary.oversizedArgumentsToolResult,
+                        "is_error": true,
+                    ])
+                    continue
+                }
                 let routedOwner = ((composerExecutor?.base ?? toolExecutor) as? any BuiltinOwnerBoundToolExecutor)?.currentBuiltinOwner
                 // Exact native names and a concrete bound owner; never MCP
                 // annotations, model assertions, browser hints, or risk level.
@@ -1516,14 +1639,20 @@ public struct AgentLoop: Sendable {
                     throw try AskUserQuestionTool.NeedsClarification(request: AskUserQuestionTool.parse(parsedCall.input))
                 }
                 let call: ParsedToolCall
-                if ["file_write", "file_edit"].contains(parsedCall.name),
-                   let runtime = childToolRuntimeBinding,
-                   let path = parsedCall.input["path"] as? String,
-                   !path.hasPrefix("/"), !path.hasPrefix("~") {
-                    // Resolve before policy, approval and locking so every
-                    // consumer sees this child's same frozen absolute target.
+                if ToolPathResolution.toolNames.contains(parsedCall.name),
+                   let path = parsedCall.input["path"] as? String, !path.isEmpty, !path.hasPrefix("/"),
+                   let absolute = ToolPathResolution.absolutePath(
+                       for: path,
+                       workingDirectory: childToolRuntimeBinding?.boundary.identity.workingDirectory
+                           ?? childWorkspaceScope?.workingDirectory
+                           ?? routedOwner?.effectiveWorkingDirectory.path) {
+                    // `~` and relative paths resolve against this call's working
+                    // directory (a child's frozen one, else the session project)
+                    // before policy, approval and locking, so every consumer sees
+                    // the same absolute target. A path with `..` stays as given
+                    // and is refused downstream.
                     var input = parsedCall.input
-                    input["path"] = runtime.boundary.identity.workingDirectory + "/" + path
+                    input["path"] = absolute
                     call = ParsedToolCall(id: parsedCall.id, name: parsedCall.name, input: input)
                 } else { call = parsedCall }
                 var receipt: ToolExecutionReceipt?
@@ -1910,8 +2039,15 @@ public struct AgentLoop: Sendable {
                             identity: BrowserSideEffectExecutionIdentity(callID: call.id, inputDigest: frozen.digest))
                     }()
                     defer { browserObservation?.discard() }
+                    // 前台命令的实时输出只给界面，不进工具结果。
+                    let liveShellSink: ShellLiveOutput.Sink? = {
+                        guard call.name == "shell_execute", let handler = onToolLiveOutput else { return nil }
+                        let callID = call.id
+                        return { @Sendable text in handler(callID, text) }
+                    }()
                     let output: String = try await BrowserSideEffectCallContext.$executionObservation.withValue(browserObservation) {
                     try await ApprovalFilePreviewContext.$current.withValue(filePreview) {
+                    try await ShellLiveOutput.$sink.withValue(liveShellSink) {
                     let output: String
                     if let composerExecutor {
                         guard let composerAuthorization else {
@@ -2064,6 +2200,7 @@ public struct AgentLoop: Sendable {
                     return output
                     }
                     }
+                    }
                     if let turn, await turn.isCancelled() {
                         throw InterruptedError()
                     }
@@ -2077,10 +2214,13 @@ public struct AgentLoop: Sendable {
                     // data out of the durable fact, and mark denial or an
                     // invalid response as an error-class terminal result.
                     let browserEvidence = browserObservation?.takeAndFreeze()
+                    // 截图成功时输出末尾带有图片标记行；先拆开再解码 JSON，
+                    // 结果文字之后再把标记接回，让图片通道取得到图。
+                    let browserSplit = ToolResultImageChannel.splitTrailingMarkers(output)
                     let browserTerminal = composerDryRun ? nil : Self.browserTerminal(
                         toolName: call.name,
                         input: call.input,
-                        output: output,
+                        output: browserSplit.body,
                         automaticExecutionEvidence: browserEvidence, receipt: receipt,
                         inputDigest: try? ComposerToolInput(call.input).digest
                     )
@@ -2092,12 +2232,13 @@ public struct AgentLoop: Sendable {
                         && orchestrationCapture != nil
                         && orchestrationOutcome?.allSucceeded != true
                     if let receipt, let ledger = toolExecutionFactLedger {
+                        let detailedSummary = await toolOutputSummaryWithDetail(call: call, output: output)
                         try settleToolExecutionFact(
                             ledger,
                             receipt: receipt,
                             status: browserTerminal?.status ?? (orchestrationFailed ? .failed : .succeeded),
                             browserDetail: browserTerminal?.detail,
-                            outputSummary: ToolOutputSummary.capture(toolName: call.name, output: output),
+                            outputSummary: detailedSummary,
                             dispatchStartedAtNanoseconds: dispatchStartedAtNanoseconds
                         )
                     }
@@ -2109,7 +2250,7 @@ public struct AgentLoop: Sendable {
                     resultParts.append([
                         "type": "tool_result",
                         "tool_use_id": call.id,
-                        "content": browserTerminal?.feedback
+                        "content": browserTerminal.map { $0.feedback + browserSplit.markers }
                             ?? (orchestrationFailed && orchestrationOutcome?.allSucceeded == nil
                                 ? "[ORCHESTRATION RESULT UNVERIFIED]" : output),
                         "is_error": composerDryRun || orchestrationFailed || (browserTerminal?.isError ?? false),
@@ -2319,7 +2460,9 @@ public struct AgentLoop: Sendable {
                     if !executorDispatchStarted,
                        (error is ComposerAuthorizationError
                         || error is CrossSessionReadAuthorizationError) {
-                        onToolNonExecution?(call.id, .blockedBeforeExecution)
+                        let category = (error as? ComposerAuthorizationError)?.blockCategory
+                            ?? .sessionRead
+                        onToolNonExecution?(call.id, .blockedByPolicy(category))
                     }
                     let message = "Error executing tool \(call.name): \(error.localizedDescription)"
                     resultParts.append([
@@ -2339,6 +2482,35 @@ public struct AgentLoop: Sendable {
                         "read cohort cleanup: \(cleanup.localizedDescription)")
                 }
                 throw error
+            }
+
+            // 工具图片（file_read 读图片、MCP image 内容）走旁路：先取走标记再做脱敏与限长，
+            // 只在模型声明支持图片输入且是原生工具调用时随本轮请求发送。
+            var toolResultImages: [Int: [LLMMessage.ImageAttachment]] = [:]
+            let modelAcceptsImages = provider.model.capabilities.supportedModalities.contains(.imageInput)
+            for index in resultParts.indices {
+                guard let content = resultParts[index]["content"] as? String else { continue }
+                let extracted = ToolResultImageChannel.extract(from: content)
+                guard extracted.text != content || !extracted.images.isEmpty else { continue }
+                var text = extracted.text
+                if extracted.droppedForLimit > 0 {
+                    text += "\n[图片超过单次 \(ToolResultImageChannel.maxImagesPerResult) 张的上限，另有 \(extracted.droppedForLimit) 张未提供]"
+                }
+                if !extracted.images.isEmpty {
+                    if isNative && modelAcceptsImages {
+                        toolResultImages[index] = extracted.images
+                    } else {
+                        text += isNative
+                            ? "\n[当前模型不支持图片输入，上述图片没有发送给你。]"
+                            : "\n[当前工具调用方式不支持传图，上述图片没有发送给你。]"
+                        // 看不了图的模型：用本地文字识别把图里的字交给它，并标明可能有误。
+                        let recognized = await ToolResultImageChannel.recognizeText(in: extracted.images)
+                        if !recognized.isEmpty {
+                            text += "\n[以下是本地文字识别（OCR）从图片中识别出的文字，可能有误]\n" + recognized
+                        }
+                    }
+                }
+                resultParts[index]["content"] = text
             }
 
             // Apply the App's known-value protection to every success/refusal
@@ -2378,11 +2550,17 @@ public struct AgentLoop: Sendable {
                 for (index, call) in calls.enumerated() {
                     let part = index < resultParts.count ? resultParts[index] : [:]
                     let content = (part["content"] as? String) ?? ""
-                    let toolMessage = LLMMessage(role: .tool, content: content, toolCallID: call.id)
+                    var toolMessage = LLMMessage(role: .tool, content: content, toolCallID: call.id)
+                    // 图片只随请求发送：持久化的消息不带图片；更早的工具图片超出保留预算后由 pruneHistoryImages 摘掉。
+                    let persistedMessage = toolMessage
+                    toolMessage.images = toolResultImages[index] ?? []
                     messages.append(toolMessage)
-                    try onMessage?(admittedMessageIndex, toolMessage)
+                    try onMessage?(admittedMessageIndex, persistedMessage)
                     admittedMessageIndex += 1
                 }
+                // 图片只保留最近的若干张（按张数和总字节预算），更早的从请求里摘掉；
+                // 不再每轮全部清空，模型能继续参照前几轮看过的图。
+                ToolResultImageChannel.pruneHistoryImages(&messages)
             } else {
                 let payload = try JSONSerialization.data(withJSONObject: resultParts)
                 let jsonString = String(data: payload, encoding: .utf8) ?? "[]"
@@ -2395,6 +2573,7 @@ public struct AgentLoop: Sendable {
                 try onMessage?(admittedMessageIndex, toolResultMessage)
                 admittedMessageIndex += 1
             }
+            todoReminder.recordRound(toolNames: calls.map(\.name), messages: messages)
         }
 
             throw AgentLoopError.maxIterationsExceeded(maxIterations)
@@ -2417,7 +2596,7 @@ public struct AgentLoop: Sendable {
                         throw AgentLoopError.parentTerminalPersistenceFailed
                     }
                 }
-                onFailure?(messages)
+                onFailure?(Self.withoutToolImages(messages))
                 throw error
             }
             }
@@ -2425,6 +2604,16 @@ public struct AgentLoop: Sendable {
         } catch {
             await turn?.finish()
             throw error
+        }
+    }
+
+    /// 工具图片只随当轮请求发送，交给调用方持久化的历史里不带图片字节。
+    static func withoutToolImages(_ messages: [LLMMessage]) -> [LLMMessage] {
+        messages.map { message in
+            guard message.role == .tool, !message.images.isEmpty else { return message }
+            var stripped = message
+            stripped.images = []
+            return stripped
         }
     }
 
@@ -2608,7 +2797,11 @@ public struct AgentLoop: Sendable {
             status: status,
             detail: detail,
             feedback: response.outcome == "failed"
-                ? "[BROWSER BACK FAILED] cannot_go_back" : output,
+                ? "[BROWSER BACK FAILED] cannot_go_back"
+                // 被拒时只在给模型的文本里追加固定的中文设置入口说明；
+                // 结构化 detail 与规范码不变。
+                : BrowserNavigationPolicy.modelFacingGuidance(forBrowserRefusalReason: response.refusalReason)
+                    .map { output + "\n" + $0 } ?? output,
             isError: isError
         )
     }
@@ -2722,8 +2915,9 @@ public struct AgentLoop: Sendable {
             if let turn, await turn.isCancelled() { throw InterruptedError() }
             if let childBoundary { try await checkChildBoundary(childBoundary) }
             try Task.checkCancellation()
+            let detailedSummary = await toolOutputSummaryWithDetail(call: call, output: output)
             try settleToolExecutionFact(ledger, receipt: receipt, status: .succeeded,
-                outputSummary: ToolOutputSummary.capture(toolName: call.name, output: output),
+                outputSummary: detailedSummary,
                 dispatchStartedAtNanoseconds: dispatchedAt)
             return output
         } catch {
@@ -2855,7 +3049,7 @@ public struct AgentLoop: Sendable {
                     } ?? true
                 }
                 let factsLive = CompactionFactCapture.verifyStores(facts, taskStore: taskStore,
-                    effectLedger: toolExecutionFactLedger, atCommit: false)
+                    effectLedger: toolExecutionFactLedger)
                 var verified = boundsHold && factsBound && factsLive
                 if checkpoint.schemaVersion == CompactionCheckpoint.segmentedProjectionSchemaVersion {
                     verified = verified && checkpoint.projectionSpans.map {
@@ -2939,7 +3133,25 @@ public struct AgentLoop: Sendable {
         "no verified request reduction", "unverified context would be lost",
     ]
 
-    /// nil = the compactor refused; real failures and cancellation propagate.
+    /// C3-05: failures of an automatic compaction that must not fail a request which can still
+    /// be sent below 95% of the window: the summary request's provider errors (a cancellation
+    /// is not one) and a checkpoint that did not pass validation (for example too many retained
+    /// facts). Conflicts, cancellation and recovery-required storage errors keep propagating.
+    public static func isRecoverableAutomaticCompactionFailure(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        if let provider = error as? LLMError {
+            switch provider {
+            case .cancelled: return false
+            case .networkError(let underlying): return (underlying as? URLError)?.code != .cancelled
+            default: return true
+            }
+        }
+        if case .invalidCompactionCheckpoint? = error as? SessionStoreError { return true }
+        return false
+    }
+
+    /// nil = the compactor refused, or the attempt failed in a recoverable way (the admission
+    /// above still blocks at >= 95%); conflicts and cancellation propagate.
     private func attemptContextCompaction(
         messages: [LLMMessage],
         currentConversationID: String?,
@@ -2950,6 +3162,8 @@ public struct AgentLoop: Sendable {
                 messages: messages, currentConversationID: currentConversationID, turn: turn)
         } catch AgentLoopError.compactionCheckpointUnavailable(let detail)
                     where Self.compactionRefusalDetails.contains(detail) {
+            return nil
+        } catch let failure where !Task.isCancelled && Self.isRecoverableAutomaticCompactionFailure(failure) {
             return nil
         }
     }
@@ -3069,15 +3283,19 @@ public struct AgentLoop: Sendable {
         final class StreamingProviderBox: @unchecked Sendable {
             let provider: any AssistantStreamingLLMProvider
             let handler: AssistantTextDeltaHandler
+            let thinkingHandler: AssistantTextDeltaHandler?
             init(
                 provider: any AssistantStreamingLLMProvider,
-                handler: @escaping AssistantTextDeltaHandler
+                handler: @escaping AssistantTextDeltaHandler,
+                thinkingHandler: AssistantTextDeltaHandler? = nil
             ) {
                 self.provider = provider
                 self.handler = handler
+                self.thinkingHandler = thinkingHandler
             }
         }
-        let box = StreamingProviderBox(provider: provider, handler: handler)
+        let box = StreamingProviderBox(provider: provider, handler: handler,
+                                       thinkingHandler: onAssistantThinkingDelta)
         let race = ProviderTimeoutRace<LLMResponse>()
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<LLMResponse, Error>) in
@@ -3116,6 +3334,8 @@ public struct AgentLoop: Sendable {
                             case .textDelta(let delta):
                                 accumulatedText += delta
                                 await box.handler(iteration, delta)
+                            case .thinkingDelta(let delta):
+                                await box.thinkingHandler?(iteration, delta)
                             case .completed(let response):
                                 completedResponse = response
                             }
@@ -3408,5 +3628,28 @@ public extension LLMMessage {
             }
         }
         return [.text(content)]
+    }
+}
+
+extension AgentLoop {
+    /// 工具卡片展开用的完整命令与输出正文：与发给模型的工具结果走同一套已知密钥保护，
+    /// 统计数字仍按原始输出计算。
+    private func toolOutputSummaryWithDetail(call: ParsedToolCall, output: String) async -> ToolOutputSummary {
+        let body = ToolResultImageChannel.splitTrailingMarkers(output).body
+        var arguments = Self.toolArgumentsJSON(call.input)
+        var detailBody = body
+        if let toolResultProjection {
+            detailBody = await toolResultProjection(body)
+            arguments = await toolResultProjection(arguments)
+        }
+        return ToolOutputSummary.captureWithDetail(
+            toolName: call.name, argumentsJSON: arguments, output: body, detailOutput: detailBody)
+    }
+
+    /// 工具卡片展开详情用的参数 JSON（键排序，便于稳定显示）。
+    static func toolArgumentsJSON(_ input: [String: Any]) -> String {
+        guard JSONSerialization.isValidJSONObject(input),
+              let data = try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys]) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
     }
 }

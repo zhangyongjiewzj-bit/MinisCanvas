@@ -103,7 +103,17 @@ struct CredentialToolResultOutbound1995Tests {
         #expect(ledger.facts.count == 1)
         let fact = try #require(ledger.facts.first)
         let sourceText = try String(contentsOf: source, encoding: .utf8)
-        #expect(fact.outputSummary == ToolOutputSummary.capture(toolName: "file_read", output: sourceText))
+        // file_read 的输出带 cat -n 行号前缀（右对齐 6 位 + 制表符），末尾换行不保留（2026-11-16）。
+        let numberedText = (sourceText.hasSuffix("\n") ? String(sourceText.dropLast()) : sourceText)
+            .split(separator: "\n", omittingEmptySubsequences: false).enumerated()
+            .map { String(format: "%6d\t%@", $0.offset + 1, String($0.element)) }.joined(separator: "\n")
+        let expectedSummary = ToolOutputSummary.capture(toolName: "file_read", output: numberedText)
+        if case .withDetail(let base, let detail) = fact.outputSummary {
+            #expect(base == expectedSummary)
+            #expect(!(detail.output ?? "").contains(secret))
+        } else {
+            #expect(fact.outputSummary == expectedSummary)
+        }
         let ledgerBytes = try Data(contentsOf: root.appendingPathComponent("facts.json"))
         #expect(!String(decoding: ledgerBytes, as: UTF8.self).contains(secret))
         chat.stopAllStreamingForSafety()

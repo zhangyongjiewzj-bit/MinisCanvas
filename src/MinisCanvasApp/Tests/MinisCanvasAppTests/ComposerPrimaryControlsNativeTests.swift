@@ -145,7 +145,7 @@ struct ComposerPrimaryControlsNativeTests {
         #expect(model.nativeStatus == "PASS")
         #expect(model.matchedCount == 1 && model.nativeMatchedCount == 1)
         #expect(model.snapshot.frame != nil && model.nativeFrame == model.snapshot.frame)
-        for (slot, label) in [("mode", "Composer 任务模式"), ("effort", "Composer 工作量")] {
+        for (slot, label) in [("mode", "任务模式"), ("effort", "工作量")] {
             let control = try #require(item.controls.first { $0.slot == slot })
             #expect(control.ownedWindowIdentifier == "uf03-owned-" + item.expected.id, "diagnostic target=\(slot)")
             #expect(control.query == label, "diagnostic target=\(slot)")
@@ -159,7 +159,7 @@ struct ComposerPrimaryControlsNativeTests {
 
     @Test("companion local labels preserve exact public attribute precedence", arguments: 0..<12)
     func companionLocalLabelAttributePrecedence(_ index: Int) {
-        let query = "Composer 任务模式"
+        let query = "任务模式"
         let cases: [(direct: String?, legacy: Any?, title: String?, kind: String, source: String?, reads: Int)] = [
             (query, "different", nil, "labelOrTitle", "accessibilityLabel", 0),
             (nil, query, nil, "labelOrTitle", "AXDescription", 1),

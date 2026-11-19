@@ -53,6 +53,16 @@ struct DeepLinkRouterTests {
         #expect(DeepLinkRouter.parse(url: URL(string: "miniscanvas://prompt/")!) == nil) // empty text
     }
 
+    @Test func acceptsLongPromptTextButKeepsOtherComponentLimits() throws {
+        let longText = String(repeating: "a", count: 3_000)
+        #expect(DeepLinkRouter.parse(url: URL(string: "miniscanvas://prompt/\(longText)")!)
+            == .sendPrompt(text: longText, session: nil))
+        #expect(DeepLinkRouter.parse(url: URL(string: "miniscanvas://prompt?text=\(longText)")!)
+            == .sendPrompt(text: longText, session: nil))
+        let longID = String(repeating: "b", count: 300)
+        #expect(DeepLinkRouter.parse(url: URL(string: "miniscanvas://session/\(longID)")!) == nil)
+    }
+
     @Test func rejectsNonMiniscanvasURLs() throws {
         #expect(DeepLinkRouter.parse(url: URL(string: "https://example.com/session/1")!) == nil)
         #expect(DeepLinkRouter.parse(url: URL(string: "miniscanvas://unknown-route")!) == nil)

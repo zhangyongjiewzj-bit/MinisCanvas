@@ -119,17 +119,17 @@ final class SettingsCenterTests: XCTestCase {
         center.defaultModelID = "gpt-4o-mini"
         center.language = "en"
 
-        XCTAssertEqual(center.settingsStore.settings.general.appearance, .system)
+        XCTAssertEqual(center.settingsStore.settings.general.appearance, .dark)
         XCTAssertEqual(center.settingsStore.settings.general.defaultProviderID, "openai")
         XCTAssertEqual(center.settingsStore.settings.general.defaultModelID, "gpt-4o-mini")
         XCTAssertEqual(center.settingsStore.settings.general.language, "en")
 
-        XCTAssertEqual(center.themePreset, .system)
+        XCTAssertEqual(center.themePreset, .light)
 
-        // 旧dark输入迁移为System；重新从磁盘加载仍为同一真值。
+        // 固定深色是独立的明暗选择；重新从磁盘加载仍为同一真值。
         let reloaded = SettingsStore(directory: dir)
-        XCTAssertEqual(reloaded.settings.general.appearance, .system)
-        XCTAssertEqual(reloaded.settings.general.themePreset, .system)
+        XCTAssertEqual(reloaded.settings.general.appearance, .dark)
+        XCTAssertEqual(reloaded.settings.general.themePreset, .light)
         XCTAssertEqual(reloaded.settings.general.defaultProviderID, "openai")
         XCTAssertEqual(reloaded.settings.general.defaultModelID, "gpt-4o-mini")
         XCTAssertEqual(reloaded.settings.general.language, "en")
@@ -137,7 +137,7 @@ final class SettingsCenterTests: XCTestCase {
         center.themePreset = .light
         let lightReload = SettingsStore(directory: dir)
         XCTAssertEqual(lightReload.settings.general.themePreset, .light)
-        XCTAssertEqual(lightReload.settings.general.appearance, .light)
+        XCTAssertEqual(lightReload.settings.general.appearance, .dark)  // 明暗独立，换配色不改明暗
         XCTAssertEqual(lightReload.settings.general.defaultProviderID, "openai")
     }
 
@@ -786,5 +786,18 @@ final class SettingsCenterTests: XCTestCase {
         XCTAssertNil(fixture.center.fileAccessAllowedRoot)
         XCTAssertEqual(fixture.center.fileAccessDeniedRoots, [])
         XCTAssertEqual(fixture.center.mountedFolderPaths, [mounted.path])
+    }
+
+    /// F1-09：删除确认框如实列出默认服务商和仍在使用它的会话。
+    func testProviderDeletionImpactSummaryDisclosesDefaultAndDependentSessions() {
+        XCTAssertEqual(
+            SettingsCenter.providerDeletionImpactSummary(dependentSessionTitles: [], isDefaultProvider: false),
+            "删除供应商配置及其 API 密钥链副本")
+        let text = SettingsCenter.providerDeletionImpactSummary(
+            dependentSessionTitles: ["会话甲", "会话乙", "会话丙", "会话丁"], isDefaultProvider: true)
+        XCTAssertTrue(text.contains("默认服务商"))
+        XCTAssertTrue(text.contains("「会话甲」"))
+        XCTAssertTrue(text.contains("4 个"))
+        XCTAssertFalse(text.contains("会话丁"))
     }
 }

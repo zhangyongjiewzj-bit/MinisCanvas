@@ -12,8 +12,16 @@ import MinisCore
 
 extension AccentTheme {
     /// SwiftUI 主强调色（来自 MinisCore RGB 分量）。
+    /// 浅色取 `accentRGB`、深色取 `darkAccentRGB`；用系统动态色，随外观自动切换，
+    /// 不依赖视图刷新，也不在 body 里新建。
     public var color: Color {
-        Color(red: accentRGB.r, green: accentRGB.g, blue: accentRGB.b)
+        let light = accentRGB
+        let dark = darkAccentRGB
+        return Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let rgb = isDark ? dark : light
+            return NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
+        })
     }
 }
 
@@ -21,9 +29,12 @@ extension ThemePreset {
     /// 预设的身份强调色（AJ-38 定版伪仙）；未验收预设为 nil，
     /// 调用方因此拿不到一个「看起来能用但其实没被批准」的颜色。
     public var accentColor: Color? {
-        guard let rgb = accentRGB else { return nil }
-        return Color(red: rgb.r, green: rgb.g, blue: rgb.b)
+        guard isAccepted else { return nil }
+        return Self.productAccentColor
     }
+
+    /// 只建一次的动态强调色（浅 #A84E2A / 深 #E08B68）。
+    private static let productAccentColor: Color = canonicalAccentTheme.color
 }
 
 extension SettingsCenter {
@@ -31,17 +42,43 @@ extension SettingsCenter {
     /// 跟随系统 → nil（真实交给 macOS 决定明暗），
     /// 浅色 / 深色 → 对应模式。
     var colorSchemePreference: ColorScheme? {
-        switch themePreset.isAccepted ? themePreset : ThemePreset.system {
+        // 明暗是独立选择（浅色 / 深色 / 跟随系统），与配色预设无关。
+        switch appearance {
         case .system: nil
         case .light: .light
-        case .dark, .highContrast: nil
+        case .dark: .dark
         }
     }
 }
 
-// System keeps the platform accent; only the product theme fixes its identity.
+// AppKit 文本视图（对话正文、输入框）的选中背景与插入点默认走系统强调色（系统蓝），
+// SwiftUI 的 .tint 管不到它们；这里给出与产品强调色同源的动态 NSColor，
+// 在创建文本视图时只设置一次，随明暗外观自动切换，不在绘制路径里计算。
+enum ThemeNativeTextColors {
+    /// 产品强调色（浅 #A84E2A / 深 #E08B68）的动态 NSColor。
+    static let accent: NSColor = {
+        let accentTheme = ThemePreset.canonicalAccentTheme
+        let light = accentTheme.accentRGB
+        let dark = accentTheme.darkAccentRGB
+        return NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+            let rgb = isDark ? dark : light
+            return NSColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
+        }
+    }()
+
+    /// 选中文字的背景：强调色半透明，保证选中文字仍可读。
+    static let selectionBackground: NSColor = accent.withAlphaComponent(0.35)
+
+    @MainActor static func apply(to textView: NSTextView) {
+        textView.selectedTextAttributes = [.backgroundColor: selectionBackground]
+        textView.insertionPointColor = accent
+    }
+}
+
+// 两个主题共用陶土橙强调色；跟随系统主题只换背景/文字等原生色，不再用系统蓝。
 extension SettingsCenter {
     var effectiveThemeAccentColor: Color {
-        themePreset.current == .system ? Color(nsColor: .controlAccentColor) : ThemePreset.light.accentColor ?? .accentColor
+        ThemePreset.light.accentColor ?? .accentColor
     }
 }

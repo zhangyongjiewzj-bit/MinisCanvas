@@ -15,10 +15,13 @@ public enum MinisIconTokens {
     public static let defaultSize: CGFloat = 16
     public static let smallSize: CGFloat = 12
     public static let largeSize: CGFloat = 20
-    public static let neutralPrimary = Color(red: 0x1C / 255, green: 0x1C / 255, blue: 0x1C / 255)
-    public static let keylineOrangeA7A = Color(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x07 / 255)
-    public static let danger = Color(red: 0xB4 / 255, green: 0x23 / 255, blue: 0x18 / 255)
-    public static let success = Color(red: 0x1A / 255, green: 0x7F / 255, blue: 0x37 / 255)
+    public static let neutralPrimary = Color(red: 0x1F / 255, green: 0x1E / 255, blue: 0x1D / 255)
+    /// 全 App 唯一强调色（第 1 套陶土橙）：浅 #A84E2A / 深 #E08B68，随外观自动切换。
+    /// 原激活橙 #D97707 已被取代；名字保留是为了不动既有引用与测试。
+    public static let keylineOrangeA7A = AccentTheme.pseudo.color
+    /// 第 1 套状态色（浅色侧）：危险 #B3261E、成功 #2A7549。
+    public static let danger = Color(red: 0xB3 / 255, green: 0x26 / 255, blue: 0x1E / 255)
+    public static let success = Color(red: 0x2A / 255, green: 0x75 / 255, blue: 0x49 / 255)
     public static let secondaryOpacity: Double = 0.24
     public static let activeSecondaryOpacity: Double = 0.26
     public static let disabledOpacity: Double = 0.38

@@ -59,6 +59,25 @@ struct SessionSearchViewConsumerTests {
         #expect(!sidebar.contains("private func activateSessionRow(_ id: String)"))
     }
 
+    /// MC4-040：后台重搜期间旧结果标记为“更新中”（界面置灰禁点），完成后恢复且可点。
+    @Test("background refresh marks stale results as updating until new results arrive")
+    func backgroundRefreshMarksStaleResultsAsUpdating() async throws {
+        let chat = ChatStore()
+        chat.appendUser("命中精确片段")
+        let model = SessionSearchModel(chat: chat)
+        model.updateQuery("精确片段")
+        settleSearch(model)
+        #expect(!model.results.isEmpty)
+        #expect(!model.isUpdating)
+
+        model.refreshInBackground()
+        #expect(model.isUpdating)
+        for _ in 0..<200 where model.isUpdating { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(!model.isUpdating)
+        let hit = try #require(model.results.first)
+        #expect(model.select(hit))
+    }
+
     @Test("search hit carries stable locator and opens the exact message")
     func searchHitCarriesStableLocatorAndOpensExactMessage() async throws {
         let chat = ChatStore()
@@ -80,6 +99,64 @@ struct SessionSearchViewConsumerTests {
         #expect(chat.searchScrollTarget?.sessionID == targetSessionID)
         #expect(chat.searchScrollTarget?.messageID == hit.uiMessageID)
         #expect(chat.searchScrollTarget?.stableMessageID == hit.messageID)
+    }
+
+    @Test("background snapshot search returns the same hits as the in-place search")
+    func backgroundSnapshotSearchMatchesInPlaceSearch() async throws {
+        let chat = ChatStore()
+        chat.appendUser("快照检索命中内容")
+        _ = chat.applyNewSession(title: "第二个")
+        chat.appendUser("另一条快照检索")
+
+        let snapshot = chat.sessionSearchSnapshot()
+        let background = await Task.detached {
+            ChatStore.searchMessageResults(in: snapshot, query: "快照检索", limit: 100)
+        }.value
+        let direct = chat.searchMessageResults(query: "快照检索", limit: 100)
+        #expect(background.count == 2)
+        #expect(background == direct)
+    }
+
+    @Test("sidebar revision moves on summary changes, list reflects rename and search")
+    func sidebarRevisionTracksSummaryChanges() async throws {
+        let chat = ChatStore()
+        chat.appendUser("侧栏摘要第一条")
+        let id = try #require(chat.activeSessionID)
+        let before = chat.sidebarRevision
+        chat.renameSession(id: id, title: "改名后的会话")
+        #expect(chat.sidebarRevision != before)
+        #expect(chat.sessionList.first(where: { $0.session.id == id })?.session.title == "改名后的会话")
+
+        chat.searchText = "摘要第一条"
+        #expect(chat.sessionList.contains(where: { $0.session.id == id }))
+        chat.searchText = "完全不存在的词"
+        #expect(!chat.sessionList.contains(where: { $0.session.id == id }))
+        chat.searchText = ""
+    }
+
+    @Test("streaming body growth does not move the sidebar revision unless a search is active")
+    func streamingGrowthDoesNotMoveSidebarRevision() async throws {
+        let chat = ChatStore()
+        chat.appendUser("流式测试")
+        chat.appendAssistant(String(repeating: "字", count: 80))
+        let countBefore = chat.activeMessageCount
+        let before = chat.sidebarRevision
+        for _ in 0..<5 {
+            chat.messages[chat.messages.count - 1].content += "追加的流式正文"
+        }
+        #expect(chat.sidebarRevision == before, "流式正文增长不得让侧栏摘要失效")
+        #expect(chat.activeMessageCount == countBefore)
+
+        chat.appendAssistant("新的一条")
+        #expect(chat.sidebarRevision != before)
+        #expect(chat.activeMessageCount == countBefore + 1)
+
+        // 正在检索时，命中集合随正文变化，修订号照常推进。
+        chat.searchText = "追加"
+        let searching = chat.sidebarRevision
+        chat.messages[chat.messages.count - 1].content += "再追加"
+        #expect(chat.sidebarRevision != searching)
+        chat.searchText = ""
     }
 
     @Test("changed transcript rejects an old result before navigation")
@@ -221,5 +298,19 @@ struct SessionSearchViewConsumerTests {
         #expect(model.results.count == 1)
         let visible = try #require(model.results.first)
         #expect(!visible.snippet.contains("sk-search-secret"))
+    }
+}
+
+extension SessionSearchViewConsumerTests {
+    @Test("a keyword after the first 160 characters is found and the snippet shows it")
+    func keywordBeyondSnippetLengthIsFound() throws {
+        let chat = ChatStore()
+        chat.appendUser(String(repeating: "前文填充", count: 100) + "远处的关键词" + String(repeating: "后文", count: 50))
+        let model = SessionSearchModel(chat: chat)
+        model.updateQuery("远处的关键词")
+        model.refresh()
+        let hit = try #require(model.results.first)
+        #expect(hit.snippet.contains("远处的关键词"))
+        #expect(hit.snippet.count <= 170)
     }
 }

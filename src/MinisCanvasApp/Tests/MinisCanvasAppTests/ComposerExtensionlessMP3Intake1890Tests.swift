@@ -52,6 +52,20 @@ struct ComposerExtensionlessMP3Intake1890Tests {
         return chat.pendingAttachments
     }
 
+    /// An extensionless file is first a ready unknown reference; the worker's MIME sniff then
+    /// re-resolves it as audio. Wait for that audio verdict (pass-through, converted or failed).
+    private func settledAttachments(_ chat: ChatStore, count: Int) async throws -> [ChatAttachment] {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        while clock.now < deadline {
+            let current = chat.pendingAttachments
+            if current.count == count
+                && current.allSatisfy({ $0.fileType == .audio && $0.status != .pending }) { return current }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return chat.pendingAttachments
+    }
+
     @Test("actual ID3 and frame-only MP3 bytes survive preparation, reopen, and local request")
     func extensionlessMP3BytesReachNextTurnWire() async throws {
         let base = try root()
@@ -116,7 +130,7 @@ struct ComposerExtensionlessMP3Intake1890Tests {
         #expect(parts.contains { ($0["text"] as? String) == composed })
     }
 
-    @Test("forged ID3 and frame prefixes are classified but rejected before submit")
+    @Test("forged ID3 and frame prefixes fail conversion and are rejected before submit")
     func forgedPrefixesNeverReachWire() async throws {
         for (name, data) in [
             ("fake-id3", Data("ID3\u{0003}\u{0000}\u{0000}\u{0000}\u{0000}\u{0000}\u{0000}xx".utf8)),
@@ -136,10 +150,10 @@ struct ComposerExtensionlessMP3Intake1890Tests {
                 customBaseURL: "https://extensionless-mp3-1890-fail.invalid")
             chat.draftText = "保留用户正文"
             let staged = try #require(chat.addAttachments(urls: [path]).first)
-            let resolved = try #require(await settledAudio(chat, count: 1).first)
+            let resolved = try #require(await settledAttachments(chat, count: 1).first)
             #expect(resolved.id == staged.id)
-            #expect(resolved.kind == .audio)
-            #expect(chat.composerMediaReadinessSnapshot.attachment(id: resolved.id)?.readiness == .unsupported)
+            #expect(resolved.status == .failed && resolved.kind == .file && resolved.data == nil)
+            #expect(chat.composerMediaReadinessSnapshot.attachment(id: resolved.id)?.readiness == .failed)
             #expect(!chat.canSubmitComposerAttachments)
             chat.submitComposer()
             #expect(chat.pendingAttachments.map(\.id) == [resolved.id])

@@ -40,7 +40,8 @@ struct ProviderRuntimeFailureProjection0420Tests {
         let ordinary = NSError(domain: "owned0420", code: 7,
             userInfo: [NSLocalizedDescriptionKey: "ordinary0420 unknown failure"])
         let visible = ChatStore.userErrorMessage(ordinary)
-        #expect(visible == "操作未完成（CHAT-UNKNOWN）。请重试；若重复出现，请输入 /doctor 打开环境诊断，导出诊断包并附上此错误信息。")
+        #expect(visible == ChatStore.unknownErrorMessage(.internalFailure))
+        #expect(visible.hasSuffix("（CHAT-UNKNOWN:internal）。"))
         #expect(!visible.contains(ordinary.localizedDescription))
         let normalizedEnvelope = envelope("")
         #expect(normalizedEnvelope.failureMessage == "事件更新")

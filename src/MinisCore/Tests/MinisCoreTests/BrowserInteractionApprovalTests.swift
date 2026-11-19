@@ -99,16 +99,36 @@ struct BrowserInteractionApprovalTests {
         let session = BrowserSession(scopeID: UUID().uuidString, userAgent: nil,
             navigationPolicy: BrowserNavigationPolicy(allowedDomains: allowed ? ["127.0.0.1"] : []))
         defer { session.close() }
-        let human = N18Human()
+        // 对齐 Claude Code：未允许的网站不再直接拒绝，而是弹审批卡；这里用户拒绝，所以仍然没有导航。
+        let human = N18Human(allow: allowed)
         let request = ApprovalGate(policy: .alwaysAsk).makeRequest(
             tool: "browser", input: ["action": "navigate", "url": "http://127.0.0.1/fixture"])
         let before = session.currentURL()
         let decision = await BrowserInteractionApproval.decide(
             request, session: session, rules: BrowserInteractionRuleStore(), delegate: human)
         #expect(decision.approved == allowed)
-        #expect(await human.requests.count == (allowed ? 1 : 0))
-        if !allowed { #expect(decision.reason == BrowserNavigationPolicy.allowedWebsitesSettingsGuidance) }
+        #expect(await human.requests.count == 1)
         #expect(session.currentURL() == before)
+    }
+
+    @Test
+    func unlistedDomainApprovalAllowsThisVisitAndOffersRemembering() async throws {
+        defer { BrowserDomainApproval.shared.revokeAll() }
+        let session = BrowserSession(scopeID: UUID().uuidString, userAgent: nil,
+            navigationPolicy: BrowserNavigationPolicy(allowedDomains: []))
+        defer { session.close() }
+        let human = N18Human(allow: true, remember: true)
+        let request = ApprovalGate(policy: .alwaysAsk).makeRequest(
+            tool: "browser", input: ["action": "navigate", "url": "http://unlisted.invalid/page"])
+        BrowserInteractionApproval.persistAllowedDomain = { _ in }
+        defer { BrowserInteractionApproval.persistAllowedDomain = nil }
+        let destination = try #require(URL(string: "http://unlisted.invalid/page"))
+        #expect(session.navigationDecision(for: destination, source: .initial) == .deny(.domainNotAuthorized))
+        let decision = await BrowserInteractionApproval.decide(
+            request, session: session, rules: BrowserInteractionRuleStore(), delegate: human)
+        #expect(decision.approved)
+        #expect(await human.requests.first?.persistentAllowOffer?.capability == "browser_domain")
+        #expect(session.navigationDecision(for: destination, source: .initial) == .allow)
     }
 
     @Test(arguments: [false, true])
@@ -136,10 +156,9 @@ struct BrowserInteractionApprovalTests {
             #expect(try await executor.authorizationDecision(callID: "fixture", capability: tool, input: input).decision
                 == .requestApproval(requiresSecondConfirmation: false))
         } else {
-            await #expect(throws: ComposerAuthorizationError.approvalDenied(
-                BrowserNavigationPolicy.allowedWebsitesSettingsGuidance)) {
-                _ = try await executor.authorizationDecision(callID: "fixture", capability: tool, input: input)
-            }
+            // 未允许的网站改为弹审批卡，不再直接拒绝。
+            #expect(try await executor.authorizationDecision(callID: "fixture", capability: tool, input: input).decision
+                == .requestApproval(requiresSecondConfirmation: false))
         }
     }
 

@@ -46,19 +46,20 @@ struct ThemePresetCatalogTests {
         #expect(entry != nil)
         let accent = entry?.accent(for: .light)
         #expect(accent != nil)
-        // 与 MinisIconTokens.keylineOrangeA7A 的定版算式同一分量（0xD9/0x77/0x07 ÷ 255）。
-        #expect(accent?.r == Double(0xD9) / 255.0)
-        #expect(accent?.g == Double(0x77) / 255.0)
-        #expect(accent?.b == Double(0x07) / 255.0)
+        // 第 1 套配色：亮侧强调 #A84E2A（0xA8/0x4E/0x2A ÷ 255），取代原 #D97707。
+        #expect(accent?.r == Double(0xA8) / 255.0)
+        #expect(accent?.g == Double(0x4E) / 255.0)
+        #expect(accent?.b == Double(0x2A) / 255.0)
         #expect(entry?.acceptance == .acceptedForLight)
     }
 
-    /// dark 分支两能力可表示但失败关闭：裁决 pending 前不提供任何暗侧色值。
-    @Test func darkBranchIsRepresentableButFailsClosed() {
-        #expect(ThemePresetCatalog.darkBranchAdjudication == .pending)
+    /// 用户 11/17 选定第 1 套（含深色）：暗侧强调色 #E08B68 获批，暗侧裁决放开。
+    @Test func darkBranchCarriesApprovedDarkAccent() {
+        #expect(ThemePresetCatalog.darkBranchAdjudication == .approved)
         let entry = ThemePresetCatalog.entry(for: .keylineOrangeA7A)
-        #expect(entry?.darkAccent == nil)
-        #expect(entry?.accent(for: .dark) == nil)
+        #expect(entry?.darkAccent?.r == Double(0xE0) / 255.0)
+        #expect(entry?.darkAccent?.g == Double(0x8B) / 255.0)
+        #expect(entry?.accent(for: .dark)?.b == Double(0x68) / 255.0)
     }
 
     /// warmCoralA7A 被点名但本头零批准色板材料 → 注册不猜色。

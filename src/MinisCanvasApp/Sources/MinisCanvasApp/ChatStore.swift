@@ -220,18 +220,32 @@ struct ChatComposedContentOwnership: Codable, Equatable, Sendable {
 struct ChatMessageUI: Identifiable, Equatable, Codable {
     let id: UUID
     let role: ChatRole
-    var content: String {
-        didSet {
-            // Appends retain exact boundaries. Replacements/reprojection cannot
-            // reuse offsets into different bytes, even canonically equal text.
-            if !content.utf16.starts(with: oldValue.utf16) { inlineToolAnchors = [] }
-        }
-    }
+    /// 正文。写入走显式 API：追加用 `content +=`（锚点保持有效），流式投影用
+    /// `setProjectedContent`，整体替换用 `replaceContent`（后两者负责维护锚点）。
+    /// 不再用 didSet 比较旧值整串（每个流式片段 O(正文长度)）。
+    var content: String
     var inlineToolAnchors: [ChatInlineToolAnchor] = []
+
+    /// 流式投影写入：调用方（broker）已经知道新文本是否以旧文本为前缀。
+    /// 追加保留精确边界；重写/重新投影不能复用指向不同字节的偏移。
+    mutating func setProjectedContent(_ text: String, extendsPrevious: Bool) {
+        content = text
+        if !extendsPrevious, !inlineToolAnchors.isEmpty { inlineToolAnchors = [] }
+    }
+
+    /// 整体替换：仅当新文本以旧文本为前缀时锚点才保留（只在有锚点时比较）。
+    mutating func replaceContent(_ text: String) {
+        if !inlineToolAnchors.isEmpty, !text.utf16.starts(with: content.utf16) { inlineToolAnchors = [] }
+        content = text
+    }
     var isStreaming: Bool
     /// Presentation only; never appended to provider message content.
     var wasInterrupted: Bool = false
-    let timestamp: Date
+    /// 重启后由持久化模型转换出来的消息，`timestamp` 只是转换时刻而不是真实
+    /// 创建时间（R3-09）：由 sidecar 的消息时间回填后清除。只在内存里，不编码；
+    /// 标记为 true 的消息时间不得写盘，也不得拿来判断文件检查点的先后。
+    var hasUnverifiedTimestamp: Bool = false
+    var timestamp: Date
     /// E11：附件（图片→多模态 images；文本→内容注入；其他→文件引用）
     var attachments: [ChatAttachment]
     /// Original Composer-only attachment text spans. Never inferred on restore.
@@ -260,6 +274,12 @@ struct ChatMessageUI: Identifiable, Equatable, Codable {
     var turnTiming: ChatTurnTimingMetadata?
     /// D-CHAT-18：回合创建时快照的 Provider 显示名（与 `turnTiming` 同生命周期）。
     var turnProviderName: String?
+    /// 模型思考过程（只用于显示，不进普通历史正文）。
+    var thinkingText: String? = nil
+    /// 思考耗时（秒）。
+    var thinkingSeconds: Double? = nil
+    /// 仅显示层展开标记，不持久化。
+    var thinkingExpanded: Bool = false
     var turnProviderDisplayLabel: String? = nil
     /// D-CHAT-18：回合创建时快照的模型标识（canonical modelID，非密钥/端点信息）。
     var turnModelID: String?
@@ -361,14 +381,21 @@ struct ChatMessageUI: Identifiable, Equatable, Codable {
         if role == .user, let referenceCard {
             return referenceCard.instruction
         }
+        // 来自其它会话的消息：界面显示为“来自会话〈标题〉的消息”，不显示信封标签；模型侧内容不变。
+        if role == .user, content.hasPrefix("<session-message "),
+           let envelope = SessionMessageEnvelope.parse(content) {
+            return "来自会话〈\(envelope.fromTitle.isEmpty ? "未命名会话" : envelope.fromTitle)〉的消息（其它会话的请求，不是你本人的指令）：\n\n" + envelope.body
+        }
         if role == .user, let summary = legacyToolOutputSummary?.displaySuffix {
             return summary
         }
         guard !attachments.isEmpty, role == .user else { return content }
-        if let range = content.range(of: "\n\n我上传了") {
-            return String(content[..<range.lowerBound])
+        // 附件段起点：“我上传了…”或音频转写文字（“[音频转写：…”）。
+        let attachmentMarkers = ["\n\n我上传了", "\n\n[音频转写："]
+        if let cut = attachmentMarkers.compactMap({ content.range(of: $0)?.lowerBound }).min() {
+            return String(content[..<cut])
         }
-        if content.hasPrefix("我上传了") { return "" }
+        if content.hasPrefix("我上传了") || content.hasPrefix("[音频转写：") { return "" }
         return content
     }
 }
@@ -493,6 +520,11 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
     /// Original character count from the actual text read, using the same
     /// Swift String.count unit as the injection cap. Nil means unknown.
     let originalTextCharacterCount: Int?
+    /// 仅用于会话附件 sidecar：图片/音频字节以 Core 转写为准，sidecar 只存
+    /// 字节的 SHA-256，重开时按顺序与哈希把 Core 字节绑回。运行中的附件恒为 nil。
+    var payloadDigest: String? = nil
+    /// 音频附件的本机转写文字（可被用户修改）；随附件持久化，重开会话不重复转写。
+    var audioTranscript: AudioTranscript? = nil
 
     init(id: UUID = UUID(), kind: Kind, fileName: String, fileType: FileType,
          mimeType: String? = nil, size: Int64? = nil,
@@ -542,9 +574,38 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
         case .ready:
             guard let videoFrames, fileType == .video else { return nil }
             guard videoImageAttachments != nil else { return "视频帧校验失败，请移除后重试" }
-            let times = videoFrames.map { Self.videoTimecode($0.timecodeSeconds) }.joined(separator: "、")
-            return "已抽取\(videoFrames.count)帧（\(times)）；\(videoContextSummary)"
+            let coverage: String
+            if let duration = videoContext?.durationSeconds {
+                coverage = "覆盖整段 \(Self.videoDurationText(duration))"
+            } else if let first = videoFrames.first, let last = videoFrames.last {
+                coverage = "时间点 \(Self.videoTimecode(first.timecodeSeconds)) 至 \(Self.videoTimecode(last.timecodeSeconds))"
+            } else {
+                coverage = "覆盖范围未知"
+            }
+            return "已抽取\(videoFrames.count)帧，\(coverage)；\(videoStatusSummary)"
         }
+    }
+
+    /// 界面标签用的时长：不足一分钟写“12.5 秒”，否则“2 分 05 秒”。
+    static func videoDurationText(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "时长未知" }
+        if seconds < 60 { return String(format: "%.1f 秒", seconds) }
+        let total = Int(seconds.rounded())
+        return String(format: "%d 分 %02d 秒", total / 60, total % 60)
+    }
+
+    /// 只给界面看的音轨/字幕状态（模型侧描述用 videoContextSummary，文字保持稳定）。
+    private var videoStatusSummary: String {
+        guard let context = videoContext else { return "音轨/字幕未提取" }
+        func state(_ value: MediaVideoTrackState, kind: String, unavailable: String) -> String {
+            switch value {
+            case .absent: return "无内嵌\(kind)"
+            case .extracted: return "\(kind)已提取"
+            case .unavailable: return unavailable
+            }
+        }
+        return state(context.audioState, kind: "音轨", unavailable: "音轨未附带（过长、多音轨或格式不支持）")
+            + "；" + state(context.subtitleState, kind: "字幕", unavailable: "字幕未提取")
     }
 
     static func videoTimecode(_ seconds: Double) -> String {
@@ -588,9 +649,67 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
         return state(context.audioState, kind: "音轨") + "；" + state(context.subtitleState, kind: "字幕")
     }
 
+    /// 只凭元数据（不含像素字节）判断：这个视频发送时会不会占用图片/音频槽位。
+    /// 与 `videoImageAttachments` 的校验一致（状态、帧数、时间递增、尺寸、上下文有效）；
+    /// 校验不过的视频发送时一个槽位也不占，重绑 sidecar 时也必须同样不计数。
+    var occupiesVideoPayloadSlots: Bool {
+        guard kind == .file, fileType == .video, status == .ready, let videoFrames,
+              (ChatStore.videoMinKeptFrameCount...ChatStore.videoMaxFrameCount).contains(videoFrames.count) else { return false }
+        var previousRequested: Double?
+        var previousActual: Double?
+        for frame in videoFrames {
+            guard frame.requestedSeconds.isFinite, frame.requestedSeconds >= 0,
+                  frame.timecodeSeconds.isFinite, frame.timecodeSeconds >= 0,
+                  frame.pixelWidth > 0, frame.pixelWidth <= ChatStore.videoMaxPixelSize,
+                  frame.pixelHeight > 0, frame.pixelHeight <= ChatStore.videoMaxPixelSize else { return false }
+            if let previousRequested, frame.requestedSeconds <= previousRequested { return false }
+            if let previousActual, frame.timecodeSeconds <= previousActual { return false }
+            previousRequested = frame.requestedSeconds
+            previousActual = frame.timecodeSeconds
+        }
+        if let videoContext,
+           !videoContext.isValid(maxOutputBytes: ChatStore.videoMaxOutputBytes, requireAudioPayload: false) { return false }
+        return true
+    }
+
+    /// 校验视频帧（逐帧 SHA-256、音轨校验）很贵，而发送门快照在一次界面刷新里会读多次，
+    /// 且都在主线程。结果只取决于 videoFrames 与 videoContext，所以按这两个值整体比较后复用上一次的结果；
+    /// 任何一帧的字节、时间或音轨变了都会重新校验。只留最近 2 条，避免长期占住已移除视频的字节。
+    private final class VideoImagesMemo: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [(frames: [ChatVideoFrame], context: MediaVideoSupplementaryContext?,
+                               images: [LLMMessage.ImageAttachment]?)] = []
+
+        func lookup(frames: [ChatVideoFrame], context: MediaVideoSupplementaryContext?)
+            -> (hit: Bool, images: [LLMMessage.ImageAttachment]?) {
+            lock.lock(); defer { lock.unlock() }
+            guard let entry = entries.first(where: { $0.frames == frames && $0.context == context }) else {
+                return (false, nil)
+            }
+            return (true, entry.images)
+        }
+
+        func store(frames: [ChatVideoFrame], context: MediaVideoSupplementaryContext?,
+                   images: [LLMMessage.ImageAttachment]?) {
+            lock.lock(); defer { lock.unlock() }
+            entries.insert((frames, context, images), at: 0)
+            if entries.count > 2 { entries.removeLast(entries.count - 2) }
+        }
+    }
+    private static let videoImagesMemo = VideoImagesMemo()
+
     var videoImageAttachments: [LLMMessage.ImageAttachment]? {
         guard kind == .file, fileType == .video, status == .ready,
-              let videoFrames, videoFrames.count == ChatStore.videoFrameCount else { return nil }
+              let videoFrames,
+              (ChatStore.videoMinKeptFrameCount...ChatStore.videoMaxFrameCount).contains(videoFrames.count) else { return nil }
+        let cached = Self.videoImagesMemo.lookup(frames: videoFrames, context: videoContext)
+        if cached.hit { return cached.images }
+        let images = validatedVideoImages(videoFrames)
+        Self.videoImagesMemo.store(frames: videoFrames, context: videoContext, images: images)
+        return images
+    }
+
+    private func validatedVideoImages(_ videoFrames: [ChatVideoFrame]) -> [LLMMessage.ImageAttachment]? {
         var previousRequested: Double?
         var previousActual: Double?
         var bytes = 0
@@ -601,19 +720,34 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
                   frame.hasValidPayload, let data = frame.pngData else { return nil }
             if let previousRequested, frame.requestedSeconds <= previousRequested { return nil }
             if let previousActual, frame.timecodeSeconds <= previousActual { return nil }
-            guard data.count <= ChatStore.videoMaxOutputBytes - bytes else { return nil }
+            guard data.count <= ChatStore.videoMaxFramesBytes - bytes else { return nil }
             bytes += data.count
             images.append(.init(mimeType: "image/png", data: data))
             previousRequested = frame.requestedSeconds
             previousActual = frame.timecodeSeconds
         }
-        if let videoContext, !videoContext.isValid(maxOutputBytes: ChatStore.videoMaxOutputBytes - bytes) { return nil }
+        if let videoContext, !videoContext.isValid(maxOutputBytes: ChatStore.videoMaxOutputBytes) { return nil }
         return images
     }
 
     /// ChatAttachmentPersistence records metadata only for video frames. The
     /// matching raw image bytes are already in the durable Core transcript.
     var sidecarProjection: ChatAttachment {
+        // 图片/音频同样只存摘要：字节以 Core 转写为准，避免多图会话撑爆 sidecar 上限。
+        if videoFrames == nil, kind == .image || kind == .audio,
+           status == .ready, let data,
+           kind == .image || MediaPayloadValidation.audioFormat(data) != nil {
+            var projection = ChatAttachment(
+                id: id, kind: kind, fileName: fileName, fileType: fileType,
+                mimeType: mimeType, size: size, data: nil, fileURL: fileURL,
+                status: status, failureReason: failureReason,
+                deliveryQuarantined: deliveryQuarantined,
+                originalTextCharacterCount: originalTextCharacterCount
+            )
+            projection.payloadDigest = ChatVideoFrame.digest(data)
+            projection.audioTranscript = audioTranscript
+            return projection
+        }
         guard let videoFrames else { return self }
         var projection = ChatAttachment(
             id: id, kind: kind, fileName: fileName, fileType: fileType,
@@ -664,6 +798,7 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
             originalTextCharacterCount: originalTextCharacterCount
         )
         copy.backgroundByteEvidence = backgroundByteEvidence
+        copy.audioTranscript = audioTranscript
         return copy
     }
 
@@ -688,7 +823,7 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
     // 按 decodeIfPresent 缺省 .ready（旧附件均为已完成态）。
     private enum CodingKeys: String, CodingKey {
         case id, kind, fileName, fileType, mimeType, size, data, fileURL, status, videoFrames, failureReason,
-             deliveryQuarantined, videoContext, originalTextCharacterCount
+             deliveryQuarantined, videoContext, originalTextCharacterCount, payloadDigest, audioTranscript
     }
 
     init(from decoder: Decoder) throws {
@@ -708,6 +843,8 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
         originalTextCharacterCount = try c.decodeIfPresent(Int.self, forKey: .originalTextCharacterCount)
         failureReason = try c.decodeIfPresent(String.self, forKey: .failureReason)
         deliveryQuarantined = try c.decodeIfPresent(Bool.self, forKey: .deliveryQuarantined)
+        payloadDigest = try c.decodeIfPresent(String.self, forKey: .payloadDigest)
+        audioTranscript = try c.decodeIfPresent(AudioTranscript.self, forKey: .audioTranscript)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -726,6 +863,8 @@ struct ChatAttachment: Identifiable, Equatable, Codable, Sendable {
         try c.encodeIfPresent(originalTextCharacterCount, forKey: .originalTextCharacterCount)
         try c.encodeIfPresent(failureReason, forKey: .failureReason)
         try c.encodeIfPresent(deliveryQuarantined, forKey: .deliveryQuarantined)
+        try c.encodeIfPresent(payloadDigest, forKey: .payloadDigest)
+        try c.encodeIfPresent(audioTranscript, forKey: .audioTranscript)
     }
 }
 
@@ -751,6 +890,10 @@ struct ComposerMediaReadinessSnapshot: Equatable, Sendable {
         let readiness: Readiness
         let reason: String
         let decision: MediaGateDecision?
+        /// 音频附件被所选模型拦下且还没有转写文字：可以在本机转成文字后发送。
+        var audioTranscribable: Bool = false
+        /// 图片附件被不支持看图的模型拦下且还没有识别结果：可以在本机识别图中文字后发送。
+        var imageTextRecognizable: Bool = false
 
         var blocksSend: Bool {
             switch readiness {
@@ -902,6 +1045,7 @@ extension ChatMessageUI {
         case id, role, content, isStreaming, timestamp, attachments, toolCallID, toolCalls, producerTextAttachmentCount, referenceCard, trustedSessionReadIntent, legacyToolOutputSummary
         // D-CHAT-18：回合时长/Provider+模型标识。旧 JSON 无键 → nil（不伪造）。
         case turnTiming, turnProviderName, turnProviderDisplayLabel, turnModelID, wasInterrupted, inlineToolAnchors
+        case thinkingText, thinkingSeconds
     }
 
     init(from decoder: Decoder) throws {
@@ -929,6 +1073,8 @@ extension ChatMessageUI {
         turnProviderDisplayLabel = ProviderDisplayLabel.safeDisplayText(
             try c.decodeIfPresent(String.self, forKey: .turnProviderDisplayLabel))
         turnModelID = try c.decodeIfPresent(String.self, forKey: .turnModelID)
+        thinkingText = try c.decodeIfPresent(String.self, forKey: .thinkingText)
+        thinkingSeconds = try c.decodeIfPresent(Double.self, forKey: .thinkingSeconds)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -951,6 +1097,8 @@ extension ChatMessageUI {
         try c.encodeIfPresent(turnProviderName, forKey: .turnProviderName)
         try c.encodeIfPresent(turnProviderDisplayLabel, forKey: .turnProviderDisplayLabel)
         try c.encodeIfPresent(turnModelID, forKey: .turnModelID)
+        try c.encodeIfPresent(thinkingText, forKey: .thinkingText)
+        try c.encodeIfPresent(thinkingSeconds, forKey: .thinkingSeconds)
     }
 }
 
@@ -1123,7 +1271,12 @@ enum ChatStoreDeletionError: Error, Equatable, Sendable {
 
 enum ChatStoreReadinessError: Error, Equatable, Sendable, LocalizedError {
     case modelNotReady(providerID: String, modelID: String?)
-    var errorDescription: String? { "模型尚未就绪（CHAT-MODEL-NOT-READY），请在设置中确认连接与模型后重试。" }
+    var errorDescription: String? {
+        if case .modelNotReady(let providerID, _) = self, providerID == ProviderType.local.rawValue {
+            return "本地模型未启动或模型不存在。请先启动本地服务（Ollama）并确认模型已安装，然后重试。"
+        }
+        return "模型尚未就绪（CHAT-MODEL-NOT-READY），请在设置中确认连接与模型后重试。"
+    }
 }
 
 enum ChatStoreModelAllowlistError: Error, Equatable, Sendable, LocalizedError {
@@ -1389,11 +1542,15 @@ struct ChatContextOccupancy: Sendable {
     /// C5: the window is the 128,000 fallback (no explicit window, no catalog
     /// hit), not a known value. Decided once where the sample is built.
     var windowIsEstimated: Bool = false
+    /// 重启后或首个用量回报之前，按本地字数估算出的占用（不是模型报告值）。
+    var isLocalEstimate: Bool = false
 
     var fraction: Double { Double(inputTokens) / Double(windowTokens) }
-    var percentage: String { String(format: "%.0f%%", fraction * 100) }
+    var percentage: String { String(format: isLocalEstimate ? "约 %.0f%%" : "%.0f%%", fraction * 100) }
     var display: String {
-        let base = "\(percentage) · \(inputTokens) / \(windowTokens) tokens"
+        let base = isLocalEstimate
+            ? "\(percentage) · 约 \(ChatStore.formatTokenCount(inputTokens)) / \(ChatStore.formatTokenCount(windowTokens)) tokens（估算）"
+            : "\(percentage) · \(ChatStore.formatTokenCount(inputTokens)) / \(ChatStore.formatTokenCount(windowTokens)) tokens"
         return windowIsEstimated ? base + " · 按 128k 估计" : base
     }
 }
@@ -1407,6 +1564,13 @@ struct SessionBudgetResetTarget: Equatable {
 /// 聊天侧栏状态：会话列表 + 消息流 + 输入 + Provider 流式回复。
 /// 指令拦截由 BridgeStore 通过 onSendCommand 注入（返回 true = 已按画布指令处理）。
 /// Snapshot 是发送边界上创建的唯一策略事实，不允许 handler 重新读取 UI 选择。
+/// 输入框草稿的逐字符失效信号，与 ChatStore 的其它状态隔离。
+@MainActor
+@Observable
+final class ComposerDraftModel {
+    var revision: UInt64 = 0
+}
+
 @MainActor
 @Observable
 final class ChatStore {
@@ -1426,6 +1590,12 @@ final class ChatStore {
     enum ExecutionFailureKind: String, Codable, Equatable, Sendable {
         case budgetPause
         case iterationLimit
+        /// 上下文超出模型窗口：失败行可提供“压缩后重试”。
+        case contextLength
+        /// API Key 无效、过期或无权限（401/403）：失败行给“检查 API Key”，不给“重试”。
+        case authorization
+        /// 余额或额度不足：失败行给“检查 API Key”（去供应商处充值或换 Key），仍可在处理后重试。
+        case quota
     }
 
     struct ExecutionSnapshot: Codable, Equatable, Sendable {
@@ -1437,6 +1607,10 @@ final class ChatStore {
         var failureReason: String?
         var failureKind: ExecutionFailureKind?
         var executionIdentity: AgentExecutionIdentity?
+        /// 授权/额度类失败发生时所用的供应商（连接检查记录里的供应商标识与显示名），
+        /// 之后改选别的模型也不会让提示和“检查 API Key”指向错的供应商。
+        var failedProviderID: String?
+        var failedProviderName: String?
 
         init(
             sessionID: UUID,
@@ -1446,8 +1620,12 @@ final class ChatStore {
             updatedAt: Date = Date(),
             failureReason: String? = nil,
             failureKind: ExecutionFailureKind? = nil,
-            executionIdentity: AgentExecutionIdentity? = nil
+            executionIdentity: AgentExecutionIdentity? = nil,
+            failedProviderID: String? = nil,
+            failedProviderName: String? = nil
         ) {
+            self.failedProviderID = failedProviderID
+            self.failedProviderName = failedProviderName
             self.sessionID = sessionID
             self.turnID = turnID
             self.taskID = taskID
@@ -1541,11 +1719,110 @@ final class ChatStore {
     // MARK: 会话
 
     /// 全部会话（内存态；active 会话的消息为单一事实来源）
-    private(set) var sessions: [ChatThread] = []
+    private(set) var sessions: [ChatThread] = [] {
+        // 不使用 oldValue（避免整数组拷贝）；只比较侧栏关心的摘要，流式正文不触发侧栏。
+        didSet { refreshSidebarRevisionIfNeeded() }
+    }
+
+    // MARK: 侧栏摘要投影（流式片段不触发侧栏重算）
+
+    /// 侧栏相关摘要（标题/时间/置顶/未读/分组/项目/消息数/预览前缀/转录修订）变化时递增。
+    /// 侧栏、会话列表读它而不是整个 `sessions`。
+    private(set) var sidebarRevision: Int = 0
+    @ObservationIgnored private var sidebarKeys: [SidebarSessionKey] = []
+    @ObservationIgnored private var sidebarVisibleCache: (revision: Int, query: String, threads: [ChatThread])?
+    @ObservationIgnored private var searchTextIndex: [UUID: SearchIndexEntry] = [:]
+
+    private struct SidebarSessionKey: Equatable {
+        let id: UUID
+        let title: String
+        let createdAt: Date
+        let updatedAt: Date
+        let pinned: Bool
+        let unread: Bool
+        let groupID: UUID?
+        let projectID: String?
+        let projectName: String?
+        let workingDirectory: String?
+        let messageCount: Int
+        let lastMessageID: UUID?
+        let previewPrefix: String
+        let transcriptRevision: UInt64
+
+        /// `includeTranscriptRevision`：转录修订号每个流式分片都会递增，只有侧栏正在按
+        /// 全文检索时才需要它（命中集合随正文变化）；否则放进摘要会让侧栏每帧重算。
+        init(_ thread: ChatThread, includeTranscriptRevision: Bool) {
+            id = thread.id
+            title = thread.title
+            createdAt = thread.createdAt
+            updatedAt = thread.updatedAt
+            pinned = thread.pinned
+            unread = thread.unread
+            groupID = thread.groupID
+            projectID = thread.projectID
+            projectName = thread.projectName
+            workingDirectory = thread.workingDirectory
+            messageCount = thread.messages.count
+            lastMessageID = thread.messages.last?.id
+            // 预览只取最后一条消息前 28 个字符；取 40 个足以决定其显示结果。
+            previewPrefix = thread.messages.last.map { String($0.content.prefix(40)) } ?? ""
+            transcriptRevision = includeTranscriptRevision ? thread.transcriptRevision : 0
+        }
+    }
+
+    private struct SearchIndexEntry {
+        let transcriptRevision: UInt64
+        let messageCount: Int
+        let lastLength: Int
+        let text: String
+    }
+
+    private func refreshSidebarRevisionIfNeeded() {
+        let searching = !searchText.trimmingCharacters(in: .whitespaces).isEmpty
+        let keys = sessions.map { SidebarSessionKey($0, includeTranscriptRevision: searching) }
+        guard keys != sidebarKeys else { return }
+        sidebarKeys = keys
+        sidebarRevision &+= 1
+    }
+
+    /// 会话 ID 列表（只随侧栏摘要变化，不随流式正文失效）。供终端按会话身份清理等低频观察使用。
+    var sessionIDsBySidebarRevision: [UUID] {
+        _ = sidebarRevision
+        return _sessions.map(\.id)
+    }
+
+    /// 当前活动会话标题（只随侧栏摘要变化，不随流式正文失效）。
+    var activeSessionTitle: String? {
+        _ = sidebarRevision
+        guard let activeSessionID else { return nil }
+        return _sessions.first(where: { $0.id == activeSessionID })?.title
+    }
+
+    /// 审批卡来源提示用：请求所属会话不是当前会话时返回该会话标题（找不到标题返回空串），否则 nil。
+    /// 只随侧栏摘要和活动会话变化，不随流式正文失效。
+    func approvalOriginSessionTitle(requestSessionID: String?) -> String? {
+        _ = sidebarRevision
+        guard let requestSessionID, let id = UUID(uuidString: requestSessionID), id != activeSessionID else { return nil }
+        return _sessions.first(where: { $0.id == id })?.title ?? ""
+    }
+
+    /// 当前活动会话的消息条数（只随侧栏摘要变化，流式正文增长不失效）。
+    var activeMessageCount: Int {
+        _ = sidebarRevision
+        guard let activeSessionID else { return 0 }
+        return _sessions.first(where: { $0.id == activeSessionID })?.messages.count ?? 0
+    }
+
+    /// 活动会话 ID 集合（只随侧栏摘要变化）。
+    var sidebarSessionIDs: Set<UUID> {
+        _ = sidebarRevision
+        return Set(_sessions.map(\.id))
+    }
     /// Session titles for the approval cards of conversation_settings session writes.
     let sessionTitleDirectory = SessionTitleDirectory()
     var activeSessionID: UUID? {
         didSet {
+            refreshDraftSummary()
             if oldValue != activeSessionID {
                 if let oldValue { goalReviewTasks[oldValue]?.task.cancel() }
                 refreshSelectedConversationGoal()
@@ -1581,9 +1858,15 @@ final class ChatStore {
                 providerPreparationTask?.cancel()
                 providerPreparationTask = nil
                 cancelComposerAttachmentPreflight(showFeedback: false)
+                // 记住最后查看的会话，下次启动回到它。装配完成前不写，避免覆盖尚未读取的上次值。
+                if persistsLastActiveSession, let activeSessionID {
+                    preferencesDefaults.set(activeSessionID.uuidString, forKey: Self.lastActiveSessionDefaultsKey)
+                }
             }
         }
     }
+    @ObservationIgnored private var persistsLastActiveSession = false
+    static let lastActiveSessionDefaultsKey = "lastActiveSessionID"
     private var credentialSubmissionSessionEpoch: UInt64 = 0
     private var pendingCredentialSubmissionID: UUID?
     private var pendingProviderPreparationID: UUID?
@@ -1921,7 +2204,30 @@ final class ChatStore {
     private func boundBuiltinRecord(for type: ProviderType, in records: [EnvVarEntry]) -> EnvVarEntry? {
         BuiltinReadinessBinding.record(for: type, in: records)
     }
-    private var draftTextBySessionID: [UUID?: String] = [:]
+    /// 草稿正文表。不参与观察：每次按键只递增 composerDraft.revision，
+    /// 大视图只订阅 hasDraft / hasNonBlankDraft（仅空与非空切换时变化）。
+    @ObservationIgnored private var draftTextBySessionID: [UUID?: String] = [:] {
+        didSet {
+            composerDraft.revision &+= 1
+            refreshDraftSummary()
+        }
+    }
+    /// 输入框子树的逐字符失效信号；其它视图不要读取。
+    @ObservationIgnored let composerDraft = ComposerDraftModel()
+    /// 当前会话草稿是否非空（仅在空/非空切换时通知观察者）。
+    private(set) var hasDraft = false
+    /// 当前会话草稿是否含非空白字符（用于菜单「发送消息」可用性）。
+    private(set) var hasNonBlankDraft = false
+
+    private func refreshDraftSummary() {
+        let text = draftTextBySessionID[activeSessionID] ?? ""
+        let nonEmpty = !text.isEmpty
+        if hasDraft != nonEmpty { hasDraft = nonEmpty }
+        let nonBlank = nonEmpty && text.unicodeScalars.contains {
+            !CharacterSet.whitespacesAndNewlines.contains($0)
+        }
+        if hasNonBlankDraft != nonBlank { hasNonBlankDraft = nonBlank }
+    }
     @ObservationIgnored private var focusedNativeDraftFlush: (() -> Void)?
     @ObservationIgnored private var draftMutationSequence: UInt64 = 0
     @ObservationIgnored private var draftMutationBaseline: UInt64 = 0
@@ -1948,6 +2254,421 @@ final class ChatStore {
         }
     }
 
+    /// @ 引用：当前项目目录内的文件路径候选（相对路径），由 updateFileMentionSuggestions 异步填充。
+    private(set) var fileMentionSuggestions: [String] = []
+    @ObservationIgnored private var fileMentionQuery: String?
+    @ObservationIgnored private var fileMentionTask: Task<Void, Never>?
+
+    /// 输入框光标（UTF-16 偏移）；@ 引用按光标处判断。不参与观察，变化时用 atMentionRevision 通知界面。
+    @ObservationIgnored private var draftCursorUTF16: Int?
+    private(set) var atMentionRevision = 0
+
+    /// 输入框上报光标位置。
+    func noteComposerCursor(_ offset: Int) {
+        guard draftCursorUTF16 != offset else { return }
+        draftCursorUTF16 = offset
+        guard draftText.contains("@") else { return }
+        updateFileMentionSuggestions()
+        atMentionRevision &+= 1
+    }
+
+    /// 光标前正在输入的 @ 引用词：@ 必须在开头或空白之后，邮箱之类不算；光标为 nil 按草稿末尾算。
+    nonisolated static func atMentionToken(
+        in text: String, cursorUTF16: Int?
+    ) -> (query: String, range: Range<String.Index>)? {
+        var end = text.endIndex
+        if let cursorUTF16, cursorUTF16 >= 0, cursorUTF16 < text.utf16.count {
+            end = String.Index(utf16Offset: cursorUTF16, in: text)
+        }
+        var cursor = end
+        while cursor > text.startIndex {
+            let previous = text.index(before: cursor)
+            let character = text[previous]
+            if character.isWhitespace { return nil }
+            if character == "@" {
+                if previous > text.startIndex, !text[text.index(before: previous)].isWhitespace { return nil }
+                return (String(text[text.index(after: previous)..<end]), previous..<end)
+            }
+            cursor = previous
+        }
+        return nil
+    }
+
+    /// 草稿末尾正在输入的 @ 引用词（不含 @）。
+    nonisolated static func atMentionQuery(in text: String) -> String? {
+        atMentionToken(in: text, cursorUTF16: nil)?.query
+    }
+
+    /// 去掉光标处（nil 为末尾）正在输入的 @ 引用词（选中候选后由候选本身接管）。
+    nonisolated static func removingAtMention(from text: String, cursorUTF16: Int?) -> String {
+        guard let token = atMentionToken(in: text, cursorUTF16: cursorUTF16) else { return text }
+        var result = text
+        result.removeSubrange(token.range)
+        return result
+    }
+
+    /// 把光标处的 @ 引用词换成指定文字（选中文件后保留指代，如"看看 a.swift 的问题"）。
+    nonisolated static func replacingAtMention(in text: String, cursorUTF16: Int?, with replacement: String) -> String {
+        guard let token = atMentionToken(in: text, cursorUTF16: cursorUTF16) else { return text }
+        var result = text
+        result.replaceSubrange(token.range, with: replacement)
+        return result
+    }
+
+    nonisolated static func removingTrailingAtMention(from text: String) -> String {
+        removingAtMention(from: text, cursorUTF16: nil)
+    }
+
+    /// 候选的显示名：文件取文件名，目录取目录名并保留结尾的 /。
+    nonisolated static func fileMentionTitle(_ path: String) -> String {
+        let isDirectory = path.hasSuffix("/")
+        let name = ((isDirectory ? String(path.dropLast()) : path) as NSString).lastPathComponent
+        return isDirectory ? name + "/" : name
+    }
+
+    /// 界面用：光标处的 @ 引用词（读取 atMentionRevision，光标移动时界面会刷新）。
+    var activeAtMentionQuery: String? {
+        _ = atMentionRevision
+        return Self.atMentionToken(in: draftText, cursorUTF16: draftCursorUTF16)?.query
+    }
+
+    /// 当前会话所属项目的工作目录（已授权目录）。
+    var activeProjectDirectory: String? {
+        sessions.first { $0.id == activeSessionID }?.workingDirectory
+    }
+
+    /// 用户随消息附上或 @ 引用的本地文件视为模型“已读”（覆盖这些文件时不必再先 file_read）。
+    /// 由组合根接到 BuiltinToolExecutor.markFileRead；参数为（文件路径，会话 ID 字符串）。
+    @ObservationIgnored var fileReadMarker: ((String, String) -> Void)?
+
+    /// 把用户自己加入的本地文件登记为已读；会话口径与执行器的 fileChangeSessionID 一致（会话 UUID 字符串）。
+    func markAttachedFileAsRead(_ url: URL) {
+        guard url.isFileURL, let session = activeSessionID?.uuidString else { return }
+        fileReadMarker?(url.path, session)
+    }
+
+    /// @ 文件候选的根：项目会话用项目目录；普通会话用它自己的私有工作目录。
+    var fileMentionRoot: String {
+        SessionFileRootPolicy.root(
+            explicit: nil, workingDirectory: activeProjectDirectory,
+            sessionDirectory: sessionStore?.directory ?? SessionStore.defaultDirectory,
+            sessionID: activeSessionID
+        ).path
+    }
+
+    /// 当前会话通过 /add-dir 加入的目录（由组合根接到已授权目录清单；未接入时为空）。
+    @ObservationIgnored var additionalDirectoriesProvider: (@MainActor (UUID) -> [String])?
+
+    /// 普通会话（没有项目目录）的 @ 搜索范围里额外加入的 /add-dir 目录；项目会话不变。
+    var fileMentionAdditionalRoots: [String] {
+        guard activeProjectDirectory == nil, let id = activeSessionID,
+              let provider = additionalDirectoriesProvider else { return [] }
+        return provider(id)
+    }
+
+    /// 在 /add-dir 目录里搜 @ 候选，返回绝对路径（目录以 / 结尾）；敏感文件过滤和扫描上限与项目根相同。
+    /// 引用词本身是某个目录下的绝对路径时（选中目录后继续往下选）只搜那个目录。
+    nonisolated static func additionalDirectoryMentionCandidates(
+        roots: [String], query: String, limit: Int = 12
+    ) -> [String] {
+        var found: [String] = []
+        for root in roots {
+            let trimmedRoot = root.hasSuffix("/") ? String(root.dropLast()) : root
+            var rootQuery = query
+            if query.hasPrefix("/") {
+                guard query == trimmedRoot || query.hasPrefix(trimmedRoot + "/") else { continue }
+                rootQuery = String(query.dropFirst(trimmedRoot.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))            }
+            for relative in FileMentionIndex.candidates(root: trimmedRoot, query: rootQuery, limit: limit) {
+                found.append(trimmedRoot + "/" + relative)
+            }
+        }
+        return Array(found.prefix(limit))
+    }
+
+    /// 在根目录内搜索文件和目录，按“名称或路径前缀 > 名称包含 > 路径包含”再按路径长度排序，返回前 limit 条相对路径。
+    nonisolated static func projectFileMentionCandidates(
+        root: String, query: String, limit: Int = 12
+    ) -> [String] {
+        // 候选含文件和目录（目录以 / 结尾）：优先 git ls-files（遵守 .gitignore，含隐藏文件），
+        // 不是仓库时再遍历目录；清单按根目录缓存，连续输入不重复扫盘。
+        FileMentionIndex.candidates(root: root, query: query, limit: limit)
+    }
+
+    /// 草稿变化时调用：末尾有 @ 引用词就在后台搜项目文件，结果只在草稿仍是同一引用词时采用。
+    func updateFileMentionSuggestions() {
+        updateMCPResourceSuggestions()
+        guard let query = Self.atMentionToken(in: draftText, cursorUTF16: draftCursorUTF16)?.query else {
+            fileMentionTask?.cancel()
+            fileMentionQuery = nil
+            if !fileMentionSuggestions.isEmpty { fileMentionSuggestions = [] }
+            return
+        }
+        let root = fileMentionRoot
+        let extraRoots = fileMentionAdditionalRoots
+        guard fileMentionQuery != query else { return }
+        fileMentionQuery = query
+        fileMentionTask?.cancel()
+        let sessionID = activeSessionID
+        fileMentionTask = Task { [weak self] in
+            // detached 任务不继承取消：这里显式把取消转给它，旧的扫描才会提前结束。
+            let worker = Task.detached(priority: .userInitiated) { () -> [String] in
+                // 引用词是 /add-dir 目录下的绝对路径时，只搜那个目录；否则私有目录在前，/add-dir 目录补在后面。
+                if query.hasPrefix("/") {
+                    return Self.additionalDirectoryMentionCandidates(roots: extraRoots, query: query)
+                }
+                var own = Self.projectFileMentionCandidates(root: root, query: query)
+                if !extraRoots.isEmpty, own.count < 12 {
+                    own += Self.additionalDirectoryMentionCandidates(roots: extraRoots, query: query, limit: 12 - own.count)
+                }
+                return own
+            }
+            let found = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled, let self, self.activeSessionID == sessionID,
+                  Self.atMentionToken(in: self.draftText, cursorUTF16: self.draftCursorUTF16)?.query == query
+            else { return }
+            self.fileMentionSuggestions = found
+            if found.isEmpty, self.activeProjectDirectory == nil, extraRoots.isEmpty {
+                self.pastedTextActionFeedback = "普通会话没有项目目录，@ 搜不到你的文件；请用输入框旁的附件按钮添加，或直接拖入文件。"
+            }
+        }
+    }
+
+    /// 候选路径落在哪个根：以 / 开头且在某个 /add-dir 目录内时用那个目录，其余用会话自己的 @ 根。
+    private func mentionLocation(_ path: String) -> (root: String, relative: String) {
+        if path.hasPrefix("/") {
+            for extra in fileMentionAdditionalRoots {
+                let base = extra.hasSuffix("/") ? String(extra.dropLast()) : extra
+                if path.hasPrefix(base + "/") { return (base, String(path.dropFirst(base.count + 1))) }
+            }
+        }
+        return (fileMentionRoot, path)
+    }
+
+    /// 选中文件：作为文件附件加入（文本注入内容，图片随消息，其余为路径引用），并去掉光标处的 @ 词。
+    /// 选中目录（以 / 结尾）：把 @ 词换成 @目录/，继续往下选。
+    @discardableResult
+    func acceptFileMention(_ mentionPath: String) -> Bool {
+        let (root, relativePath) = mentionLocation(mentionPath)
+        guard !relativePath.isEmpty,
+              !relativePath.split(separator: "/").contains("..") else { return false }
+        if relativePath.hasSuffix("/") {
+            guard let token = Self.atMentionToken(in: draftText, cursorUTF16: draftCursorUTF16) else { return false }
+            var text = draftText
+            text.replaceSubrange(token.range, with: "@" + mentionPath)
+            fileMentionQuery = nil
+            draftText = text
+            return true
+        }
+        let target = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(relativePath)
+        guard !SensitiveFilePolicy.contains(target.path) else {
+            pastedTextActionFeedback = "该文件可能含密钥，不能作为引用加入。"
+            return false
+        }
+        // 符号链接：对解析后的真实路径再做敏感检查，并要求仍在 @ 引用的根目录内。
+        let realTarget = target.resolvingSymlinksInPath().path
+        let realRoot = URL(fileURLWithPath: root, isDirectory: true).resolvingSymlinksInPath().path
+        guard !SensitiveFilePolicy.contains(realTarget) else {
+            pastedTextActionFeedback = "该文件可能含密钥，不能作为引用加入。"
+            return false
+        }
+        guard realTarget == realRoot || realTarget.hasPrefix(realRoot.hasSuffix("/") ? realRoot : realRoot + "/") else {
+            pastedTextActionFeedback = "该文件通过链接指向了项目目录之外，不能用 @ 引用；可直接拖入或用附件按钮添加。"
+            return false
+        }
+        // 保留文字指代：把 @ 词换成相对路径（不带 @，避免再次弹出候选），文件本身作为附件加入。
+        draftText = Self.replacingAtMention(in: draftText, cursorUTF16: draftCursorUTF16, with: mentionPath)
+        fileMentionTask?.cancel()
+        fileMentionQuery = nil
+        fileMentionSuggestions = []
+        addAttachments(urls: [target])
+        return true
+    }
+
+    /// 选中"引用此目录"：目录本身作为路径引用附件加入（模型自己用 file_glob / ls 查看），@ 词换成目录名。
+    @discardableResult
+    func acceptDirectoryMention(_ mentionPath: String) -> Bool {
+        let trimmedMention = mentionPath.hasSuffix("/") ? String(mentionPath.dropLast()) : mentionPath
+        let (root, trimmed) = mentionLocation(trimmedMention)
+        guard !trimmed.isEmpty, !trimmed.split(separator: "/").contains("..") else { return false }
+        let target = URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent(trimmed, isDirectory: true)
+        let realTarget = target.resolvingSymlinksInPath().path
+        let realRoot = URL(fileURLWithPath: root, isDirectory: true).resolvingSymlinksInPath().path
+        guard !SensitiveFilePolicy.contains(target.path), !SensitiveFilePolicy.contains(realTarget) else {
+            pastedTextActionFeedback = "该目录可能含密钥，不能作为引用加入。"
+            return false
+        }
+        guard realTarget == realRoot || realTarget.hasPrefix(realRoot.hasSuffix("/") ? realRoot : realRoot + "/") else {
+            pastedTextActionFeedback = "该目录通过链接指向了项目目录之外，不能用 @ 引用；可直接拖入或用附件按钮添加。"
+            return false
+        }
+        draftText = Self.replacingAtMention(in: draftText, cursorUTF16: draftCursorUTF16, with: trimmedMention + "/")
+        fileMentionTask?.cancel()
+        fileMentionQuery = nil
+        fileMentionSuggestions = []
+        addAttachments(urls: [target])
+        return true
+    }
+
+    // MARK: MCP 资源（@ 引用）与提示词（斜杠菜单）
+
+    /// MCP 资源/提示词服务：只对已启用且已授权的服务器发只读请求。
+    @ObservationIgnored private var mcpResourcePromptServiceStorage: (manager: ObjectIdentifier, service: MCPResourcePromptService)?
+    var mcpResourcePromptService: MCPResourcePromptService? {
+        guard let manager = SettingsCenter.active?.mcpManager else { return nil }
+        if let stored = mcpResourcePromptServiceStorage, stored.manager == ObjectIdentifier(manager) {
+            return stored.service
+        }
+        let service = MCPResourcePromptService(manager: manager)
+        mcpResourcePromptServiceStorage = (ObjectIdentifier(manager), service)
+        return service
+    }
+
+    /// @ 候选里的“MCP 资源”分组，由 updateMCPResourceSuggestions 异步填充。
+    private(set) var mcpResourceSuggestions: [MCPResourceItem] = []
+    @ObservationIgnored private var mcpResourceQuery: String?
+    @ObservationIgnored private var mcpResourceTask: Task<Void, Never>?
+    /// 斜杠菜单里的 MCP 提示词（/mcp__服务器__提示词）。
+    private(set) var mcpPromptSlashCommands: [CustomSlashCommand] = []
+    @ObservationIgnored private var mcpPromptTask: Task<Void, Never>?
+
+    /// 斜杠菜单要显示的全部自定义命令：命令文件、内置提示词和 MCP 提示词。
+    var slashMenuCustomCommands: [CustomSlashCommand] { customSlashCommands + mcpPromptSlashCommands }
+
+    private func updateMCPResourceSuggestions() {
+        guard let query = Self.atMentionToken(in: draftText, cursorUTF16: draftCursorUTF16)?.query,
+              let service = mcpResourcePromptService else {
+            mcpResourceTask?.cancel()
+            mcpResourceQuery = nil
+            if !mcpResourceSuggestions.isEmpty { mcpResourceSuggestions = [] }
+            return
+        }
+        guard mcpResourceQuery != query else { return }
+        mcpResourceQuery = query
+        mcpResourceTask?.cancel()
+        let sessionID = activeSessionID
+        mcpResourceTask = Task { [weak self] in
+            let report = await service.resourcesReport(matching: query, limit: 6)
+            let found = report.items
+            guard !Task.isCancelled, let self, self.activeSessionID == sessionID,
+                  Self.atMentionToken(in: self.draftText, cursorUTF16: self.draftCursorUTF16)?.query == query
+            else { return }
+            self.mcpResourceSuggestions = found
+            if !report.failedServers.isEmpty {
+                self.pastedTextActionFeedback = "MCP 服务器「\(report.failedServers.joined(separator: "、"))」读取资源列表失败，这不代表没有资源；稍后再输入 @ 重试。"
+            }
+        }
+    }
+
+    /// 输入框进入斜杠状态时刷新 MCP 提示词清单（后台读取，读完后菜单自动更新）。
+    private func refreshMCPPromptSlashCommands() {
+        guard let service = mcpResourcePromptService else {
+            if !mcpPromptSlashCommands.isEmpty { mcpPromptSlashCommands = [] }
+            return
+        }
+        mcpPromptTask?.cancel()
+        mcpPromptTask = Task { [weak self] in
+            let report = await service.promptsReport()
+            let prompts = report.items
+            guard !Task.isCancelled, let self else { return }
+            if !report.failedServers.isEmpty {
+                self.pastedTextActionFeedback = "MCP 服务器「\(report.failedServers.joined(separator: "、"))」读取提示词列表失败，这不代表没有提示词；稍后再输入 / 重试。"
+            }
+            let commands = prompts.map { item in
+                CustomSlashCommand(
+                    name: item.slashName,
+                    description: (item.info.description?.isEmpty == false ? item.info.description! : item.info.name)
+                        + "（\(item.serverName)）",
+                    argumentHint: item.argumentHint,
+                    source: .mcp,
+                    template: ""
+                )
+            }
+            if commands != self.mcpPromptSlashCommands { self.mcpPromptSlashCommands = commands }
+        }
+    }
+
+    /// 选中 MCP 资源：读取内容（脱敏、限长）后作为一段带来源标注的文字放进草稿，并去掉光标处的 @ 词。
+    func acceptMCPResourceMention(_ item: MCPResourceItem) {
+        guard let service = mcpResourcePromptService else { return }
+        let sessionID = activeSessionID
+        let token = Self.atMentionToken(in: draftText, cursorUTF16: draftCursorUTF16)
+        let before = draftText
+        mcpResourceSuggestions = []
+        mcpResourceQuery = nil
+        pastedTextActionFeedback = "正在读取 MCP 资源「\(item.title)」…"
+        Task { [weak self] in
+            do {
+                let content = try await service.readResource(item)
+                guard let self, self.activeSessionID == sessionID else { return }
+                var text = self.draftText == before ? Self.removingAtMention(from: before, cursorUTF16: token == nil ? nil : self.draftCursorUTF16) : self.draftText
+                let block = "<mcp-resource server=\"\(item.serverName)\" uri=\"\(item.uri)\">\n\(content)\n</mcp-resource>"
+                if !text.isEmpty, !text.hasSuffix("\n") { text += "\n" }
+                self.draftText = text + block
+                self.pastedTextActionFeedback = nil
+            } catch {
+                guard let self, self.activeSessionID == sessionID else { return }
+                self.pastedTextActionFeedback = (error as? LocalizedError)?.errorDescription
+                    ?? "读取 MCP 资源失败：请确认服务器可用后重试。"
+            }
+        }
+    }
+
+    /// 草稿是 "/mcp__服务器__提示词 参数" 时：异步调用 prompts/get，展开结果作为普通用户消息发送。
+    /// 返回 true 表示已接管本次发送（失败时草稿保留并给出提示）。
+    private func beginMCPPromptExpansionIfNeeded(onAdmission: ((Bool) -> Void)?) -> Bool {
+        let draft = draftText
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 带附件或长粘贴卡片也照常展开：展开后的文字替换草稿，附件和卡片随这条消息一起发送。
+        guard trimmed.hasPrefix("/mcp__"), literalComposerDraftBySessionID[activeSessionID] != draft,
+              !isEditingMessage,
+              let service = mcpResourcePromptService else { return false }
+        let body = trimmed.dropFirst()
+        let name = String(body.prefix { !$0.isWhitespace })
+        let arguments = String(body.dropFirst(name.count))
+        let sessionID = activeSessionID
+        onAdmission?(false)
+        pastedTextActionFeedback = "正在读取 MCP 提示词…"
+        Task { [weak self] in
+            do {
+                let expanded = try await service.expandPrompt(slashName: name, argumentText: arguments)
+                guard let self else { return }
+                guard self.activeSessionID == sessionID, self.draftText == draft else {
+                    // 读取期间草稿或会话变了：不发送，也不能让“正在读取”提示一直挂着。
+                    self.pastedTextActionFeedback = "读取期间输入框内容变了，已取消展开。请重新发送。"
+                    return
+                }
+                guard !expanded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    self.pastedTextActionFeedback = "该 MCP 提示词没有返回内容。草稿已保留。"
+                    return
+                }
+                self.pastedTextActionFeedback = nil
+                self.draftText = expanded
+                // 展开结果按普通消息发送，不再当斜杠命令解析。
+                self.literalComposerDraftBySessionID[sessionID] = expanded
+                self.submitComposer(onAdmission: nil, interactive: true)
+            } catch {
+                guard let self else { return }
+                guard self.activeSessionID == sessionID, self.draftText == draft else {
+                    self.pastedTextActionFeedback = nil
+                    return
+                }
+                self.pastedTextActionFeedback = (error as? LocalizedError)?.errorDescription
+                    ?? "读取 MCP 提示词失败：请确认服务器可用后重试。草稿已保留。"
+            }
+        }
+        return true
+    }
+
+    /// 选中技能：去掉光标处的 @ 词后按原有选择流程插入完整的 @技能名。
+    func acceptSkillMention(_ item: PickerCatalogItem) {
+        draftText = Self.removingAtMention(from: draftText, cursorUTF16: draftCursorUTF16)
+        if !selectedPickerItems.contains(where: { $0.id == item.id }) { togglePickerItem(item) }
+    }
+
     // Local navigation state only; history comes from this session's stored user messages.
     private var inputHistoryIndexBySession: [UUID?: Int] = [:]
     private var inputHistoryRecalledTextBySession: [UUID?: String] = [:]
@@ -1957,6 +2678,23 @@ final class ChatStore {
               message.legacyToolOutputSummary == nil else { return nil }
         let text = message.displayContent
         return text.isEmpty && message.referenceCard == nil ? nil : text
+    }
+
+    /// 跨会话的最近输入（旧到新排列，最近的在末尾）：去重、最多 100 条、不含空文本。
+    func recentInputHistoryAcrossSessions(limit: Int = 100) -> [String] {
+        var seen: Set<String> = []
+        var recentFirst: [String] = []
+        let items = (sessions + archivedSessions).flatMap { thread in
+            thread.messages.compactMap { message in
+                Self.inputHistoryText(message).map { (text: $0, at: message.timestamp) }
+            }
+        }.sorted { $0.at > $1.at }
+        for item in items {
+            guard !item.text.isEmpty, seen.insert(item.text).inserted else { continue }
+            recentFirst.append(item.text)
+            if recentFirst.count >= limit { break }
+        }
+        return recentFirst.reversed()
     }
 
     var localInputHistory: [String] { messages.compactMap(Self.inputHistoryText).filter { !$0.isEmpty } }
@@ -2022,9 +2760,11 @@ final class ChatStore {
         guard key == .up || key == .down, editingMessageID == nil,
               pendingAttachments.isEmpty, activePastedTextDraft == nil else { return false }
         let browsing = inputHistoryRecalledTextBySession[activeSessionID] == draftText
-        guard draftText.isEmpty || browsing else { return false }
-        if key == .up, draftText.isEmpty, takeQueuedComposerForEditing() { return true }
-        let history = localInputHistory
+        guard !hasDraft || browsing else { return false }
+        if key == .up, !hasDraft, takeQueuedComposerForEditing() { return true }
+        var history = localInputHistory
+        // 当前会话还没有输入时，继续翻到最近其它会话的输入（对齐 Claude Code 的全局输入历史）。
+        if history.isEmpty { history = recentInputHistoryAcrossSessions() }
         guard !history.isEmpty else { return false }
         let current = inputHistoryIndexBySession[activeSessionID] ?? history.count
         let next = key == .up ? max(0, current - 1) : min(history.count, current + 1)
@@ -2036,8 +2776,13 @@ final class ChatStore {
         return true
     }
 
+    /// 逐字符观察读取：只应由输入框子树的 body 使用；
+    /// 大视图判断空/非空请读 hasDraft。
     var draftText: String {
-        get { draftTextBySessionID[activeSessionID] ?? "" }
+        get {
+            _ = composerDraft.revision
+            return draftTextBySessionID[activeSessionID] ?? ""
+        }
         set { setDraftText(newValue, for: activeSessionID) }
     }
 
@@ -2115,6 +2860,7 @@ final class ChatStore {
     }
 
     private func setDraftText(_ newValue: String, for targetSessionID: UUID?) {
+        let perf = PerformanceSignposts.begin(.composerDraftCommit); defer { perf.end() }
         if literalComposerDraftBySessionID[targetSessionID] != newValue {
             literalComposerDraftBySessionID.removeValue(forKey: targetSessionID)
         }
@@ -2222,6 +2968,9 @@ final class ChatStore {
         }
     }
     private(set) var compactionPresentation: CompactionPresentation?
+    /// “压缩后重试”等待压缩结果的那一次请求；只在压缩成功后触发一次重发。
+    @ObservationIgnored
+    private var compactAndRetryRequest: (requestID: UUID, identity: RetryIdentity)?
     private(set) var compactionUndoFeedback: (sessionID: UUID, succeeded: Bool)?
     // A session switch can replace the visible presentation before its worker finishes.
     @ObservationIgnored private var pendingCompactionOwners: [UUID: UUID] = [:]
@@ -2239,6 +2988,30 @@ final class ChatStore {
     }
 
     func finishCompactionPresentation(requestID: UUID, sessionID: UUID?, state: CompactionPresentation.State) {
+        // C3-12: messages sent while this compaction ran waited in the queue (success, failure or
+        // cancel alike); send the first one now, on the compacted history. Same conditions as the
+        // end of an ordinary turn: the session is open, idle, and the user did not pause its queue.
+        defer {
+            if let sessionID, !pendingCompactionOwners.values.contains(sessionID),
+               !pausedComposerQueueSessions.contains(sessionID),
+               queuedComposerMessages.contains(where: { $0.sessionID == sessionID }) {
+                if sessionID == activeSessionID {
+                    _ = sendNextQueuedComposer(automatically: true)
+                } else {
+                    // The user switched away while the summary ran: the queued message waits for
+                    // the user to come back, like a turn that ends in the background (S-03).
+                    queueResumeOnReturnSessions.insert(sessionID)
+                }
+            }
+        }
+        if let pending = compactAndRetryRequest, pending.requestID == requestID {
+            compactAndRetryRequest = nil
+            if case .succeeded = state, pending.identity.sessionID == sessionID {
+                // 压缩已写回原会话；沿用同一条失败行的重试通道重发上一条用户消息。
+                // 重试被拒（失败状态已变化）时只保留压缩结果，用户可手动重发。
+                _ = retryFailedSession(pending.identity)
+            }
+        }
         if let sessionID, pendingCompactionOwners[requestID] == sessionID {
             pendingCompactionOwners.removeValue(forKey: requestID)
         }
@@ -2373,7 +3146,8 @@ final class ChatStore {
         guard let message = messages.first(where: { $0.id == messageID }),
               message.role == .user else { return }
         stopStreamingForSwitch()
-        draftText = message.content
+        // 附件已转为待发送附件，正文只取用户自己的文字，避免附件全文重复注入。
+        draftText = message.referenceCard == nil ? message.displayContent : message.content
         pendingAttachments = message.attachments
         editingMessageID = messageID
     }
@@ -2427,12 +3201,120 @@ final class ChatStore {
     }
     @ObservationIgnored private var attachmentPreparationsBySessionID: [UUID?: [UUID: AttachmentPreparation]] = [:]
     private var pendingAttachmentsBySessionID: [UUID?: [ChatAttachment]] = [:]
+    /// 音频附件本机转写：界面状态（按附件 id）与进行中的任务；逻辑在 ChatStore+AudioTranscription.swift。
+    var audioTranscriptionStates: [UUID: AudioTranscriptionUIState] = [:]
+    @ObservationIgnored var audioTranscriptionRuns: [UUID: AudioTranscriptionRun] = [:]
+    /// 图片附件的本机文字识别状态（按附件 id）：模型看不到图时，识别出的文字代替图片发送；逻辑在 ChatStore+AudioTranscription.swift。
+    var attachmentTextRecognitionStates: [UUID: AttachmentTextRecognitionState] = [:]
+    @ObservationIgnored var attachmentTextRecognitionRuns: [UUID: Task<Void, Never>] = [:]
+    /// 重启后从草稿里读出、等音频重新读入后按路径接回的转写文字（会话 → 路径 → 转写）。
+    @ObservationIgnored var restoredAudioTranscriptsBySessionID: [UUID: [String: AudioTranscript]] = [:]
+    /// 设置里的 App 语言（BridgeStore 绑定时写入），转写默认跟随它。
+    @ObservationIgnored var audioTranscriptionGeneralLanguage: String?
     private(set) var pendingAttachments: [ChatAttachment] {
         get { pendingAttachmentsBySessionID[activeSessionID] ?? [] }
         set {
             cancelComposerAttachmentPreflight(showFeedback: false)
             pendingAttachmentsBySessionID[activeSessionID] = newValue
+            persistPendingAttachmentReferences(sessionID: activeSessionID)
         }
+    }
+
+    // MARK: 未发送附件的路径引用持久化（重启后按路径重新走 addAttachments）
+
+    private static func chatAttachmentsDraftKey(sessionID: UUID) -> String {
+        "chatAttachments.\(sessionID.uuidString)"
+    }
+
+    /// 草稿附件的持久化条目：原始路径 + 是否已是“只发路径”的引用形态（重启后直接还原成引用，不再读全文）。
+    struct PendingAttachmentDraftEntry: Codable, Equatable, Sendable {
+        let path: String
+        let asReference: Bool
+        /// 音频附件已转好（或用户改过）的转写文字；重启后重新读入音频时按路径接回，避免白转或丢掉用户的修改。
+        var audioTranscript: AudioTranscript? = nil
+    }
+
+    nonisolated static func decodePendingAttachmentDraftEntries(_ data: Data) -> [PendingAttachmentDraftEntry] {
+        if let entries = try? JSONDecoder().decode([PendingAttachmentDraftEntry].self, from: data) { return entries }
+        // 旧版本只存路径数组。
+        if let paths = try? JSONDecoder().decode([String].self, from: data) {
+            return paths.map { PendingAttachmentDraftEntry(path: $0, asReference: false) }
+        }
+        return []
+    }
+
+    nonisolated static func pendingAttachmentDraftEntries(for attachments: [ChatAttachment]) -> [PendingAttachmentDraftEntry] {
+        var seen = Set<String>()
+        return attachments
+            .filter { $0.status != .failed }
+            .compactMap { attachment -> PendingAttachmentDraftEntry? in
+                guard let path = attachment.fileURL, seen.insert(path).inserted else { return nil }
+                let isReference = attachment.kind == .file && attachment.videoFrames == nil
+                    && attachment.fileType != .video && attachment.status == .ready
+                return PendingAttachmentDraftEntry(
+                    path: path, asReference: isReference,
+                    audioTranscript: attachment.kind == .audio ? attachment.audioTranscript : nil)
+            }
+    }
+
+    /// 只保存草稿里附件的原始路径和形态（不存字节）；重启后重新读取，文件没了会提示。
+    private func persistPendingAttachmentReferences(sessionID: UUID?) {
+        guard let drafts = draftStore, let sessionID else { return }
+        let key = Self.chatAttachmentsDraftKey(sessionID: sessionID)
+        let entries = Self.pendingAttachmentDraftEntries(for: pendingAttachmentsBySessionID[sessionID] ?? [])
+        guard !entries.isEmpty, let payload = try? JSONEncoder().encode(entries) else {
+            // 无条件清除：还没写盘的防抖任务也要一并取消，否则已发送的附件重启后会复活。
+            _ = drafts.clear(key: key)
+            return
+        }
+        drafts.scheduleSave(key: key, payload: payload)
+    }
+
+    private func restorePendingAttachmentReferences(sessionID: UUID) {
+        guard let drafts = draftStore,
+              pendingAttachmentsBySessionID[sessionID] == nil,
+              let data = drafts.load(key: Self.chatAttachmentsDraftKey(sessionID: sessionID)) else { return }
+        let entries = Self.decodePendingAttachmentDraftEntries(data)
+        guard !entries.isEmpty else { return }
+        var existing: [URL] = []
+        var references: [PendingAttachmentDraftEntry] = []
+        var missing: [String] = []
+        for entry in entries {
+            if FileManager.default.fileExists(atPath: entry.path) {
+                if entry.asReference { references.append(entry) } else {
+                    existing.append(URL(fileURLWithPath: entry.path))
+                    if let transcript = entry.audioTranscript {
+                        restoredAudioTranscriptsBySessionID[sessionID, default: [:]][entry.path] = transcript
+                    }
+                }
+            } else {
+                missing.append((entry.path as NSString).lastPathComponent)
+            }
+        }
+        if !missing.isEmpty {
+            pastedTextActionFeedback = "上次未发送的附件 \(missing.prefix(3).joined(separator: "、"))"
+                + "\(missing.count > 3 ? " 等" : "") 已不存在（临时文件可能已被清理），请重新添加。"
+        }
+        if existing.isEmpty, references.isEmpty {
+            _ = drafts.clear(key: Self.chatAttachmentsDraftKey(sessionID: sessionID))
+            return
+        }
+        // 引用形态的附件直接还原成路径引用，不再读入全文。
+        for entry in references {
+            var isDirectory: ObjCBool = false
+            _ = FileManager.default.fileExists(atPath: entry.path, isDirectory: &isDirectory)
+            let url = URL(fileURLWithPath: entry.path, isDirectory: isDirectory.boolValue)
+            let reference: ChatAttachment
+            if isDirectory.boolValue {
+                reference = Self.directoryReference(id: UUID(), url: url, size: nil)
+            } else {
+                let base = ChatAttachment(kind: .file, fileName: url.lastPathComponent, fileType: .unknown, fileURL: entry.path)
+                reference = Self.pathReference(for: base) ?? base
+            }
+            addComposerDraftAttachment(reference)
+            markAttachedFileAsRead(url)
+        }
+        if !existing.isEmpty { addAttachments(urls: existing) }
     }
 
     /// Both Composer surfaces and the model entry use this same draft boundary.
@@ -2453,9 +3335,22 @@ final class ChatStore {
         makeComposerMediaReadinessSnapshot(for: pendingAttachments)
     }
 
+    /// 按所选模型调整后的草稿（视频去音轨、音频换转写等），供本机转写/识别判断哪些附件需要补文字。
+    var composerAdaptedPendingAttachments: [ChatAttachment] {
+        makeComposerMediaReadinessResult(for: pendingAttachments).adapted
+    }
+
     private func makeComposerMediaReadinessSnapshot(
         for sourceAttachments: [ChatAttachment]
     ) -> ComposerMediaReadinessSnapshot {
+        makeComposerMediaReadinessResult(for: sourceAttachments).snapshot
+    }
+
+    /// 视频随所选模型自动调整：不能收图片 → 路径引用；只缺音频 → 去掉音轨。
+    /// 发送前把 pendingAttachments 换成 adapted，草稿里的预览也提前按调整后的状态判定。
+    private func makeComposerMediaReadinessResult(
+        for sourceAttachments: [ChatAttachment]
+    ) -> (snapshot: ComposerMediaReadinessSnapshot, adapted: [ChatAttachment], notes: [UUID: String]) {
         let selectedProviderID = selectedChatProviderID
         let providerID = selectedProviderID
             ?? streamingProviderOverride?.name
@@ -2478,9 +3373,12 @@ final class ChatStore {
         }
         let model: LLMModel?
         if selectionIsCurrent, selectedProviderID != nil, let modelID, let selectedProviderType {
+            // 静态清单里没有的模型（Ollama 本地模型、OpenRouter 清单外模型等）：
+            // 与 builtinRuntimeModel 同一口径按服务商默认能力放行，由服务端在不支持时拒绝。
+            // 清单内的已知模型（含已知"不支持"）仍按清单判定，不放松。
             model = fieldBuiltinModels(for: selectedProviderType).first {
                 Self.canonicalModelID($0.id) == Self.canonicalModelID(modelID)
-            }
+            } ?? (modelID.isEmpty ? nil : builtinRuntimeModel(for: selectedProviderType, modelID: modelID))
         } else if let selectedProviderID, let modelID,
                   let customProvider = selectedCustomProvider,
                   selectedProviderID == customProvider.name {
@@ -2506,7 +3404,32 @@ final class ChatStore {
         let mediaWire = selectedProviderType.flatMap { BuiltinReadinessBinding.route(for: $0)?.wire }
             ?? selectedCustomProvider?.protocolType
             ?? streamingProviderOverride.flatMap { Self.mediaWire(for: $0) }
-        let attachments = sourceAttachments.map { attachment -> ComposerMediaReadinessSnapshot.Attachment in
+        var adaptationNotes: [UUID: String] = [:]
+        let adaptedSource: [ChatAttachment] = sourceAttachments.map { source in
+            guard let model else { return source }
+            let result = Self.adaptingVideo(source, supported: model.capabilities.supportedModalities)
+            if let note = result.note { adaptationNotes[source.id] = note }
+            // 重新转写进行中不发送旧文字（发送门会拦住，等新文字出来）。
+            let retranscribing: Bool = {
+                if case .running? = audioTranscriptionStates[source.id]?.phase { return true }
+                return false
+            }()
+            if !retranscribing, let transcribed = Self.audioTranscriptSubstitution(
+                result.attachment, supported: model.capabilities.supportedModalities, wire: mediaWire
+            ) {
+                adaptationNotes[source.id] = transcribed.note
+                return transcribed.attachment
+            }
+            if let recognized = Self.imageTextSubstitution(
+                result.attachment, supported: model.capabilities.supportedModalities,
+                recognizedText: attachmentTextRecognitionStates[source.id]?.text
+            ) {
+                adaptationNotes[source.id] = recognized.note
+                return recognized.attachment
+            }
+            return result.attachment
+        }
+        let attachments = adaptedSource.map { attachment -> ComposerMediaReadinessSnapshot.Attachment in
             let mediaMIME: String?
             switch attachment.kind {
             case .image, .audio: mediaMIME = attachment.mimeType
@@ -2517,32 +3440,42 @@ final class ChatStore {
             let readiness: ComposerMediaReadinessSnapshot.Readiness
             let reason: String
             let decision: MediaGateDecision?
+            var audioTranscribable = false
+            var imageTextRecognizable = false
             var requiredInputs: ModelModality = []
             if attachment.videoFrames != nil { requiredInputs.insert(.imageInput) }
             if attachment.videoContext?.audio != nil { requiredInputs.insert(.audioInput) }
             if !(attachment.videoContext?.subtitles.isEmpty ?? true) { requiredInputs.insert(.textInput) }
             if attachment.status == .failed {
                 readiness = .failed
-                reason = "\(attachment.statusText ?? "读取失败")，请移除后重新添加"
+                reason = Self.composerFailedAttachmentReason(for: attachment)
                 decision = nil
             } else if attachment.status == .pending {
                 readiness = .pending
-                reason = "附件解析中，完成后请再次发送"
+                reason = "附件解析中，解析完成后即可发送（不会自动发送，请再按一次发送）"
+                decision = nil
+            } else if attachment.fileType == .video,
+                      case .running? = attachmentTextRecognitionStates[attachment.id] {
+                // E-6：模型收不了音轨，正在把音轨转成文字；转完才发，免得悄悄丢掉。
+                readiness = .pending
+                reason = "正在本机转写视频音轨，完成后即可发送（不会自动发送，请再按一次发送）"
                 decision = nil
             } else if attachment.fileType == .video,
                       attachment.videoFrames != nil,
                       attachment.videoImageAttachments == nil {
                 readiness = .failed
-                reason = "视频帧校验失败，请移除后重新添加"
+                reason = Self.composerBlockedReason(
+                    base: "视频帧校验失败", canReference: attachment.fileURL != nil)
                 decision = nil
             } else if (attachment.kind == .image || attachment.kind == .audio),
                       attachment.data == nil {
                 readiness = .failed
-                reason = "附件媒体内容不可用，请移除后重新添加"
+                reason = Self.composerBlockedReason(
+                    base: "附件媒体内容不可用", canReference: attachment.fileURL != nil)
                 decision = nil
             } else if !attachment.hasModelMediaPayload {
                 readiness = .referenceOnly
-                reason = attachment.statusText ?? "作为文字或文件引用提供"
+                reason = adaptationNotes[attachment.id] ?? attachment.statusText ?? "作为文字或文件引用提供"
                 decision = nil
             } else if let mediaMIME, let model {
                 var verdict: MediaGateDecision
@@ -2570,14 +3503,34 @@ final class ChatStore {
                 decision = verdict
                 if verdict.isAllowed {
                     readiness = .supported
-                    reason = attachment.statusText.map {
+                    reason = (adaptationNotes[attachment.id].map { $0 + " " } ?? "") + (attachment.statusText.map {
                         "所选模型可接收此附件；\($0)"
-                    } ?? "所选模型可接收此附件"
+                    } ?? "所选模型可接收此附件")
                 } else {
                     readiness = .unsupported
+                    audioTranscribable = attachment.kind == .audio
+                        && AudioTranscriptionDecision.action(
+                            modelAcceptsAudio: Self.audioNativelyDeliverable(
+                                supported: model.capabilities.supportedModalities, wire: mediaWire,
+                                byteCount: attachment.data?.count ?? 0),
+                            transcriptText: nil) == .needsTranscription
                     if case .rejected(let rejectedKind, let rejection) = verdict {
-                        if rejectedKind == .rasterImage, rejection.contains("image input capability") {
-                            reason = "\(model.displayName) 不支持图片输入。请在模型菜单选择支持图片的模型，或移除附件后发送。"
+                        if audioTranscribable {
+                            reason = audioTranscriptionBlockReason(for: attachment, modelName: model.displayName)
+                        } else if rejectedKind == .rasterImage, rejection.contains("image input capability"),
+                                  attachment.kind == .image, attachment.data != nil {
+                            // E-5：模型看不到图时，在本机识别图中文字后只发文字。
+                            switch attachmentTextRecognitionStates[attachment.id] {
+                            case .running?:
+                                reason = "\(model.displayName) 不支持图片输入，正在本机识别图中的文字，完成后即可发送（不会自动发送）；也可以移除附件，或选择支持图片的模型"
+                            case .failed(let message)?:
+                                reason = message
+                            default:
+                                imageTextRecognizable = true
+                                reason = "\(model.displayName) 不支持图片输入，正在准备本机识别图中的文字，完成后即可发送（不会自动发送）；也可以移除附件，或选择支持图片的模型"
+                            }
+                        } else if rejectedKind == .rasterImage, rejection.contains("image input capability") {
+                            reason = "\(model.displayName) 不支持图片输入。请在模型菜单选择支持图片的模型，或移除附件后发送。如该模型实际支持图片，可在 设置 → 模型 → 编辑供应商 里勾选「支持图片」。"
                         } else {
                             reason = "附件不可发送：\(rejection)。请更换支持此类附件的模型，或移除附件后发送。"
                         }
@@ -2593,10 +3546,173 @@ final class ChatStore {
             return .init(attachmentID: attachment.id, mimeType: attachment.mimeType,
                          wireMIMEType: mediaMIME,
                          requiredInputModalities: requiredInputs,
-                         readiness: readiness, reason: reason, decision: decision)
+                         readiness: readiness, reason: reason, decision: decision,
+                         audioTranscribable: audioTranscribable,
+                         imageTextRecognizable: imageTextRecognizable)
         }
-        return .init(providerID: providerID, modelID: modelID,
-                     selectionRevision: revision, wireProtocol: mediaWire, attachments: attachments)
+        // 一次发送的图片张数与总字节预检：超出的图片按“发送被拦”提示，用户可移除或改为路径引用。
+        var gatedAttachments = attachments
+        var imageCount = 0
+        var imageBytes = 0
+        // 视频抽出的帧和音轨同样占请求体，先计入，再检查图片附件。
+        for (index, source) in adaptedSource.enumerated()
+        where source.fileType == .video && source.status == .ready && gatedAttachments[index].readiness == .supported {
+            var videoCount = 0
+            var videoBytes = 0
+            for frame in source.videoImageAttachments ?? [] {
+                videoCount += 1
+                videoBytes += frame.data.count
+            }
+            videoBytes += source.videoContext?.audio?.data?.count ?? 0
+            if imageCount + videoCount > Self.maxComposerImageCount
+                || imageBytes + videoBytes > Self.maxComposerImageTotalBytes {
+                // 视频自己的帧就超限：发送前拦下，不要等到请求被拒。
+                let old = gatedAttachments[index]
+                gatedAttachments[index] = .init(
+                    attachmentID: old.attachmentID, mimeType: old.mimeType, wireMIMEType: old.wireMIMEType,
+                    requiredInputModalities: old.requiredInputModalities, readiness: .unsupported,
+                    reason: "视频抽出的画面帧过多或过大（一条消息最多 \(Self.maxComposerImageCount) 张图片或帧、合计不超过 \(Self.maxComposerImageTotalBytes / 1024 / 1024) MB）；请缩短视频、减少其它图片，或改为路径引用后再发送。",
+                    decision: old.decision)
+                continue
+            }
+            imageCount += videoCount
+            imageBytes += videoBytes
+        }
+        for (index, source) in adaptedSource.enumerated()
+        where source.kind == .image && source.status == .ready && gatedAttachments[index].readiness == .supported {
+            imageCount += 1
+            imageBytes += source.data?.count ?? 0
+            guard imageCount > Self.maxComposerImageCount || imageBytes > Self.maxComposerImageTotalBytes else { continue }
+            let old = gatedAttachments[index]
+            gatedAttachments[index] = .init(
+                attachmentID: old.attachmentID, mimeType: old.mimeType, wireMIMEType: old.wireMIMEType,
+                requiredInputModalities: old.requiredInputModalities, readiness: .unsupported,
+                reason: "一条消息最多带 \(Self.maxComposerImageCount) 张图片、合计不超过 \(Self.maxComposerImageTotalBytes / 1024 / 1024) MB，这张超出了；请移除部分图片，或改为路径引用后分批发送。",
+                decision: old.decision)
+        }
+        // 一条消息里所有文本附件注入的字符合计上限：超出的那些按“发送被拦”提示，可移除或改为路径引用。
+        var textCharacters = 0
+        for (index, source) in adaptedSource.enumerated()
+        where source.kind == .text && source.status == .ready
+            && (gatedAttachments[index].readiness == .supported || gatedAttachments[index].readiness == .referenceOnly) {
+            textCharacters += source.data.map { String(decoding: $0, as: UTF8.self).count } ?? 0
+            guard textCharacters > Self.maxComposerTextAttachmentTotalChars else { continue }
+            let old = gatedAttachments[index]
+            gatedAttachments[index] = .init(
+                attachmentID: old.attachmentID, mimeType: old.mimeType, wireMIMEType: old.wireMIMEType,
+                requiredInputModalities: old.requiredInputModalities, readiness: .unsupported,
+                reason: "本条消息的文本附件总量超出上限（合计不超过 \(Self.maxComposerTextAttachmentTotalChars / 10_000) 万字），这个附件超出了；请移除部分附件，或改为路径引用后分批发送。",
+                decision: old.decision)
+        }
+        let snapshot = ComposerMediaReadinessSnapshot(
+            providerID: providerID, modelID: modelID,
+            selectionRevision: revision, wireProtocol: mediaWire, attachments: gatedAttachments)
+        return (snapshot, adaptedSource, adaptationNotes)
+    }
+
+    /// 扫描件 PDF 渲染出的页面图片：图片附件，来源路径是 .pdf（普通图片不会指向 pdf）。
+    nonisolated static func isScannedPDFPageImage(_ attachment: ChatAttachment) -> Bool {
+        attachment.kind == .image && attachment.status == .ready
+            && attachment.fileURL?.lowercased().hasSuffix(".pdf") == true
+    }
+
+    /// 音频转写文字作为文本附件发送时使用的类型标记（正文已带“[音频转写：…]”头）。
+    nonisolated static let audioTranscriptMimeType = "text/x-audio-transcript"
+
+    /// 模型和线路能否原样接收这段音频附件（Anthropic 线路与“其他”线路不发音频；
+    /// 超过直发字节上限 25 MB 的音频发不出去，也算不能原样收，改走本机转写）。
+    nonisolated static func audioNativelyDeliverable(
+        supported: ModelModality, wire: ProviderWireProtocol?, byteCount: Int = 0
+    ) -> Bool {
+        supported.contains(.audioInput) && wire != .anthropic && wire != .other
+            && byteCount <= MediaPayloadValidation.maxInputBytes
+    }
+
+    /// 模型收不了音频且附件已有转写文字：换成一个只含文字的文本附件（不改草稿里的原音频）。
+    nonisolated static func audioTranscriptSubstitution(
+        _ attachment: ChatAttachment, supported: ModelModality, wire: ProviderWireProtocol?
+    ) -> (attachment: ChatAttachment, note: String)? {
+        guard attachment.kind == .audio, attachment.status == .ready,
+              let transcript = attachment.audioTranscript,
+              AudioTranscriptionDecision.action(
+                modelAcceptsAudio: audioNativelyDeliverable(
+                    supported: supported, wire: wire, byteCount: attachment.data?.count ?? 0),
+                transcriptText: transcript.text) == .sendTranscript else { return nil }
+        let body = AudioTranscriptFormat.modelText(
+            fileName: attachment.fileName, durationSeconds: transcript.durationSeconds, body: transcript.text)
+        var text = ChatAttachment(
+            id: attachment.id, kind: .text, fileName: attachment.fileName, fileType: .audio,
+            mimeType: audioTranscriptMimeType, size: Int64(body.utf8.count),
+            data: Data(body.utf8), fileURL: nil, status: .ready)
+        text.audioTranscript = transcript
+        return (text, "当前模型无法直接接收这段音频（不支持音频输入，或音频超过 25 MB），已改发本机转写的文字。")
+    }
+
+    nonisolated static func adaptingVideo(
+        _ attachment: ChatAttachment, supported: ModelModality
+    ) -> (attachment: ChatAttachment, note: String?) {
+        if isScannedPDFPageImage(attachment), !supported.contains(.imageInput),
+           let reference = pathReference(for: attachment) {
+            return (reference, "当前模型不支持图片输入，扫描件 PDF 已改为路径引用（模型可用 file_read 的 as_images=true 按页看图，或用命令处理）。")
+        }
+        guard attachment.kind == .file, attachment.fileType == .video,
+              attachment.status == .ready, attachment.videoFrames != nil else { return (attachment, nil) }
+        if !supported.contains(.imageInput) {
+            let reference = ChatAttachment(
+                id: attachment.id, kind: .file, fileName: attachment.fileName, fileType: .video,
+                mimeType: attachment.mimeType, size: attachment.size, fileURL: attachment.fileURL)
+            return (reference, "当前模型不支持图片输入，视频已改为路径引用（模型可用 ffmpeg 等命令处理）。")
+        }
+        if let context = attachment.videoContext, context.audio != nil,
+           !supported.contains(.audioInput) {
+            let stripped = MediaVideoSupplementaryContext(
+                durationSeconds: context.durationSeconds, audioState: .unavailable,
+                subtitleState: context.subtitleState, audio: nil, subtitles: context.subtitles)
+            let adapted = ChatAttachment(
+                id: attachment.id, kind: .file, fileName: attachment.fileName, fileType: .video,
+                mimeType: attachment.mimeType, size: attachment.size, data: attachment.data,
+                fileURL: attachment.fileURL, status: .ready, videoFrames: attachment.videoFrames,
+                deliveryQuarantined: attachment.deliveryQuarantined, videoContext: stripped,
+                originalTextCharacterCount: attachment.originalTextCharacterCount)
+            return (adapted, "当前模型不支持音频输入，只发送视频画面，未附带音轨。")
+        }
+        return (attachment, nil)
+    }
+
+    /// 发送前调用：把草稿里被所选模型拦住的视频换成可发送的形态，并提示用户。
+    private func adaptPendingVideosToSelectedModel() {
+        let source = pendingAttachments
+        guard source.contains(where: {
+            ($0.fileType == .video && $0.videoFrames != nil) || Self.isScannedPDFPageImage($0)
+                || ($0.kind == .audio && $0.audioTranscript != nil)
+                || ($0.kind == .image && attachmentTextRecognitionStates[$0.id]?.text != nil)
+        }) else { return }
+        let result = makeComposerMediaReadinessResult(for: source)
+        guard result.adapted != source else { return }
+        // 同一份扫描件 PDF 的多页图片改成路径引用后只保留一条。
+        var seenReferencePaths = Set<String>()
+        let deduped = zip(source, result.adapted).compactMap { original, adapted -> ChatAttachment? in
+            guard Self.isScannedPDFPageImage(original), adapted.kind == .file,
+                  let path = adapted.fileURL else { return adapted }
+            return seenReferencePaths.insert(path).inserted ? adapted : nil
+        }
+        pendingAttachments = deduped
+        if let note = result.notes.values.first { pastedTextActionFeedback = note }
+    }
+
+    /// 发送退出时草稿里仍留着“音频换成的转写文字”，说明这次没有真正发出：还原成原音频，转写文字仍保留在附件上。
+    private func restoreAudioDraftsAfterAdaptation(_ originals: [ChatAttachment]) {
+        // 凭据预检等异步发送步骤还在进行（pendingCredentialSubmissionID 非空）时不能还原：
+        // 还原会改动草稿附件，让异步步骤误判"发送条件已变化"（旅程测试 11/17：音频转写后每次都发不出去）。
+        guard !originals.isEmpty, attachmentSubmissionTask == nil, pendingAttachmentSubmissionID == nil,
+              pendingCredentialSubmissionID == nil else { return }
+        let restored = pendingAttachments.map { current -> ChatAttachment in
+            guard current.kind == .text,
+                  current.mimeType == Self.audioTranscriptMimeType || current.mimeType == Self.imageTextMimeType,
+                  let original = originals.first(where: { $0.id == current.id }) else { return current }
+            return original
+        }
+        if restored != pendingAttachments { pendingAttachments = restored }
     }
 
     func isCurrentComposerMediaReadiness(_ snapshot: ComposerMediaReadinessSnapshot) -> Bool {
@@ -2675,15 +3791,78 @@ final class ChatStore {
         }
         attachments[slot] = resolved
         pendingAttachmentsBySessionID[sessionID] = attachments
+        persistPendingAttachmentReferences(sessionID: sessionID)
     }
 
-    /// 文本/markdown/json 附件注入消息内容的字符上限（超长截断，提示 file_read 读全文）
-    nonisolated static let maxTextAttachmentChars = 4_000
+    /// 文本/markdown/json 附件注入消息内容的字符上限（约 2000 行量级；超长保留开头与结尾，中间省略，提示 file_read 按行续读）
+    nonisolated static let maxTextAttachmentChars = 60_000
+    /// 一条消息里所有文本附件注入字符的合计上限（20 万字）。
+    nonisolated static let maxComposerTextAttachmentTotalChars = 200_000
+    /// 超限时保留的开头与结尾字数（二者之和等于 maxTextAttachmentChars）
+    nonisolated static let textAttachmentHeadChars = 48_000
+    nonisolated static let textAttachmentTailChars = 12_000
+    /// 文本附件只读文件开头的这么多字节，再按字节截断后解码，避免整读大文件。
+    nonisolated static let maxTextAttachmentReadBytes = 2 * 1024 * 1024
+    /// 未知类型文件嗅探是否文本时读取的字节数。
+    nonisolated static let textSniffByteCount = 8 * 1024
+    /// AVFoundation 无法抽帧的容器格式（扩展名小写）。
+    nonisolated static let unsupportedVideoFrameExtensions: Set<String> = ["mkv", "webm", "avi", "wmv", "flv"]
     /// 图片/音频附件字节上限（超过降级为文件引用，避免请求体爆炸）
     nonisolated static let maxBinaryAttachmentBytes = 25 * 1024 * 1024
+    /// 音频转码后的上限：只用于本机转写（不发给云端），不受 25 MB 直发上限约束。
+    nonisolated static let maxTranscribableAudioBytes = 100 * 1024 * 1024
+    /// 一次发送带的图片张数与总字节上限（请求体预检；各供应商请求体通常在 32 MB 内，base64 约放大三分之一）。
+    nonisolated static let maxComposerImageCount = 20
+    /// 18 MB 原始字节 base64 后约 24 MB，给文字、历史和请求外壳留出余量；24 MB 会正好压在 32 MB 请求体上限上。
+    /// 历史媒体预算（HistoryMediaBudget，16 MB）已把最新一条计入，所以整份请求的媒体不会超过这条上限。
+    nonisolated static let maxComposerImageTotalBytes = 18 * 1024 * 1024
+    /// 图片源文件的读入上限：超过 25 MB 的图片先转码缩小，源文件大于此值才直接拒绝。
+    nonisolated static let maxSourceImageBytes = 200 * 1024 * 1024
+    /// 图片上传体积与长边上限：非 PNG/JPEG/WebP 或超过体积上限的图片先转码。
+    /// Anthropic 的 5 MB 按 base64 编码后计算，原始字节须 ≤ 5 MB × 3/4（3.75 MB）；各线路统一按此放行。
+    nonisolated static let maxUploadImageBytes = 5 * 1024 * 1024 * 3 / 4
+    /// 转码目标取 2000：一次请求超过 20 张图时 Anthropic 要求每张边长都不超过 2000 像素。
+    nonisolated static let uploadImageMaxPixel = 2000
+    nonisolated static let imagePassThroughMIMETypes: Set<String> = ["image/png", "image/jpeg", "image/webp"]
+    /// 音频只直接放行 WAV/MP3，其余容器先转 16 kHz 单声道 WAV。
+    nonisolated static let audioPassThroughMIMETypes: Set<String> = ["audio/wav", "audio/mpeg", "audio/mp3"]
+    /// 富文本文档：整读上限与提取为纯文本后的注入字数上限。
+    nonisolated static let maxRichDocumentReadBytes = 32 * 1024 * 1024
+    /// html/htm 不在此列：和 Claude Code 一样按源码文本注入（模型要看标签结构时才看得到）。
+    nonisolated static let richDocumentExtensions: Set<String> = ["docx", "doc", "rtf", "rtfd", "odt"]
+    /// 二进制 Office/办公文件：只能作路径引用，file_read 无法直接读取。
+    nonisolated static let binaryOfficeExtensions: Set<String> = [
+        "docx", "doc", "xlsx", "xls", "pptx", "ppt", "odt", "ods", "odp", "pages", "numbers", "key"
+    ]
+    /// 区分“已从文档提取为纯文本”的文本附件（与 PDF 的 application/pdf 同一做法）。
+    nonisolated static let extractedDocumentMimeType = "text/x-extracted-document"
+    /// 附件正文里的截断说明标记；注入提示与 Composer 状态行共用，避免两处措辞漂移。
+    nonisolated static let textOmissionNoteMarker = "[中间省略 "
+    nonisolated static let textHeadOnlyNoteMarker = "[文件很大，仅读取了开头部分"
+    nonisolated static let richDocumentTruncationNoteMarker = "[全文较长，已截取前 "
+    /// 抽帧数随时长增加：约每 10 秒 1 帧，至少 3 帧、最多 12 帧，均匀取在整段视频内部。
     nonisolated static let videoFrameCount = 3
+    /// 实际留下的帧数下限：画面不动的视频（系统录屏）相邻取样会落在同一帧上，重复帧被跳过，所以可能少于请求数。
+    nonisolated static let videoMinKeptFrameCount = 1
+    nonisolated static let videoMaxFrameCount = 12
+    nonisolated static let videoSecondsPerFrame = 10.0
     nonisolated static let videoMaxPixelSize = 768
-    nonisolated static let videoMaxOutputBytes = 2 * 1024 * 1024
+    /// 全部帧图合计字节上限（单帧超出份额时缩小重取，不整体失败）。
+    nonisolated static let videoMaxFramesBytes = 6 * 1024 * 1024
+    /// 音轨（16 kHz 单声道约 32 KB/秒，约 3 分钟）与字幕的字节预算，和帧图分开计；
+    /// 同时是单帧的字节上限（会话恢复处也按它校验）。
+    nonisolated static let videoMaxOutputBytes = 6 * 1024 * 1024
+
+    nonisolated static func videoFrameCountFor(duration: Double) -> Int {
+        guard duration.isFinite, duration > 0 else { return videoFrameCount }
+        let wanted = Int((duration / videoSecondsPerFrame).rounded(.up))
+        return min(videoMaxFrameCount, max(videoFrameCount, wanted))
+    }
+
+    /// 在整段时长内均匀取 count 个内部时刻（3 帧时即 1/6、1/2、5/6 处）。
+    nonisolated static func videoFrameTimes(duration: Double, count: Int) -> [Double] {
+        (0..<count).map { duration * (Double(2 * $0 + 1) / Double(2 * count)) }
+    }
 
     /// 添加附件（📎 面板 / 拖放统一入口）：FileImporter 分类 + 读内容。
     /// 返回实际添加的附件（读取失败的文件降级为 file 引用，仍可添加）。
@@ -2695,25 +3874,34 @@ final class ChatStore {
         // metadata is absent until the original draft slot accepts the result.
         var added: [ChatAttachment] = []
         for url in urls {
+            // 只接受本地文件；http(s) 等 URL 读内容会同步联网。
+            guard url.isFileURL else {
+                pastedTextActionFeedback = "请先把网页上的文件保存到本地再添加"
+                continue
+            }
             // A syntactic directory hint needs no main-actor metadata I/O.
+            // 目录按路径引用加入（和 Claude Code 一样让模型自己用 file_glob / ls 查看），不读内容。
             if url.hasDirectoryPath {
-                pastedTextActionFeedback = "文件夹不能作为附件，请选择文件或先压缩文件夹。"
+                let reference = Self.directoryReference(id: UUID(), url: url, size: nil)
+                added.append(reference)
+                addComposerDraftAttachment(reference)
                 continue
             }
             // FileImporter has no PDF FileType. Known .pdf names can avoid its
             // MIME fallback mapping on the main actor; PDFKit validates bytes
             // after the bounded background read.
             let namedPDF = url.pathExtension.lowercased() == "pdf"
-            let declaredType = FileImporter.type(forExtension: url.pathExtension)
-            let type = declaredType ?? .unknown
             let name = url.lastPathComponent
+            let declaredType = FileImporter.declaredType(forFileName: name)
+            let type = declaredType ?? .unknown
             let mime = FileImporter.mimeType(forExtension: url.pathExtension)
             let isPDF = type == .unknown && mime?.lowercased() == "application/pdf"
 
             // 两阶段状态可见（P3-COMP-04）：需后台读取的类型先以 .pending 占位入列，
             // 解析完成后原位升级 .ready（成功）/ .failed（读取失败/超限）；
             // 无需读取的类型直接以 .ready 落文件引用，不进入 pending。
-            let needsBackgroundRead = isPDF || type == .video || type == .image || type == .audio
+            let isRichDocument = Self.richDocumentExtensions.contains(url.pathExtension.lowercased())
+            let needsBackgroundRead = isPDF || isRichDocument || type == .video || type == .image || type == .audio
                 || type == .text || type == .markdown || type == .json
             let fileFallback = ChatAttachment(kind: .file, fileName: name, fileType: type,
                                               mimeType: mime, size: nil, fileURL: url.path,
@@ -2721,6 +3909,7 @@ final class ChatStore {
             added.append(fileFallback)
 
             addComposerDraftAttachment(fileFallback)
+            markAttachedFileAsRead(url)
             let attachmentID = fileFallback.id
             let sessionID = activeSessionID
             let frameSourceFactory = videoFrameSourceFactory
@@ -2728,32 +3917,53 @@ final class ChatStore {
             let preparation = Task.detached(priority: .userInitiated) { [weak self] in
                 let scoped = url.startAccessingSecurityScopedResource()
                 defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+                // Symlinks and Finder aliases are followed for every read and
+                // attribute; the draft slot keeps the user's original path.
+                let readURL = Self.resolvedAttachmentSourceURL(url)
+                let attrs = try? FileManager.default.attributesOfItem(atPath: readURL.path)
                 let isDirectory = (attrs?[.type] as? FileAttributeType) == .typeDirectory
-                    || (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                    || (try? readURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
                 let size = (attrs?[.size] as? NSNumber)?.int64Value
-                let mime = namedPDF ? "application/pdf" : FileImporter.mimeType(of: url)
+                let mime = namedPDF ? "application/pdf" : FileImporter.mimeType(of: readURL)
                 let type = declaredType ?? mime.flatMap(FileImporter.type(forMIME:)) ?? .unknown
                 let isPDF = type == .unknown && mime?.lowercased() == "application/pdf"
                 let resolved: ChatAttachment
+                var conversionNotice: String?
+                var extraPages: [ChatAttachment] = []
                 if isDirectory {
-                    resolved = ChatAttachment(id: attachmentID, kind: .file, fileName: name,
-                        fileType: type, mimeType: mime, size: size, fileURL: url.path,
-                        status: .failed, failureReason: "文件夹不能作为附件，请选择文件或先压缩文件夹。")
+                    resolved = Self.directoryReference(id: attachmentID, url: url, size: size)
+                } else if SensitiveFilePolicy.isCredentialPath(readURL.path)
+                            || (readURL.path != url.path && SensitiveFilePolicy.contains(readURL.path)) {
+                    // 符号链接或别名指向凭据文件：按实际读取的路径判断，不读内容，只给路径引用。
+                    resolved = ChatAttachment(
+                        id: attachmentID, kind: .file, fileName: name, fileType: .unknown,
+                        mimeType: mime, size: size, fileURL: url.path)
+                    conversionNotice = "\(name) 可能含密钥，未读取内容，仅作为路径引用。"
                 } else if isPDF {
-                    let read = Self.readPDFBytesOffMain(url: url, reportedSize: size)
+                    let read = Self.readPDFBytesOffMain(url: readURL, reportedSize: size)
                     // PDFKit decode and page-string extraction stay on this
                     // detached worker. Only the immutable Sendable attachment
                     // crosses back to the main actor for owner-fenced commit.
-                    resolved = Self.resolvePDFAttachment(
-                        id: attachmentID, url: url, type: type, name: name,
+                    let outcome = Self.resolvePDFAttachment(
+                        id: attachmentID, url: url, readURL: readURL, type: type, name: name,
                         size: size, read: read
                     )
+                    resolved = outcome.attachment
+                    extraPages = outcome.extraPages
+                    conversionNotice = outcome.notice
+                } else if type == .video,
+                          Self.unsupportedVideoFrameExtensions.contains(url.pathExtension.lowercased()) {
+                    // AVFoundation cannot decode these containers: go straight
+                    // to a path reference instead of a doomed frame attempt.
+                    resolved = ChatAttachment(
+                        id: attachmentID, kind: .file, fileName: name, fileType: .video,
+                        mimeType: mime, size: size, fileURL: url.path)
+                    conversionNotice = "\(name) 的格式无法直接抽帧，已改为路径引用；模型可用 ffmpeg 等命令处理。"
                 } else if type == .video {
                     let scoped = url.startAccessingSecurityScopedResource()
                     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                     do {
-                        let source = try frameSourceFactory(url)
+                        let source = try frameSourceFactory(readURL)
                         resolved = await Self.resolveVideoAttachment(
                             id: attachmentID, url: url, name: name, mime: mime,
                             size: size, source: source
@@ -2765,6 +3975,34 @@ final class ChatStore {
                             fileURL: url.path, status: .failed
                         )
                     }
+                } else if isRichDocument {
+                    resolved = Self.resolveRichDocumentAttachment(
+                        id: attachmentID, url: url, readURL: readURL, name: name, size: size)
+                } else if type == .image {
+                    let result = Self.resolveImageAttachmentOffMain(
+                        id: attachmentID, url: url, readURL: readURL, name: name, mime: mime, size: size)
+                    resolved = result.attachment
+                    conversionNotice = result.notice
+                } else if type == .audio {
+                    let result = await Self.resolveAudioAttachmentOffMain(
+                        id: attachmentID, url: url, readURL: readURL, name: name, mime: mime, size: size)
+                    resolved = result.attachment
+                    conversionNotice = result.notice
+                } else if type == .unknown,
+                          SensitiveFilePolicy.isCredentialPath(url.path)
+                            || SensitiveFilePolicy.isCredentialPath(readURL.path) {
+                    // .env、.pem、.key 等凭据文件：不嗅探、不读内容，只给路径引用。
+                    resolved = ChatAttachment(
+                        id: attachmentID, kind: .file, fileName: name, fileType: .unknown,
+                        mimeType: mime, size: size, fileURL: url.path)
+                    conversionNotice = "\(name) 可能含密钥，未读取内容，仅作为路径引用。"
+                } else if type == .unknown, Self.sniffsAsUTF8Text(url: url, readURL: readURL, attrs: attrs) {
+                    // No known extension, but the first 8 KB is NUL-free
+                    // UTF-8: inject it like any other text attachment.
+                    resolved = Self.readAttachmentDataOffMain(
+                        id: attachmentID, url: url, readURL: readURL, type: .text,
+                        name: name, mime: "text/plain", size: size
+                    )
                 } else if type == .unknown {
                     // An unknown payload is a file reference, not decoded
                     // bytes. Verify the original source while this worker
@@ -2772,7 +4010,7 @@ final class ChatStore {
                     // file must become a visible failure before Composer's
                     // awaited send can treat the reference as ready.
                     let readable: Bool
-                    if let handle = try? FileHandle(forReadingFrom: url) {
+                    if let handle = try? FileHandle(forReadingFrom: readURL) {
                         try? handle.close()
                         readable = (attrs?[.type] as? FileAttributeType).map { $0 == .typeRegular } ?? true
                     } else {
@@ -2786,18 +4024,33 @@ final class ChatStore {
                     )
                 } else {
                     resolved = Self.readAttachmentDataOffMain(
-                        id: attachmentID, url: url, type: type, name: name,
+                        id: attachmentID, url: url, readURL: readURL, type: type, name: name,
                         mime: mime, size: size
                     )
                 }
+                let notice = conversionNotice
+                let extras = extraPages
                 await MainActor.run { [weak self] in
-                    if isDirectory {
-                        self?.rejectComposerDirectoryAttachment(fileFallback, sessionID: sessionID)
-                    } else {
+                    do {
                         self?.applyComposerAttachmentResolution(
                             resolved, sessionID: sessionID,
                             initialReadyReference: fileFallback
                         )
+                        let landed = self?.pendingAttachmentsBySessionID[sessionID]?.contains(where: { $0 == resolved }) == true
+                        // 重启后还原的音频：把上次存下的转写文字按路径接回，不重新转写。
+                        if landed, resolved.kind == .audio, resolved.audioTranscript == nil,
+                           let sessionID, let path = resolved.fileURL,
+                           let saved = self?.restoredAudioTranscriptsBySessionID[sessionID]?.removeValue(forKey: path) {
+                            _ = self?.mutatePendingAudio(id: resolved.id, sessionID: sessionID) { $0.audioTranscript = saved }
+                        }
+                        // 扫描件 PDF 的后续页图片紧跟在首页之后加入草稿。
+                        if landed, !extras.isEmpty {
+                            self?.insertComposerAttachments(extras, after: resolved.id, sessionID: sessionID)
+                        }
+                        // 转码提示只在结果真正落进草稿槽、且仍在原会话时显示。
+                        if let notice, self?.activeSessionID == sessionID, landed {
+                            self?.pastedTextActionFeedback = notice
+                        }
                     }
                     if self?.attachmentPreparationsBySessionID[sessionID]?[attachmentID]?.requestID == preparationID {
                         self?.attachmentPreparationsBySessionID[sessionID]?.removeValue(forKey: attachmentID)
@@ -2814,14 +4067,25 @@ final class ChatStore {
         return added
     }
 
-    private func rejectComposerDirectoryAttachment(_ original: ChatAttachment, sessionID: UUID?) {
+    /// 目录附件：只带路径的引用，类型标记为 inode/directory，发送时提示模型这是目录。
+    nonisolated static let directoryAttachmentMimeType = "inode/directory"
+
+    nonisolated static func directoryReference(id: UUID, url: URL, size: Int64?) -> ChatAttachment {
+        var path = url.path
+        while path.count > 1, path.hasSuffix("/") { path.removeLast() }
+        let name = (path as NSString).lastPathComponent
+        return ChatAttachment(id: id, kind: .file, fileName: name.isEmpty ? path : name, fileType: .unknown,
+                              mimeType: directoryAttachmentMimeType, size: nil, fileURL: path)
+    }
+
+    /// 把一批附件插到指定附件之后（用于扫描件 PDF 的多页图片）。
+    func insertComposerAttachments(_ extras: [ChatAttachment], after anchorID: UUID, sessionID: UUID?) {
         guard var attachments = pendingAttachmentsBySessionID[sessionID],
-              let index = attachments.firstIndex(where: { $0 == original }) else { return }
-        attachments.remove(at: index)
+              let index = attachments.firstIndex(where: { $0.id == anchorID }) else { return }
+        let existing = Set(attachments.map(\.id))
+        attachments.insert(contentsOf: extras.filter { !existing.contains($0.id) }, at: index + 1)
         pendingAttachmentsBySessionID[sessionID] = attachments
-        if activeSessionID == sessionID {
-            pastedTextActionFeedback = "文件夹不能作为附件，请选择文件或先压缩文件夹。"
-        }
+        persistPendingAttachmentReferences(sessionID: sessionID)
     }
 
     /// PDF bytes are read off the main actor through a capped stream. Metadata
@@ -2853,48 +4117,100 @@ final class ChatStore {
     /// Resolves only the pending draft slot owned by the original session.
     /// The extracted page text is frozen into `data`; neither later provider
     /// changes nor late callbacks can reinterpret an already sent PDF.
+    /// 扫描件 PDF 最多渲染成图片的页数（超出的页让模型用 file_read 的 page_start 续读）。
+    nonisolated static let scannedPDFMaxRenderedPages = 10
+
     private nonisolated static func resolvePDFAttachment(
-        id: UUID, url: URL, type: FileType, name: String,
+        id: UUID, url: URL, readURL: URL, type: FileType, name: String,
         size: Int64?, read: PDFAttachmentReadResult
-    ) -> ChatAttachment {
-        func failed(_ reason: String) -> ChatAttachment {
+    ) -> (attachment: ChatAttachment, extraPages: [ChatAttachment], notice: String?) {
+        func failedAttachment(_ reason: String) -> ChatAttachment {
             ChatAttachment(id: id, kind: .file, fileName: name, fileType: type,
                            mimeType: "application/pdf", size: size, fileURL: url.path,
                            status: .failed, failureReason: reason)
         }
+        func failed(_ reason: String) -> (attachment: ChatAttachment, extraPages: [ChatAttachment], notice: String?) {
+            (failedAttachment(reason), [], nil)
+        }
+        // 超过提取上限：不标失败，直接降为路径引用，模型可用 file_read 的 page_start 按页读取。
+        func pdfTooLargeReference() -> (attachment: ChatAttachment, extraPages: [ChatAttachment], notice: String?) {
+            let limitMB = MediaConversion.defaultMaxPDFInputBytes / 1024 / 1024
+            let reference = ChatAttachment(
+                id: id, kind: .file, fileName: name, fileType: type,
+                mimeType: "application/pdf", size: size, fileURL: url.path)
+            return (reference, [], "\(name) 超过 \(limitMB) MB 提取上限，已改为路径引用；模型可用 file_read 的 page_start 按页读取。")
+        }
         switch read {
         case .tooLarge:
-            return failed("PDF 超过 \(MediaConversion.defaultMaxPDFInputBytes / 1024 / 1024) MB 提取上限")
+            return pdfTooLargeReference()
         case .unreadable:
             return failed("PDF 文件读取失败")
         case .bytes(let bytes):
             // Fail closed if a future refactor calls this worker on the UI
             // thread: PDFKit must never decode as part of MainActor commit.
             guard !Thread.isMainThread else { return failed("PDF 后台解析不可用") }
+            if MediaConversion.isPasswordProtectedPDF(bytes) {
+                return failed("PDF 受密码保护，无法读取内容；请先在 PDF 阅读器里去掉密码再添加")
+            }
             switch MediaConversion.extractPDFPages(bytes) {
             case .failure(.emptyResult):
-                return failed("PDF 已检查范围内没有可提取文本（最多 \(MediaConversion.defaultMaxPDFPages) 页，可能是扫描件）")
+                // 没有文字层：多半是扫描件。把前几页渲染成图片走图片通道；
+                // 模型不支持图片时，发送前会自动改成路径引用（见 adaptingVideo）。
+                let rendered = (try? MediaConversion.renderPDFPagesAsImages(
+                    url: readURL, maxPages: scannedPDFMaxRenderedPages, maxLongEdge: uploadImageMaxPixel)) ?? []
+                var pages: [ChatAttachment] = []
+                for (index, page) in rendered.enumerated() {
+                    var pageData = page.data
+                    var pageMime = page.mimeType
+                    if pageData.count > maxUploadImageBytes,
+                       case .success(let converted) = MediaConversion.convertImageForUpload(
+                           pageData, maxBytes: maxUploadImageBytes, maxPixel: uploadImageMaxPixel) {
+                        pageData = converted.data
+                        pageMime = converted.mimeType
+                    }
+                    guard pageData.count <= maxUploadImageBytes else { continue }
+                    pages.append(ChatAttachment.fromBackgroundBinaryRead(
+                        id: index == 0 ? id : UUID(), kind: .image, fileName: "\(name) 第\(page.page)页",
+                        fileType: .image, mimeType: pageMime, size: Int64(pageData.count),
+                        data: pageData, fileURL: url.path))
+                }
+                guard let first = pages.first else {
+                    return failed("PDF 没有文字层（可能是扫描件），页面也无法转成图片；可改为路径引用，或先用 OCR 工具处理")
+                }
+                let notice = "\(name) 没有文字层（可能是扫描件），已把前 \(pages.count) 页转成图片；需要支持图片的模型，其余页可让模型用 file_read（as_images=true，page_start 指定起始页）继续看。"
+                return (first, Array(pages.dropFirst()), notice)
             case .failure(.sourceTooLarge):
-                return failed("PDF 超过 \(MediaConversion.defaultMaxPDFInputBytes / 1024 / 1024) MB 提取上限")
+                return pdfTooLargeReference()
             case .failure:
                 return failed("PDF 文件无法解析")
             case .success(let extraction):
-                let scope = extraction.isTruncated ? "仅包含有界提取结果，后续页或文字未发送" : "已检查全部页面的文本层"
+                var scope = extraction.isTruncated
+                    ? "仅包含有界提取结果，后续页或文字未发送；可用 file_read 的 page_start=\(extraction.inspectedPageCount) 续读"
+                    : "已检查全部页面的文本层"
+                let withText = Set(extraction.pages.map(\.pageNumber))
+                let blank = (1...max(1, extraction.inspectedPageCount)).filter { !withText.contains($0) }
+                if !blank.isEmpty {
+                    let listed = blank.prefix(10).map(String.init).joined(separator: "、")
+                    scope += "；第 \(listed) 页\(blank.count > 10 ? "等" : "")没有文字层（空白页或扫描页），未提取"
+                }
                 let header = "PDF 文本层；原始文件 \(bytes.count) 字节；共 \(extraction.totalPageCount) 页，检查 \(extraction.inspectedPageCount) 页；\(scope)。"
                 let pageText = extraction.pages.map { "[原文第 \($0.pageNumber) 页]\n\($0.text)" }
                     .joined(separator: "\n\n")
                 let body = "\(header)\n\n\(pageText)"
-                return ChatAttachment(id: id, kind: .text, fileName: name, fileType: type,
-                                      mimeType: "application/pdf", size: Int64(bytes.count),
-                                      data: Data(body.utf8), fileURL: url.path)
+                return (ChatAttachment(id: id, kind: .text, fileName: name, fileType: type,
+                                       mimeType: "application/pdf", size: Int64(bytes.count),
+                                       data: Data(body.utf8), fileURL: url.path), [],
+                        blank.isEmpty ? nil
+                            : "\(name) 有 \(blank.count) 页没有文字层（空白页或扫描页），这些页的内容没有提取；需要时可让模型用 file_read（as_images=true，page_start 指定页）按页看图。")
             }
         }
     }
 
-    /// The caller selects three evenly spaced interior moments. These are
+    /// The caller selects evenly spaced interior moments (about one per ten
+    /// seconds, three at minimum). These are
     /// sampling choices for this stage, not a claim about frames the decoder
     /// actually returned: the Core result carries the actual presentation
-    /// time and rejects duplicate/partial batches.
+    /// time, skips a repeated actual frame (still pictures) and rejects failed batches.
     nonisolated static func resolveVideoAttachment(
         id: UUID,
         url: URL,
@@ -2911,21 +4227,21 @@ final class ChatStore {
             try Task.checkCancellation()
             let duration = try await source.durationSeconds()
             guard duration.isFinite, duration > 0 else { return fallback }
-            let requestedTimes = [1.0 / 6.0, 0.5, 5.0 / 6.0].map { duration * $0 }
+            let frameCount = videoFrameCountFor(duration: duration)
+            let requestedTimes = videoFrameTimes(duration: duration, count: frameCount)
             let limits = MediaVideoExtractionLimits(
-                maxFrameCount: videoFrameCount,
+                maxFrameCount: frameCount,
                 maxPixelSize: videoMaxPixelSize,
-                maxOutputBytes: videoMaxOutputBytes
+                maxOutputBytes: videoMaxFramesBytes
             )
             let result = await MediaVideoExtraction.extractFrames(
                 from: source, requestedTimes: requestedTimes, limits: limits
             )
             guard case .success(let frames) = result,
-                  frames.count == requestedTimes.count else { return fallback }
-            let remaining = videoMaxOutputBytes - frames.reduce(0) { $0 + $1.pngData.count }
-            let context = await source.supplementaryContext(maxOutputBytes: remaining)
+                  !frames.isEmpty, frames.count <= requestedTimes.count else { return fallback }
+            let context = await source.supplementaryContext(maxOutputBytes: videoMaxOutputBytes)
             try Task.checkCancellation()
-            if let context, !context.isValid(maxOutputBytes: remaining) { return fallback }
+            if let context, !context.isValid(maxOutputBytes: videoMaxOutputBytes) { return fallback }
             return ChatAttachment(
                 id: id, kind: .file, fileName: name, fileType: .video,
                 mimeType: mime, size: size, fileURL: url.path,
@@ -2936,9 +4252,10 @@ final class ChatStore {
         }
     }
 
-    /// 后台线程安全地读文件构造附件：数据读取不触碰主线程；失败/超限/未知二进制 → file 引用。
+    /// 后台线程安全地读文件构造附件：数据读取不触碰主线程；失败/超限/未知二进制 → 失败态（可改为路径引用）。
+    /// `url` 是用户给的原路径（写入附件的 fileURL）；`readURL` 是符号链接/别名解析后的真实读取位置。
     private nonisolated static func readAttachmentDataOffMain(
-        id: UUID, url: URL, type: FileType, name: String, mime: String?, size: Int64?
+        id: UUID, url: URL, readURL: URL, type: FileType, name: String, mime: String?, size: Int64?
     ) -> ChatAttachment {
         // 拖放/面板 URL 可能是 security-scoped：读取期间保持访问权
         let scoped = url.startAccessingSecurityScopedResource()
@@ -2950,39 +4267,421 @@ final class ChatStore {
         }
         switch type {
         case .image, .audio:
-            guard let data = try? Data(contentsOf: url) else {
-                return failed("无法读取此附件，请检查文件权限后重新添加。")
-            }
-            guard data.count <= Self.maxBinaryAttachmentBytes else {
-                return failed("附件超过25MB，请压缩文件或选择较小的文件后重新添加。")
-            }
-            return ChatAttachment.fromBackgroundBinaryRead(id: id, kind: type == .image ? .image : .audio,
-                fileName: name, fileType: type, mimeType: mime,
-                size: size, data: data, fileURL: url.path)
+            // 图片与音频由 resolveImageAttachmentOffMain / resolveAudioAttachmentOffMain 处理（含转码）。
+            return failed("无法读取此附件")
         case .text, .markdown, .json:
-            guard let data = try? Data(contentsOf: url) else {
-                return failed("无法读取此附件，请检查文件权限后重新添加。")
+            guard let read = Self.readLeadingBytes(url: readURL, maxBytes: Self.maxTextAttachmentReadBytes) else {
+                return failed("无法读取此附件（请检查文件权限）")
             }
-            guard let text = String(data: data, encoding: .utf8) else {
-                return failed("文本不是UTF-8编码，请转换为UTF-8后重新添加。")
+            guard let text = Self.decodeTextAttachmentBytes(read.data, truncated: read.truncated) else {
+                return failed("文本编码无法识别（已尝试 UTF-8 与 GB18030）")
             }
-            let capped = text.count > Self.maxTextAttachmentChars
-                ? String(text.prefix(Self.maxTextAttachmentChars)) : text
+            let total = read.truncated
+                ? Self.estimatedTextCharacterCount(
+                    decodedCount: text.count, readBytes: read.data.count, fileSize: size)
+                : text.count
+            // 文件超过读入上限时再读文件末尾，开头和结尾都给模型（中间部分让模型用 file_read 续读）。
+            let tailText = read.truncated ? Self.readTrailingText(url: readURL) : nil
+            let capped = Self.capTextForInjection(
+                text, sourceWasTruncated: read.truncated, estimatedTotalCharacters: total,
+                sourcePath: url.path, tailText: tailText)
             return ChatAttachment(id: id, kind: .text, fileName: name, fileType: type,
                 mimeType: mime, size: size, data: Data(capped.utf8), fileURL: url.path,
-                originalTextCharacterCount: text.count)
+                originalTextCharacterCount: total)
         case .video, .unknown:
-            return failed("无法读取此附件，请移除后重新添加。")
+            return failed("无法读取此附件")
         }
+    }
+
+    /// 图片：PNG/JPEG/WebP 且不超过 5 MB 原样放行；其余（HEIC、GIF 首帧、TIFF、BMP、AVIF 或体积超限）
+    /// 在后台转码为 PNG/JPEG，长边不超过 2000。转换失败给出中文原因（可改为路径引用）。
+    private nonisolated static func resolveImageAttachmentOffMain(
+        id: UUID, url: URL, readURL: URL, name: String, mime: String?, size: Int64?
+    ) -> (attachment: ChatAttachment, notice: String?) {
+        func failed(_ reason: String) -> (attachment: ChatAttachment, notice: String?) {
+            (ChatAttachment(id: id, kind: .file, fileName: name, fileType: .image,
+                mimeType: mime, size: size, fileURL: url.path, status: .failed, failureReason: reason), nil)
+        }
+        // 超过 25 MB 也先尝试转码缩小；只有源文件大到无法读入内存才直接拒绝。
+        let sourceLimitText = "\(maxSourceImageBytes / 1024 / 1024) MB"
+        if let size, size > Int64(maxSourceImageBytes) { return failed("图片文件超过 \(sourceLimitText)，无法处理") }
+        // 不用内存映射：源文件之后被原地改写（cp、重定向、ffmpeg 覆盖）会让映射的字节变掉甚至崩溃。
+        guard let data = try? Data(contentsOf: readURL) else {
+            return failed("无法读取此附件（请检查文件权限）")
+        }
+        guard data.count <= maxSourceImageBytes else { return failed("图片文件超过 \(sourceLimitText)，无法处理") }
+        // 体积不大但长边超过 2000 的 PNG/JPEG/WebP 也要转码（视网膜屏截图正是这种），
+        // 否则一次请求超过 20 张图时会被线路拒收。
+        let pixelsTooLarge = MediaConversion.imagePixelSize(data).map {
+            MediaConversion.imageExceedsPassThroughPixels(
+                width: $0.width, height: $0.height, maxLongEdge: uploadImageMaxPixel)
+        } ?? false
+        // 以文件头为准：扩展名改错（.jpg 实为 WebP 等）时按真实格式放行；文件头认不出（GIF、HEIC、AVIF 等）
+        // 不再信扩展名，一律走下面的转码。
+        if let actualMime = MediaPayloadValidation.sniffedImageMIME(data),
+           imagePassThroughMIMETypes.contains(actualMime.lowercased()),
+           data.count <= maxUploadImageBytes, !pixelsTooLarge {
+            return (ChatAttachment.fromBackgroundBinaryRead(id: id, kind: .image, fileName: name,
+                fileType: .image, mimeType: actualMime, size: size, data: data, fileURL: url.path), nil)
+        }
+        switch MediaConversion.convertImageForUpload(
+            data, maxBytes: maxUploadImageBytes, maxPixel: uploadImageMaxPixel
+        ) {
+        case .success(let converted):
+            let label = converted.mimeType == "image/png" ? "PNG" : "JPEG"
+            let notice = "已将 \(name) 自动转换为 \(label)（\(formatByteCount(Int64(data.count))) → "
+                + "\(formatByteCount(Int64(converted.data.count)))），原文件不变。"
+                + (imageFrameCount(data) > 1 ? "这是动图，只取首帧。" : "")
+            return (ChatAttachment.fromBackgroundBinaryRead(id: id, kind: .image, fileName: name,
+                fileType: .image, mimeType: converted.mimeType, size: Int64(converted.data.count),
+                data: converted.data, fileURL: url.path), notice)
+        case .failure(let failure):
+            return failed(imageConversionFailureReason(failure))
+        }
+    }
+
+    /// 按实际图像数据数帧（不信扩展名）；多帧的动图转码只取首帧。
+    nonisolated static func imageFrameCount(_ data: Data) -> Int {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return 0 }
+        return CGImageSourceGetCount(source)
+    }
+
+    nonisolated static func imageConversionFailureReason(_ failure: MediaConversionFailure) -> String {
+        switch failure {
+        case .undecodableSource: return "图片格式不是 PNG、JPEG 或 WebP，且自动转换失败（文件可能已损坏或系统无法解码）"
+        case .outputTooLarge: return "图片自动转换后仍超过 3.75 MB（按 base64 编码后约 5 MB），已无法继续压缩"
+        default: return "图片格式不是 PNG、JPEG 或 WebP，且自动转换失败"
+        }
+    }
+
+    /// 音频：WAV/MP3 原样放行；m4a/aac/flac/aiff/caf 等转为 16 kHz 单声道 WAV；ogg 等无法转换。
+    private nonisolated static func resolveAudioAttachmentOffMain(
+        id: UUID, url: URL, readURL: URL, name: String, mime: String?, size: Int64?
+    ) async -> (attachment: ChatAttachment, notice: String?) {
+        func failed(_ reason: String) -> (attachment: ChatAttachment, notice: String?) {
+            (ChatAttachment(id: id, kind: .file, fileName: name, fileType: .audio,
+                mimeType: mime, size: size, fileURL: url.path, status: .failed, failureReason: reason), nil)
+        }
+        // WAV/MP3 超过 25 MB 时不直接失败，转成 16 kHz 单声道 WAV 后再判断大小。
+        let withinCap = size.map { $0 <= Int64(maxBinaryAttachmentBytes) } ?? true
+        if withinCap, let mime, audioPassThroughMIMETypes.contains(mime.lowercased()) {
+            guard let data = try? Data(contentsOf: readURL) else {
+                return failed("无法读取此附件（请检查文件权限）")
+            }
+            // 以字节结构为准：声明的扩展名与真实容器不符（.wav 实为 MP3）时按真实格式放行；
+            // 结构校验不过（带尾部杂数据的 WAV 等）则落到下面的转码。
+            if data.count <= maxBinaryAttachmentBytes,
+               let actualMime = MediaPayloadValidation.sniffedAudioMIME(data) {
+                return (ChatAttachment.fromBackgroundBinaryRead(id: id, kind: .audio, fileName: name,
+                    fileType: .audio, mimeType: actualMime, size: size, data: data, fileURL: url.path), nil)
+            }
+        }
+        // 转码上限放宽到 100 MB：长录音不能直发给模型，但本机转写不受云端 25 MB 上限限制；
+        // 模型原生收音频时仍由发送前校验按 25 MB 拦截。
+        switch await MediaConversion.convertAudioToWAV(fileURL: readURL, maxBytes: maxTranscribableAudioBytes) {
+        case .success(let wav):
+            let notice = "已将 \(name) 自动转换为 WAV（16 kHz 单声道，\(formatByteCount(Int64(wav.count)))），原文件不变。"
+            return (ChatAttachment.fromBackgroundBinaryRead(id: id, kind: .audio, fileName: name,
+                fileType: .audio, mimeType: "audio/wav", size: Int64(wav.count),
+                data: wav, fileURL: url.path), notice)
+        case .failure(let failure):
+            return failed(audioConversionFailureReason(failure))
+        }
+    }
+
+    nonisolated static func audioConversionFailureReason(_ failure: MediaConversionFailure) -> String {
+        switch failure {
+        case .unsupportedFormat: return "该音频格式（如 ogg、opus）无法转换"
+        case .undecodableSource: return "音频格式不是 WAV 或 MP3，且自动转换失败（文件可能已损坏或系统无法解码）"
+        case .outputTooLarge: return "音频转换为 WAV 后超过 100 MB（约 50 分钟，音频过长）"
+        default: return "音频格式不是 WAV 或 MP3，且自动转换失败"
+        }
+    }
+
+    /// docx/doc/rtf/rtfd/odt/html/htm：整读（上限 32 MB）后在后台提取纯文本，按文本附件注入。
+    private nonisolated static func resolveRichDocumentAttachment(
+        id: UUID, url: URL, readURL: URL, name: String, size: Int64?
+    ) -> ChatAttachment {
+        func failed(_ reason: String) -> ChatAttachment {
+            ChatAttachment(id: id, kind: .file, fileName: name, fileType: .text,
+                mimeType: nil, size: size, fileURL: url.path, status: .failed, failureReason: reason)
+        }
+        let limitMB = maxRichDocumentReadBytes / 1024 / 1024
+        if let size, size > Int64(maxRichDocumentReadBytes) { return failed("文档超过 \(limitMB) MB") }
+        guard let read = readLeadingBytes(url: readURL, maxBytes: maxRichDocumentReadBytes) else {
+            return failed("无法读取此附件（请检查文件权限）")
+        }
+        guard !read.truncated else { return failed("文档超过 \(limitMB) MB") }
+        switch MediaConversion.extractRichDocumentText(
+            read.data, fileExtension: url.pathExtension, maxCharacters: maxTextAttachmentChars
+        ) {
+        case .success(let extracted):
+            let body = extracted.truncated
+                ? extracted.text + "\n\n\(richDocumentTruncationNoteMarker)\(extracted.text.count) 字，其余未提取。]"
+                : extracted.text
+            return ChatAttachment(id: id, kind: .text, fileName: name, fileType: .text,
+                mimeType: extractedDocumentMimeType, size: size, data: Data(body.utf8), fileURL: url.path)
+        case .failure(let failure):
+            return failed(richDocumentFailureReason(failure))
+        }
+    }
+
+    nonisolated static func richDocumentFailureReason(_ failure: MediaConversionFailure) -> String {
+        switch failure {
+        case .emptyResult: return "文档中没有可提取的文字"
+        case .unsupportedFormat: return "该文档格式无法提取文字"
+        default: return "文档无法解析（文件可能已损坏或受密码保护）"
+        }
+    }
+
+    /// 符号链接与 Finder 别名：返回真实读取位置。非别名文件原样返回（resolvingAlias 抛错即忽略）。
+    nonisolated static func resolvedAttachmentSourceURL(_ url: URL) -> URL {
+        var target = url.resolvingSymlinksInPath()
+        if let alias = try? URL(resolvingAliasFileAt: target, options: [.withoutUI]) {
+            target = alias.resolvingSymlinksInPath()
+        }
+        return target
+    }
+
+    /// 读文件开头至多 maxBytes 字节；文件更长时 truncated 为真（多读 1 字节判断，返回内容仍是 maxBytes）。
+    nonisolated static func readLeadingBytes(url: URL, maxBytes: Int) -> (data: Data, truncated: Bool)? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var bytes = Data()
+        do {
+            while bytes.count <= maxBytes {
+                guard let chunk = try handle.read(upToCount: maxBytes + 1 - bytes.count),
+                      !chunk.isEmpty else { break }
+                bytes.append(chunk)
+            }
+        } catch {
+            return nil
+        }
+        guard bytes.count > maxBytes else { return (bytes, false) }
+        return (Data(bytes.prefix(maxBytes)), true)
+    }
+
+    /// 读文件末尾约 48 KB 并解码（开头可能落在多字节字符中间，逐字节丢弃至多 3 个再解码）。
+    nonisolated static func readTrailingText(url: URL, maxBytes: Int = 48 * 1024) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd(), end > 0 else { return nil }
+        let start = end > UInt64(maxBytes) ? end - UInt64(maxBytes) : 0
+        guard (try? handle.seek(toOffset: start)) != nil,
+              let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+        for dropped in 0...3 where data.count > dropped {
+            if let text = decodeTextAttachmentBytes(Data(data.dropFirst(dropped)), truncated: false) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    /// 未知类型文件：常规文件、扩展名允许嗅探、前 8 KB 非空且无 NUL 且是合法 UTF-8。
+    private nonisolated static func sniffsAsUTF8Text(
+        url: URL, readURL: URL, attrs: [FileAttributeKey: Any]?
+    ) -> Bool {
+        guard FileImporter.allowsTextSniffing(forExtension: url.pathExtension),
+              (attrs?[.type] as? FileAttributeType).map({ $0 == .typeRegular }) ?? false,
+              let head = readLeadingBytes(url: readURL, maxBytes: textSniffByteCount) else { return false }
+        return FileImporter.looksLikeUTF8Text(head.data, truncated: head.truncated)
+    }
+
+    /// UTF-8 优先；失败再试 GB18030（覆盖 GBK/GB2312）。字节被截断时允许末尾不完整字符。
+    nonisolated static func decodeTextAttachmentBytes(_ data: Data, truncated: Bool) -> String? {
+        // 带 BOM 的 UTF-16 按 BOM 解码。
+        if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
+            if let text = String(data: data, encoding: .utf16) { return text }
+        }
+        if let text = FileImporter.utf8DecodedAllowingTruncatedTail(data, truncated: truncated) { return text }
+        // UTF-8 里只混了零星坏字节（混合编码的日志等）：宽松解码并替换坏字节，不整段改按 GB18030。
+        // 替换字符占比超过千分之一才认为不是 UTF-8，改试 GB18030。
+        let lenient = String(decoding: data, as: UTF8.self)
+        let scalarCount = lenient.unicodeScalars.count
+        let replacementCount = lenient.unicodeScalars.reduce(0) { $0 + ($1 == "\u{FFFD}" ? 1 : 0) }
+        if replacementCount <= max(1, scalarCount / 1000) { return lenient }
+        let gb18030 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+        if let text = String(data: data, encoding: gb18030) { return text }
+        guard truncated else { return nil }
+        for dropped in 1...3 where data.count > dropped {
+            if let text = String(data: data.prefix(data.count - dropped), encoding: gb18030) { return text }
+        }
+        return nil
+    }
+
+    /// 只读了文件开头时，按已解码字数与字节比例估算全文字数（至少不小于已解码字数）。
+    nonisolated static func estimatedTextCharacterCount(
+        decodedCount: Int, readBytes: Int, fileSize: Int64?
+    ) -> Int {
+        guard readBytes > 0, let fileSize, fileSize > Int64(readBytes) else { return decodedCount }
+        return max(decodedCount, Int((Double(decodedCount) * Double(fileSize) / Double(readBytes)).rounded()))
+    }
+
+    /// 超过 maxTextAttachmentChars 时保留开头 48000 字与结尾 12000 字，中间用一行说明；
+    /// 只读了文件开头（sourceWasTruncated）时无真实结尾，保留开头 60000 字并注明全文约多少字。
+    nonisolated static func capTextForInjection(
+        _ text: String, sourceWasTruncated: Bool = false, estimatedTotalCharacters: Int? = nil,
+        sourcePath: String? = nil, tailText: String? = nil
+    ) -> String {
+        let pathNote = sourcePath.map { "（\($0)）" } ?? ""
+        if sourceWasTruncated, let tailText, !tailText.isEmpty {
+            let head = String(text.prefix(textAttachmentHeadChars))
+            let tail = String(tailText.suffix(textAttachmentTailChars))
+            let total = max(estimatedTotalCharacters ?? text.count, head.count + tail.count)
+            let omitted = max(0, total - head.count - tail.count)
+            return head + "\n\n\(textOmissionNoteMarker)约 \(omitted) 字（全文约 \(total) 字，按文件大小估算），可用 file_read 按行续读原文件，或加 direction=tail 读文件末尾\(pathNote)。]\n\n" + tail
+        }
+        if sourceWasTruncated {
+            let head = String(text.prefix(maxTextAttachmentChars))
+            let total = max(estimatedTotalCharacters ?? text.count, text.count)
+            return head + "\n\n\(textHeadOnlyNoteMarker)，已注入前 \(head.count) 字，全文约 \(total) 字（按文件大小估算）；其余可用 file_read 按行续读原文件\(pathNote)。]"
+        }
+        guard text.count > maxTextAttachmentChars else { return text }
+        let head = String(text.prefix(textAttachmentHeadChars))
+        let tail = String(text.suffix(textAttachmentTailChars))
+        let omitted = text.count - head.count - tail.count
+        return head + "\n\n\(textOmissionNoteMarker)\(omitted) 字，可用 file_read 按行续读原文件\(pathNote)。]\n\n" + tail
+    }
+
+    /// 失败原因 + 下一步提示，单句收尾，不重复也不出现“。，”。
+    nonisolated static func composerBlockedReason(base: String, canReference: Bool) -> String {
+        let trimmed = base.trimmingCharacters(in: CharacterSet(charactersIn: "。.，, ；;"))
+        return canReference
+            ? "\(trimmed)；可改为路径引用，或移除后重新添加。"
+            : "\(trimmed)；请移除后重新添加。"
+    }
+
+    nonisolated static func composerFailedAttachmentReason(for attachment: ChatAttachment) -> String {
+        let canReference = attachment.fileURL != nil
+        if let reason = attachment.failureReason {
+            return composerBlockedReason(base: reason, canReference: canReference)
+        }
+        guard attachment.fileType == .video else {
+            return composerBlockedReason(base: "读取失败", canReference: canReference)
+        }
+        let ext = (attachment.fileName as NSString).pathExtension.lowercased()
+        if unsupportedVideoFrameExtensions.contains(ext) {
+            return canReference ? "该视频格式不支持抽帧，可改为路径引用。" : "该视频格式不支持抽帧，请移除后重新添加。"
+        }
+        return composerBlockedReason(base: "视频抽帧失败", canReference: canReference)
+    }
+
+    /// 失败/不可发送的附件改成只带路径的文件引用（同一 id，状态 ready）。没有路径则无法转换。
+    nonisolated static func pathReference(for attachment: ChatAttachment) -> ChatAttachment? {
+        guard let path = attachment.fileURL else { return nil }
+        let isPDF = (path as NSString).pathExtension.lowercased() == "pdf"
+        let mime = attachment.mimeType == directoryAttachmentMimeType
+            ? directoryAttachmentMimeType
+            : (isPDF ? "application/pdf" : "application/octet-stream")
+        // 扫描件 PDF 的页面图片文件名带“第N页”，改成路径引用后用原文件名。
+        let name = isPDF && attachment.kind == .image
+            ? (path as NSString).lastPathComponent : attachment.fileName
+        return ChatAttachment(
+            id: attachment.id, kind: .file, fileName: name, fileType: .unknown,
+            mimeType: mime, size: attachment.size, fileURL: path)
+    }
+
+    /// chip 上是否显示“改为路径引用”：已解析完（或失败）、有路径，且还不是单纯的路径引用。
+    /// 不再要求被发送门拦住：已就绪的文本/图片也可以主动改成只发路径。
+    nonisolated static func canConvertToPathReference(_ attachment: ChatAttachment) -> Bool {
+        attachment.fileURL != nil && attachment.status != .pending
+            && (attachment.status == .failed || attachment.kind != .file || attachment.videoFrames != nil)
+    }
+
+    /// chip 上的“改为路径引用”：处理已解析完的草稿附件（含已就绪的）。
+    @discardableResult
+    func convertPendingAttachmentToPathReference(id: UUID) -> Bool {
+        guard let index = pendingAttachments.firstIndex(where: { $0.id == id }),
+              Self.canConvertToPathReference(pendingAttachments[index]),
+              let reference = Self.pathReference(for: pendingAttachments[index]) else { return false }
+        pendingAttachments[index] = reference
+        pastedTextActionFeedback = nil
+        return true
+    }
+
+    /// 按回车被附件拦住时，把原因告诉用户（沿用 pastedTextActionFeedback 的提示位）。
+    func noteComposerSendBlockedByAttachments() {
+        guard let reason = composerAttachmentBlockReason else { return }
+        pastedTextActionFeedback = reason
+    }
+
+    /// 拖放入口：只接受本地文件；网页链接不作为附件，提示先保存到本地。
+    nonisolated static func partitionDroppedURLs(_ urls: [URL]) -> (files: [URL], webLinkCount: Int) {
+        let files = urls.filter(\.isFileURL)
+        return (files, urls.count - files.count)
+    }
+
+    /// 粘贴/拖入的图片：已有“图 N.png”的最大 N 加一（对齐 Claude Code 的 Image #N）。
+    nonisolated static func nextPastedImageNumber(existingFileNames: [String]) -> Int {
+        var maxNumber = 0
+        for name in existingFileNames where name.hasPrefix("图 ") && name.hasSuffix(".png") {
+            if let number = Int(name.dropFirst(2).dropLast(4)) { maxNumber = max(maxNumber, number) }
+        }
+        return maxNumber + 1
+    }
+
+    /// 剪贴板/浏览器拖拽写出的临时图片（PastedImages 目录）改名为“图 N.png”，模型文案里带序号。
+    private func numberingStagedPastedImages(_ files: [URL]) -> [URL] {
+        let marker = "/MinisCanvas/ChatAttachments/PastedImages/"
+        guard files.contains(where: { $0.path.contains(marker) }) else { return files }
+        var names = pendingAttachments.map(\.fileName)
+        if let session = sessions.first(where: { $0.id == activeSessionID }) {
+            names += session.messages.flatMap { $0.attachments.map(\.fileName) }
+        }
+        var next = Self.nextPastedImageNumber(existingFileNames: names)
+        return files.map { url in
+            guard url.path.contains(marker) else { return url }
+            let target = url.deletingLastPathComponent().appendingPathComponent("图 \(next).png", isDirectory: false)
+            guard (try? FileManager.default.moveItem(at: url, to: target)) != nil else { return url }
+            next += 1
+            return target
+        }
+    }
+
+    func noteComposerInputFeedback(_ text: String) { pastedTextActionFeedback = text }
+
+    /// 粘贴、拖放（主输入框、侧栏、文字区）统一的落地函数。返回是否接收了至少一个本地文件。
+    @discardableResult
+    func addDroppedURLs(_ urls: [URL]) -> Bool {
+        let (files, webLinkCount) = Self.partitionDroppedURLs(urls)
+        if files.isEmpty, webLinkCount > 0 {
+            // 只拖入了网页链接：和 Claude Code 一样把链接当文字放进输入框（不联网读取）。
+            let links = urls.filter { !$0.isFileURL }.map(\.absoluteString).joined(separator: "\n")
+            draftText += (draftText.isEmpty || draftText.hasSuffix("\n") || draftText.hasSuffix(" ") ? "" : " ") + links
+            pastedTextActionFeedback = "已把链接作为文字放进输入框；需要文件内容时请先保存到本地再拖入。"
+            return true
+        }
+        if webLinkCount > 0 { pastedTextActionFeedback = "请先把网页上的文件保存到本地再拖入" }
+        guard !files.isEmpty else { return false }
+        addAttachments(urls: numberingStagedPastedImages(files))
+        return true
     }
 
 
     func removePendingAttachment(id: UUID) {
+        cancelAudioTranscription(id: id)
+        cancelAttachmentTextRecognition(id: id)
         pendingAttachments.removeAll { $0.id == id }
     }
 
     func clearPendingAttachments() {
+        for id in Array(audioTranscriptionRuns.keys) { cancelAudioTranscription(id: id) }
+        for id in Array(attachmentTextRecognitionRuns.keys) { cancelAttachmentTextRecognition(id: id) }
         pendingAttachments = []
+    }
+
+    /// 修改指定会话草稿里的某个音频附件（转写结果写回、用户改字）；附件已不在草稿里返回 false。
+    @discardableResult
+    func mutatePendingAudio(id: UUID, sessionID: UUID?, _ body: (inout ChatAttachment) -> Void) -> Bool {
+        guard var attachments = pendingAttachmentsBySessionID[sessionID],
+              let index = attachments.firstIndex(where: { $0.id == id }),
+              attachments[index].kind == .audio else { return false }
+        body(&attachments[index])
+        pendingAttachmentsBySessionID[sessionID] = attachments
+        // 转写文字也要进草稿持久化（防抖写盘），重启后才不会丢。
+        persistPendingAttachmentReferences(sessionID: sessionID)
+        return true
     }
 
     /// Keep the sent attachment and its bytes in the original UI/durable
@@ -3017,6 +4716,17 @@ final class ChatStore {
     /// The current submission (including an explicit retry) may use its own
     /// media. Later turns retain the original text/UI record but never replay
     /// another turn's unfinished or failed media payload by accident.
+    /// 把其它会话的回复作为数据附在最后一条用户消息末尾（只影响发给模型的副本）。
+    static func historyAppendingSessionReplies(
+        _ history: [ChatMessageUI], replyText: String?
+    ) -> [ChatMessageUI] {
+        guard let replyText, !replyText.isEmpty,
+              let index = history.lastIndex(where: { $0.role == .user }) else { return history }
+        var result = history
+        result[index].content += "\n\n" + SessionMessagingHub.replyContextHeader + "\n" + replyText
+        return result
+    }
+
     static func providerHistoryExcludingQuarantinedMedia(
         _ history: [ChatMessageUI], currentMediaSourceMessageID: UUID
     ) -> [ChatMessageUI] {
@@ -3072,15 +4782,26 @@ final class ChatStore {
             case .text:
                 textSourceCount += 1
                 let body = att.data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                if att.mimeType == audioTranscriptMimeType || att.mimeType == imageTextMimeType {
+                    parts.append(body)
+                    continue
+                }
                 if att.mimeType?.lowercased() == "application/pdf" {
                     var block = "我上传了 PDF 文件 \(att.fileName)（仅包含提取的文本层，不含原生 PDF 或页面图片）：\n\(body)"
                     if let path = att.fileURL { block += "\n\n（来源路径：\(path)。）" }
                     parts.append(block)
                     continue
                 }
+                if att.mimeType == extractedDocumentMimeType {
+                    // 二进制文档（docx 等）file_read 读不了，不提示读原文件；截断说明已在正文末尾。
+                    var block = "我上传了文档 \(att.fileName)（已提取为纯文本，不含图片和排版）：\n\(body)"
+                    if let path = att.fileURL { block += "\n\n（来源路径：\(path)。）" }
+                    parts.append(block)
+                    continue
+                }
                 var block = "我上传了文件 \(att.fileName)：\n\(body)"
                 if let path = att.fileURL {
-                    block += "\n\n（文件路径：\(path)。内容已截断时可用 file_read 工具读取全文。）"
+                    block += "\n\n（文件路径：\(path)。内容已截断时可用 file_read 工具按行续读（offset 为起始行号）读取全文。）"
                 }
                 parts.append(block)
             case .file:
@@ -3091,19 +4812,41 @@ final class ChatStore {
                     continue
                 }
                 if att.fileType == .video {
-                    parts.append("我上传了视频 \(att.fileName)，这里只保留文件引用；没有解析或发送视频画面，不能认为已看过视频。")
+                    var block = "我上传了视频 \(att.fileName)，这里只保留文件引用；没有解析或发送视频画面，不能认为已看过视频。"
+                    if let path = att.fileURL {
+                        block += "\n路径 \(path)\n（可用 shell 命令处理，例如 ffmpeg 抽帧或提取音轨后再查看。）"
+                    }
+                    parts.append(block)
+                    continue
+                }
+                if att.mimeType == directoryAttachmentMimeType {
+                    var block = "我提供了目录 \(att.fileName)"
+                    if let path = att.fileURL {
+                        block += "：\n路径 \(path)\n（这是目录，不是文件；可用 file_glob 或 shell 的 ls 查看里面的内容，再用 file_read 读取需要的文件。）"
+                    }
+                    parts.append(block)
                     continue
                 }
                 var block = "我上传了文件 \(att.fileName)"
                 if let size = att.size { block += "（\(formatByteCount(size))）" }
                 if let path = att.fileURL {
-                    block += "：\n路径 \(path)\n（可用 file_read 工具读取该文件。）"
+                    block += "：\n路径 \(path)\n" + pathReferenceHint(fileName: att.fileName)
                 }
                 parts.append(block)
             case .image:
-                parts.append("我上传了图片 \(att.fileName)（已随消息附加，请查看）。")
+                // 带上来源路径：历史里较早的图片会因预算被省略，模型凭路径可以用 file_read 重新看。
+                let sourcePath = att.fileURL.map { "来源路径：\($0)" }
+                if isScannedPDFPageImage(att) {
+                    parts.append("我上传了图片 \(att.fileName)（扫描件 PDF 的页面，已随消息附加，请查看；该 PDF 只附带了前几页，更多页请用 file_read 并设置 as_images=true、page_start 指定起始页"
+                        + (sourcePath.map { "；\($0)" } ?? "") + "）。")
+                } else {
+                    parts.append("我上传了图片 \(att.fileName)（已随消息附加，请查看"
+                        + (sourcePath.map { "；\($0)" } ?? "") + "）。")
+                }
             case .audio:
-                parts.append("我上传了音频 \(att.fileName)（已随消息附加，请收听）。")
+                // 带上来源路径：历史里较早的音频会因预算被省略，路径能帮助定位要请用户重新添加的是哪一段。
+                parts.append("我上传了音频 \(att.fileName)（已随消息附加，请收听"
+                    + (att.fileURL.map { "；来源路径：\($0)" } ?? "") + "）。")
             }
         }
         let content = parts.joined(separator: "\n\n")
@@ -3131,6 +4874,36 @@ final class ChatStore {
             attachmentParts: attachmentParts
         )
         return (content, ownership, textSourceCount)
+    }
+
+    /// 路径引用附件给模型的读取提示：二进制 Office 文件与未识别格式 file_read 读不了，要如实说明。
+    nonisolated static func pathReferenceHint(fileName: String) -> String {
+        let ext = (fileName as NSString).pathExtension.lowercased()
+        let lowerName = fileName.lowercased()
+        if ext == "zip" || ext == "jar" {
+            return "（这是压缩包，file_read 无法直接读取；可用 shell 命令 unzip -l 查看内容清单，需要某个文件时再 unzip -p 或解压到临时目录后读取。不会自动解压。）"
+        }
+        if ["tar", "tgz", "gz", "bz2", "xz", "7z", "rar"].contains(ext) || lowerName.hasSuffix(".tar.gz") {
+            return "（这是压缩包，file_read 无法直接读取；可用 shell 命令查看内容清单（tar -tf、7z l 等），需要某个文件时再解压到临时目录后读取。不会自动解压。）"
+        }
+        if ext == "xlsx" {
+            return "（这是二进制 Office 文件，file_read 无法直接读取；可用 shell 命令转换：xlsx 本身是压缩包，可先 unzip -l 查看结构，再 unzip -p 读取 xl/sharedStrings.xml（文字）和 xl/worksheets/sheet1.xml（单元格），或用 python 的 openpyxl 读取。）"
+        }
+        if ext == "pptx" {
+            return "（这是二进制 Office 文件，file_read 无法直接读取；可用 shell 命令转换：pptx 本身是压缩包，可先 unzip -l 查看结构，再 unzip -p 读取 ppt/slides/slide1.xml 等幻灯片文字。）"
+        }
+        if binaryOfficeExtensions.contains(ext) {
+            return "（这是二进制 Office 文件，file_read 无法直接读取；可用 shell 命令转换，例如 textutil 处理 docx/doc/rtf/odt，xlsx/pptx 可先 unzip 再读取其中的 XML。）"
+        }
+        if ext == "pdf" {
+            return "（这是 PDF：可用 file_read 读取其文字层，用 page_start / page_count 按页续读；扫描件没有文字层时，请给 file_read 设置 as_images=true，并用 page_start 指定起始页，按页渲染成图片查看，需要支持图片的模型；若提示受密码保护，需先解除密码。）"
+        }
+        switch FileImporter.type(forExtension: ext) {
+        case .text, .markdown, .json:
+            return "（可用 file_read 工具读取该文件。）"
+        default:
+            return "（该文件不是已识别的文本格式，file_read 可能无法直接读取；可用 shell 命令查看或转换。）"
+        }
     }
 
     /// 字节数 → 人类可读（如 1.5 MB）
@@ -3166,6 +4939,8 @@ final class ChatStore {
     private var compactionJudgedRevision: [UUID: UInt64] = [:]
     /// C7：本会话已提示过的钳制提示（`ContextClampNotice.dedupeKey`），每会话每键一次。
     private var shownContextClampNotices: [UUID: Set<String>] = [:]
+    /// 压缩丢弃图片原图的提示，每个会话只提示一次。
+    var compactionImageNoticeSessionIDs: Set<UUID> = []
     /// A preflight owns one ordinary send in its captured session. A second
     /// send cannot bypass its pending checkpoint while the first awaits Core.
     private var ordinaryAutoCompactionPreflights: [UUID: UUID] = [:]
@@ -3232,20 +5007,176 @@ final class ChatStore {
     }
 
     var contextOccupancy: ChatContextOccupancy? {
-        activeSessionID.flatMap { contextOccupancyBySession[$0] }
+        guard let sessionID = activeSessionID else { return nil }
+        if let reported = contextOccupancyBySession[sessionID] { return reported }
+        return estimatedContextOccupancy(sessionID: sessionID)
     }
+
+    /// 内置工具定义的估算占用，随每次请求发送。
+    private static let builtinToolSchemaTokens: Int =
+        AgentContextTokenBudget.estimatedToolSchemaTokens(AgentToolCatalog.makeTools())
+
+    /// 重启后或首个用量回报前的本地估算（CJK 约一字一 token，含工具定义）；
+    /// 只用于显示，绝不当作用量回报或压缩判断的锚点。
+    private func estimatedContextOccupancy(sessionID: UUID) -> ChatContextOccupancy? {
+        guard sessionID == activeSessionID else { return nil }
+        let history = messages.filter { $0.role != .system && !$0.isStreaming }
+        guard !history.isEmpty else { return nil }
+        let knownWindow = latestContextWindows[sessionID]
+            ?? SettingsCenter.active?.defaultModelContextWindowTokens
+        let window = knownWindow ?? 128_000
+        // 视图每次刷新都会读这里：同一会话、同样的消息条数和末条长度时直接用上次结果。
+        let cacheKey = [history.count, history.last?.content.count ?? 0, window, outputMode.hashValue,
+                        Int(truncatingIfNeeded: transcriptRevision(forSession: sessionID) ?? 0)]
+        if let cached = estimatedOccupancyCache, cached.sessionID == sessionID, cached.key == cacheKey {
+            return cached.value
+        }
+        var value: ChatContextOccupancy?
+        var estimateMessages = history.map { $0.asLLMMessage() }
+        // 压缩过的会话：模型实际收到的是“摘要 + 保留的最近几条 + 其后的新消息”，
+        // 按这个估算，而不是整段原始记录。
+        if let store = sessionStore,
+           let checkpoint = try? store.loadLatestCompactionCheckpoint(sessionID: sessionID.uuidString),
+           checkpoint.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion {
+            let consumed = checkpoint.compactedMessageRange.upperBound + (checkpoint.projectionRecentCount ?? 0)
+            if consumed <= estimateMessages.count {
+                estimateMessages = checkpoint.replacementHistory + Array(estimateMessages.dropFirst(consumed))
+            }
+        }
+        if window > 0,
+           let tokens = AgentContextTokenBudget.estimatedInputCost(
+            estimateMessages, systemPrompt: Self.systemPrompt(for: outputMode),
+            toolSchemaTokens: Self.builtinToolSchemaTokens) {
+            value = ChatContextOccupancy(
+                inputTokens: tokens, windowTokens: window, providerID: "", modelID: selectedModelID ?? "",
+                executionIdentity: nil, windowIsEstimated: knownWindow == nil, isLocalEstimate: true)
+        }
+        estimatedOccupancyCache = (sessionID, cacheKey, value)
+        return value
+    }
+
+    @ObservationIgnored private var estimatedOccupancyCache: (sessionID: UUID, key: [Int], value: ChatContextOccupancy?)?
 
     var contextOccupancyText: String { contextOccupancy?.percentage ?? "—" }
 
     var contextOccupancyHelp: String {
-        "最近一次模型报告的输入上下文占用；首个用量回报前显示 —，不使用累计计费用量。"
+        "最近一次模型报告的输入上下文占用；重启后或首个用量回报前显示带“约”的本地估算，不使用累计计费用量。"
     }
-    var composerThinkingLevel: ThinkingLevel? = nil
+    /// 思考档位：按模型落盘（重开后记住），切到有记录的模型时恢复；没有记录时保持当前选择。
+    var composerThinkingLevel: ThinkingLevel? = nil {
+        didSet {
+            guard !isRestoringThinkingLevel, let modelID = selectedModelID, !modelID.isEmpty else { return }
+            let key = Self.thinkingLevelDefaultsKey(modelID: modelID)
+            if let composerThinkingLevel {
+                preferencesDefaults.set(composerThinkingLevel.rawValue, forKey: key)
+            } else {
+                preferencesDefaults.removeObject(forKey: key)
+            }
+        }
+    }
+    @ObservationIgnored private var isRestoringThinkingLevel = false
+
+    private static func thinkingLevelDefaultsKey(modelID: String) -> String {
+        "composer.thinkingLevel." + modelID.lowercased()
+    }
+
+    /// 切换模型后恢复该模型上次选择的档位（没有记录则不改动）。
+    private func restoreThinkingLevelForSelectedModel() {
+        guard let modelID = selectedModelID, !modelID.isEmpty else { return }
+        isRestoringThinkingLevel = true
+        defer { isRestoringThinkingLevel = false }
+        if let raw = preferencesDefaults.string(forKey: Self.thinkingLevelDefaultsKey(modelID: modelID)),
+           let level = ThinkingLevel(rawValue: raw), level != composerThinkingLevel {
+            composerThinkingLevel = level
+        }
+        // 当前档位不在新模型的可选项里（例如新模型只有“模型默认”）：回到“模型默认”，
+        // 不写入记忆，原模型记录不受影响。
+        if let current = composerThinkingLevel,
+           !ComposerThinkingSelection.options(modelID: modelID).contains(where: { $0 == current }) {
+            composerThinkingLevel = nil
+        }
+    }
 
     func canContinueAfterIterationLimit(sessionID: UUID) -> Bool {
         guard !isStreaming, !isActiveSessionGenerating,
               let current = resolvedExecutionSnapshot(for: sessionID) else { return false }
         return current.state == .failed && current.failureKind == .iterationLimit
+    }
+
+    /// 当前会话最近一次失败是授权类（Key 无效/无权限）或额度不足时，给出“是哪个供应商、该做什么”的提示；
+    /// 界面据此显示“检查 API Key”按钮，401/403 时同时隐藏“重试”。
+    var failedProviderCheckNotice: (text: String, hidesRetry: Bool)? {
+        guard !isStreaming, !isActiveSessionGenerating,
+              let sessionID = activeSessionID,
+              let current = resolvedExecutionSnapshot(for: sessionID),
+              current.state == .failed, let kind = current.failureKind,
+              kind == .authorization || kind == .quota else { return nil }
+        // 换好 Key、该供应商重新通过连接检查后，旧失败提示不再卡住用户。
+        if providerCheckPassedAfterFailure(current) { return nil }
+        let name = current.failedProviderName ?? currentProviderIdentityForFailureNotice().name
+        switch kind {
+        case .authorization:
+            return ("\(name) 的 API Key 无效、已过期或没有权限。请检查 API Key 后再发送。", true)
+        default:
+            return ("\(name) 的账户余额或额度不足。请到供应商处充值或更换 API Key 后重试。", false)
+        }
+    }
+
+    /// 当前所选供应商的连接检查标识与显示名（用于记录失败时的供应商）。
+    private func currentProviderIdentityForFailureNotice() -> (id: String?, name: String) {
+        if let custom = selectedCustomProvider {
+            let record = providerRecordsSource?().first { $0.id == custom.id } ?? custom
+            return (record.name, ProviderDisplayLabel.resolve(record: record))
+        }
+        if let type = selectedProviderType {
+            return (type.runtimeProviderID, type.displayName)
+        }
+        return (nil, "当前供应商")
+    }
+
+    /// 失败之后该供应商是否已有更新的“已通过”连接检查记录（说明用户已修好 Key 或额度）。
+    private func providerCheckPassedAfterFailure(_ snapshot: ExecutionSnapshot) -> Bool {
+        guard let providerID = snapshot.failedProviderID, let store = providerReadinessStore else { return false }
+        return store.records.contains {
+            $0.providerID.caseInsensitiveCompare(providerID) == .orderedSame
+                && $0.status == .passed && $0.checkedAt > snapshot.updatedAt
+        }
+    }
+
+    /// 授权/额度失败所用供应商的标识；“检查 API Key”据此直接打开那个供应商。
+    var failedProviderCheckProviderID: String? {
+        guard let sessionID = activeSessionID,
+              let current = resolvedExecutionSnapshot(for: sessionID) else { return nil }
+        return current.failedProviderID
+    }
+
+    /// 授权类失败后用户已修好并通过检查：失败行恢复“重试”，也允许重新生成。
+    func providerFailureRecoveredByCheck(sessionID: UUID) -> Bool {
+        guard let current = resolvedExecutionSnapshot(for: sessionID), current.state == .failed,
+              current.failureKind == .authorization || current.failureKind == .quota else { return false }
+        return providerCheckPassedAfterFailure(current)
+    }
+
+    /// 当前会话最近一次失败是上下文超出模型窗口，且有可压缩的历史时，才提供“压缩后重试”。
+    var canCompactAndRetryFailedSession: Bool {
+        guard !isStreaming, !isActiveSessionGenerating, compactAndRetryRequest == nil,
+              let sessionID = activeSessionID,
+              let current = resolvedExecutionSnapshot(for: sessionID),
+              current.state == .failed, current.failureKind == .contextLength else { return false }
+        return messages.filter { $0.role != .system }.count > Self.defaultCompactionKeepRecent
+    }
+
+    /// 先走现有 /compact 流程，压缩成功后重发上一条用户消息；压缩失败照常提示，不重发。
+    @discardableResult
+    func compactAndRetryFailedSession() -> Bool {
+        guard canCompactAndRetryFailedSession,
+              let sessionID = activeSessionID,
+              let current = resolvedExecutionSnapshot(for: sessionID) else { return false }
+        compactContext()
+        guard let presentation = compactionPresentation,
+              presentation.sessionID == sessionID, presentation.state == .pending else { return false }
+        compactAndRetryRequest = (presentation.requestID, current.retryIdentity)
+        return true
     }
 
     @discardableResult
@@ -3280,7 +5211,23 @@ final class ChatStore {
     private(set) var sessionContinuationNotice: String?
 
     func continueAfterContextLimit() {
-        guard canContinueAfterContextLimit, !isActiveSessionGenerating,
+        guard canContinueAfterContextLimit else { return }
+        beginSessionContinuation()
+    }
+
+    /// 会话菜单“在新聊天中继续”：先切到该会话，再按上下文达限时同一套流程生成交接摘要，
+    /// 用户审阅确认后带着摘要进入新会话（不再是整段复制）。
+    func continueInNewChat(sessionID: UUID) {
+        if sessionID != activeSessionID {
+            switchSession(id: sessionID)
+        }
+        guard activeSessionID == sessionID,
+              messages.contains(where: { $0.role != .system }) else { return }
+        beginSessionContinuation()
+    }
+
+    private func beginSessionContinuation() {
+        guard !isActiveSessionGenerating,
               sessionContinuationDraft == nil,
               let source = sessions.first(where: { $0.id == activeSessionID }) else { return }
         let draft = SessionContinuationDraft(sourceSessionID: source.id)
@@ -3290,9 +5237,15 @@ final class ChatStore {
         do { provider = try compactionProviderOverride ?? activeProvider() }
         catch { draft.reportGenerationFailure(); return }
         draft.markGenerationPending()
-        let history = source.messages.map { $0.asLLMMessage() }
+        let history = source.messages.filter { $0.role != .system }.map { $0.asLLMMessage() }
+        // 交接摘要也以上一份压缩摘要为基础，避免只看原始消息而丢掉更早的内容。
+        let priorSummary = sessionStore.flatMap { store in
+            LossySummaryCompaction.priorSummary(
+                checkpoint: try? store.loadLatestCompactionCheckpoint(sessionID: source.id.uuidString),
+                messages: history)
+        }
         sessionContinuationGenerationTask = Task { @MainActor in
-            await draft.generate(messages: history, provider: provider)
+            await draft.generate(messages: history, provider: provider, priorSummary: priorSummary)
         }
     }
 
@@ -3376,7 +5329,7 @@ final class ChatStore {
     }
 
     private var budgetResetInProgress: (target: SessionBudgetResetTarget, task: Task<Void, Never>)?
-    private static let budgetPauseMessage = "本会话累计用量已达上限，已暂停。可以在新会话继续；原会话保留。"
+    private static let budgetPauseMessage = "本会话累计用量已达上限，已暂停。可重置本会话预算，或到设置里调高上限或改为不限；也可以在新会话继续，原会话保留。"
 
     var sessionBudgetResetTarget: SessionBudgetResetTarget? {
         guard budgetIsOverLimit, let sessionID = activeSessionID else { return nil }
@@ -3540,7 +5493,7 @@ final class ChatStore {
     }
 
     /// E8：按 AppSettings.agent 组配置会话预算（BridgeStore 装配时调用）：
-    /// - 上限：agent.maxTokensPerSession（持久设置，默认100k）
+    /// - 上限：agent.maxTokensPerSession（持久设置，默认 100 万；可设为不限）
     /// - 警告阈值：复用 agent.autoCompactThreshold（0~1）
     func configureBudget(
         from agent: AgentSettings,
@@ -3602,6 +5555,37 @@ final class ChatStore {
         return configuredAutoCompactThreshold
     }
 
+    /// C10: the window admission of one turn, from the same figures for every
+    /// kind of turn. nil without a trigger fact (no threshold) keeps the loop as before.
+    func contextAdmissionConfig(
+        sessionID: UUID?, model: LLMModel, settings: BL6EffectiveSettingsSnapshot?,
+        initialAnchor: ContextWindowPolicy.Anchor? = nil, compactionAlreadyJudged: Bool = false,
+        allowsCompaction: Bool = true
+    ) -> ContextAdmissionConfig? {
+        guard let threshold = resolvedAutoCompactionThreshold(in: settings) else { return nil }
+        return ContextAdmissionConfig(
+            windowTokens: sessionID.flatMap { latestContextWindows[$0] } ?? model.contextWindowTokens,
+            triggerFraction: threshold, initialAnchor: initialAnchor,
+            compactionAlreadyJudged: compactionAlreadyJudged,
+            outputReserveTokens: Self.chatMaxOutputTokens(model: model),
+            allowsCompaction: allowsCompaction)
+    }
+
+    /// R3-05: background session turns, project tasks and scheduled requests are
+    /// admitted by reduction and overflow retry only. They have no live assistant
+    /// bubble to adopt a compaction checkpoint, and their callers fence on the
+    /// session's transcript revision, which a checkpoint write would change.
+    private func withReductionOnlyAdmission(
+        _ engine: any ChatAgentEngine, sessionID: UUID, model: LLMModel,
+        settings: BL6EffectiveSettingsSnapshot?
+    ) -> any ChatAgentEngine {
+        guard let loopEngine = engine as? AgentLoopChatEngine,
+              let admission = contextAdmissionConfig(
+                sessionID: sessionID, model: model, settings: settings, allowsCompaction: false)
+        else { return engine }
+        return loopEngine.withContextAdmission(admission)
+    }
+
     /// C1: the latest reported occupancy of `sessionID`, only when it describes
     /// this provider and model.
     private func matchingOccupancySample(
@@ -3647,7 +5631,7 @@ final class ChatStore {
     }
 
     /// E8：token 数 → 简短人类可读格式（0 / 999 / 1.2k / 100k / 1.2m）
-    static func formatTokenCount(_ count: Int) -> String {
+    nonisolated static func formatTokenCount(_ count: Int) -> String {
         let value = max(0, count)
         if value >= 1_000_000 {
             let v = Double(value) / 1_000_000
@@ -3674,7 +5658,10 @@ final class ChatStore {
     }
     /// 所选模型 ID（nil = 该 Provider 默认模型）
     var selectedModelID: String? {
-        didSet { composerMediaSelectionEpoch &+= 1 }
+        didSet {
+            composerMediaSelectionEpoch &+= 1
+            if oldValue != selectedModelID { restoreThinkingLevelForSelectedModel() }
+        }
     }
 
     /// Chat-only readiness facts used by the model directory adapter.
@@ -3755,9 +5742,37 @@ final class ChatStore {
         }
     }
 
+    /// F1-01：供应商改名后，把会话里保存的 "custom.<旧名>" 改成新名，避免这些会话
+    /// 被当作"覆盖失效"悄悄退回默认模型。名字比较与记录查找一致（不分大小写）。
+    func migrateSessionProviderBindings(fromProviderName oldName: String, to newName: String) {
+        let oldRaw = "custom.\(oldName)"
+        var changed = false
+        for index in sessions.indices {
+            guard let raw = sessions[index].providerTypeRaw,
+                  raw.caseInsensitiveCompare(oldRaw) == .orderedSame else { continue }
+            sessions[index].providerTypeRaw = "custom.\(newName)"
+            changed = true
+        }
+        guard changed else { return }
+        onSessionsChanged?()
+        refreshActiveSessionModelDisplay()
+    }
+
+    /// F1-09：仍把某个自定义供应商作为会话级选择的会话标题（删除前披露用）。
+    func sessionTitlesBound(toProviderName name: String) -> [String] {
+        let raw = "custom.\(name)"
+        return sessions.compactMap { thread in
+            guard let value = thread.providerTypeRaw,
+                  value.caseInsensitiveCompare(raw) == .orderedSame else { return nil }
+            return thread.title
+        }
+    }
+
     /// 失效的会话级 Provider 覆盖不能继续留在内存和磁盘中，否则下一次
     /// 切换仍会显示一个不存在的供应商/模型。清除后回到已装配的全局默认。
     private func clearInvalidSessionModelOverride(at index: Int) {
+        let lostName = Self.sessionModelOverrideDisplayName(
+            providerRaw: sessions[index].providerTypeRaw, modelID: sessions[index].modelID)
         sessions[index].providerTypeRaw = nil
         sessions[index].modelID = nil
         onSessionsChanged?()
@@ -3765,6 +5780,16 @@ final class ChatStore {
         selectedProviderType = defaultProviderType
         selectedModelID = defaultModelID
         syncTierFromSelectedModel()
+        // 悄悄换家会让历史发给另一家服务商：告诉用户原来用的是什么、现在改用什么。
+        let fallbackName = defaultModelID ?? defaultCustomProvider?.name ?? defaultProviderType?.displayName ?? "默认设置"
+        pastedTextActionFeedback = "这个会话原来用的模型（\(lostName)）已不可用，已改用默认模型 \(fallbackName)。"
+    }
+
+    /// 会话级覆盖在提示里的名字：优先模型名，其次服务商名（custom.<名称> 去掉前缀）。
+    nonisolated static func sessionModelOverrideDisplayName(providerRaw: String?, modelID: String?) -> String {
+        if let modelID, !modelID.isEmpty { return modelID }
+        guard let providerRaw, !providerRaw.isEmpty else { return "未知" }
+        return providerRaw.hasPrefix("custom.") ? String(providerRaw.dropFirst("custom.".count)) : providerRaw
     }
 
     /// L1 刷新当前会话的模型显示：会话有覆盖 → 生效字段 = 会话值；
@@ -3957,19 +5982,44 @@ final class ChatStore {
         } else {
             guard let type = ProviderType(rawValue: providerID),
                   Self.chatProviderTypes.contains(type) else { return false }
-            // An unknown model retains the existing first-catalog fallback.
-            let model = general.defaultModelID.flatMap { requested in
-                type.builtInModels.first(where: { $0.id == requested })
-            } ?? type.builtInModels.first
-            if let model {
-                guard allowsReadinessSelection(providerID: type.rawValue, modelID: model.id) else {
-                    return false
+            // 只有“确实存在的”模型才原样选回：内置目录里有、本地后端（模型名任意）、或某条供应商记录里列着。
+            // 已下线或写错的模型名仍回落到该供应商的第一个内置模型，免得每次请求都报模型不存在。
+            let knownRequested = general.defaultModelID.flatMap { requested -> String? in
+                guard !requested.isEmpty else { return nil }
+                if type.builtInModels.contains(where: { $0.id == requested }) || type == .local { return requested }
+                let canonical = Self.canonicalModelID(requested)
+                let listed = (providerRecordsSource?() ?? []).contains { record in
+                    record.modelNames.map(Self.canonicalModelID).contains(canonical)
                 }
+                return listed ? requested : nil
             }
-            resolvedProviderType = type
-            resolvedCustomProvider = nil
-            resolvedModelID = model?.id
-            resolvedTier = model.flatMap { ModelSpeedTier.tier(for: $0) }
+            if let requested = knownRequested {
+                // 用户亲手选的模型（含本地手填、供应商记录里自带、未检查的模型）重启后原样选回；
+                // 当时不可用时保持选中，由界面原有的“未就绪”提示说明，不静默换成别的模型。
+                let catalogModel = type.builtInModels.first(where: { $0.id == requested })
+                if catalogModel != nil {
+                    // 目录内模型沿用就绪闸门：未就绪时不套用（与自定义供应商一致）。
+                    guard allowsReadinessSelection(providerID: type.rawValue, modelID: requested) else {
+                        return false
+                    }
+                }
+                let model = catalogModel ?? LLMModel(id: requested, displayName: requested, provider: type.rawValue)
+                resolvedProviderType = type
+                resolvedCustomProvider = nil
+                resolvedModelID = requested
+                resolvedTier = ModelSpeedTier.tier(for: model)
+            } else {
+                let model = type.builtInModels.first
+                if let model {
+                    guard allowsReadinessSelection(providerID: type.rawValue, modelID: model.id) else {
+                        return false
+                    }
+                }
+                resolvedProviderType = type
+                resolvedCustomProvider = nil
+                resolvedModelID = model?.id
+                resolvedTier = model.flatMap { ModelSpeedTier.tier(for: $0) }
+            }
         }
 
         defaultProviderType = resolvedProviderType
@@ -4031,7 +6081,7 @@ final class ChatStore {
                 composerBypassDisabledFeedback = "设置里已禁用绕过权限模式，已回落到手动审批。"
             }
             if composerPolicySelection.mode != .bypassPermission || !composerPolicySelection.bypassModeConfirmed {
-                nativeCommandBypassConfirmedSessionID = nil
+                nativeCommandBypassConfirmed = false
             }
             guard oldValue != composerPolicySelection else { return }
             if oldValue.mode != composerPolicySelection.mode
@@ -4060,9 +6110,11 @@ final class ChatStore {
         let ceiling: AutonomyLevel
 
         var confirmationText: String {
-            "允许使用：\(ComposerPolicyPresentation.modeLabel(mode))？此设置会一直保留，可在设置中降低。已授予的批准将被撤销。"
+            "允许使用：\(ComposerPolicyPresentation.modeLabel(mode))？此设置会一直保留，可在设置中降低。确认后，各会话中已授予的“本会话内允许”类批准（按工具和路径）将被撤销，之后需要重新批准；回合进行中无法切换。"
         }
     }
+
+    static let composerCeilingTurnInProgressFeedback = "当前回合进行中，无法切换最高模式。请先停止回合，再重新切换。"
 
     private(set) var composerCeilingRequest: ComposerCeilingRequest?
     private var confirmingComposerCeilingRequestID: UUID?
@@ -4081,6 +6133,10 @@ final class ChatStore {
             confirmingComposerCeilingRequestID = nil
             if composerCeilingRequest?.id == request.id { composerCeilingRequest = nil }
         }
+        if request.sessionID == activeSessionID, isActiveSessionGenerating {
+            composerBypassDisabledFeedback = Self.composerCeilingTurnInProgressFeedback
+            return false
+        }
         guard request.sessionID == activeSessionID,
               request.originalMode == composerPolicySelection.mode,
               request.ceiling == composerPolicyFacts.autonomyCeiling,
@@ -4090,8 +6146,12 @@ final class ChatStore {
               let revoke = onSessionPermissionContextChanged,
               let persist = persistComposerCeiling else { return false }
         revoke()
-        guard await persist(request.ceiling, request.mode.requiredAutonomyLevel),
-              request.sessionID == activeSessionID,
+        let saved = await persist(request.ceiling, request.mode.requiredAutonomyLevel)
+        guard saved else {
+            composerBypassDisabledFeedback = "最高模式保存失败，当前权限模式未变更；本会话内已授予的批准已被撤销，需要时请重新批准。请稍后重试，或在设置中直接调整。"
+            return false
+        }
+        guard request.sessionID == activeSessionID,
               request.originalMode == composerPolicySelection.mode,
               composerCeilingRequest?.id == request.id,
               request.proposalID == nil || activePlanApproval?.id == request.proposalID,
@@ -4099,7 +6159,9 @@ final class ChatStore {
               !isComposerAttachmentPreflightPending,
               !(request.mode == .bypassPermission && composerBypassDisabled),
               composerPolicyFacts.autonomyCeiling == request.mode.requiredAutonomyLevel else {
-            composerBypassDisabledFeedback = "无法保存最高模式，当前权限模式未变更。"
+            composerBypassDisabledFeedback = isActiveSessionGenerating
+                ? Self.composerCeilingTurnInProgressFeedback
+                : "保存期间会话或权限状态已变化，当前权限模式未变更；本会话内已授予的批准已被撤销，需要时请重新批准。请确认当前选择后重试。"
             return false
         }
         return true
@@ -4127,24 +6189,25 @@ final class ChatStore {
     private func applyInteractiveComposerMode(_ mode: ComposerTaskMode) {
         composerPolicySelection.mode = mode
     }
-    /// Only the explicit Composer risk confirmation can bind native command
-    /// consent to a session. Restoring the global bypass preference never does.
-    private var nativeCommandBypassConfirmedSessionID: UUID?
+    /// 只有用户在输入区明确确认过风险才会置位；恢复全局绕过偏好不会。
+    /// 对齐 Claude Code：确认后切换或新建会话继续沿用，直到退出绕过、取消确认、
+    /// 授权失效或上限变化才清除。
+    private var nativeCommandBypassConfirmed = false
 
     var hasNativeCommandBypassConfirmation: Bool {
-        guard let activeSessionID else { return false }
-        return nativeCommandBypassConfirmedSessionID == activeSessionID
+        nativeCommandBypassConfirmed
             && effectiveComposerSelection.mode == .bypassPermission
             && effectiveComposerSelection.bypassModeConfirmed && composerPolicyFacts.autonomyCeiling == .l3
     }
 
     @discardableResult
     func confirmComposerBypass(for sessionID: UUID?) -> Bool {
-        guard sessionID == activeSessionID, effectiveComposerSelection.mode == .bypassPermission,
+        // 用原始选择判断：未确认的绕过在 effectiveComposerSelection 里已按手动处理。
+        guard sessionID == activeSessionID, composerPolicySelection.mode == .bypassPermission,
               composerPolicyFacts.autonomyCeiling == .l3 else { return false }
         composerPolicySelection.bypassModeConfirmed = true
         guard sessionID == activeSessionID, effectiveComposerSelection.bypassModeConfirmed else { return false }
-        nativeCommandBypassConfirmedSessionID = sessionID
+        nativeCommandBypassConfirmed = true
         return true
     }
 
@@ -4161,6 +6224,126 @@ final class ChatStore {
     private var composerCommandRegistryInstalled = false
     private var composerCommandRegistryUsed = false
     var registeredComposerCommandRegistry: CommandRegistry { composerCommandRegistry }
+
+    // MARK: 自定义斜杠命令（对齐 Claude Code：.claude/commands/**/*.md，另含 /init）
+
+    /// 斜杠菜单用的缓存；输入框进入斜杠状态时由界面调用 `refreshCustomSlashCommands()` 刷新。
+    private(set) var customSlashCommands: [CustomSlashCommand] =
+        CustomSlashCommandLoader.builtinPromptCommands
+
+    /// 外部技能根（只读）：由 App 装配；nil 表示不提供外部技能。
+    var externalSkillCatalog: ExternalSkillCatalog?
+
+    /// 设置页「外部技能」分区用：当前会话已信任项目目录（普通会话为 nil）。
+    var activeTrustedProjectRoot: URL? {
+        activeMemoryScope.flatMap { trustedProjectRootProvider?($0) }
+    }
+
+    /// 自定义子智能体：用户级 ~/.claude/agents 加当前会话已信任项目的 .claude/agents。
+    /// `sessionID` 是发起派发的那个会话（执行上下文里的会话）：后台回合或别的会话派发时，
+    /// 不能按界面上当前打开的会话去找项目。没有给出会话才退回当前会话。
+    func customSubagentDefinitions(forSession sessionID: String? = nil) -> [CustomSubagentDefinition] {
+        let scope: MemoryScope?
+        if let sessionID, let uuid = UUID(uuidString: sessionID) {
+            if let projectID = sessions.first(where: { $0.id == uuid })?.projectID {
+                let candidate = MemoryScope(sessionID: uuid.uuidString, projectID: projectID)
+                scope = candidate.isValid ? candidate : nil
+            } else {
+                scope = nil
+            }
+        } else {
+            scope = activeMemoryScope
+        }
+        // 没有确认记录库时不提供项目级子智能体（项目里的文件必须经用户确认内容才能用）。
+        let projectRoot = customSubagentConfirmations == nil
+            ? nil : scope.flatMap { trustedProjectRootProvider?($0) }
+        return CustomSubagentLoader.load(projectRoot: projectRoot, confirmations: customSubagentConfirmations)
+    }
+
+    /// 项目级自定义子智能体的确认记录（由 App 装配）。
+    var customSubagentConfirmations: CustomSubagentConfirmationStore?
+
+    /// skill_read 读外部技能用：外部技能目录和发起会话的已信任项目根（没有项目时只读用户级）。
+    func externalSkillReadContext(forSession sessionID: String?) -> (catalog: ExternalSkillCatalog, projectRoot: URL?)? {
+        guard let catalog = externalSkillCatalog else { return nil }
+        var root: URL?
+        if let sessionID, let uuid = UUID(uuidString: sessionID),
+           let projectID = sessions.first(where: { $0.id == uuid })?.projectID {
+            let scope = MemoryScope(sessionID: uuid.uuidString, projectID: projectID)
+            if scope.isValid { root = trustedProjectRootProvider?(scope) }
+        }
+        return (catalog, root)
+    }
+
+    /// 当前会话是否绑定了已信任的项目目录（普通会话为 false，/init 因此置灰）。
+    var activeSessionHasProjectRoot: Bool {
+        activeMemoryScope.flatMap { trustedProjectRootProvider?($0) } != nil
+    }
+
+    /// 重新读取用户级与当前项目级的命令文件。普通会话没有项目根时只读用户级。
+    /// 目录扫描在后台线程做，读完后菜单自动更新；扫描期间菜单先用上一次的缓存。
+    func refreshCustomSlashCommands() {
+        customSlashCacheIsFresh = false
+        customSlashLoadTask?.cancel()
+        customSlashLoadTask = Task { [weak self] in
+            await self?.reloadCustomSlashCommandsInBackground()
+        }
+        refreshMCPPromptSlashCommands()
+    }
+
+    /// 后台扫描命令目录并更新缓存；读完时如果会话（项目根）已经换了，丢弃这次结果。
+    func reloadCustomSlashCommandsInBackground() async {
+        let root = activeMemoryScope.flatMap { trustedProjectRootProvider?($0) }
+        let commands = await Task.detached(priority: .userInitiated) {
+            CustomSlashCommandLoader.load(projectRoot: root)
+        }.value
+        guard !Task.isCancelled else { return }
+        let currentRoot = activeMemoryScope.flatMap { trustedProjectRootProvider?($0) }
+        guard currentRoot?.path == root?.path else { return }
+        customSlashCommands = commands
+        customSlashCacheRootPath = root?.path
+        customSlashCacheIsFresh = true
+    }
+
+    /// 斜杠缓存：输入 "/" 触发的后台扫描完成后为 true，提交时直接用，不再在主线程重扫目录。
+    @ObservationIgnored private var customSlashCacheIsFresh = false
+    @ObservationIgnored private var customSlashCacheRootPath: String?
+    @ObservationIgnored private var customSlashLoadTask: Task<Void, Never>?
+
+    private func loadCustomSlashCommands() -> [CustomSlashCommand] {
+        let root = activeMemoryScope.flatMap { trustedProjectRootProvider?($0) }
+        return CustomSlashCommandLoader.load(projectRoot: root)
+    }
+
+    /// 草稿是 "/名称 参数" 且名称命中自定义命令时，返回展开后的消息文本；内置命令优先，不命中返回 nil。
+    func expandedCustomSlashCommand(for draft: String) -> String? {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/"), trimmed.count > 1 else { return nil }
+        let body = trimmed.dropFirst()
+        let name = String(body.prefix { !$0.isWhitespace })
+        guard !name.isEmpty,
+              composerCommandRegistry.command(id: name) == nil,
+              !CustomSlashCommandLoader.defaultReservedNames.contains(CommandDefinition.canonicalID(name))
+        else { return nil }
+        let currentRoot = activeMemoryScope.flatMap { trustedProjectRootProvider?($0) }
+        let commands: [CustomSlashCommand]
+        if customSlashCacheIsFresh, customSlashCacheRootPath == currentRoot?.path {
+            // 输入 "/" 时后台已扫描过：直接用缓存，提交不卡主线程。
+            commands = customSlashCommands
+        } else {
+            commands = loadCustomSlashCommands()
+            customSlashCommands = commands
+        }
+        customSlashCacheIsFresh = false
+        guard let command = CustomSlashCommandLoader.command(named: name, in: commands) else { return nil }
+        let arguments = String(body.dropFirst(name.count))
+        // @文件只在项目根（已信任的授权根）内读取，敏感文件不读；!命令 交给模型走审批。
+        let projectRoot = activeMemoryScope.flatMap { trustedProjectRootProvider?($0) }
+        let expanded = command.expandForSending(
+            arguments: arguments, projectRoot: projectRoot,
+            allowedRoots: projectRoot.map { [$0.path] } ?? [])
+        return expanded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : expanded
+    }
     /// Installed only by the production registry binder. Preset/App slash
     /// commands reuse the menu/palette executor before any user-message write.
     var onRegisteredNonComposerSlashCommand:
@@ -4270,7 +6453,7 @@ final class ChatStore {
         }
         if previous != facts { cancelComposerAttachmentPreflight(showFeedback: false) }
         composerPolicyFacts = facts
-        if facts.revoked || facts.autonomyCeiling != .l3 { nativeCommandBypassConfirmedSessionID = nil }
+        if facts.revoked || facts.autonomyCeiling != .l3 { nativeCommandBypassConfirmed = false }
     }
 
     private static func equivalentDialogueRights(
@@ -4367,13 +6550,25 @@ final class ChatStore {
     /// 纵深防御：构造提交快照用的 Composer 选择。「禁用绕过」开着时，即使
     /// `composerPolicySelection` 因任何路径仍是绕过，也一律降为手动并清除确认，
     /// 保证快照里不会出现可打开 BypassOpenScope 的绕过模式。
-    private var effectiveComposerSelection: ComposerPolicySelection {
+    var effectiveComposerSelection: ComposerPolicySelection {
         var selection = composerPolicySelection
         if composerBypassDisabled, selection.mode == .bypassPermission {
             selection.mode = .manual
             selection.bypassModeConfirmed = false
         }
+        // 对齐 Claude Code：没确认绕过风险就不进绕过模式，提交快照按手动审批处理
+        // （只读工具照常放行，其余弹审批卡）；确认后行为不变。Core 授权层的拒绝保留作纵深防御。
+        if selection.mode == .bypassPermission, !selection.bypassModeConfirmed {
+            selection.mode = .manual
+        }
         return selection
+    }
+
+    /// 已选"绕过权限"但还没勾确认：提交按手动审批处理，输入框据此给一句提示。
+    var composerBypassUnconfirmedFallbackActive: Bool {
+        !composerBypassDisabled
+            && composerPolicySelection.mode == .bypassPermission
+            && !composerPolicySelection.bypassModeConfirmed
     }
 
     private func unattendedComposerSelection() -> ComposerPolicySelection {
@@ -4393,6 +6588,10 @@ final class ChatStore {
     @ObservationIgnored var onOpenSettingsPage: ((String) -> Void)?
     /// Carries keyboard origin only during synchronous evaluation of this request.
     @TaskLocal static var keyboardComposerCommandRequestID: UUID?
+    /// The request the user personally submitted (typed slash command, command
+    /// row or its queued replay). Only `/compact` uses it: a user's own compact
+    /// runs without an approval card in every mode (user decision 2026-11-16).
+    @TaskLocal static var userComposerCommandRequestID: UUID?
     @TaskLocal static var nativeWaitingToolApprovalFacts: ComposerPolicyFactSource?
 
     /// Existing Policy/Approval composition may hold a canonical command at
@@ -4407,21 +6606,25 @@ final class ChatStore {
     /// 回退 streamMessage 直连 LLM，行为与升级前一致）。
     var agentEngine: any ChatAgentEngine = AgentLoopChatEngine()
 
-    /// Single-turn output ceiling for chat turns: the catalog limit, at most 16384
-    /// (same cap as ComposerEffortExecutionProfile.maxTokenCap); 16384 when the catalog has none.
+    /// Single-turn output ceiling for chat turns, aligned with Claude Code: the
+    /// model's own declared limit when it has one; a model that declares none
+    /// (e.g. a custom provider serving "gpt-4o") gets 32000, but never more than the
+    /// built-in catalog's limit for the same model id (R3-08).
+    nonisolated static let defaultChatMaxOutputTokens = 32_000
     nonisolated static func chatMaxOutputTokens(model: LLMModel) -> Int {
-        min(16_384, model.maxOutputTokens ?? 16_384)
+        if let declared = model.maxOutputTokens { return max(1, declared) }
+        let known = LLMModel.allModels.first { $0.id == model.id }?.maxOutputTokens
+        return max(1, min(defaultChatMaxOutputTokens, known ?? defaultChatMaxOutputTokens))
     }
     nonisolated static func chatOutputRequestTokens(
         model: LLMModel, effort: ComposerEffort, engine: any ChatAgentEngine
     ) -> Int {
         let ceiling = chatMaxOutputTokens(model: model)
-        let standardBudget = max(1, ceiling * 3 / 4)
         // The production loop applies effort itself. Other engines receive
         // the already scaled request because they do not use that loop.
-        if engine is AgentLoopChatEngine { return standardBudget }
+        if engine is AgentLoopChatEngine { return ceiling }
         return ComposerEffortExecutionProfile(
-            effort: effort, baseMaxIterations: 1, baseMaxTokens: standardBudget,
+            effort: effort, baseMaxIterations: 1, baseMaxTokens: ceiling,
             maxOutputTokensCeiling: ceiling
         ).maxTokens
     }
@@ -4471,8 +6674,24 @@ final class ChatStore {
     private static let projectInstructionsNotLoadedNotice = "项目指令本次未加载；本次请求按无项目指令处理。"
     private static let skillRejectedNoticeMarker = "未在当前会话和项目审核"
 
-    func noteProjectInstructionsNotLoaded() {
-        sessionContinuationNotice = Self.projectInstructionsNotLoadedNotice
+    /// 自动匹配上但未批准的技能轻提示：同一技能同一会话只提示一次；没有新技能时返回 nil。
+    /// 文案含 `skillRejectedNoticeMarker`，下一回合会随该标记一起被清掉。
+    func takeUnapprovedSkillHint(sessionID: UUID, ids: [String]) -> String? {
+        let already = unapprovedSkillHintedBySession[sessionID] ?? []
+        let fresh = ids.filter { !already.contains($0) }
+        guard !fresh.isEmpty else { return nil }
+        unapprovedSkillHintedBySession[sessionID] = already.union(fresh)
+        let names = fresh.map { "「\($0)」" }.joined(separator: "、")
+        return "技能\(names)与这条消息匹配，但\(Self.skillRejectedNoticeMarker)，这次没有加载；可在设置的技能页批准。"
+    }
+
+    /// `reason` 是预处理给出的“原因 + 下一步”；没有时用固定提示。
+    func noteProjectInstructionsNotLoaded(reason: String? = nil) {
+        if let reason = reason?.trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
+            sessionContinuationNotice = "项目指令本次未加载，本次请求按无项目指令处理。" + reason
+        } else {
+            sessionContinuationNotice = Self.projectInstructionsNotLoadedNotice
+        }
     }
 
     func admittedProjectPrompt(_ prepared: ChatTurnPromptPreprocessResult,
@@ -4481,7 +6700,9 @@ final class ChatStore {
                                       instructionModalPhase: ComposerModelPreparationContext.InstructionModalPhase? = nil
     ) -> ChatTurnPromptPreprocessResult {
         guard let candidate = prepared.trustedProjectInstructions else {
-            if prepared.projectInstructionsUnavailable { noteProjectInstructionsNotLoaded() }
+            if prepared.projectInstructionsUnavailable {
+                noteProjectInstructionsNotLoaded(reason: prepared.projectInstructionsUnavailableReason)
+            }
             return prepared
         }
         let current = { !Task.isCancelled && isCurrent() }
@@ -4561,9 +6782,13 @@ final class ChatStore {
     /// 关闭时不注入任何记忆片段。
     var memoryEnabledProvider: (() -> Bool)?
     var globalInstructionsEnabledProvider: (() -> Bool)?
+    /// 后台任务完成后自动续跑的开关：nil = 未装配（不自动续跑）；装配后每次判断时实时读取。
+    var backgroundAutoContinueEnabledProvider: (() -> Bool)?
     /// 2026-11-15 提示词方案 v2：每个会话最近命中过的技能（最多 2 篇），后续回合继续注入。
     /// 绑定注入时的作用域；作用域变了就清掉，不带到别的项目或会话范围。
     @ObservationIgnored var retainedSkillsBySession: [UUID: (scope: MemoryScope?, skills: [RetainedSkill])] = [:]
+    /// 每个会话里已经提示过“匹配但未批准”的技能 id，同一技能同一会话只提示一次。
+    @ObservationIgnored var unapprovedSkillHintedBySession: [UUID: Set<String>] = [:]
 
     /// Typed authority captured on the composition actor before off-main
     /// prompt preparation. Nil keeps classified Personal memory unavailable.
@@ -4793,12 +7018,28 @@ final class ChatStore {
     /// 非置顶会话（按 updatedAt 升序），直到回到上限内。置顶会话与当前活跃会话
     /// 不参与自动归档（置顶受保护；活跃会话正在使用不应被归档）。
     /// 归档后仍可能超限（如全部置顶），此时保持现状、不强行归档置顶会话。
-    private func enforceSessionLimit() {
+    /// 定时任务的锚点会话（任务绑定的目标会话）：自动归档不碰它们，否则任务下次触发就找不到目标。
+    /// 由 App 装配时接上调度存储；没接上时为空集。
+    var scheduledAnchorSessionIDs: (@MainActor () -> Set<UUID>)?
+    /// 本次运行中由定时任务"每次开新会话"生成的会话：超出上限时优先归档它们。
+    private(set) var scheduledRunSessionIDs: Set<UUID> = []
+
+    /// `protecting`：刚被恢复但没有激活的会话（对话里恢复归档会话），不能在恢复后立刻被自动归档回去。
+    func enforceSessionLimit(protecting: UUID? = nil) {
         guard sessions.count > Self.maxSessionListCount else { return }
         let excess = sessions.count - Self.maxSessionListCount
+        let anchors = scheduledAnchorSessionIDs?() ?? []
+        let generated = scheduledRunSessionIDs
         let candidates = sessions
-            .filter { !$0.pinned && $0.id != activeSessionID }
-            .sorted { $0.updatedAt < $1.updatedAt }
+            .filter {
+                !$0.pinned && $0.id != activeSessionID && $0.id != protecting && !anchors.contains($0.id)
+                    && !isSessionGenerating($0.id)
+            }
+            .sorted {
+                let lhs = generated.contains($0.id), rhs = generated.contains($1.id)
+                if lhs != rhs { return lhs }
+                return $0.updatedAt < $1.updatedAt
+            }
         guard !candidates.isEmpty else { return }
         for session in candidates.prefix(excess) {
             // 数据完整性：磁盘归档成功才移出内存 —— 归档失败（吞错）仍移出的话，
@@ -4832,6 +7073,7 @@ final class ChatStore {
 
     @discardableResult
     func applySwitchSession(id: UUID) -> Bool {
+        let perf = PerformanceSignposts.begin(.sessionSwitch); defer { perf.end() }
         guard sessions.contains(where: { $0.id == id }) else { return false }
         guard id != activeSessionID else { return true }
         let cancelledProviderPreparation = pendingProviderPreparationID != nil
@@ -4860,13 +7102,20 @@ final class ChatStore {
             pastedTextActionFeedback =
                 "上一会话的附件请求未发送；草稿已保留，请返回确认后重试。"
         } else {
+            // 末尾保留 refreshActiveSessionModelDisplay 刚设的“原模型已不可用”提示（切换开头已清空旧提示）。
             pastedTextActionFeedback = providerPreparationCancellationNoticeBySessionID[id]
                 ?? attachmentPreflightCancellationNoticeBySessionID[id]
+                ?? pastedTextActionFeedback
         }
         if !didMarkRead, !hasUnsavedSessionChanges, let onSessionSelectionChanged {
             onSessionSelectionChanged()
         } else {
             onSessionsChanged?()
+        }
+        // 排队消息在会话生成结束时只会给当时的活动会话自动发；切走期间正常结束的，切回来时补发
+        // （会话已空闲、没有草稿、用户没按过停止）。
+        if queueResumeOnReturnSessions.remove(id) != nil, !pausedComposerQueueSessions.contains(id) {
+            _ = sendNextQueuedComposer(automatically: true)
         }
         return true
     }
@@ -5081,6 +7330,10 @@ final class ChatStore {
             receipt = try store.deleteSession(id: id.uuidString, intent: intent, now: now)
         }
         removeActiveSession(at: index, id: id)
+        // 永久删除不可恢复：此时才清该会话的工具输出文件。
+        endBackgroundShellSession(id: id)
+        // 永久删除后该会话不会回来，待发队列里的孤儿条目不再占全局上限。
+        queuedComposerMessages.removeAll { $0.sessionID == id }
         onSessionsChanged?()
         return receipt
     }
@@ -5170,17 +7423,30 @@ final class ChatStore {
             if archivedSessions.contains(where: { $0.id == id }) {
                 onSessionPermissionContextChanged?()
             }
-            if archivedSessions.contains(where: { $0.id == id }) {
-                endBackgroundShellSession(id: id)
-            }
+            // 回收站里的会话永久删除时，才清它的工具输出文件（移入回收站时保留）。
+            endBackgroundShellSession(id: id)
             archivedSessions.removeAll { $0.id == id }
         }
     }
 
     /// Conversation lifecycle owns background shell cleanup. Ending an ordinary
     /// provider turn leaves these commands running.
+    /// 移入回收站：只终止后台命令、丢弃内存里的命令输出；工具输出文件保留，
+    /// 从回收站恢复后历史里的输出引用才不会失效。永久删除时走 endBackgroundShellSession 再清文件。
+    private func terminateBackgroundShellSession(id: UUID) {
+        pendingBackgroundShellFinishes.removeValue(forKey: id)
+        FileReadRecordStore.shared.clear(sessionID: id.uuidString)
+        let registry = BackgroundShellRegistry.shared
+        Task {
+            _ = await registry.terminateAll(sessionID: id.uuidString, reason: .sessionEnded)
+            registry.discardOutput(sessionID: id.uuidString)
+        }
+    }
+
     private func endBackgroundShellSession(id: UUID) {
         pendingBackgroundShellFinishes.removeValue(forKey: id)
+        // 会话删除后不再需要它的“先读再改”读取记录（只在内存里）。
+        FileReadRecordStore.shared.clear(sessionID: id.uuidString)
         let registry = BackgroundShellRegistry.shared
         let storageRoot = sessionStore?.directory
         Task { [weak self] in
@@ -5200,11 +7466,13 @@ final class ChatStore {
     }
 
     private func removeActiveSession(at index: Int, id: UUID) {
+        MinisCore.HookRuntime.installed?.notifyEvent(
+            .sessionEnd, sessionID: id.uuidString, fields: ["reason": "deleted"])
         if sessionContinuationDraft?.sourceSessionID == id { cancelSessionContinuation() }
         transientCompactionProjections.removeValue(forKey: id)
         if compactionPresentation?.sessionID == id { compactionPresentation = nil }
         if compactionUndoFeedback?.sessionID == id { compactionUndoFeedback = nil }
-        endBackgroundShellSession(id: id)
+        terminateBackgroundShellSession(id: id)
         if id != activeSessionID { onSessionPermissionContextChanged?() }
         credentialBroker.cancel(sessionID: id)
         for message in sessions[index].messages { credentialBroker.finishStream(messageID: message.id) }
@@ -5213,6 +7481,7 @@ final class ChatStore {
         literalComposerDraftBySessionID.removeValue(forKey: id)
         draftPersistenceFailureSessionIDs.remove(id)
         pendingAttachmentsBySessionID.removeValue(forKey: id)
+        if let drafts = draftStore { _ = drafts.clear(key: Self.chatAttachmentsDraftKey(sessionID: id)) }
         editingMessageIDBySessionID.removeValue(forKey: id)
         pastedTextBySessionID.removeValue(forKey: id)
         if id == activeSessionID {
@@ -5254,6 +7523,33 @@ final class ChatStore {
         sessions.sorted {
             if $0.pinned != $1.pinned { return $0.pinned }
             return $0.updatedAt > $1.updatedAt
+        }
+    }
+
+    /// /resume 候选：与侧栏搜索同一套匹配（标题 / 预览 / 全文 / 日期），
+    /// 活动与已归档会话都包含；不改侧栏搜索框。空查询返回全部。置顶优先，其余按最近更新。
+    func resumeCandidates(matching query: String) -> [(session: ChatThread, isArchived: Bool)] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        let parsedDate = Self.searchDate(from: q)
+        let all = sessions.map { ($0, false) } + archivedSessions.map { ($0, true) }
+        let result = all
+            .filter { q.isEmpty || matchesSearch($0.0, query: q, parsedDate: parsedDate) }
+            .sorted {
+                if $0.0.pinned != $1.0.pinned { return $0.0.pinned }
+                return $0.0.updatedAt > $1.0.updatedAt
+            }
+            .map { (session: $0.0, isArchived: $0.1) }
+        // 侧栏没有在搜索时，/resume 临时建的全文索引不常驻。
+        if searchText.isEmpty { searchTextIndex.removeAll() }
+        return result
+    }
+
+    /// /resume 选中的会话：已归档的先移回活动列表再切换。
+    func resumeSession(id: UUID) {
+        if archivedSessions.contains(where: { $0.id == id }) {
+            restoreSession(id: id)
+        } else {
+            switchSession(id: id)
         }
     }
 
@@ -5426,11 +7722,29 @@ final class ChatStore {
     private(set) var archivedSessions: [ChatThread] = []
 
     /// 会话搜索关键字（空 = 显示全部）
-    var searchText: String = ""
+    var searchText: String = "" {
+        didSet {
+            // 搜索结束后释放全文索引，避免常驻双份会话文本。
+            if searchText.isEmpty { searchTextIndex.removeAll() }
+        }
+    }
+
+    /// 侧栏可见的活动会话（已按搜索过滤、置顶/更新时间排序）。
+    /// 结果按「侧栏摘要修订号 + 查询」缓存：流式正文片段不会让它失效或重算。
+    private func sidebarVisibleThreads() -> [ChatThread] {
+        let revision = sidebarRevision
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        if let cache = sidebarVisibleCache, cache.revision == revision, cache.query == query {
+            return cache.threads
+        }
+        let threads = visible(_sessions)
+        sidebarVisibleCache = (revision, query, threads)
+        return threads
+    }
 
     /// 活动会话（搜索过滤 + 统计 + 最近更新排序）
     var sessionList: [SessionListItem] {
-        let listedSessions = visible(sessions)
+        let listedSessions = sidebarVisibleThreads()
         let external = agentTaskExecutionSnapshots(for: Set(listedSessions.map(\.id)))
         return listedSessions.map {
             SessionListItem(
@@ -5513,6 +7827,11 @@ final class ChatStore {
             pending.append(BackgroundShellCompletion(id: snapshot.id, state: snapshot.state,
                                                       exitCode: snapshot.exitCode))
             pendingBackgroundShellFinishes[sessionID] = Array(pending.suffix(16))
+            // 先发"完成提示"（走现有通知通道，是否弹出由通知设置决定）；
+            // 是否自动续跑一轮由设置开关和下面的空闲/上限判断决定，开关关闭时不提交新一轮。
+            onResponseNotification?(sessionID, "shell:" + snapshot.id,
+                                    !(snapshot.state == .exited && snapshot.exitCode == 0))
+            scheduleBackgroundCompletionContinuation(sessionID: sessionID)
         }
     }
     var activePendingBackgroundResultCount: Int {
@@ -5529,9 +7848,14 @@ final class ChatStore {
         var pending = pendingBackgroundResults[sessionID] ?? []
         guard !pending.contains(where: { $0.id == notice.id }) else { return }
         pending.append(notice)
+        MinisCore.HookRuntime.installed?.notifyEvent(
+            .subagentStop, sessionID: sessionID.uuidString,
+            fields: ["stop_reason": notice.succeeded ? "completed" : "failed"])
         // This queue contains only bounded, redacted summaries; durable complete
-        // results remain in AgentTaskStore. No callback submits a user turn.
+        // results remain in AgentTaskStore. Whether a continuation turn starts is
+        // decided by scheduleBackgroundCompletionContinuation (setting + idle checks).
         pendingBackgroundResults[sessionID] = Array(pending.suffix(16))
+        scheduleBackgroundCompletionContinuation(sessionID: sessionID)
     }
 
     func attachAgentTaskStore(_ store: AgentTaskStore) {
@@ -5573,6 +7897,27 @@ final class ChatStore {
         return external ?? local
     }
 
+    /// 任务账本里一条任务属于哪个会话：父编号本身是会话编号，或以"前缀:会话编号"结尾。
+    nonisolated static func ledgerSessionID(parentID: String) -> UUID? {
+        UUID(uuidString: parentID)
+            ?? parentID.split(separator: ":").last.flatMap { UUID(uuidString: String($0)) }
+    }
+
+    /// 新一轮开始时，账本里本会话已经失败的任务都是"更早的事"：侧栏不再让它们盖住这一轮的状态
+    /// （任务中心里照常保留）。这一轮开始之后才失败的任务不在名单里，仍会显示。
+    /// 主对话的失败不进任务账本（只记在本地执行状态里，新一轮开始就被覆盖），所以真正会
+    /// 一直挂着的只有账本里的子任务、会话动作等失败，靠这个名单让位。
+    private func suppressLedgerFailuresBeforeNewTurn(sessionID: UUID) {
+        guard let agentTaskStore else { return }
+        var earlier = Set<String>()
+        for task in agentTaskStore.taskCenterSnapshots() where task.status == .failed {
+            if Self.ledgerSessionID(parentID: task.parentID) == sessionID { earlier.insert(task.taskID) }
+        }
+        guard !earlier.isEmpty else { return }
+        suppressedExternalFailureTaskIDs[sessionID, default: []].formUnion(earlier)
+        invalidateAgentTaskProjectionCache()
+    }
+
     private func agentTaskExecutionSnapshot(for sessionID: UUID) -> ExecutionSnapshot? {
         agentTaskExecutionSnapshots(for: [sessionID])[sessionID]
     }
@@ -5590,8 +7935,7 @@ final class ChatStore {
         var firstFailed: [UUID: AgentTaskSnapshot] = [:]
         var firstActive: [UUID: AgentTaskSnapshot] = [:]
         for task in agentTaskStore.taskCenterSnapshots() {
-            let parent = task.parentID.split(separator: ":").last.map(String.init) ?? task.parentID
-            guard let sessionID = UUID(uuidString: task.parentID) ?? UUID(uuidString: parent),
+            guard let sessionID = Self.ledgerSessionID(parentID: task.parentID),
                   sessionIDs.contains(sessionID) else { continue }
             if task.status == .failed {
                 if firstFailed[sessionID] == nil,
@@ -5666,6 +8010,7 @@ final class ChatStore {
     ) {
         guard sessions.contains(where: { $0.id == sessionID }) else { return }
         exhaustedProviderRetryBySession.removeValue(forKey: sessionID)
+        suppressLedgerFailuresBeforeNewTurn(sessionID: sessionID)
         executionBySessionID[sessionID] = ExecutionSnapshot(
             sessionID: sessionID,
             turnID: turnID,
@@ -5694,6 +8039,7 @@ final class ChatStore {
             return false
         }
         exhaustedProviderRetryBySession.removeValue(forKey: sessionID)
+        suppressLedgerFailuresBeforeNewTurn(sessionID: sessionID)
         executionBySessionID[sessionID] = ExecutionSnapshot(
             sessionID: sessionID,
             turnID: executionIdentity.turn.turnID,
@@ -5714,6 +8060,8 @@ final class ChatStore {
     ) {
         guard sessions.contains(where: { $0.id == sessionID }) else { return }
         let previous = executionBySessionID[sessionID]
+        let providerFailure = failureKind == .authorization || failureKind == .quota
+        let failedProvider = providerFailure ? currentProviderIdentityForFailureNotice() : nil
         executionBySessionID[sessionID] = ExecutionSnapshot(
             sessionID: sessionID,
             turnID: previous?.turnID,
@@ -5722,7 +8070,9 @@ final class ChatStore {
             updatedAt: updatedAt,
             failureReason: Self.sanitizedExecutionFailure(credentialBroker.protect(reason)),
             failureKind: failureKind,
-            executionIdentity: previous?.executionIdentity
+            executionIdentity: previous?.executionIdentity,
+            failedProviderID: failedProvider?.id,
+            failedProviderName: failedProvider?.name
         )
         persistExecutionState()
         onSessionsChanged?()
@@ -5827,7 +8177,61 @@ final class ChatStore {
         persistExecutionState()
     }
 
-    /// 失败行的重试入口：重放该会话最后一条用户消息，不复制用户气泡。
+    /// 重试时要被丢掉的输出里，已经执行完成的改动类工具（只读工具不算）。
+    struct RetryDiscardedSideEffect: Equatable {
+        let toolName: String
+        let target: String
+    }
+
+    /// 只读或纯内部的工具：重来一遍不会改变外部状态，不需要提醒。其余（含 MCP、浏览器、
+    /// 未知工具）一律按"可能有副作用"算。
+    nonisolated private static let retrySafeToolNames: Set<String> = [
+        "file_read", "file_grep", "file_glob", "web_fetch", "web_search", "shell_output",
+        "todo_write", "ask_user", "skill_read", "task_board", "context_compact",
+        "external_session_read",
+    ]
+
+    /// 最后一条用户消息之后、已经拿到结果的改动类工具调用（按出现顺序）。
+    /// 判定只看"有没有拿到结果"，工具内部失败或被拒绝的调用也会算进来（宁可多提醒一次）。
+    nonisolated static func completedSideEffectTools(afterLastUserIn messages: [ChatMessageUI]) -> [RetryDiscardedSideEffect] {
+        guard let lastUser = messages.lastIndex(where: { $0.role == .user }) else { return [] }
+        let tail = messages[(lastUser + 1)...]
+        let answered = Set(tail.compactMap { $0.role == .tool ? $0.toolCallID : nil })
+        var result: [RetryDiscardedSideEffect] = []
+        for message in tail where message.role == .assistant {
+            for call in message.toolCalls where answered.contains(call.id) && !retrySafeToolNames.contains(call.name) {
+                let target = (call.arguments["path"] as? String)
+                    ?? (call.arguments["command"] as? String)
+                    ?? (call.arguments["url"] as? String)
+                    ?? ""
+                result.append(RetryDiscardedSideEffect(toolName: call.name, target: String(target.prefix(200))))
+            }
+        }
+        return result
+    }
+
+    /// 确认框的正文：最多列 5 条，其余写"另有 N 项"。
+    nonisolated static func retryConfirmationBody(_ items: [RetryDiscardedSideEffect]) -> String {
+        let lines = items.prefix(5).map { item in
+            item.target.isEmpty ? "· \(item.toolName)" : "· \(item.toolName)：\(item.target)"
+        }
+        let more = items.count > 5 ? "\n另有 \(items.count - 5) 项" : ""
+        return "这条消息之后已经执行过：\n" + lines.joined(separator: "\n") + more
+            + "\n\n重试会从这条消息重新开始，这些改动可能再做一遍。"
+    }
+
+    /// 重试前的确认。默认弹原生确认框；测试里替换成固定答案。
+    @ObservationIgnored var retryConfirmation: ([RetryDiscardedSideEffect]) -> Bool = { items in
+        let alert = NSAlert()
+        alert.messageText = "重试可能重复已做的改动"
+        alert.informativeText = ChatStore.retryConfirmationBody(items)
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "仍然重试")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// 失败行的重试入口：从该会话最后一条用户消息重新开始（先去掉其后失败那一轮的半截产出与
+    /// 错误提示，对齐 Claude Code / Codex），重放这条用户消息，不复制用户气泡。
     @discardableResult
     func retryFailedSession(_ identity: RetryIdentity) -> Bool {
         guard budgetResetInProgress?.target.sessionID != identity.sessionID,
@@ -5841,15 +8245,48 @@ final class ChatStore {
         // A stale row must not retry a task whose canonical external ledger is
         // already terminal in another state. Unknown local task IDs remain
         // valid for the chat-only path.
+        let externalTaskID: String?
         if let taskID = identity.taskID,
            let externalTask = externalTaskSnapshot(sessionID: identity.sessionID, taskID: taskID) {
             guard externalTask.status == .failed else { return false }
-            suppressedExternalFailureTaskIDs[identity.sessionID, default: []].insert(taskID)
-            invalidateAgentTaskProjectionCache()
+            externalTaskID = taskID
+        } else {
+            externalTaskID = nil
         }
-        if activeSessionID != identity.sessionID {
-            switchSession(id: identity.sessionID)
+        return replayLastUserMessageDiscardingTurnOutput(
+            session: session, lastUserMessage: lastUserMessage, actionName: "重试"
+        ) { [self] in
+            if let externalTaskID {
+                suppressedExternalFailureTaskIDs[identity.sessionID, default: []].insert(externalTaskID)
+                invalidateAgentTaskProjectionCache()
+            }
         }
+    }
+
+    /// 重试与"被中断回答的重新生成"共用：去掉最后一条用户消息之后这一轮的半截产出，再按原用户消息重跑。
+    /// 重跑会丢掉这一轮的输出：其中已经执行成功的改动类工具（写文件、执行命令等）可能被再做一遍，先让用户知情再决定。
+    private func replayLastUserMessageDiscardingTurnOutput(
+        session: ChatThread, lastUserMessage: ChatMessageUI, actionName: String,
+        afterDiscard: () -> Void
+    ) -> Bool {
+        let completedSideEffects = Self.completedSideEffectTools(afterLastUserIn: session.messages)
+        if !completedSideEffects.isEmpty {
+            let shown = completedSideEffects.map { item in
+                RetryDiscardedSideEffect(toolName: item.toolName, target: credentialBroker.protect(item.target))
+            }
+            guard retryConfirmation(shown) else {
+                pastedTextActionFeedback = "已取消\(actionName)。"
+                return false
+            }
+        }
+        if activeSessionID != session.id {
+            switchSession(id: session.id)
+        }
+        guard discardFailedTurnOutputBeforeRetry(session.id) else {
+            pastedTextActionFeedback = "会话已变化、仍有任务在运行或写入未确认，这次没有\(actionName)。请稍后再点\(actionName)。"
+            return false
+        }
+        afterDiscard()
         let snapshot = makeComposerSubmissionSnapshot(
             messageID: UUID(),
             messageText: lastUserMessage.content,
@@ -5861,6 +8298,50 @@ final class ChatStore {
             mediaSourceMessageID: lastUserMessage.id
         )
         return true
+    }
+
+    /// 重试前把失败那一轮的半截产出从会话正史里去掉（只保留到最后一条用户消息）。
+    /// 与"回退会话"同样的前提：会话空闲、无运行中的后台子任务、落盘与界面一致；
+    /// 用户消息之后本来就没有内容时直接放行。
+    private func discardFailedTurnOutputBeforeRetry(_ sessionID: UUID) -> Bool {
+        guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return false }
+        let persisted = sessions[index].asPersisted()
+        guard let lastUser = persisted.messages.lastIndex(where: { $0.role == .user }) else { return false }
+        guard lastUser + 1 < persisted.messages.count else { return true }
+        guard let store = sessionStore else {
+            // 没接落盘存储的会话：只在内存里去掉失败那一轮的产出，结果与有存储时一致。
+            guard (try? requireConversationRewindIdle(sessionID)) != nil,
+                  let uiLastUser = sessions[index].messages.lastIndex(where: { $0.role == .user }),
+                  uiLastUser + 1 < sessions[index].messages.count else { return false }
+            sessions[index].messages.removeSubrange((uiLastUser + 1)...)
+            sessions[index].transcriptRevision &+= 1
+            transientCompactionProjections.removeValue(forKey: sessionID)
+            return true
+        }
+        do {
+            try requireConversationRewindIdle(sessionID)
+            guard let admission = admitPersistence(writing: true) else {
+                throw SessionStoreError.sessionSnapshotConflict(sessionID.uuidString)
+            }
+            defer { admission.release() }
+            guard let canonical = store.loadSession(id: sessionID.uuidString),
+                  canonical.transcriptRevision == persisted.transcriptRevision,
+                  canonical.messages == persisted.messages else {
+                throw SessionStoreError.sessionSnapshotConflict(sessionID.uuidString)
+            }
+            let committed = try store.discardOutputAfterLastUserMessage(expectedSession: canonical)
+            guard adoptScheduledCanonicalSession(committed) else {
+                canonicalWriteIsolatedSessions.insert(sessionID)
+                return false
+            }
+            transientCompactionProjections.removeValue(forKey: sessionID)
+            return true
+        } catch {
+            if let failure = error as? SessionStoreError, case .sessionCommitUncertain = failure {
+                canonicalWriteIsolatedSessions.insert(sessionID)
+            }
+            return false
+        }
     }
 
     /// Consume one producer-owned ToolExecutionFact. Every identity field is
@@ -6016,6 +8497,12 @@ final class ChatStore {
         return "这个会话还有后台运行的子任务。请先在任务中心停止它们，或等它们完成后再删除。"
     }
 
+    /// 归档与删除用同一个守卫：会话还有后台子任务在跑时不归档，免得子任务在归档后继续跑完。
+    func backgroundArchiveBlockReason(sessionID: String) -> String? {
+        backgroundDeletionBlockReason(sessionID: sessionID) == nil
+            ? nil : "归档未执行：这个会话还有后台运行的子任务。请先在任务中心停止它们，或等它们完成后再归档。"
+    }
+
     private func requireNoLiveBackgroundChildren(_ id: UUID) throws {
         if backgroundDeletionBlockReason(sessionID: id.uuidString) != nil {
             throw ChatStoreDeletionError.backgroundChildrenRunning(id)
@@ -6157,6 +8644,7 @@ final class ChatStore {
     /// 侧栏分组列表：自定义组（创建序，空组也显示）→ 项目分组（AJ-30，
     /// 仅未归自定义组的会话）→ 未归属项目（最后）。搜索态隐藏空自定义组。
     var sessionGroups: [SessionGroup] {
+        let perf = PerformanceSignposts.begin(.sidebarSessionGroups); defer { perf.end() }
         let items = sessionList
         var result: [SessionGroup] = []
 
@@ -6230,11 +8718,34 @@ final class ChatStore {
         }
     }
 
+    /// 会话全文的小写拼接文本（消息间用 NUL 分隔，避免跨消息误匹配）。
+    /// 按会话缓存；消息数、末条长度或转录修订变化时才重建，搜索时不再逐条消息做本地化比较。
+    private func searchableBodyText(of session: ChatThread) -> String {
+        let lastLength = session.messages.last?.content.utf8.count ?? 0
+        if let entry = searchTextIndex[session.id],
+           entry.transcriptRevision == session.transcriptRevision,
+           entry.messageCount == session.messages.count,
+           entry.lastLength == lastLength {
+            return entry.text
+        }
+        var text = ""
+        for message in session.messages {
+            text += message.content.lowercased()
+            text += "\u{0}"
+        }
+        searchTextIndex[session.id] = SearchIndexEntry(
+            transcriptRevision: session.transcriptRevision,
+            messageCount: session.messages.count,
+            lastLength: lastLength,
+            text: text)
+        return text
+    }
+
     /// 会话是否命中查询（标题 / 预览 / 全文 / 日期）。
-    private func matchesSearch(_ session: ChatThread, query q: String, parsedDate: Date?) -> Bool {
+    private func matchesSearch(_ session: ChatThread, query q: String, parsedDate: SearchDay?) -> Bool {
         if session.title.localizedCaseInsensitiveContains(q) { return true }
         if session.preview.localizedCaseInsensitiveContains(q) { return true }
-        if session.messages.contains(where: { $0.content.localizedCaseInsensitiveContains(q) }) {
+        if searchableBodyText(of: session).range(of: q.lowercased(), options: .literal) != nil {
             return true
         }
         if let day = parsedDate {
@@ -6243,28 +8754,38 @@ final class ChatStore {
         return false
     }
 
+    /// 解析出的检索日期。不带年份的写法（"11-17""11月17日"）`hasYear == false`，只比月和日。
+    private struct SearchDay {
+        let date: Date
+        let hasYear: Bool
+    }
+
     /// 尝试把查询串解析为日期（yyyy-MM-dd / yyyy/MM/dd / yyyy.MM.dd / MM-dd / M月d日）。
-    private static func searchDate(from query: String) -> Date? {
+    private static func searchDate(from query: String) -> SearchDay? {
         let trimmed = query.trimmingCharacters(in: .whitespaces)
-        for fmt in Self.searchDateFormatters {
-            if let date = fmt.date(from: trimmed) { return date }
+        for (fmt, hasYear) in Self.searchDateFormatters {
+            if let date = fmt.date(from: trimmed) { return SearchDay(date: date, hasYear: hasYear) }
         }
         return nil
     }
 
     /// 日期检索格式（en_US_POSIX 保证数字解析稳定）。
-    private static let searchDateFormatters: [DateFormatter] = {
-        ["yyyy-MM-dd", "yyyy/MM/dd", "yyyy.MM.dd", "MM-dd", "M月d日"].map { fmt in
+    private static let searchDateFormatters: [(DateFormatter, hasYear: Bool)] = {
+        [("yyyy-MM-dd", true), ("yyyy/MM/dd", true), ("yyyy.MM.dd", true), ("MM-dd", false), ("M月d日", false)].map { item in
             let f = DateFormatter()
             f.locale = Locale(identifier: "en_US_POSIX")
-            f.dateFormat = fmt
-            return f
+            f.dateFormat = item.0
+            return (f, item.1)
         }
     }()
 
-    /// 两个日期是否落在同一天（按当前时区）。
-    private static func isSameDay(_ a: Date, _ b: Date) -> Bool {
-        Calendar.current.isDate(a, inSameDayAs: b)
+    /// 会话日期是否命中检索日期（按当前时区）；检索日期不带年份时只比月和日。
+    private static func isSameDay(_ a: Date, _ day: SearchDay) -> Bool {
+        if day.hasYear { return Calendar.current.isDate(a, inSameDayAs: day.date) }
+        let calendar = Calendar.current
+        let lhs = calendar.dateComponents([.month, .day], from: a)
+        let rhs = calendar.dateComponents([.month, .day], from: day.date)
+        return lhs.month == rhs.month && lhs.day == rhs.day
     }
 
     /// 重命名会话（标题去空白；空标题忽略）。不刷新 updatedAt，避免列表跳动。
@@ -6304,45 +8825,149 @@ final class ChatStore {
         return applyDuplicateSession(id: id)
     }
 
+    /// 复制或分叉被拒（会话正在生成回复）时给用户的说明；侧栏复制菜单和消息上的分叉共用。
+    nonisolated static let duplicateWhileGeneratingNotice = "复制未执行：该会话正在生成回复，请等它完成或先停止。"
+
+    /// 复制会话返回 nil 时的原因说明：会话正在生成回复才有，其它原因返回 nil。
+    func duplicateRefusalNotice(sessionID: UUID) -> String? {
+        streamingTasks[sessionID] != nil ? Self.duplicateWhileGeneratingNotice : nil
+    }
+
+    /// 一次 fork 的边界与新会话草稿（由 `forkSession` 设置，`applyDuplicateSession` 消费）。
+    /// 会话动作处理器只带源会话 ID，边界借这个同步槽位传入，调用前后都会清空。
+    @ObservationIgnored private var pendingForkRequest: (prefixCount: Int, draft: String?, attachments: [ChatAttachment])?
+
+    /// 从某条消息处分叉到新会话。`inclusive == true`：保留到这条消息（含）；
+    /// `false`：保留到这条之前（编辑旧消息时用：新会话从这条用户消息之前开始，
+    /// 编辑后的文字作为草稿）。边界会落在工具调用与结果成对的位置上。
+    @discardableResult
+    func forkSession(id: UUID, atMessageID messageID: UUID, inclusive: Bool,
+                     draft: String? = nil, attachments: [ChatAttachment] = []) -> UUID? {
+        guard let source = sessions.first(where: { $0.id == id }),
+              let index = source.messages.firstIndex(where: { $0.id == messageID }) else { return nil }
+        guard !source.messages[index].isStreaming,
+              !(id == activeSessionID && isActiveSessionGenerating) else {
+            pastedTextActionFeedback = Self.duplicateWhileGeneratingNotice
+            return nil
+        }
+        let prefix = Self.pairedForkPrefixCount(source.messages, rawCount: inclusive ? index + 1 : index)
+        guard prefix > 0 || draft != nil else { return nil }
+        pendingForkRequest = (prefix, draft, attachments)
+        defer { pendingForkRequest = nil }
+        let forked = duplicateSession(id: id)
+        if forked == nil, let notice = duplicateRefusalNotice(sessionID: id) { pastedTextActionFeedback = notice }
+        return forked
+    }
+
+    /// 编辑旧消息时的“从这里分叉到新会话”：新会话保留这条消息之前的历史，
+    /// 编辑后的文字作为草稿；原会话保持不变（编辑仍是追加新一轮，D-CHAT-09）。
+    @discardableResult
+    func forkFromEditedMessage() -> UUID? {
+        guard let sessionID = activeSessionID, let messageID = editingMessageID else { return nil }
+        // 编辑的是整条消息：附件跟着草稿一起放进新会话的输入框。
+        return forkSession(id: sessionID, atMessageID: messageID, inclusive: false,
+                           draft: draftText, attachments: pendingAttachments)
+    }
+
+    /// 把分叉边界调整到工具调用与结果成对的位置：边界落在一组工具结果之前时把结果带上，
+    /// 末尾若是还没有结果的工具调用则整条去掉。
+    nonisolated static func pairedForkPrefixCount(_ messages: [ChatMessageUI], rawCount: Int) -> Int {
+        var end = min(max(0, rawCount), messages.count)
+        if end > 0 {
+            let last = messages[end - 1]
+            if last.role == .tool || (last.role == .assistant && !last.toolCalls.isEmpty) {
+                while end < messages.count, messages[end].role == .tool { end += 1 }
+            }
+        }
+        while end > 0, messages[end - 1].role == .assistant, !messages[end - 1].toolCalls.isEmpty {
+            end -= 1
+        }
+        return end
+    }
+
     @discardableResult
     func applyDuplicateSession(id: UUID) -> UUID? {
-        guard let source = sessions.first(where: { $0.id == id }) else { return nil }
+        guard let source = sessions.first(where: { $0.id == id }),
+              streamingTasks[id] == nil else { return nil }
         // Fork also changes the active composer, so its unsent long draft must
         // be materialized before the new session becomes active.
         flushCurrentDraft()
+        let fork = pendingForkRequest
+        pendingForkRequest = nil
+        // 整段复制也按工具调用与结果成对处理：末尾有调用没结果的助手消息不带过去。
+        let prefixCount = min(
+            fork?.prefixCount ?? Self.pairedForkPrefixCount(source.messages, rawCount: source.messages.count),
+            source.messages.count)
+        let copiedSource = Array(source.messages.prefix(prefixCount))
+        // 元数据：分组、会话级模型随会话走；从消息处分叉且来源已落盘时再带上血缘（根、父、边界）。
+        let lineageParentKnown = fork != nil
+            && knownPersistedSessionIDs.contains(source.id.uuidString.lowercased())
+        let boundaryID: String? = lineageParentKnown && prefixCount > 0
+            ? Compactor.stableMessageID(copiedSource[prefixCount - 1].asLLMMessage(),
+                                        transcriptIndex: prefixCount - 1)
+            : nil
         let copyID = UUID()
         let copy = ChatThread(
             id: copyID,
-            title: source.title + "（副本）",
+            title: source.title + (fork == nil ? "（副本）" : "（分叉）"),
             createdAt: Date(),
             updatedAt: Date(),
-            messages: source.messages.map {
-                ChatMessageUI(role: $0.role, content: $0.content, timestamp: $0.timestamp,
-                              attachments: $0.attachments,
-                              toolCallID: $0.toolCallID,
-                              toolCalls: $0.toolCalls,
-                              legacyToolOutputSummary: $0.legacyToolOutputSummary,
-                              referenceCard: $0.referenceCard.map {
-                                  PastedTextReferenceCard(
-                                      id: $0.id,
-                                      sessionID: copyID,
-                                      instruction: $0.instruction,
-                                      material: $0.material,
-                                      kind: $0.kind,
-                                      isExpanded: $0.isExpanded
-                                  )
-                              })
+            // 完整复制每条消息的元数据（只换新 ID 和粘贴卡所属会话）：
+            // 耗时、模型标识、思考过程、内嵌工具锚点、会话引用卡都带过去。
+            messages: copiedSource.map { original in
+                var message = ChatMessageUI(
+                    role: original.role, content: original.content, timestamp: original.timestamp,
+                    attachments: original.attachments,
+                    composedContentOwnership: original.composedContentOwnership,
+                    toolCallID: original.toolCallID,
+                    toolCalls: original.toolCalls,
+                    legacyToolOutputSummary: original.legacyToolOutputSummary,
+                    inlineToolAnchors: original.inlineToolAnchors,
+                    producerTextAttachmentCount: original.producerTextAttachmentCount,
+                    referenceCard: original.referenceCard.map {
+                        PastedTextReferenceCard(
+                            id: $0.id,
+                            sessionID: copyID,
+                            instruction: $0.instruction,
+                            material: $0.material,
+                            kind: $0.kind,
+                            isExpanded: $0.isExpanded
+                        )
+                    },
+                    sessionReferenceCard: original.sessionReferenceCard,
+                    trustedSessionReadIntent: original.trustedSessionReadIntent,
+                    turnTiming: original.turnTiming,
+                    turnProviderName: original.turnProviderName,
+                    turnModelID: original.turnModelID)
+                message.wasInterrupted = original.wasInterrupted
+                message.hasUnverifiedTimestamp = original.hasUnverifiedTimestamp
+                message.thinkingText = original.thinkingText
+                message.thinkingSeconds = original.thinkingSeconds
+                message.turnProviderDisplayLabel = original.turnProviderDisplayLabel
+                return message
             },
             projectID: source.projectID,
             projectName: source.projectName,
-            workingDirectory: source.workingDirectory
+            workingDirectory: source.workingDirectory,
+            groupID: source.groupID,
+            modelID: source.modelID,
+            providerTypeRaw: source.providerTypeRaw,
+            rootSessionID: lineageParentKnown ? source.rootSessionID : nil,
+            parentSessionID: lineageParentKnown ? source.id.uuidString : nil,
+            forkedFromSessionID: lineageParentKnown ? source.id.uuidString : nil,
+            // 校验只要求不超过来源已落盘的版本；这里取 0，避免内存版本领先磁盘时校验失败。
+            forkedThroughTranscriptRevision: lineageParentKnown ? 0 : nil,
+            forkedThroughMessageID: boundaryID
         )
         sessions.append(copy)
         activeSessionID = copy.id
+        // 副本带着来源的会话级模型覆盖：刷新输入框的模型显示。
+        refreshActiveSessionModelDisplay()
         // Fork creates a fresh composer; the source session keeps its own
         // unsent attachments and edit target for a later return.
-        pendingAttachments = []
+        pendingAttachments = fork?.attachments ?? []
         editingMessageID = nil
+        if let draft = fork?.draft { draftText = draft }
         enforceSessionLimit()
         onSessionsChanged?()
         return copy.id
@@ -6353,13 +8978,24 @@ final class ChatStore {
     /// 数据完整性（审计）：磁盘归档失败则**不变更内存**（否则归档失败的文件仍在
     /// 活动目录，却已移出内存 → 下次 persistSessions 全量同步把它当「已删除实体」
     /// 硬删，永久丢数据）。
-    func archiveSession(id: UUID) {
-        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return }
+    /// 返回是否真的归档了。正在后台生成回复的非活动会话会被拒绝（与永久删除的
+    /// `sessionBusy` 守卫对称）：否则后半段回复写不回去，工具还在后台跑。
+    @discardableResult
+    func archiveSession(id: UUID) -> Bool {
+        guard let index = sessions.firstIndex(where: { $0.id == id }) else { return false }
+        if id != activeSessionID, isSessionGenerating(id) { return false }
+        if backgroundArchiveBlockReason(sessionID: id.uuidString) != nil { return false }
         if id == activeSessionID {
-            stopStreamingForSwitch()
             // C3-3：归档当前会话前落盘其草稿（归档≠删除——草稿保留在 DraftStore，
-            // 之后 restoreSession 会随会话一起恢复，不残留也不丢失）
+            // 之后 restoreSession 会随会话一起恢复，不残留也不丢失）。放在预检之前：
+            // 预检失败时归档不执行，输入框里正在编辑的原生草稿也要已经落到会话草稿里。
             flushCurrentDraft()
+            // 先确认磁盘上归档做得成，再停回复：否则写盘失败时回复已经被停掉、会话却没归档。
+            if let reason = archiveDiskPreflightFailure(id: id) {
+                logManager.error("归档会话未执行（回复保持运行）：\(reason)", category: "Persistence")
+                return false
+            }
+            stopStreamingForSwitch()
         }
         if let manager = sessionManager {
             do {
@@ -6368,9 +9004,13 @@ final class ChatStore {
                 // 磁盘归档失败：保持内存不变（会话留在活动列表），记日志供诊断。
                 logManager.error(
                     "归档会话失败，已保留在活动列表：\(error)", category: "Persistence")
-                return
+                return false
             }
         }
+        MinisCore.HookRuntime.installed?.notifyEvent(
+            .sessionEnd, sessionID: id.uuidString, fields: ["reason": "archived"])
+        // 归档会话的读取记录只在内存里，不再占用；恢复后按“未读过”重新判断。
+        FileReadRecordStore.shared.clear(sessionID: id.uuidString)
         let session = sessions.remove(at: index)
         archivedSessions.insert(session, at: 0)
         if activeSessionID == id {
@@ -6381,7 +9021,29 @@ final class ChatStore {
             restoreDraftForActiveSession()
         }
         onSessionsChanged?()
+        return true
     }
+
+    /// 归档前对磁盘做只读检查（不移动任何文件）：归档目录已有同名文件，或归档目录建不出来/不可写，
+    /// 这两种情况归档一定会失败。返回失败原因；可以归档返回 nil。没有磁盘管理器（纯内存）时不检查。
+    func archiveDiskPreflightFailure(id: UUID) -> String? {
+        guard let manager = sessionManager else { return nil }
+        let fm = FileManager.default
+        let archiveDirectory = manager.archiveDirectory
+        if fm.fileExists(atPath: archiveDirectory.appendingPathComponent("\(id.uuidString).json").path) {
+            return "归档目录里已有同名会话文件"
+        }
+        var isDirectory: ObjCBool = false
+        if fm.fileExists(atPath: archiveDirectory.path, isDirectory: &isDirectory) {
+            return isDirectory.boolValue && fm.isWritableFile(atPath: archiveDirectory.path)
+                ? nil : "归档目录不可写"
+        }
+        return fm.isWritableFile(atPath: archiveDirectory.deletingLastPathComponent().path)
+            ? nil : "无法创建归档目录"
+    }
+
+    /// 该会话是否有正在生成的回复，或正在跑定时任务的回合（侧栏归档、复制前用来给出提示）。
+    func isSessionGenerating(_ id: UUID) -> Bool { streamingTasks[id] != nil || scheduledSessionBusy.contains(id) }
 
     /// 恢复归档会话：移回活动列表并切换过去；磁盘文件经 SessionManager 移回。
     /// 数据完整性：磁盘恢复失败则**不变更内存**（否则 _archive 仍留一份、内存又加回，
@@ -6421,7 +9083,8 @@ final class ChatStore {
             // C3-3：恢复该会话上次未发送的草稿（归档时 flushCurrentDraft 已落盘）
             restoreDraftForActiveSession()
         }
-        enforceSessionLimit()
+        // 对话里恢复（不激活）的会话通常是最旧的，不能刚恢复就被自动归档回去。
+        enforceSessionLimit(protecting: activating ? nil : session.id)
         onSessionsChanged?()
     }
 
@@ -6821,7 +9484,7 @@ final class ChatStore {
               !value.contains("/Users/"),
               !value.contains("://"),
               !sensitiveMarkers.contains(where: lowercased.contains) else {
-            return "未知 Provider"
+            return "未知服务商"
         }
         return String(value.prefix(80))
     }
@@ -6869,13 +9532,13 @@ final class ChatStore {
             }
             let servedProvider = Self.safeProviderRuntimeID(servedProviderID)
             return "**\(Self.fallbackRouteProjectionPrefix)**\n"
-                + "原 Provider：`\(originalProvider)`\n"
+                + "原服务商：`\(originalProvider)`\n"
                 + "失败原因：\(failureReason)\n"
                 + "尝试：\(attempts)\n"
-                + "最终 served Provider：`\(servedProvider)`"
+                + "最终实际使用的服务商：`\(servedProvider)`"
         case .terminalFailure:
             return "**\(Self.fallbackRouteProjectionPrefix)失败**\n"
-                + "原 Provider：`\(originalProvider)`\n"
+                + "原服务商：`\(originalProvider)`\n"
                 + "失败原因：\(failureReason)\n"
                 + "尝试：\(attempts)\n"
                 + "本次未提供结果。"
@@ -6890,7 +9553,8 @@ final class ChatStore {
         _ transcript: [LLMMessage], fact: ToolExecutionFact,
         sessionID: UUID?, messageID: UUID, identity: AgentTurnIdentity,
         executionIdentity: AgentExecutionIdentity,
-        immediateTraceMessageIDs: inout Set<UUID>
+        immediateTraceMessageIDs: inout Set<UUID>,
+        excerptWindow: inout CrossTurnExcerptWindow
     ) -> Bool {
         let isTrace = CrossTurnToolTracePolicy.rule(for: fact.toolName) != nil && fact.status == .succeeded
         guard (fact.toolName == OrchestrationToolExecutor.toolName || isTrace),
@@ -6937,10 +9601,21 @@ final class ChatStore {
         if !isTrace {
             sessions[sessionIndex].messages.removeAll { immediateTraceMessageIDs.contains($0.id) }
             immediateTraceMessageIDs.removeAll()
+            excerptWindow = CrossTurnExcerptWindow()
         }
         guard let insertionIndex = lookupMessageIndex(in: sessionIndex, matching: messageID) else { return false }
         sessions[sessionIndex].messages.insert(contentsOf: projected, at: insertionIndex)
-        if isTrace { immediateTraceMessageIDs.formUnion(projected.map(\.id)) }
+        if isTrace {
+            immediateTraceMessageIDs.formUnion(projected.map(\.id))
+            // 每回合摘录对留最新的 12 对 / 16 KiB：较早的整对移除；句柄类（无摘录成本）不计入。
+            if let cost = CrossTurnToolTracePolicy.excerptCost(of: transcript) {
+                let evicted = Set(excerptWindow.add(messageIDs: projected.map(\.id), cost: cost))
+                if !evicted.isEmpty {
+                    sessions[sessionIndex].messages.removeAll { evicted.contains($0.id) }
+                    immediateTraceMessageIDs.subtract(evicted)
+                }
+            }
+        }
         touchSession(sessionID)
         return true
     }
@@ -6953,13 +9628,16 @@ final class ChatStore {
         identity: AgentTurnIdentity,
         append text: String
     ) -> Bool {
+        let perf = PerformanceSignposts.begin(.streamDeltaWriteback); defer { perf.end() }
         guard acceptsWriteback(sessionID: sessionID, identity: identity),
               let sessionID,
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               let messageIndex = lookupMessageIndex(in: sessionIndex, matching: messageID)
         else { return false }
-        sessions[sessionIndex].messages[messageIndex].content = credentialBroker.projectStream(
+        let update = credentialBroker.projectStreamUpdate(
             messageID: messageID, current: sessions[sessionIndex].messages[messageIndex].content, append: text)
+        sessions[sessionIndex].messages[messageIndex].setProjectedContent(
+            update.text, extendsPrevious: update.extendsPrevious)
         return true
     }
 
@@ -6973,6 +9651,12 @@ final class ChatStore {
               let sessionID,
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               let messageIndex = lookupMessageIndex(in: sessionIndex, matching: messageID) else { return }
+        // 流式脱敏会扣住尾部几个字符；锚点必须落在"已显示的全部文字"之后，
+        // 否则工具卡会出现在尚未显示的词之前。
+        if let settled = credentialBroker.settleStream(messageID: messageID) {
+            sessions[sessionIndex].messages[messageIndex].setProjectedContent(
+                settled.text, extendsPrevious: settled.extendsPrevious)
+        }
         sessions[sessionIndex].messages[messageIndex].captureInlineToolAnchor(for: key)
     }
 
@@ -6989,9 +9673,40 @@ final class ChatStore {
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               let messageIndex = lookupMessageIndex(in: sessionIndex, matching: messageID)
         else { return false }
-        sessions[sessionIndex].messages[messageIndex].content = credentialBroker.replaceStream(
-            messageID: messageID, with: content)
+        sessions[sessionIndex].messages[messageIndex].replaceContent(
+            credentialBroker.replaceStream(messageID: messageID, with: content))
         return true
+    }
+
+    /// 追加模型思考过程（只用于显示）；`seconds` 非空时记录思考耗时。
+    @discardableResult
+    func appendThinking(
+        sessionID: UUID?, messageID: UUID, identity: AgentTurnIdentity,
+        text: String, seconds: Double? = nil
+    ) -> Bool {
+        guard acceptsWriteback(sessionID: sessionID, identity: identity),
+              let sessionID,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
+              let messageIndex = lookupMessageIndex(in: sessionIndex, matching: messageID)
+        else { return false }
+        if !text.isEmpty {
+            // 思考文字与正文同样经过增量脱敏：被扣住的尾部在回合终态放开或遮蔽。
+            sessions[sessionIndex].messages[messageIndex].thinkingText = credentialBroker.projectThinking(
+                messageID: messageID,
+                current: sessions[sessionIndex].messages[messageIndex].thinkingText ?? "",
+                append: text)
+        }
+        if let seconds { sessions[sessionIndex].messages[messageIndex].thinkingSeconds = seconds }
+        return true
+    }
+
+    /// 回合终态：把思考通道里被扣住的尾部放开（普通文字）或遮蔽（疑似密钥）。
+    private func finalizeThinkingTail(sessionIndex: Int, messageIndex: Int) {
+        let message = sessions[sessionIndex].messages[messageIndex]
+        if let closed = credentialBroker.finalizeThinking(
+            messageID: message.id, current: message.thinkingText ?? "") {
+            sessions[sessionIndex].messages[messageIndex].thinkingText = closed
+        }
     }
 
     /// 稳定身份版本的流结束。
@@ -7016,19 +9731,23 @@ final class ChatStore {
            let routeSuffix = providerRouteProjectionSuffix(for: executionIdentity) {
             additions.append(routeSuffix)
         }
-        if !additions.isEmpty {
-            sessions[sessionIndex].messages[messageIndex].content = credentialBroker.projectStream(
-                messageID: messageID,
-                current: sessions[sessionIndex].messages[messageIndex].content,
-                append: additions.joined(separator: "\n\n")
-            )
+        // 终态：对整条原文做一次全量脱敏并以它为准（同时把流式中扣住的尾部显示出来）。
+        if let closing = credentialBroker.finalizeStream(
+            messageID: messageID,
+            current: sessions[sessionIndex].messages[messageIndex].content,
+            append: additions.joined(separator: "\n\n")
+        ) {
+            sessions[sessionIndex].messages[messageIndex].setProjectedContent(
+                closing.text, extendsPrevious: closing.extendsPrevious)
         }
+        finalizeThinkingTail(sessionIndex: sessionIndex, messageIndex: messageIndex)
         credentialBroker.finishStream(messageID: messageID)
         // D-CHAT-18：回合终止（成功/失败/中断共用此出口）→ 闭合时长与生成阶段。
         _ = closeTurnTiming(sessionID: sessionID, messageID: messageID)
         if sessionID != activeSessionID {
             sessions[sessionIndex].unread = true
         }
+        notifySessionMessagingTurnFinished(sessionID: sessionID)
         return true
     }
 
@@ -7055,6 +9774,587 @@ final class ChatStore {
         return true
     }
 
+    // MARK: 会话之间的协作（session_send）
+
+    /// 把来自其它会话的消息（带信封）写进目标会话，不触发运行。目标正在生成时拒绝，避免打乱它的流。
+    @discardableResult
+    func deliverSessionMessage(_ text: String, toSession sessionID: UUID) -> Bool {
+        guard streamingTasks[sessionID] == nil,
+              let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return false }
+        let appendedAt = Date()
+        sessions[index].messages.append(ChatMessageUI(
+            role: .user, content: credentialBroker.protect(text),
+            isStreaming: false, timestamp: appendedAt,
+            turnTiming: ChatTurnTimingMetadata.appMessageTurnTiming(at: appendedAt)
+        ))
+        sessions[index].transcriptRevision &+= 1
+        if sessionID != activeSessionID { sessions[index].unread = true }
+        onSessionsChanged?()
+        return true
+    }
+
+    /// 让目标会话以这条消息开始一轮：沿用现有“待发队列”，由目标会话自己的模式、权限与审批处理。
+    /// 目标是当前打开的会话时，空闲即发、生成中排到回合结束之后；否则排队等用户打开。
+    func startSessionMessageRun(_ text: String, inSession sessionID: UUID) -> SessionRunStart {
+        // 目标不是当前打开的会话：优先在后台无人值守地跑一轮；条件不满足才退回“等用户打开”。
+        if sessionID != activeSessionID,
+           let started = startBackgroundSessionMessageRun(text, inSession: sessionID) {
+            return started
+        }
+        queuedComposerMessages.append(QueuedComposerMessage(
+            sessionID: sessionID, text: text, attachments: [], pastedDrafts: []))
+        guard sessionID == activeSessionID else {
+            if let index = sessions.firstIndex(where: { $0.id == sessionID }) { sessions[index].unread = true }
+            return .waitingForUserToOpen
+        }
+        if isActiveSessionGenerating { return .queuedBehindCurrentTurn }
+        _ = sendNextQueuedComposer(automatically: true)
+        return queuedComposerMessages.contains(where: { $0.text == text && $0.sessionID == sessionID })
+            ? .queuedBehindCurrentTurn : .started
+    }
+
+    /// 回合结束时认领“被其它会话唤醒的那一轮”：触发它的用户消息带本中枢登记过的信封时，
+    /// 把本轮最终回复交给发起方（在等就直接交回，不在等就留到发起方下一回合）。
+    func notifySessionMessagingTurnFinished(sessionID: UUID) {
+        // 回合刚结束：此前因会话忙而没能续跑的后台完成结果，现在再判断一次。
+        scheduleBackgroundCompletionContinuation(sessionID: sessionID)
+        // 一个前台回合结束，可能腾出了后台排队消息的目标会话。
+        if !backgroundRunLimiter.waiting.isEmpty { scheduleBackgroundRunPump(afterSeconds: 0.3) }
+        guard let thread = sessions.first(where: { $0.id == sessionID }),
+              let userIndex = thread.messages.lastIndex(where: { $0.role == .user }),
+              let envelope = SessionMessageEnvelope.parse(thread.messages[userIndex].content),
+              SessionMessagingHub.shared.isTrackedRun(messageID: envelope.messageID) else { return }
+        let reply = thread.messages[(userIndex + 1)...]
+            .last(where: { $0.role == .assistant && !$0.isStreaming && !$0.content.isEmpty })?.content
+            ?? "（目标会话本轮没有产生文字回复）"
+        SessionMessagingHub.shared.complete(messageID: envelope.messageID, reply: reply)
+    }
+
+    // MARK: 非当前会话的后台运行（session_send mode=run）
+
+    /// 同时最多 2 个后台运行，其余排队；只在主线程使用。
+    @ObservationIgnored private var backgroundRunLimiter = BackgroundSessionRunLimiter()
+    @ObservationIgnored private var backgroundRunTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var backgroundTurnTaskIDs: Set<String> = []
+    @ObservationIgnored private var backgroundRunPumpScheduled = false
+    /// 正在后台无人值守运行的会话，侧栏据此显示“后台运行”。
+    private(set) var backgroundRunSessionIDs: Set<UUID> = []
+
+    private enum BackgroundSessionRunError: Error {
+        case unavailable(String)
+    }
+
+    private enum BackgroundSessionTurnOutcome {
+        case reply(String)
+        case failed(String)
+        case cancelled
+    }
+
+    /// 准备策略时用：这个任务是后台会话回合，按目标会话自己的目录与权限准备，不走项目绑定。
+    func isBackgroundSessionTurnTask(_ taskID: String) -> Bool {
+        backgroundTurnTaskIDs.contains(taskID)
+    }
+
+    /// 由一次触发的 effectID 确定的会话 ID：同一次触发重试时指向同一个会话。
+    static func scheduledRunSessionID(effectID: String) -> UUID {
+        let digest = Array(SHA256.hash(data: Data(("scheduled-run-session:" + effectID).utf8)))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
+
+    /// 定时任务“每次运行开新会话”：在锚点会话所属项目里建一个空会话（不切换当前会话），
+    /// 沿用锚点会话的项目、工作目录、模型与分组，标题含任务名与触发时间。
+    /// 同一次触发已经建过且仍是空会话时直接复用；已有内容则拒绝（不往别的转录里写）。
+    func createScheduledRunSession(
+        from anchor: ChatThread, taskName: String, effectID: String, at date: Date
+    ) -> UUID? {
+        let id = Self.scheduledRunSessionID(effectID: effectID)
+        if let existing = sessions.first(where: { $0.id == id }) {
+            return existing.messages.isEmpty && existing.projectID == anchor.projectID ? id : nil
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M月d日 HH:mm"
+        let name = taskName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var session = ChatThread(
+            id: id, title: (name.isEmpty ? "定时任务" : name) + " · " + formatter.string(from: date),
+            projectID: anchor.projectID, projectName: anchor.projectName,
+            workingDirectory: anchor.workingDirectory, groupID: anchor.groupID,
+            modelID: anchor.modelID, providerTypeRaw: anchor.providerTypeRaw)
+        session.updatedAt = date
+        sessions.append(session)
+        scheduledRunSessionIDs.insert(id)
+        enforceSessionLimit()
+        guard persistSessions(), sessionStore?.loadSession(id: id.uuidString) != nil else {
+            sessions.removeAll { $0.id == id }
+            scheduledRunSessionIDs.remove(id)
+            return nil
+        }
+        return id
+    }
+
+    /// 新会话已建好、但后面的检查没通过时：把这个仍是空的会话收回，不留空会话。
+    func discardEmptyScheduledRunSession(_ id: UUID) {
+        guard let session = sessions.first(where: { $0.id == id }), session.messages.isEmpty,
+              id != activeSessionID else { return }
+        sessions.removeAll { $0.id == id }
+        scheduledRunSessionIDs.remove(id)
+        _ = persistSessions()
+    }
+
+    private func canStartBackgroundRunNow(_ sessionID: UUID) -> Bool {
+        streamingTasks[sessionID] == nil && !scheduledSessionBusy.contains(sessionID)
+            && ordinaryAutoCompactionTasks[sessionID] == nil
+    }
+
+    private func canRunSessionInBackground(_ sessionID: UUID) -> Bool {
+        guard let thread = sessions.first(where: { $0.id == sessionID }),
+              agentEngine is AgentLoopChatEngine,
+              !composerPolicyFacts.revoked,
+              !isCanonicalWriteIsolated(sessionID) else { return false }
+        // 项目会话：项目的原生目录授权必须仍然有效，否则退回“等用户打开该会话”，不在后台越过项目授权。
+        if let projectID = thread.projectID {
+            guard let directory = thread.workingDirectory,
+                  projectSessionHandler?.isTaskFileProjectAuthorized(
+                    projectID: projectID, workingDirectory: directory) == true else { return false }
+        }
+        return schedulerProviderPreflight(for: thread.asPersisted()).isReadyForExecution
+    }
+
+    /// 返回 nil 表示不能后台运行，调用方退回“等用户打开该会话”。
+    private func startBackgroundSessionMessageRun(_ text: String, inSession sessionID: UUID) -> SessionRunStart? {
+        guard let envelope = SessionMessageEnvelope.parse(text), canRunSessionInBackground(sessionID) else {
+            return nil
+        }
+        let delivery = SessionMessageDelivery(
+            messageID: envelope.messageID, fromSessionID: envelope.fromSessionID,
+            fromTitle: envelope.fromTitle, body: envelope.body, hop: envelope.hop)
+        let ticket = BackgroundSessionRunTicket(targetID: sessionID.uuidString, delivery: delivery)
+        switch backgroundRunLimiter.request(ticket, targetBusy: !canStartBackgroundRunNow(sessionID)) {
+        case .startNow:
+            launchBackgroundSessionRun(ticket)
+            return .startedInBackground
+        case .queued:
+            scheduleBackgroundRunPump(afterSeconds: 2)
+            return .queuedForBackgroundSlot
+        case .refused:
+            return nil
+        }
+    }
+
+    private func launchBackgroundSessionRun(_ ticket: BackgroundSessionRunTicket) {
+        guard let targetID = UUID(uuidString: ticket.targetID) else {
+            backgroundRunLimiter.finish(targetID: ticket.targetID)
+            return
+        }
+        scheduledSessionBusy.insert(targetID)
+        backgroundRunSessionIDs.insert(targetID)
+        let delivery = ticket.delivery
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            let outcome = await self.runBackgroundSessionTurn(targetID: targetID, delivery: delivery)
+            self.finishBackgroundSessionRun(targetID: targetID, delivery: delivery, outcome: outcome)
+        }
+        backgroundRunTasks[targetID] = task
+        streamingTasks[targetID] = task
+        isStreaming = true
+    }
+
+    private func finishBackgroundSessionRun(
+        targetID: UUID, delivery: SessionMessageDelivery, outcome: BackgroundSessionTurnOutcome
+    ) {
+        scheduledSessionBusy.remove(targetID)
+        backgroundRunSessionIDs.remove(targetID)
+        if let mine = backgroundRunTasks.removeValue(forKey: targetID), streamingTasks[targetID] == mine {
+            streamingTasks.removeValue(forKey: targetID)
+        }
+        isStreaming = !streamingTasks.isEmpty
+        backgroundRunLimiter.finish(targetID: targetID.uuidString)
+        var failed = false
+        switch outcome {
+        case .reply(let text):
+            SessionMessagingHub.shared.complete(messageID: delivery.messageID, reply: text)
+        case .failed(let reason):
+            failed = true
+            appendAssistant("后台运行没有完成：\(reason)", toSession: targetID)
+            SessionMessagingHub.shared.complete(
+                messageID: delivery.messageID, reply: "（目标会话的后台运行没有完成：\(reason)）")
+        case .cancelled:
+            failed = true
+            appendAssistant("后台运行已被停止。", toSession: targetID)
+            SessionMessagingHub.shared.complete(
+                messageID: delivery.messageID, reply: "（目标会话的后台运行被用户停止，没有产生回复。）")
+        }
+        if let index = sessions.firstIndex(where: { $0.id == targetID }), targetID != activeSessionID {
+            sessions[index].unread = true
+        }
+        onResponseNotification?(targetID, "session-run:" + delivery.messageID, failed)
+        pumpBackgroundSessionRuns()
+    }
+
+    private func scheduleBackgroundRunPump(afterSeconds seconds: Double) {
+        guard !backgroundRunPumpScheduled else { return }
+        backgroundRunPumpScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0.05, seconds) * 1_000_000_000))
+            guard let self else { return }
+            self.backgroundRunPumpScheduled = false
+            self.pumpBackgroundSessionRuns()
+        }
+    }
+
+    /// 有名额且目标空闲时，按先后顺序启动排队的后台运行；用户已打开的目标改走前台队列。
+    func pumpBackgroundSessionRuns() {
+        if let active = activeSessionID {
+            let moved = backgroundRunLimiter.removeWaiting(forTarget: active.uuidString)
+            if !moved.isEmpty {
+                for ticket in moved {
+                    queuedComposerMessages.append(QueuedComposerMessage(
+                        sessionID: active, text: ticket.delivery.envelopeText, attachments: [], pastedDrafts: []))
+                }
+                _ = sendNextQueuedComposer(automatically: true)
+            }
+        }
+        // 等用户审批的后台运行不占并发名额（仍占着自己的目标会话）。
+        backgroundRunLimiter.setParked(Set(backgroundRunLimiter.running.filter { id in
+            UUID(uuidString: id).map { sessionRuntimeStatus(for: $0) == .waitingApproval } ?? false
+        }))
+        while true {
+            let blocked = Set(backgroundRunLimiter.waiting.map(\.targetID).filter { id in
+                UUID(uuidString: id).map { !canStartBackgroundRunNow($0) } ?? false
+            })
+            guard let ticket = backgroundRunLimiter.takeNextReady(canStart: { !blocked.contains($0.targetID) }) else {
+                break
+            }
+            launchBackgroundSessionRun(ticket)
+        }
+        // 还有排队：名额满或目标忙都要稍后再看（运行转入"等审批"会释放名额）。
+        if !backgroundRunLimiter.waiting.isEmpty {
+            scheduleBackgroundRunPump(afterSeconds: 2)
+        }
+    }
+
+    /// 在目标会话上无人值守地跑一轮：用它自己的模型、会话预算与工作目录；权限模式取当前设置，
+    /// 绕过档降为手动审批；工具审批走原有审批中心（侧栏标“等待审批”并发系统通知）。
+    /// 不读当前打开的会话、草稿或输入框。
+    private func runBackgroundSessionTurn(
+        targetID: UUID, delivery: SessionMessageDelivery
+    ) async -> BackgroundSessionTurnOutcome {
+        let text = delivery.envelopeText
+        let userMessageID = UUID()
+        var stopIdentity: AgentExecutionIdentity?
+        do {
+            guard let thread = sessions.first(where: { $0.id == targetID }),
+                  !isCanonicalWriteIsolated(targetID) else {
+                throw BackgroundSessionRunError.unavailable("目标会话已不可用。")
+            }
+            let target = thread.asPersisted()
+            guard schedulerProviderPreflight(for: target).isReadyForExecution else {
+                throw BackgroundSessionRunError.unavailable("目标会话的模型还没有就绪，请打开该会话检查模型后重试。")
+            }
+            let provider = try await preparedScheduledProvider(for: target)
+            try await awaitBudgetResetBeforeUnattendedCapture(sessionID: targetID)
+            let allowlist = modelAllowlistProvider?() ?? []
+            guard Self.isModelAllowed(modelID: provider.model.id, whitelist: allowlist) else {
+                throw BackgroundSessionRunError.unavailable("目标会话的模型不在允许列表内。")
+            }
+            let effectiveSettingsSnapshot = effectiveSettingsSnapshotSource?()
+            guard effectiveSettingsSnapshotSource == nil || (
+                effectiveSettingsSnapshot != nil && turnRuntimeSnapshotFactory != nil
+            ) else {
+                throw BackgroundSessionRunError.unavailable("设置暂时不可用，请稍后再试。")
+            }
+            let selection = unattendedComposerSelection()
+            let liveAuthorityFacts = composerPolicyFacts
+            let turnID = max(1, nextAgentTurnID)
+            nextAgentTurnID = turnID + 1
+            let attemptID = UUID().uuidString
+            let taskID = "chat:\(targetID.uuidString):\(turnID):\(attemptID)"
+            backgroundTurnTaskIDs.insert(taskID)
+            defer {
+                backgroundTurnTaskIDs.remove(taskID)
+                preparedTopLevelTaskEngines.removeValue(forKey: taskID)
+            }
+            let baseTaskEngine: any ChatAgentEngine
+            let facts: ComposerPolicyFactSource
+            if let prepareTopLevelTaskPolicy {
+                guard prepareTopLevelTaskPolicy(taskID, Date(), targetID, true),
+                      let prepared = preparedTopLevelTaskEngines.removeValue(forKey: taskID) as? AgentLoopChatEngine,
+                      let preparedFacts = prepared.capturedComposerPolicyFacts else {
+                    throw BackgroundSessionRunError.unavailable("目标会话的工作目录或权限现在不可用，请打开该会话检查后重试。")
+                }
+                baseTaskEngine = prepared
+                facts = preparedFacts
+            } else {
+                baseTaskEngine = agentEngine
+                facts = composerPolicyFacts
+            }
+            guard !facts.revoked, facts.expiresAt > Date(), facts.workspaceID == composerWorkspaceID else {
+                throw BackgroundSessionRunError.unavailable("授权已过期或被撤销，请在应用里重新授权后重试。")
+            }
+            // 用目标会话自己的用量预算，不占用当前打开会话的额度。
+            let budgetOwner: SessionBudgetOwner
+            if let retained = sessionBudgetOwners[targetID] {
+                budgetOwner = retained
+            } else {
+                let fresh = RequestBudget(maxRequestsPerSession: requestBudget.maxRequestsPerSession,
+                    maxTokensPerSession: nextSessionTokenBudgetLimit,
+                    overBudgetPolicy: requestBudget.overBudgetPolicy, deadline: requestBudget.deadline)
+                budgetOwner = SessionBudgetOwner(tracker: BudgetTracker(fresh), snapshot: fresh)
+                sessionBudgetOwners[targetID] = budgetOwner
+            }
+            let budgetedEngine: any ChatAgentEngine =
+                (baseTaskEngine as? AgentLoopChatEngine)?.withRequestBudget(budgetOwner.tracker) ?? baseTaskEngine
+            let messageID = UUID()
+            let turn = AgentTurnIdentity(sessionID: targetID.uuidString,
+                turnID: turnID, messageID: messageID.uuidString)
+            let identity = AgentExecutionIdentity(
+                turn: turn, operationID: "session-run:" + delivery.messageID, attempt: 1)
+            stopIdentity = identity
+            captureUnattendedBudget(budgetedEngine, identity: identity)
+            defer { finishUnattendedBudget(identity: identity) }
+            let snapshot = ComposerSubmissionSnapshot(mode: selection.mode,
+                approvalScope: selection.approvalScope, effort: selection.effort,
+                sessionID: targetID.uuidString, turnID: turnID, taskID: taskID,
+                attemptID: attemptID, messageID: messageID.uuidString,
+                inputDigest: ComposerToolInput(values: [
+                    "content": .string(text), "attachments": .array([])
+                ]).digest,
+                workspaceID: composerWorkspaceID, createdAt: Date(),
+                policyRevision: facts.revision, grantEpoch: facts.grantEpoch,
+                bypassModeConfirmed: selection.bypassModeConfirmed,
+                autonomyCeiling: facts.autonomyCeiling)
+            let stillCurrent: @MainActor () -> Bool = { [weak self] in
+                guard let self else { return false }
+                return self.sessions.contains(where: { $0.id == targetID })
+                    && self.retainsComposerAuthority(liveAuthorityFacts)
+                    && !facts.revoked && facts.expiresAt > Date()
+            }
+            let authorizedEngine: any ChatAgentEngine = (budgetedEngine as? AgentLoopChatEngine)?
+                .withChildAuthorityCheck {
+                    await MainActor.run { stillCurrent() }
+                } ?? budgetedEngine
+            let taskEngine = withReductionOnlyAdmission(
+                authorizedEngine, sessionID: targetID, model: provider.model,
+                settings: effectiveSettingsSnapshot)
+
+            let pendingRuntime = turnRuntimeSnapshotFactory.map { factory in
+                factory(turn, provider).withEffectiveSettings(
+                    effectiveSettingsSnapshot,
+                    operationID: identity.operationID,
+                    required: effectiveSettingsSnapshotSource != nil
+                )
+            }
+            let runtime = await pendingRuntime?.preparedForExecution()
+            try Task.checkCancellation()
+            guard pendingRuntime == nil || (runtime != nil && runtime?.hasCurrentSkillAuthority != false) else {
+                throw CancellationError()
+            }
+            guard runtime != nil || !(agentEngine is AgentLoopChatEngine) else {
+                throw ChatTurnRuntimeSnapshotError.missingRequiredSnapshot
+            }
+            let usageCandidates = chatProviderOptions
+            let usageDirectSelection: ChatProvider? = {
+                guard streamingProviderOverride == nil,
+                      let selection = scheduledProviderSelection(for: target) else { return nil }
+                if let custom = selection.custom { return .custom(custom) }
+                if let type = selection.type { return .builtIn(type) }
+                return nil
+            }()
+
+            // 提示词：与前台回合同源的记忆、技能、项目指令装配；普通会话没有记忆范围。
+            var system = Self.systemPrompt(for: outputMode)
+            if personaEnabled { system = Self.systemPrompt(withPersona: system, persona: persona) }
+            let memoryScope: MemoryScope? = thread.projectID.flatMap { projectID in
+                let scope = MemoryScope(sessionID: targetID.uuidString, projectID: projectID)
+                return scope.isValid ? scope : nil
+            }
+            let principal = memoryTrustedPrincipalProvider?()
+            let memoryContext = memoryScope.map { scope in
+                MemoryInjectionContext(
+                    scope: scope, trustedPrincipal: principal,
+                    temporaryLifetime: resolvedMemoryTemporaryLifetime(for: scope))
+            }
+            let trustedProjectRoot = memoryScope.flatMap { trustedProjectRootProvider?($0) }
+            injectedMemoryFactIDsBySession[targetID] = []
+            injectedMemoryFactSummariesBySession.removeValue(forKey: targetID)
+            memoryReadFailedSessions.remove(targetID)
+            injectedGlobalBytesBySession.removeValue(forKey: targetID)
+            memoryResponseConfirmedSessions.remove(targetID)
+            let preprocessInput = ChatTurnPromptPreprocessInput(
+                basePrompt: system, userMessage: delivery.body,
+                memoryEnabled: memoryEnabledProvider?() == true, memoryInjector: memoryInjector,
+                memoryScope: memoryScope, skillInjector: runtime?.skillInjector,
+                legacySkillResult: SkillInjectionResult(fragment: nil, receipts: []),
+                pickerCatalog: [], steers: [], memoryContext: memoryContext,
+                intentText: delivery.body, trustedProjectRoot: trustedProjectRoot,
+                trustedMemoryPrincipal: principal,
+                globalInstructionsEnabled: globalInstructionsEnabledProvider?() ?? true)
+            let preparation = Task.detached(priority: .userInitiated) {
+                ChatTurnPromptPreprocessor.prepare(preprocessInput)
+            }
+            let prepared = await withTaskCancellationHandler {
+                await preparation.value
+            } onCancel: {
+                preparation.cancel()
+            }
+            try Task.checkCancellation()
+            guard let prepared else { throw CancellationError() }
+            let admittedPrompt = admittedProjectPrompt(prepared, scope: memoryScope,
+                allowPrompt: false, isCurrent: { stillCurrent() })
+            system = admittedPrompt.systemPrompt
+            let trustedInstructions = admittedPrompt.trustedProjectInstructions?
+                .redactingText { credentialBroker.protect($0) }
+            guard stillCurrent() else {
+                throw BackgroundSessionRunError.unavailable("目标会话或授权已变化。")
+            }
+            adoptMemoryPreparation(admittedPrompt, sessionID: targetID)
+            system += "\n\n" + credentialBroker.protect(Self.turnEnvironmentPrompt(
+                now: Date(), goalObjective: target.goal?.objective, projectDirectory: target.workingDirectory,
+                modelID: runtime?.providerRuntimeRoute?.model.id ?? provider.model.id,
+                mode: snapshot.mode, includesGoalReporting: false, sessionID: targetID.uuidString))
+            system += "\n\n本回合由应用内另一个会话叫起，在后台运行，用户当前不在这个会话里。需要审批的操作会等用户处理；被拒绝的操作不要反复重试，直接在回复里说明。"
+
+            // 把这条来自其它会话的消息写进目标会话（同时让 session_send 的 hop 计数看得到它）。
+            guard let index = sessions.firstIndex(where: { $0.id == targetID }) else {
+                throw BackgroundSessionRunError.unavailable("目标会话已不可用。")
+            }
+            let sentAt = Date()
+            sessions[index].messages.append(ChatMessageUI(
+                id: userMessageID, role: .user, content: credentialBroker.protect(text),
+                isStreaming: false, timestamp: sentAt,
+                turnTiming: ChatTurnTimingMetadata.appMessageTurnTiming(at: sentAt)))
+            touchSession(targetID)
+            markExecutionRunning(sessionID: targetID, turnID: turnID, taskID: taskID)
+            let history = sessions[index].messages.filter { $0.role != .system }
+            let approvalConsumer = try await awaitApprovalRecovery()
+            try Task.checkCancellation()
+            guard stillCurrent() else {
+                throw BackgroundSessionRunError.unavailable("目标会话或授权已变化。")
+            }
+            let stream: AsyncThrowingStream<AgentStreamEvent, Error>
+            if let runtime {
+                let ownedProvider: any LLMProvider & Sendable
+                if let frozenRoute = runtime.providerRuntimeRoute {
+                    ownedProvider = frozenRoute
+                } else if runtime.requiresProviderRuntimeRoute {
+                    throw runtime.providerRuntimeRouteError
+                        ?? ProviderRuntimeSnapshotError.missingPrimaryProvenance
+                } else {
+                    ownedProvider = ChatActorOwnedProvider(provider)
+                }
+                stream = try await TrustedProjectInstructionContext.$current.withValue(trustedInstructions) {
+                    return try await taskEngine.streamReply(provider: ownedProvider, history: history,
+                        systemPrompt: system,
+                        maxTokens: Self.chatOutputRequestTokens(model: ownedProvider.model, effort: snapshot.effort, engine: taskEngine),
+                        conversationID: targetID.uuidString,
+                        authorizedSessionReadSessionID: nil, authorizedSessionReadScope: nil,
+                        turnID: turnID, composerSnapshot: snapshot,
+                        executionIdentity: identity, turnRuntimeSnapshot: runtime)
+                }
+            } else {
+                stream = try await TrustedProjectInstructionContext.$current.withValue(trustedInstructions) {
+                    return try await taskEngine.streamReply(provider: provider, history: history,
+                        systemPrompt: system,
+                        maxTokens: Self.chatOutputRequestTokens(model: provider.model, effort: snapshot.effort, engine: taskEngine),
+                        conversationID: targetID.uuidString,
+                        authorizedSessionReadSessionID: nil, authorizedSessionReadScope: nil,
+                        turnID: turnID, composerSnapshot: snapshot, executionIdentity: identity)
+                }
+            }
+            var output = ""
+            var completed = false
+            // 后台回合没有界面气泡：把用过的工具按名字计数，回合结束时写一行摘要进目标会话的转录。
+            var toolCallCounts: [(name: String, count: Int)] = []
+            for try await event in stream {
+                try Task.checkCancellation()
+                guard toolLifecycleConsumer === approvalConsumer else {
+                    throw ApprovalRecoveryError.consumerChanged
+                }
+                guard stillCurrent() else {
+                    throw BackgroundSessionRunError.unavailable("目标会话或授权已变化。")
+                }
+                switch event {
+                case .textDelta(let value):
+                    if !value.isEmpty { memoryResponseConfirmedSessions.insert(targetID) }
+                    output += value
+                case .done(let reason):
+                    if case .endTurn = reason { completed = true }
+                case .usage(let usage):
+                    memoryResponseConfirmedSessions.insert(targetID)
+                    let attribution = Self.usageProviderAttribution(
+                        primaryProvider: provider.name, primaryModel: provider.model.id,
+                        route: runtime?.providerRuntimeRoute?.snapshot,
+                        observation: providerRuntimeObservationsByIdentity[identity],
+                        candidates: usageCandidates, trustedDirectSelection: usageDirectSelection)
+                    usageStore?.recordCall(provider: attribution.provider, model: attribution.model,
+                        usage: usage,
+                        providerRecordID: attribution.recordID,
+                        providerDisplaySnapshot: attribution.displaySnapshot,
+                        sessionID: targetID.uuidString)
+                case .toolExecutionPhase(let phase):
+                    if phase.executionIdentity == identity {
+                        _ = await ingestToolExecutionPhase(
+                            phase, eventID: phase.compositeKey.toolCallID, eventName: phase.toolName,
+                            taskID: taskID, expectedAttemptID: attemptID)
+                    }
+                case .approvalLifecycle(let fact):
+                    _ = await ingestApprovalLifecycleFact(
+                        fact, expectedExecutionIdentity: identity,
+                        expectedAttemptID: attemptID, expectedConsumer: approvalConsumer)
+                case .toolCallComplete(let id, let name, _, let metadata):
+                    if let slot = toolCallCounts.firstIndex(where: { $0.name == name }) {
+                        toolCallCounts[slot].count += 1
+                    } else {
+                        toolCallCounts.append((name: name, count: 1))
+                    }
+                    if let fact = metadata?.toolExecutionFact, fact.executionIdentity == identity {
+                        _ = await ingestToolExecutionFact(fact, eventID: id, eventName: name,
+                            taskID: taskID, expectedAttemptID: attemptID,
+                            liveFailureFeedback: metadata?.liveFailureFeedback)
+                    }
+                default: break
+                }
+            }
+            try Task.checkCancellation()
+            guard toolLifecycleConsumer === approvalConsumer else {
+                throw ApprovalRecoveryError.consumerChanged
+            }
+            guard completed else {
+                throw BackgroundSessionRunError.unavailable("模型没有正常结束这一轮，请打开该会话查看。")
+            }
+            let reply = output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "（目标会话本轮没有产生文字回复）" : output
+            // 转录里留一行工具摘要；回传给发起会话的回复仍只含正文。
+            let toolSummary = toolCallCounts.isEmpty ? "" : "\n\n（本轮后台运行调用了工具："
+                + toolCallCounts.map { "\($0.name) × \($0.count)" }.joined(separator: "、")
+                + "；详细记录可在任务中心查看。）"
+            guard appendAssistant(reply + toolSummary, toSession: targetID) else {
+                throw BackgroundSessionRunError.unavailable("目标会话已不可用，回复没有保存。")
+            }
+            touchSession(targetID)
+            markExecutionIdle(sessionID: targetID)
+            return .reply(reply)
+        } catch is CancellationError {
+            if let stopIdentity { onTurnStreamingStopped?(stopIdentity) }
+            markExecutionIdle(sessionID: targetID)
+            return .cancelled
+        } catch {
+            if let stopIdentity { onTurnStreamingStopped?(stopIdentity) }
+            let reason: String
+            if let known = error as? BackgroundSessionRunError, case .unavailable(let message) = known {
+                reason = message
+            } else {
+                reason = Self.sanitizedExecutionFailure(credentialBroker.protect(Self.unattendedUserErrorMessage(error)))
+            }
+            markExecutionFailed(sessionID: targetID, reason: reason, failureKind: Self.executionFailureKind(for: error))
+            return .failed(reason)
+        }
+    }
+
     /// F3：更新指定会话的消息内容（替代 `messages[i].content +=` ——
     /// 后者下标按活跃会话解释，流式中途切会话会把旧流写进新会话）。
     /// 会话/下标越界 → 丢弃（返回 false）。
@@ -7066,8 +10366,10 @@ final class ChatStore {
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               sessions[sessionIndex].messages.indices.contains(index) else { return false }
         let messageID = sessions[sessionIndex].messages[index].id
-        sessions[sessionIndex].messages[index].content = credentialBroker.projectStream(
+        let update = credentialBroker.projectStreamUpdate(
             messageID: messageID, current: sessions[sessionIndex].messages[index].content, append: text)
+        sessions[sessionIndex].messages[index].setProjectedContent(
+            update.text, extendsPrevious: update.extendsPrevious)
         return true
     }
 
@@ -7080,8 +10382,9 @@ final class ChatStore {
         guard let sessionID,
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               sessions[sessionIndex].messages.indices.contains(index) else { return false }
-        sessions[sessionIndex].messages[index].content = credentialBroker.replaceStream(
-            messageID: sessions[sessionIndex].messages[index].id, with: content)
+        sessions[sessionIndex].messages[index].replaceContent(
+            credentialBroker.replaceStream(
+                messageID: sessions[sessionIndex].messages[index].id, with: content))
         return true
     }
 
@@ -7095,11 +10398,13 @@ final class ChatStore {
               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }),
               sessions[sessionIndex].messages.indices.contains(index) else { return false }
         sessions[sessionIndex].messages[index].isStreaming = false
-        if let suffix, !suffix.isEmpty {
-            sessions[sessionIndex].messages[index].content = credentialBroker.projectStream(
-                messageID: sessions[sessionIndex].messages[index].id,
-                current: sessions[sessionIndex].messages[index].content, append: suffix)
+        if let closing = credentialBroker.finalizeStream(
+            messageID: sessions[sessionIndex].messages[index].id,
+            current: sessions[sessionIndex].messages[index].content, append: suffix ?? "") {
+            sessions[sessionIndex].messages[index].setProjectedContent(
+                closing.text, extendsPrevious: closing.extendsPrevious)
         }
+        finalizeThinkingTail(sessionIndex: sessionIndex, messageIndex: index)
         credentialBroker.finishStream(messageID: sessions[sessionIndex].messages[index].id)
         // D-CHAT-18：同「稳定身份版」一致闭合回合时长。
         _ = closeTurnTiming(
@@ -7738,7 +11043,8 @@ final class ChatStore {
         messageID: UUID,
         messageText: String,
         attachments: [ChatAttachment] = [],
-        interactiveAutoChoice: InteractiveComposerAutoChoice? = nil
+        interactiveAutoChoice: InteractiveComposerAutoChoice? = nil,
+        downgradeBypass: Bool = false
     ) -> ComposerSubmissionSnapshot {
         let sessionID = activeSessionID?.uuidString ?? "<no-session>"
         let turnID = nextAgentTurnID
@@ -7774,7 +11080,12 @@ final class ChatStore {
             "content": .string(messageText),
             "attachments": .array(attachmentValues)
         ]).digest
-        let selection = effectiveComposerSelection
+        var selection = effectiveComposerSelection
+        // 别的会话投递来的消息不是本人发起：绕过档降为手动，且不带“绕过已确认”。
+        if downgradeBypass, selection.mode == .bypassPermission {
+            selection.mode = .manual
+            selection.bypassModeConfirmed = false
+        }
         let snapshot = ComposerSubmissionSnapshot(
             mode: selection.mode,
             approvalScope: selection.approvalScope,
@@ -8057,9 +11368,11 @@ final class ChatStore {
         let decision: ComposerCommandPolicyDecision
         if let onComposerCommandPolicy {
             let authorizedRequestID = fromKeyboard && hasNativeCommandBypassConfirmation ? request.id : nil
-            decision = Self.$keyboardComposerCommandRequestID.withValue(authorizedRequestID) {
-                Self.$nativeWaitingToolApprovalFacts.withValue(authorizedRequestID == nil ? nil : waitingApprovalFacts) {
-                    onComposerCommandPolicy(request, snapshot)
+            decision = Self.$userComposerCommandRequestID.withValue(request.id) {
+                Self.$keyboardComposerCommandRequestID.withValue(authorizedRequestID) {
+                    Self.$nativeWaitingToolApprovalFacts.withValue(authorizedRequestID == nil ? nil : waitingApprovalFacts) {
+                        onComposerCommandPolicy(request, snapshot)
+                    }
                 }
             }
         } else {
@@ -8146,6 +11459,20 @@ final class ChatStore {
         persistComposerCommandState()
         return true
     }
+
+    /// 等目标会话空闲再提交定时任务。等待期间执行租约由运行时的心跳续着；
+    /// 超过上限仍忙才按"会话正忙"失败。
+    private func awaitScheduledTargetIdle(_ sessionID: UUID, context: SchedulerExecutionContext) async throws {
+        var waited = 0
+        while scheduledSessionBusy.contains(sessionID) || streamingTasks[sessionID] != nil {
+            guard waited < Self.scheduledBusyMaxWaitSeconds else { throw ScheduledSubmissionError.busy }
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            try Task.checkCancellation()
+            guard context.isCurrent() else { throw CancellationError() }
+            waited += 1
+        }
+    }
+    private static let scheduledBusyMaxWaitSeconds = 30 * 60
 
     enum ScheduledSubmissionError: Error, Sendable {
         case targetUnavailable, anchorChanged, policyUnavailable, busy, duplicateEffect, unsupportedCommand, incompleteStream, effectUncertain
@@ -8242,6 +11569,8 @@ final class ChatStore {
             sessions[index].transcriptRevision, canonical.transcriptRevision
         )
         sessions[index].updatedAt = canonical.updatedAt
+        // 压缩后上下文已变小：丢弃压缩前的占用回报，下一次用量回报前用本地估算。
+        contextOccupancyBySession.removeValue(forKey: id)
         return true
     }
 
@@ -8286,6 +11615,8 @@ final class ChatStore {
         sessions[index].transcriptRevision = max(sessions[index].transcriptRevision,
             canonical.transcriptRevision)
         sessions[index].updatedAt = canonical.updatedAt
+        // 压缩后上下文已变小：丢弃压缩前的占用回报，下一次用量回报前用本地估算。
+        contextOccupancyBySession.removeValue(forKey: id)
         return true
     }
 
@@ -8695,7 +12026,7 @@ final class ChatStore {
                 policyRevision: facts.revision, grantEpoch: facts.grantEpoch,
                 bypassModeConfirmed: selection.bypassModeConfirmed,
                 autonomyCeiling: facts.autonomyCeiling)
-            let taskEngine: any ChatAgentEngine = (baseTaskEngine as? AgentLoopChatEngine)?
+            let authorizedEngine: any ChatAgentEngine = (baseTaskEngine as? AgentLoopChatEngine)?
                 .withChildAuthorityCheck { [weak self] in
                     await MainActor.run {
                         guard let self else { return false }
@@ -8705,6 +12036,9 @@ final class ChatStore {
                             && !facts.revoked && facts.expiresAt > Date()
                     }
                 } ?? baseTaskEngine
+            let taskEngine = withReductionOnlyAdmission(
+                authorizedEngine, sessionID: targetID, model: provider.model,
+                settings: effectiveSettingsSnapshot)
             let skillCaptureRevision = transcriptRevision(forSession: targetID)
             let pendingRuntime = turnRuntimeSnapshotFactory.map { factory in
                 factory(turn, provider).withEffectiveSettings(
@@ -8748,6 +12082,12 @@ final class ChatStore {
             )
             let pinnedSkillInjector = runtime?.skillInjector
             let trustedProjectRoot = trustedProjectRootProvider?(memoryScope)
+            // 项目任务和定时任务一样不经过 beginTurn：把已信任的项目根登记到
+            // HookRuntime，项目 hooks 才会对它执行（或按未登记 fail-closed 处理）。
+            MinisCore.HookRuntime.installed?.registerSessionRoot(
+                sessionID: targetID.uuidString,
+                projectRoot: trustedProjectRoot
+            )
             var trustedInstructions: TrustedProjectInstructionSnapshot?
             if pinnedMemoryInjector != nil || pinnedSkillInjector != nil || trustedProjectRoot != nil {
                 let basePrompt = system
@@ -8796,7 +12136,8 @@ final class ChatStore {
             let modelID = runtime?.providerRuntimeRoute?.model.id ?? provider.model.id
             system += "\n\n" + credentialBroker.protect(Self.turnEnvironmentPrompt(
                 now: Date(), goalObjective: target.goal?.objective, projectDirectory: target.workingDirectory,
-                modelID: modelID, mode: snapshot.mode, includesGoalReporting: false
+                modelID: modelID, mode: snapshot.mode, includesGoalReporting: false,
+                sessionID: targetID.uuidString
             ))
             let stream: AsyncThrowingStream<AgentStreamEvent, Error>
             if let runtime {
@@ -8839,9 +12180,11 @@ final class ChatStore {
                     throw ProjectSessionAppError.targetUnavailable
                 }
                 switch event {
-                case .textDelta(let value), .thinkingDelta(let value):
+                case .textDelta(let value):
                     if !value.isEmpty { memoryResponseConfirmedSessions.insert(targetID) }
                     output += value
+                case .thinkingDelta:
+                    break
                 case .done(let reason):
                     if case .endTurn = reason { completed = true }
                 case .usage(let usage):
@@ -8999,7 +12342,7 @@ final class ChatStore {
         now: Date = Date()
     ) -> SchedulerProviderPreflight {
         guard now.timeIntervalSinceReferenceDate.isFinite else {
-            return .unavailable("调度时间无效，无法验证 Provider/model")
+            return .unavailable("调度时间无效，无法验证服务商和模型")
         }
         guard let selection = scheduledProviderSelection(for: target) else {
             let hasProvider = target.providerTypeRaw != nil || defaultProviderType != nil || defaultCustomProvider != nil
@@ -9008,7 +12351,7 @@ final class ChatStore {
                 modelID: target.modelID,
                 credentialVersion: nil,
                 status: hasProvider ? .missingModel : .missingProvider,
-                detail: hasProvider ? "目标 Provider 尚未绑定可用模型" : "目标会话尚未绑定 Provider"
+                detail: hasProvider ? "目标服务商尚未绑定可用模型" : "目标会话尚未绑定服务商"
             )
         }
         if let type = selection.type,
@@ -9018,7 +12361,7 @@ final class ChatStore {
                 modelID: selection.modelID,
                 credentialVersion: nil,
                 status: .incompatibleSelection,
-                detail: "目标 Provider 不支持 Composer 调度"
+                detail: "目标服务商不支持定时任务调度"
             )
         }
 
@@ -9031,7 +12374,7 @@ final class ChatStore {
                 credentialVersion: schedulerCredentialVersionSource?(selection.providerID)
                     ?? "unmanaged-provider-selection",
                 status: .ready,
-                detail: "Provider/model 已解析"
+                detail: "服务商和模型已确定"
             )
         }
 
@@ -9043,7 +12386,7 @@ final class ChatStore {
                 modelID: selection.modelID,
                 credentialVersion: "local:no-credential",
                 status: .ready,
-                detail: "本地 Provider 无需远端凭据"
+                detail: "本地服务商无需远端凭据"
             )
         }
 
@@ -9056,7 +12399,7 @@ final class ChatStore {
                 modelID: selection.modelID,
                 credentialVersion: nil,
                 status: .missingCredential,
-                detail: "当前 Provider/model 的 readiness 报告缺少凭据"
+                detail: "当前服务商和模型缺少凭据，请先在设置里补全"
             )
         }
 
@@ -9066,7 +12409,7 @@ final class ChatStore {
                 modelID: selection.modelID,
                 credentialVersion: nil,
                 status: .incompatibleSelection,
-                detail: "当前 Provider/model 未通过 readiness 选择门禁"
+                detail: "当前服务商和模型没有通过可用性检查，不能用于定时任务"
             )
         }
         guard let receipt = chatModelPickerReceipt(
@@ -9078,7 +12421,7 @@ final class ChatStore {
                 modelID: selection.modelID,
                 credentialVersion: nil,
                 status: .staleReadiness,
-                detail: "缺少当前 Provider/model 的 Apply 就绪凭证，请重新检查并应用"
+                detail: "当前服务商和模型还没有通过最新一次检查，请到设置里重新检查并应用"
             )
         }
         if selection.custom != nil {
@@ -9089,7 +12432,7 @@ final class ChatStore {
                     modelID: selection.modelID,
                     credentialVersion: nil,
                     status: .missingCredential,
-                    detail: "自定义 Provider 的凭据绑定不可用"
+                    detail: "自定义服务商的凭据绑定不可用"
                 )
             }
             return SchedulerProviderPreflight(
@@ -9097,7 +12440,7 @@ final class ChatStore {
                 modelID: selection.modelID,
                 credentialVersion: "binding:\(bindingRevision)|apply:\(receipt.applyReceiptID)",
                 status: .ready,
-                detail: "Provider/model 与凭据绑定已验证"
+                detail: "服务商、模型与凭据绑定已验证"
             )
         }
         let bindingVersion = schedulerCredentialVersionSource?(selection.providerID)
@@ -9107,7 +12450,7 @@ final class ChatStore {
             modelID: selection.modelID,
             credentialVersion: "\(readinessVersion)apply:\(receipt.applyReceiptID)",
             status: .ready,
-            detail: "Provider/model 与就绪凭证已验证"
+            detail: "服务商、模型与最新检查结果已验证"
         )
     }
 
@@ -9198,6 +12541,7 @@ final class ChatStore {
             record.baseURL ?? ""
         )
         config.apiKey = credential
+        config.applyNetworkOptions(from: record)
         return FrozenProviderConstruction(
             config: config,
             model: Self.customProviderModel(
@@ -9232,8 +12576,37 @@ final class ChatStore {
         memoryProposalConsumer: MemoryProposalConsumer? = nil
     ) async throws -> SchedulerEffectOutcome {
         let request = context.request
-        guard let targetID = request.targetSessionID else { throw ScheduledSubmissionError.targetUnavailable }
-        try await awaitBudgetResetBeforeUnattendedCapture(sessionID: targetID)
+        guard let anchorSessionID = request.targetSessionID else { throw ScheduledSubmissionError.targetUnavailable }
+        try await awaitBudgetResetBeforeUnattendedCapture(sessionID: anchorSessionID)
+        // “每次运行开新会话”：授权与来源锚点仍绑定任务定义 + 目标会话所在项目；本次运行在一个
+        // 由本次触发（effectID）确定的新会话里进行，重试同一触发复用同一个会话，不会重复新建。
+        let targetID: UUID
+        // 新建的运行会话在后面的检查都通过（拿到执行身份）之前，失败就收回，不留空会话。
+        var freshRunSessionID: UUID?
+        var runSessionCommitted = false
+        defer {
+            if let fresh = freshRunSessionID, !runSessionCommitted {
+                discardEmptyScheduledRunSession(fresh)
+            }
+        }
+        if let definition = context.store.task(id: request.taskID),
+           definition.version == request.taskVersion, definition.opensNewSessionEachRun {
+            guard context.isCurrent(),
+                  let projectID = request.targetProjectID, let ordinal = request.targetTurnID,
+                  let anchorThread = sessions.first(where: { $0.id == anchorSessionID && $0.projectID == projectID }),
+                  let occurrence = context.store.occurrence(id: request.occurrenceID),
+                  let binding = occurrence.sourceAnchorDigest ?? definition.sourceAnchorDigest,
+                  schedulerSourceAnchorDigest(sessionID: anchorSessionID, projectID: projectID, ordinal: ordinal) == binding,
+                  let created = createScheduledRunSession(
+                    from: anchorThread, taskName: definition.name, effectID: request.effectID, at: context.now())
+            else { throw ScheduledSubmissionError.targetUnavailable }
+            targetID = created
+            freshRunSessionID = created
+        } else {
+            targetID = anchorSessionID
+            // 会话正忙（用户在对话或另一个定时任务在跑）：顺延到空闲再执行，不记失败。
+            try await awaitScheduledTargetIdle(targetID, context: context)
+        }
         guard context.isCurrent(),
               let projectID = request.targetProjectID, let ordinal = request.targetTurnID,
               let store = sessionStore,
@@ -9247,7 +12620,7 @@ final class ChatStore {
               let binding = occurrence.sourceAnchorDigest ?? context.store.task(id: request.taskID).flatMap({
                   $0.version == request.taskVersion ? $0.sourceAnchorDigest : nil
               }),
-              schedulerSourceAnchorDigest(sessionID: targetID, projectID: projectID, ordinal: ordinal) == binding else {
+              schedulerSourceAnchorDigest(sessionID: anchorSessionID, projectID: projectID, ordinal: ordinal) == binding else {
             throw ScheduledSubmissionError.targetUnavailable
         }
         guard !scheduledSessionBusy.contains(targetID), streamingTasks[targetID] == nil else { throw ScheduledSubmissionError.busy }
@@ -9282,6 +12655,7 @@ final class ChatStore {
         guard let execution = context.store.beginExecutionIdentity(request, owner: context.owner, token: context.token,
             minimumTurn: max(1, max(nextAgentTurnID, ordinal + 1)), now: context.now()),
               let messageID = UUID(uuidString: execution.messageID) else { throw ScheduledSubmissionError.duplicateEffect }
+        runSessionCommitted = true
         let baseTaskEngine: any ChatAgentEngine
         let facts: ComposerPolicyFactSource
         if let prepareTopLevelTaskPolicy {
@@ -9327,7 +12701,7 @@ final class ChatStore {
         let stillCurrent = { @MainActor [self] in
             guard context.isCurrent(), self.retainsComposerAuthority(authorizationFacts),
                   facts.expiresAt > context.now(),
-                  self.schedulerSourceAnchorDigest(sessionID: targetID, projectID: projectID, ordinal: ordinal) == binding,
+                  self.schedulerSourceAnchorDigest(sessionID: anchorSessionID, projectID: projectID, ordinal: ordinal) == binding,
                   let current = self.sessionStore?.loadSession(id: targetID.uuidString) else { return false }
             if current == target { return true }
             guard let write = self.scheduledSourceCardWrites[identity],
@@ -9425,7 +12799,8 @@ final class ChatStore {
                     + [LLMMessage(role: .user, content: text)]
                 let occupancy = ContextWindowPolicy.estimateInput(
                     messages: nextRequest, systemPrompt: Self.systemPrompt(for: outputMode),
-                    anchor: sample.flatMap(Self.contextAnchor(of:))) ?? Int.max
+                    anchor: sample.flatMap(Self.contextAnchor(of:)),
+                    toolSchemaTokens: Self.builtinToolSchemaTokens) ?? Int.max
                 let decision = ContextWindowPolicy.decide(
                     occupancyTokens: occupancy, windowTokens: window, threshold: threshold,
                     compactionAlreadyJudgedForThisTranscript:
@@ -9550,13 +12925,17 @@ final class ChatStore {
                 // pinned submission was checked. Recheck its live fences
                 // before the engine can dispatch a provider or tool attempt.
                 guard stillCurrent() else { throw ScheduledSubmissionError.policyUnavailable }
-                let taskEngine: any ChatAgentEngine = (authorizedTaskEngine as? AgentLoopChatEngine)?
+                let scheduledEngine: any ChatAgentEngine = (authorizedTaskEngine as? AgentLoopChatEngine)?
                     .withScheduledInput(.init(sessionID: targetID.uuidString,
                         transcriptRevision: target.transcriptRevision, messageID: messageID, text: text))
                     ?? authorizedTaskEngine
+                let taskEngine = withReductionOnlyAdmission(
+                    scheduledEngine, sessionID: targetID, model: providerBox.value.model,
+                    settings: effectiveSettingsSnapshot)
                 system += "\n\n" + credentialBroker.protect(Self.turnEnvironmentPrompt(
                     now: Date(), goalObjective: target.goal?.objective, projectDirectory: target.workingDirectory,
-                    modelID: providerBox.value.model.id, mode: snapshot.mode, scheduled: true
+                    modelID: providerBox.value.model.id, mode: snapshot.mode, scheduled: true,
+                    sessionID: targetID.uuidString
                 ))
                 let stream: AsyncThrowingStream<AgentStreamEvent, Error>
             if let runtime {
@@ -9583,9 +12962,11 @@ final class ChatStore {
                 }
                 guard stillCurrent() else { throw ScheduledSubmissionError.anchorChanged }
                 switch event {
-                case .textDelta(let value), .thinkingDelta(let value):
+                case .textDelta(let value):
                     if !value.isEmpty { memoryResponseConfirmedSessions.insert(targetID) }
                     output += value
+                case .thinkingDelta:
+                    break
                 case .done(let reason):
                     if case .endTurn = reason { completed = true }
                 case .usage(let usage):
@@ -9684,7 +13065,7 @@ final class ChatStore {
         case uiNotReady, canonicalWriteIsolated, attachmentsNotReady
         case autoCompactionPreflightActive, effectiveSettingsUnavailable
         case credentialCaptureIntercepted, emptyPayload, slashCommandRejected
-        case slashCommandHandled, memoryForgetHandled, sessionUnavailable, mediaSelectionChanged
+        case slashCommandHandled, memoryForgetHandled, memoryWriteHandled, sessionUnavailable, mediaSelectionChanged
         case credentialRevisionUnavailable, credentialPreflightSuperseded
         case credentialPreflightFenceChanged, credentialRecordChanged
         case credentialUnavailable, streamSteer, appendNotObserved
@@ -9767,6 +13148,8 @@ final class ChatStore {
         /// user message (no reminder reset, no per-turn notification).
         let isGoalContinuation: Bool
         let memoryFact: String?
+        /// 别的会话投递来的消息：不是用户本人发起，模式里的绕过档降为手动（与后台运行一致）。
+        var downgradesBypass = false
         var answerOnlyRegeneration: Bool { regenerationTarget != nil }
         /// Turns that may advance and be measured against the session goal.
         var drivesConversationGoal: Bool {
@@ -9804,14 +13187,15 @@ final class ChatStore {
         guard agentEngine is AgentLoopChatEngine else { return "当前引擎不支持仅重新回答" }
         guard !isActiveSessionGenerating, !isComposerCredentialPreflightPending,
               !isComposerAttachmentPreflightPending else { return "请等待当前回合结束" }
-        guard draftText.isEmpty, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty,
+        guard !hasDraft, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty,
               activeQueuedComposerMessages.isEmpty, !isEditingMessage else { return "请先处理未发送的输入、附件或队列" }
         guard let latest = messages.last(where: { $0.role == .assistant }), latest.id == messageID,
               let index = messages.firstIndex(where: { $0.id == messageID }),
               messages[..<index].contains(where: { $0.role == .user }),
-              !latest.isStreaming, !latest.wasInterrupted, !latest.content.isEmpty,
-              activeSessionID.map({ resolvedExecutionSnapshot(for: $0)?.state != .failed }) ?? false
-        else { return "仅支持重新生成最近一条已完成的回答" }
+              !latest.isStreaming, !latest.content.isEmpty || latest.wasInterrupted,
+              activeSessionID.map({ resolvedExecutionSnapshot(for: $0)?.state != .failed
+                  || providerFailureRecoveredByCheck(sessionID: $0) }) ?? false
+        else { return "仅支持重新生成最近一条回答" }
         return nil
     }
 
@@ -9825,6 +13209,13 @@ final class ChatStore {
             pastedTextActionFeedback = reason
             return false
         }
+        // 被中断的回答：对齐重试，去掉半截产出后按原用户消息重跑，不插提示消息、不追加在半截回答后面。
+        if let interrupted = messages.last(where: { $0.role == .assistant }), interrupted.wasInterrupted,
+           let session = sessions.first(where: { $0.id == sessionID }),
+           let lastUserMessage = session.messages.last(where: { $0.role == .user }) {
+            return replayLastUserMessageDiscardingTurnOutput(
+                session: session, lastUserMessage: lastUserMessage, actionName: "重新生成") {}
+        }
         draftText = "请基于已有上下文重新回答上一问题，保留已经得到的结果；本回合仅生成回答，不执行工具。"
         return await submitComposerAwaitingAdmission(literal: true,
             regenerationTarget: (sessionID, messageID, expectedRevision, draftText))
@@ -9833,7 +13224,7 @@ final class ChatStore {
     /// Review comments use the same Composer owner and retain their panel text
     /// until this exact send is admitted. No direct model/tool entry exists here.
     func submitChangeComment(_ text: String, expectedSessionID: UUID) async -> Bool {
-        guard activeSessionID == expectedSessionID, draftText.isEmpty, pendingAttachments.isEmpty,
+        guard activeSessionID == expectedSessionID, !hasDraft, pendingAttachments.isEmpty,
               activePastedTextDrafts.isEmpty, !isEditingMessage,
               !isComposerCredentialPreflightPending, !isComposerAttachmentPreflightPending,
               recallLocalInput(text, expectedSessionID: expectedSessionID) else { return false }
@@ -9857,7 +13248,29 @@ final class ChatStore {
             if remainder.first == ":" || remainder.first == "：" { remainder = remainder.dropFirst() }
             fact = remainder.trimmingCharacters(in: .whitespaces)
         }
-        guard !fact.isEmpty, fact.count <= 400, fact.utf8.count <= 512,
+        guard !fact.isEmpty, fact.count <= MemoryInjector.maxFactCharacters,
+              fact.utf8.count <= MemoryInjector.maxFactCharacters * 3 + 200,
+              !fact.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
+        return fact
+    }
+
+    /// 本人在输入框里打的“请记住…”“记住：…”“记一下：…”或以“# ”开头的单行：返回要记的内容。
+    /// 这类消息由 App 直接写入记忆，不发给模型；英文长句式和“以后都…”仍走模型提议 + 批准。
+    private static func userTypedMemoryDirective(in draft: String) -> String? {
+        let line = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.contains(where: \.isNewline) else { return nil }
+        var remainder: Substring
+        if line.hasPrefix("# ") || line.hasPrefix("#\u{3000}") {
+            remainder = line.dropFirst(2)
+        } else if let prefix = ["请记住这条事实", "请记住", "记住这条事实", "记住：", "记住:", "记一下：", "记一下:"]
+            .first(where: { line.hasPrefix($0) }) {
+            remainder = line.dropFirst(prefix.count)
+        } else {
+            return nil
+        }
+        if remainder.first == ":" || remainder.first == "：" { remainder = remainder.dropFirst() }
+        let fact = remainder.trimmingCharacters(in: .whitespaces)
+        guard !fact.isEmpty, fact.count <= MemoryInjector.maxFactCharacters,
               !fact.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else { return nil }
         return fact
     }
@@ -9879,6 +13292,7 @@ final class ChatStore {
         interactive: Bool = false,
         goalContinuation: Bool = false,
         userInitiated: Bool = false,
+        deliveredFromOtherSession: Bool = false,
         regenerationTarget: (sessionID: UUID, messageID: UUID, revision: UInt64, draft: String)? = nil) {
         // A turn started or approved by the user (send, queued message, interrupt
         // resend, approved plan) or a goal continuation (same admission as a user
@@ -9886,9 +13300,9 @@ final class ChatStore {
         // external sessions never come through here.
         let currentMode = effectiveComposerSelection.mode
         let interactiveAutoChoice = (interactive || goalContinuation || userInitiated)
-            && !isEditingMessage && (currentMode == .autoEdit || currentMode == .auto)
+            && (currentMode == .autoEdit || currentMode == .auto)
             ? activeSessionID.map { InteractiveComposerAutoChoice(sessionID: $0, mode: currentMode) } : nil
-        let admission = onAdmission != nil || interactive || goalContinuation || userInitiated
+        let admission = onAdmission != nil || interactive || goalContinuation || userInitiated || deliveredFromOtherSession
             ? ComposerSubmissionAdmission(regenerationTarget: regenerationTarget,
                 interactiveAutoChoice: interactiveAutoChoice,
                 isInteractiveUserSubmission: interactive && regenerationTarget == nil,
@@ -9897,6 +13311,7 @@ final class ChatStore {
                     && pendingAttachments.isEmpty && activePastedTextDrafts.isEmpty
                     ? Self.explicitMemoryFact(in: draftText) : nil, onAdmission)
             : nil
+        admission?.downgradesBypass = deliveredFromOtherSession
         guard !blocksComposerStreamingActions, !isComposerAttachmentPreflightPending else {
             recordComposerSubmissionStage(
                 .submitRejected, reason: .uiNotReady, sessionID: activeSessionID
@@ -9908,6 +13323,7 @@ final class ChatStore {
             providerPreparationCancellationNoticeBySessionID.removeValue(forKey: activeSessionID)
             attachmentPreflightCancellationNoticeBySessionID.removeValue(forKey: activeSessionID)
         }
+        if beginMCPPromptExpansionIfNeeded(onAdmission: onAdmission) { return }
         pastedTextActionFeedback = nil
         submitComposer(afterCredentialPreflight: false,
             literalText: literalComposerDraftBySessionID[activeSessionID] == draftText,
@@ -10032,6 +13448,88 @@ final class ChatStore {
         return true
     }
 
+    /// 内置本地模型的就绪凭据 5 分钟过期。发送前自动重探本机 11434（3 秒）：
+    /// 通过就续期并继续发送；不通过就提示“本地模型未启动或模型不存在”，草稿保留。
+    private func deferSendForLocalModelReprobe(
+        literalText: Bool, includeBackgroundShellCompletions: Bool,
+        admission: ComposerSubmissionAdmission?
+    ) -> Bool {
+        guard providerReadinessStore != nil, streamingProviderOverride == nil,
+              selectedCustomProvider == nil, selectedProviderType == .local,
+              let modelID = selectedModelID, !modelID.isEmpty,
+              !allowsLocalReadinessSelection(modelID: modelID) else { return false }
+        let requestID = UUID()
+        let sessionID = activeSessionID
+        let sessionEpoch = credentialSubmissionSessionEpoch
+        let transcript = transcriptRevision(forSession: sessionID)
+        let body = draftText
+        let attachments = pendingAttachments
+        pendingCredentialSubmissionID = requestID
+        pendingProviderPreparationID = requestID
+        let deadline = ContinuousClock.now + Self.providerPreparationBudget
+        recordComposerSubmissionStage(.credentialPreflightStarted, sessionID: sessionID)
+        providerPreparationDeadlineTask = Task { [weak self] in
+            do { try await ContinuousClock().sleep(until: deadline) }
+            catch { return }
+            self?.expireUncommittedProviderPreparation(
+                requestID: requestID, sessionID: sessionID, admission: admission
+            )
+        }
+        providerPreparationTask = Task { [weak self] in
+            await withTaskCancellationHandler {
+                var forwarded = false
+                defer { if !forwarded { admission?.resolve(false) } }
+                guard let self else { return }
+                let accepted = await self.prepareLocalModelSelection(
+                    modelID: modelID,
+                    isCurrentSelection: { self.pendingCredentialSubmissionID == requestID }
+                )
+                guard !Task.isCancelled, self.pendingCredentialSubmissionID == requestID else { return }
+                defer {
+                    if self.pendingCredentialSubmissionID == requestID {
+                        self.pendingCredentialSubmissionID = nil
+                        self.pendingProviderPreparationID = nil
+                        self.providerPreparationDeadlineTask?.cancel()
+                        self.providerPreparationDeadlineTask = nil
+                        self.providerPreparationTask = nil
+                    }
+                }
+                guard accepted else {
+                    self.pastedTextActionFeedback = "本地模型未启动或模型不存在，本次未发送。请先启动本地服务（Ollama）并确认模型已安装；草稿已保留。"
+                    self.recordComposerSubmissionStage(.credentialPreflightRejected,
+                        reason: .credentialUnavailable, sessionID: sessionID)
+                    return
+                }
+                guard self.activeSessionID == sessionID,
+                      self.credentialSubmissionSessionEpoch == sessionEpoch,
+                      self.selectedModelID == modelID,
+                      self.streamingProviderOverride == nil,
+                      self.transcriptRevision(forSession: sessionID) == transcript,
+                      self.draftText == body,
+                      self.pendingAttachments == attachments else {
+                    self.pastedTextActionFeedback = "发送条件已变化，本次消息未发送。草稿已保留，请确认后重试。"
+                    self.recordComposerSubmissionStage(.credentialPreflightRejected,
+                        reason: .credentialPreflightFenceChanged, sessionID: sessionID)
+                    return
+                }
+                self.pendingCredentialSubmissionID = nil
+                self.pendingProviderPreparationID = nil
+                self.providerPreparationDeadlineTask?.cancel()
+                self.providerPreparationDeadlineTask = nil
+                self.providerPreparationTask = nil
+                self.recordComposerSubmissionStage(.credentialPreflightAccepted, sessionID: sessionID)
+                forwarded = true
+                self.submitComposer(afterCredentialPreflight: true, preparationDeadline: deadline,
+                    literalText: literalText,
+                    includeBackgroundShellCompletions: includeBackgroundShellCompletions,
+                    admission: admission)
+            } onCancel: {
+                if let admission { Task { @MainActor in admission.resolve(false) } }
+            }
+        }
+        return true
+    }
+
     /// Metadata admission precedes appendUser. The committed worker inherits
     /// the same absolute deadline when this exact submission resumes.
     private func deferSendForProviderMetadataPreparation(
@@ -10039,6 +13537,11 @@ final class ChatStore {
         settingsSnapshot: BL6EffectiveSettingsSnapshot?, literalText: Bool,
         includeBackgroundShellCompletions: Bool, admission: ComposerSubmissionAdmission?
     ) -> Bool {
+        if deferSendForLocalModelReprobe(
+            literalText: literalText,
+            includeBackgroundShellCompletions: includeBackgroundShellCompletions,
+            admission: admission
+        ) { return true }
         if providerCredentialMetadataSource == nil, providerReadinessStore != nil,
            streamingProviderOverride == nil, selectedProvider != nil, selectedProviderType != .local {
             let ready = selectedChatProviderID.flatMap { providerID in
@@ -10188,7 +13691,14 @@ final class ChatStore {
                 }
                 guard self.canSelectChatModel(providerID: providerID, modelID: modelID),
                       self.chatModelPickerReceipt(providerID: providerID, modelID: modelID)?.isApplied == true else {
-                    self.pastedTextActionFeedback = "连接或模型检查未通过；请打开连接设置检查后重试。草稿已保留。"
+                    let failureFeedback = Self.readinessFailureFeedback(
+                        category: self.chatModelPickerProjection
+                            .item(providerID: providerID, modelID: Self.pickerModelID(modelID, providerID: providerID))?
+                            .errorCategory,
+                        providerName: ProviderDisplayLabel.resolve(record: record),
+                        isChatGPTAccount: record.name == ChatGPTAccountSession.providerName)
+                    self.pastedTextActionFeedback = failureFeedback
+                    self.readinessFailureRepair = (failureFeedback, record.name)
                     return
                 }
                 let afterProbeRevision = await metadataSource(record.id, record.name)
@@ -10258,6 +13768,13 @@ final class ChatStore {
             )
             return
         }
+        // 改成转写文字只为这次发送；发送没成功（被后续检查拦下）时把草稿里的原音频还原。
+        let audioDraftsBeforeAdaptation = pendingAttachments.filter {
+            ($0.kind == .audio && $0.audioTranscript != nil)
+                || ($0.kind == .image && attachmentTextRecognitionStates[$0.id]?.text != nil)
+        }
+        adaptPendingVideosToSelectedModel()
+        defer { restoreAudioDraftsAfterAdaptation(audioDraftsBeforeAdaptation) }
         let mediaReadiness = composerMediaReadinessSnapshot
         guard mediaReadiness.canSubmitAttachments else {
             pastedTextActionFeedback = mediaReadiness.blockedReason
@@ -10291,6 +13808,28 @@ final class ChatStore {
         lastSubmissionBlockedByInvalidSettings = false
         let pastedDraft = activePastedTextDraft
         let pastedDrafts = activePastedTextDrafts
+        // 自定义斜杠命令（含 /init）：展开成普通用户消息，后面按普通发送处理。
+        // 附件不阻止命令展开；发送在这一步之后被拦下时，草稿恢复成用户原来写的命令。
+        var customCommandOriginalDraft: String?
+        var customCommandExpandedDraft: String?
+        defer {
+            if let original = customCommandOriginalDraft, draftText == customCommandExpandedDraft,
+               attachmentSubmissionTask == nil, pendingAttachmentSubmissionID == nil,
+               !isComposerCredentialPreflightPending, !isComposerAttachmentPreflightPending {
+                draftText = original
+            }
+        }
+        // 展开结果是命令文件的内容，不是本人键入的话：按原样文字发送（和 MCP 提示词一样
+        // 当 literal 处理），不再走内置命令路由、"忘掉"解析和"请记住"直写。
+        var expandedFromCustomCommand = false
+        if !literalText, pastedDrafts.isEmpty, editingMessageID == nil,
+           let expanded = expandedCustomSlashCommand(for: draftText) {
+            customCommandOriginalDraft = draftText
+            customCommandExpandedDraft = expanded
+            draftText = expanded
+            expandedFromCustomCommand = true
+        }
+        let isLiteralSubmission = literalText || expandedFromCustomCommand
         let composerBody = draftText
         // A pasted card owns exact material bytes, including boundary whitespace.
         // Ordinary typed-only sends retain their existing trimming policy.
@@ -10321,7 +13860,7 @@ final class ChatStore {
         }.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let typedWords = composerBody.split(maxSplits: 1, whereSeparator: \.isWhitespace)
-        if !literalText,
+        if !isLiteralSubmission,
            (typedWords.first == "/goal" || intentText.split(maxSplits: 1, whereSeparator: \.isWhitespace).first == "/goal") {
             // D2-14：回车与发送按钮走同一入口；不带参数时显示当前目标。
             guard attachments.isEmpty, pastedDrafts.isEmpty,
@@ -10343,6 +13882,25 @@ final class ChatStore {
                 recordComposerSubmissionStage(.routedLocally, reason: .slashCommandHandled, sessionID: sessionID)
                 return
             }
+            // 子命令对齐 Claude Code / Codex：clear、pause、resume 是控制目标，不是目标内容。
+            let goalArgument = typedWords[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            if let control = Self.goalSubcommandControl(goalArgument) {
+                if let goal = conversationGoal(for: sessionID) {
+                    do {
+                        try controlConversationGoal(sessionID: sessionID, goalID: goal.id, action: control)
+                        pastedTextActionFeedback = Self.goalSubcommandDoneNotice(control)
+                    } catch {
+                        pastedTextActionFeedback = "当前目标的状态下不能执行这个操作。"
+                    }
+                } else {
+                    pastedTextActionFeedback = "当前会话还没有目标。"
+                }
+                draftText = ""
+                clearCurrentDraft()
+                admission?.resolve(true)
+                recordComposerSubmissionStage(.routedLocally, reason: .slashCommandHandled, sessionID: sessionID)
+                return
+            }
             do {
                 try startConversationGoal(sessionID: sessionID, objective: String(typedWords[1]))
                 draftText = ""
@@ -10356,7 +13914,7 @@ final class ChatStore {
         }
 
         // "忘掉…"：本地打开 设置 › 记忆 并预填检索，不发给模型、不进转录；删除仍由用户在设置里做。
-        if !literalText, admission?.isInteractiveUserSubmission == true, !isEditingMessage,
+        if !isLiteralSubmission, admission?.isInteractiveUserSubmission == true, !isEditingMessage,
            attachments.isEmpty, pastedDrafts.isEmpty, draftText == composerBody,
            let query = Self.explicitForgetQuery(in: composerBody) {
             let sessionID = activeSessionID
@@ -10372,12 +13930,46 @@ final class ChatStore {
             return
         }
 
+        // 本人键入的"请记住…"/"# …"：像 Claude Code 一样直接写入，不发给模型、不进转录。
+        // 项目会话写项目记忆，普通会话写个人（全局）记忆。来源判定仍是"本人在输入框提交"
+        // （interactive 提交）；模型自己提的记忆继续走提案 + 批准。
+        if !isLiteralSubmission, admission?.isInteractiveUserSubmission == true, !isEditingMessage,
+           attachments.isEmpty, pastedDrafts.isEmpty, draftText == composerBody,
+           let fact = Self.userTypedMemoryDirective(in: composerBody),
+           let settings = SettingsCenter.active {
+            let sessionID = activeSessionID
+            let memoryOffNote = settings.memoryEnabled ? "" : "（注意：设置里的“记忆”开关是关闭的，打开后才会在对话里生效）"
+            switch settings.addUserTypedMemory(fact, within: activeMemoryScope, sessionID: sessionID?.uuidString) {
+            case .project:
+                pastedTextActionFeedback = "已记住（项目记忆）：\(fact.prefix(60))。可在 设置 › 记忆 查看或删除。\(memoryOffNote)"
+            case .personal:
+                pastedTextActionFeedback = "已记住（个人记忆，所有会话可用）：\(fact.prefix(60))。可在 设置 › 记忆 查看或删除。\(memoryOffNote)"
+            case .credentialLike:
+                pastedTextActionFeedback = "这段内容像密钥或密码，没有保存为记忆。输入内容已保留。"
+                admission?.resolve(false)
+                return
+            case .personalFull:
+                pastedTextActionFeedback = "个人记忆已接近上限，没有保存。请到 设置 › 记忆 精简后再记；输入内容已保留。"
+                admission?.resolve(false)
+                return
+            case .failed:
+                pastedTextActionFeedback = "记忆未能保存，请检查存储后重试；输入内容已保留。"
+                admission?.resolve(false)
+                return
+            }
+            draftText = ""
+            clearCurrentDraft()
+            admission?.resolve(true)
+            recordComposerSubmissionStage(.routedLocally, reason: .memoryWriteHandled, sessionID: sessionID)
+            return
+        }
+
         // Composer slash commands are commands, not user messages. Freeze an
         // identity for the pending request, then route before edit handling,
         // appendUser, and Provider resolution.
         // intentText already excludes reference material; an accompanying
         // reference must not suppress the separately typed current command.
-        if !literalText, attachments.isEmpty,
+        if !isLiteralSubmission, attachments.isEmpty,
            intentText.hasPrefix("/") {
             let nativeApprovalCanRun = fromKeyboard && isActiveSessionGenerating
                 && intentText == composerBody.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -10449,7 +14041,7 @@ final class ChatStore {
                 }
                 if composerCommandValidationFailure != nil || lastComposerCommandReceipt?.disposition == .reject {
                     if consumedCommandDraft, activeSessionID == sourceSessionID,
-                       draftText.isEmpty, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty {
+                       !hasDraft, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty {
                         draftText = composerBody
                         if let sourceSessionID {
                             pastedTextBySessionID[sourceSessionID] = pastedDrafts
@@ -10498,7 +14090,7 @@ final class ChatStore {
         }
         if !afterCredentialPreflight,
            deferSendForProviderMetadataPreparation(
-               mediaReadiness: mediaReadiness, settingsSnapshot: effectiveSettingsSnapshot, literalText: literalText,
+               mediaReadiness: mediaReadiness, settingsSnapshot: effectiveSettingsSnapshot, literalText: isLiteralSubmission,
                includeBackgroundShellCompletions: includeBackgroundShellCompletions, admission: admission
            ) { forwarded = true; return }
 
@@ -10522,6 +14114,17 @@ final class ChatStore {
         // 新输入按当前设置打断生成或进入待发队列，停止后保留队列。
         // F3 对话互不干扰：只打断「当前活跃会话自己的流」（isActiveSessionStreaming）；
         // 其他会话的后台流不因本会话发消息被取消。
+        // C3-12：手动压缩进行中（摘要还没回来）不打断也不直接发：排进待发队列，压缩结束后再发，
+        // 用的是压缩后的历史；否则新消息会让压缩结果作废。
+        if isActiveSessionManualCompacting, admission?.regenerationTarget == nil {
+            if admission?.isGoalContinuation == true {
+                admission?.resolve(false)
+                return
+            }
+            let queued = enqueueComposer()
+            admission?.resolve(queued)
+            return
+        }
         if isActiveSessionStreaming {
             // A continuation never interrupts or queues behind a running turn;
             // it is refused here and waits for that turn's end.
@@ -10632,7 +14235,8 @@ final class ChatStore {
             messageID: messageID,
             messageText: content,
             attachments: attachments,
-            interactiveAutoChoice: admission?.interactiveAutoChoice
+            interactiveAutoChoice: admission?.interactiveAutoChoice,
+            downgradeBypass: admission?.downgradesBypass == true
         )
         guard prepareTopLevelTaskPolicy == nil
                 || preparedTopLevelTaskEngines[composerSnapshot.taskID] != nil else {
@@ -10644,7 +14248,7 @@ final class ChatStore {
         }
 
         // 1) 画布指令优先（仅纯文本消息拦截；带附件一律走 LLM）
-        if !literalText, attachments.isEmpty,
+        if !isLiteralSubmission, attachments.isEmpty,
            pastedDraft?.kind != .reference,
            let handled = onSendCommand?(intentText, composerSnapshot), handled {
             preparedTopLevelTaskEngines.removeValue(forKey: composerSnapshot.taskID)
@@ -10750,6 +14354,8 @@ final class ChatStore {
     var fileCheckpointStore: FileCheckpointStore?
     private var fileCheckpointRevision: UInt64 = 0
     private(set) var checkpointFeedback: String?
+    /// 上一次“恢复到此之前”因文件冲突被拒时记下检查点，界面据此提供“先存当前版本再覆盖”。
+    private(set) var rewindConflictOfferCheckpointID: UUID?
     var fileCheckpoints: [FileCheckpointStore.Summary] {
         _ = fileCheckpointRevision
         guard let fileCheckpointStore, let id = activeSessionID else { return [] }
@@ -10797,7 +14403,7 @@ final class ChatStore {
         let line = SessionSearchSafeText.sanitized(safe)
         guard !line.isEmpty else { return metadata }
         return ConversationRewindDisplay(anchor: anchor, preview: String(line.prefix(60)),
-                                         timestamp: message.timestamp)
+                                         timestamp: message.hasUnverifiedTimestamp ? nil : message.timestamp)
     }
 
     private func requireConversationRewindIdle(_ sessionID: UUID) throws {
@@ -10885,6 +14491,12 @@ final class ChatStore {
         guard let store = fileCheckpointStore, let sessionID = activeSessionID,
               !isActiveSessionGenerating,
               let summary = fileCheckpoints.first(where: { $0.id == checkpointID }) else { return false }
+        // 同时恢复对话会改写会话记录，守卫与“仅回退对话”一致：生成中、预检中、
+        // 有后台子任务、写入被隔离时都不执行。只恢复文件不受影响。
+        if includeConversation, (try? requireConversationRewindIdle(sessionID)) == nil {
+            checkpointFeedback = "未恢复：会话仍在运行或有后台任务，请等它结束后再恢复文件和对话。"
+            return false
+        }
         let facts = composerPolicyFacts
         let revision = transcriptRevision(forSession: sessionID)
         let path = URL(fileURLWithPath: summary.path)
@@ -10909,7 +14521,7 @@ final class ChatStore {
                         && self.transcriptRevision(forSession: sessionID) == revision
                         && (confirmedBypass || PolicyRuntimePathBoundary.isWithinRoots(path: path.path, roots: facts.allowedWriteRoots))
                 }
-                guard authorized else { throw FileCheckpointStore.Failure.changed }
+                guard authorized else { throw FileCheckpointStore.Failure.notAuthorized }
                 if let restoreAuthority {
                     return try await restoreAuthority.restoreFileCheckpoint(
                         checkpointID, store: store, sessionID: sessionID.uuidString)
@@ -10939,7 +14551,7 @@ final class ChatStore {
                 touchSession(sessionID)
                 fileCheckpointRevision &+= 1
                 if let returnedRequest {
-                    if draftText.isEmpty && pendingAttachments.isEmpty {
+                    if !hasDraft && pendingAttachments.isEmpty {
                         draftText = returnedRequest.content
                         pendingAttachments = returnedRequest.attachments
                         checkpointFeedback = "文件和对话已恢复；原请求已放回输入框，可修改后重新发送。"
@@ -10955,9 +14567,168 @@ final class ChatStore {
             checkpointFeedback = "文件已恢复。"
             return true
         } catch {
-            checkpointFeedback = "未恢复：文件、权限或检查点已变化，请重新检查。"
+            var message = Self.checkpointRestoreFailureMessage(error)
+            // 单个恢复要求文件当前内容正好是这次改动之后的样子；同一文件还有更新的检查点时，先点旧的一定失败，直说原因。
+            if let failure = error as? FileCheckpointStore.Failure, case .changed = failure,
+               fileCheckpoints.contains(where: { $0.path == summary.path && $0.createdAt > summary.createdAt }) {
+                message += "这个文件还有更新的检查点：请先恢复更新的那个，或用“恢复到此之前”一次撤销多个。"
+            }
+            checkpointFeedback = message
             return false
         }
+    }
+
+    /// 回滚失败的原因分开说明：文件被改、文件被删、权限不含、检查点失效各有各的话。
+    private static func checkpointRestoreFailureMessage(_ error: Error, batch: Bool = false) -> String {
+        let prefix = batch ? "未完整恢复：" : "未恢复："
+        if let failure = error as? FileCheckpointStore.Failure {
+            return prefix + failure.localizedDescription
+        }
+        if let conflict = error as? FileCheckpointStore.RewindConflictError {
+            return prefix + (conflict.errorDescription ?? "有文件在检查点之后又变了。")
+        }
+        if error is CancellationError { return prefix + "操作已取消。" }
+        return prefix + "文件、权限或检查点已变化，请重新检查。"
+    }
+
+    nonisolated private static func withSortedFileLocks<T: Sendable>(
+        _ paths: ArraySlice<String>, _ body: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        guard let first = paths.first else { return try await body() }
+        let rest = paths.dropFirst()
+        return try await ToolFileMutationScope.withLock(path: URL(fileURLWithPath: first)) {
+            try await Self.withSortedFileLocks(rest, body)
+        }
+    }
+
+    /// 按固定顺序给涉及的路径加锁，整体预检后一次恢复；任一路径不满足授权或哈希，
+    /// 一条都不动。授权逐路径校验（授权根或已确认的绕过档底线）。
+    private func restoreFiles(before plan: FileCheckpointStore.RewindPlan, store: FileCheckpointStore,
+                              sessionID: UUID, overwriteConflicts: Bool = false) async throws -> [UUID] {
+        let facts = composerPolicyFacts
+        let revision = transcriptRevision(forSession: sessionID)
+        let selection = effectiveComposerSelection
+        let confirmedBypass = selection.mode == .bypassPermission && selection.bypassModeConfirmed
+        let restoreAuthority = confirmedBypass ? ComposerAuthorizationController(
+            snapshot: ComposerSubmissionSnapshot(mode: selection.mode,
+                approvalScope: selection.approvalScope, effort: selection.effort,
+                sessionID: sessionID.uuidString, turnID: max(1, nextAgentTurnID),
+                taskID: UUID().uuidString, messageID: UUID().uuidString,
+                workspaceID: composerWorkspaceID, createdAt: Date(),
+                policyRevision: facts.revision, grantEpoch: facts.grantEpoch,
+                bypassModeConfirmed: true, autonomyCeiling: facts.autonomyCeiling), facts: facts) : nil
+        let order = plan.lockOrder.sorted {
+            PolicyRuntimePathBoundary.foldedForPathComparison($0) < PolicyRuntimePathBoundary.foldedForPathComparison($1)
+        }
+        return try await Self.withSortedFileLocks(order[...]) { [weak self] in
+            let allowed: Set<String>? = await MainActor.run { () -> Set<String>? in
+                guard let self, self.fileCheckpointStore === store,
+                      self.activeSessionID == sessionID, !self.isActiveSessionGenerating,
+                      self.retainsComposerAuthority(facts), facts.expiresAt > Date(),
+                      self.effectiveComposerSelection == selection,
+                      self.transcriptRevision(forSession: sessionID) == revision else { return nil }
+                return Set(order.filter {
+                    confirmedBypass || PolicyRuntimePathBoundary.isWithinRoots(path: $0, roots: facts.allowedWriteRoots)
+                })
+            }
+            guard let allowed else { throw FileCheckpointStore.Failure.notAuthorized }
+            if let restoreAuthority {
+                return try await restoreAuthority.restoreFileCheckpointsBefore(
+                    plan, store: store, sessionID: sessionID.uuidString, overwriteConflicts: overwriteConflicts)
+            }
+            return try store.restoreBefore(plan, sessionID: sessionID.uuidString,
+                                           overwriteConflicts: overwriteConflicts) { allowed.contains($0) }
+        }
+    }
+
+    /// 恢复到所选检查点之前：该检查点及其之后的所有文件改动按从新到旧撤销。
+    /// 只恢复文件，对话不动。
+    /// `overwriteConflicts` 只在用户主动选择“先把当前版本存为检查点再覆盖”时为 true。
+    @discardableResult func restoreFileCheckpointsBefore(_ checkpointID: UUID, overwriteConflicts: Bool = false) async -> Bool {
+        guard let store = fileCheckpointStore, let sessionID = activeSessionID,
+              !isActiveSessionGenerating else { return false }
+        do {
+            let plan = try store.rewindPlan(before: checkpointID, sessionID: sessionID.uuidString)
+            let restored = try await restoreFiles(before: plan, store: store, sessionID: sessionID,
+                                                  overwriteConflicts: overwriteConflicts)
+            fileCheckpointRevision &+= 1
+            rewindConflictOfferCheckpointID = nil
+            checkpointFeedback = overwriteConflicts
+                ? "已恢复 \(plan.lockOrder.count) 个文件；被改动的文件已先把当前版本存为新检查点，可再恢复回来；对话未改动。"
+                : "已恢复 \(plan.lockOrder.count) 个文件（撤销 \(restored.count) 次改动）；对话未改动。"
+            return true
+        } catch {
+            fileCheckpointRevision &+= 1
+            rewindConflictOfferCheckpointID = error is FileCheckpointStore.RewindConflictError ? checkpointID : nil
+            checkpointFeedback = Self.checkpointRestoreFailureMessage(error, batch: true)
+            return false
+        }
+    }
+
+    /// 回退到所选消息，并恢复其后（下一条消息起）改动过的所有文件。
+    /// 先恢复文件，整体预检失败则会话也不回退。
+    @discardableResult func restoreConversationAndFiles(_ anchor: SessionTranscriptRewindAnchor) async -> Bool {
+        guard let sessionID = activeSessionID, sessionID.uuidString == anchor.expectedSession.id,
+              let session = sessions.first(where: { $0.id == sessionID }),
+              session.transcriptRevision == anchor.expectedSession.transcriptRevision else { return false }
+        let visible = session.messages.filter { $0.role != .system }
+        guard visible.indices.contains(anchor.messageIndex) else { return false }
+        var restoredFileCount = 0
+        // R3-09：下一条消息的时间没有保存（旧版本留下的会话）时，按时间找不到
+        // 可信的检查点分界，不能说“没有文件改动”；回退会话后让用户按检查点逐个恢复。
+        var cutoffUnknownWithCheckpoints = false
+        if visible.indices.contains(anchor.messageIndex + 1), let store = fileCheckpointStore {
+            let next = visible[anchor.messageIndex + 1]
+            let cutoff = next.timestamp
+            if next.hasUnverifiedTimestamp {
+                cutoffUnknownWithCheckpoints = !fileCheckpoints.isEmpty
+            } else if let oldest = fileCheckpoints.last(where: { $0.createdAt >= cutoff }) {
+                do {
+                    let plan = try store.rewindPlan(before: oldest.id, sessionID: sessionID.uuidString)
+                    _ = try await restoreFiles(before: plan, store: store, sessionID: sessionID)
+                    restoredFileCount = plan.lockOrder.count
+                    fileCheckpointRevision &+= 1
+                } catch {
+                    checkpointFeedback = Self.checkpointRestoreFailureMessage(error, batch: true) + "会话未回退。"
+                    return false
+                }
+            }
+        }
+        guard restoreConversationHistory(anchor) else {
+            // 文件已经先恢复了，别让用户以为什么都没改。
+            if restoredFileCount > 0 {
+                checkpointFeedback = "已把 \(restoredFileCount) 个文件恢复到该检查点，但对话没有回退（"
+                    + (checkpointFeedback ?? "回退未确认完成") + "）。"
+            }
+            return false
+        }
+        if cutoffUnknownWithCheckpoints {
+            checkpointFeedback = "已回退会话。回退点之后的第一条消息没有记下发送时间，没法判断从哪个时刻起改过哪些文件，所以没有自动恢复文件；请在恢复窗口按检查点逐个恢复。"
+            return true
+        }
+        checkpointFeedback = restoredFileCount > 0
+            ? "已回退会话，并恢复其后改动的 \(restoredFileCount) 个文件；草稿、附件和模式保持不变。"
+            : "已回退会话；其后没有文件改动需要恢复。"
+        return true
+    }
+
+    /// 停止当前生成，并撤销本轮（最近一条用户消息之后）的文件改动。
+    @discardableResult func stopAndRevertTurnFiles() async -> Bool {
+        guard isActiveSessionGenerating, fileCheckpointStore != nil else { return false }
+        let turnStart = messages.last(where: { $0.role == .user })?.timestamp
+        stopStreaming(returnQueuedToDraft: true)
+        for _ in 0..<50 where isActiveSessionGenerating {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard !isActiveSessionGenerating else {
+            checkpointFeedback = "已请求停止，但生成尚未结束；结束后可在恢复窗口回退本轮文件。"
+            return false
+        }
+        guard let turnStart, let oldest = fileCheckpoints.last(where: { $0.createdAt >= turnStart }) else {
+            checkpointFeedback = "已停止；本轮没有文件改动需要回退。"
+            return true
+        }
+        return await restoreFileCheckpointsBefore(oldest.id)
     }
 
     var onResponseCompleted: (@MainActor () -> Void)?
@@ -11049,7 +14820,7 @@ final class ChatStore {
 
     @discardableResult
     func editQueuedComposer(id: UUID) -> Bool {
-        guard let sessionID = activeSessionID, draftText.isEmpty, pendingAttachments.isEmpty,
+        guard let sessionID = activeSessionID, !hasDraft, pendingAttachments.isEmpty,
               activePastedTextDrafts.isEmpty, editingMessageID == nil,
               let index = queuedComposerMessages.firstIndex(where: { $0.id == id && $0.sessionID == sessionID }) else { return false }
         let item = queuedComposerMessages[index]
@@ -11068,12 +14839,32 @@ final class ChatStore {
         return true
     }
     private var pausedComposerQueueSessions: Set<UUID> = []
+    /// 回合在用户切走期间正常结束、且有排队消息的会话：切回时补发队首（只补发这种情形，
+    /// 失败/停止后的队列和重启后恢复的队列仍保持原样）。
+    @ObservationIgnored private var queueResumeOnReturnSessions: Set<UUID> = []
+    /// 用户手动排队的消息总条数上限。
+    static let maximumQueuedComposerMessages = 50
+    /// 刚由 Stop 钩子 block 触发了续跑的会话；续跑回合结束时用它判断 stop_hook_active。
+    private var stopHookContinuedSessions: Set<UUID> = []
+    /// Stop 钩子续跑那一轮继承的"会话互叫层数"：续跑消息不是信封，不记下来层数会归零。
+    /// 只存在内存里，续跑回合结束、失败或取消时清掉。
+    var stopContinuationHops: [UUID: Int] = [:]
+    /// Stop 钩子续跑消息的开头，用来确认最近一条用户消息确实是续跑触发的。
+    static let stopContinuationPrefix = "Stop 钩子要求继续："
     var activeQueuedComposerMessages: [QueuedComposerMessage] {
         queuedComposerMessages.filter { $0.sessionID == activeSessionID }
     }
     var isActiveSessionGenerating: Bool {
         streamingTasks[activeSessionID] != nil
             || activeSessionID.map { ordinaryAutoCompactionTasks[$0] != nil } == true
+    }
+    /// C3-12: a manual compaction of the active session is still running. A message sent now would
+    /// change the history under the summary and void its result, so it waits in the queue instead.
+    /// Judged by the per-session owner record, not the single visible presentation slot: a compaction
+    /// of another session replaces that slot while this session's summary is still running.
+    var isActiveSessionManualCompacting: Bool {
+        guard let sessionID = activeSessionID else { return false }
+        return pendingCompactionOwners.values.contains(sessionID)
     }
 
     /// Queue exact composed text and ready attachments without sending or
@@ -11090,6 +14881,17 @@ final class ChatStore {
         let text = composeDraftPayload()
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 || !pendingAttachments.isEmpty else { return false }
+        // 待发队列有上限：排得太多说明前面的卡住了，草稿保留，提示后返回 true 表示已处理。
+        if queuedComposerMessages.count >= Self.maximumQueuedComposerMessages {
+            pastedTextActionFeedback = "待发队列已满（最多 \(Self.maximumQueuedComposerMessages) 条），请等前面的发送完或先清理队列，草稿已保留。"
+            return true
+        }
+        // 排队的“请记住…/忘掉…”是本人键入的本地指令：入队前就地处理，不让它出队后当普通消息发给模型。
+        if pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty,
+           literalComposerDraftBySessionID[activeSessionID] != draftText,
+           handleQueuedLocalMemoryDirective(sessionID: sessionID) {
+            return true
+        }
         queuedComposerMessages.append(QueuedComposerMessage(sessionID: sessionID,
             text: draftText, attachments: pendingAttachments, pastedDrafts: activePastedTextDrafts))
         draftText = ""
@@ -11099,9 +14901,41 @@ final class ChatStore {
         return true
     }
 
+    /// 入队前处理本人键入的记忆指令。返回 true 表示已就地处理（草稿已清空，不再入队）；
+    /// 保存失败时保留草稿并返回 true（同样不入队，避免发给模型）。
+    private func handleQueuedLocalMemoryDirective(sessionID: UUID) -> Bool {
+        let body = draftText
+        if let query = Self.explicitForgetQuery(in: body) {
+            SettingsCenter.active?.pendingMemorySearchQuery = query.isEmpty ? nil : query
+            onOpenSettingsPage?(SettingsPage.memory.rawValue)
+            pastedTextActionFeedback = query.isEmpty
+                ? "已打开 设置 › 记忆，请在列表里删除要忘掉的条目。"
+                : "已打开 设置 › 记忆 并搜索「\(query)」，请在结果里删除要忘掉的条目。"
+            draftText = ""
+            clearCurrentDraft()
+            return true
+        }
+        guard let fact = Self.userTypedMemoryDirective(in: body), let settings = SettingsCenter.active else {
+            return false
+        }
+        switch settings.addUserTypedMemory(fact, within: activeMemoryScope, sessionID: sessionID.uuidString) {
+        case .project, .personal:
+            pastedTextActionFeedback = "已记住：\(fact.prefix(60))。可在 设置 › 记忆 查看或删除。"
+            draftText = ""
+            clearCurrentDraft()
+        case .credentialLike:
+            pastedTextActionFeedback = "这段内容像密钥或密码，没有保存为记忆。输入内容已保留。"
+        case .personalFull:
+            pastedTextActionFeedback = "个人记忆已接近上限，没有保存。请到 设置 › 记忆 精简后再记；输入内容已保留。"
+        case .failed:
+            pastedTextActionFeedback = "记忆未能保存，请检查存储后重试；输入内容已保留。"
+        }
+        return true
+    }
+
     /// Up recalls queued input before transcript history, without dispatching it.
     @discardableResult func takeQueuedComposerForEditing() -> Bool {
-        guard let sessionID = activeSessionID, draftText.isEmpty, pendingAttachments.isEmpty, activePastedTextDraft == nil,
+        guard let sessionID = activeSessionID, !hasDraft, pendingAttachments.isEmpty, activePastedTextDraft == nil,
               let index = queuedComposerMessages.firstIndex(where: { $0.sessionID == activeSessionID })
         else { return false }
         let item = queuedComposerMessages.remove(at: index)
@@ -11114,9 +14948,10 @@ final class ChatStore {
 
     @discardableResult func sendNextQueuedComposer(automatically: Bool = false) -> Bool {
         var consumed = false
-        while let sessionID = activeSessionID, !isActiveSessionGenerating, !isActiveSessionBudgetResetting,
+        while let sessionID = activeSessionID, !isActiveSessionGenerating, !isActiveSessionManualCompacting,
+              !isActiveSessionBudgetResetting,
               !isComposerCredentialPreflightPending, !isComposerAttachmentPreflightPending,
-              draftText.isEmpty, pendingAttachments.isEmpty, activePastedTextDraft == nil,
+              !hasDraft, pendingAttachments.isEmpty, activePastedTextDraft == nil,
               let index = queuedComposerMessages.firstIndex(where: { $0.sessionID == sessionID }) {
             let item = queuedComposerMessages.remove(at: index)
             draftText = item.text
@@ -11124,7 +14959,10 @@ final class ChatStore {
             pastedTextBySessionID[sessionID] = item.pastedDrafts
             persistPastedTextDrafts()
             pausedComposerQueueSessions.remove(sessionID)
-            submitComposer(onAdmission: nil, includeBackgroundShellCompletions: !automatically, userInitiated: true)
+            // 别的会话投递来的消息（带发送信封）不是本人发起：不按用户本人处理，绕过档降为手动。
+            let delivered = SessionMessageEnvelope.parse(item.text) != nil
+            submitComposer(onAdmission: nil, includeBackgroundShellCompletions: !automatically,
+                           userInitiated: !delivered, deliveredFromOtherSession: delivered)
             consumed = true
             // A pending adjudication or changed session owns the next decision.
             if pendingComposerCommand != nil || activeSessionID != sessionID { break }
@@ -11188,7 +15026,7 @@ final class ChatStore {
             if hasPayload {
                 guard enqueueComposer() else { return }
             } else {
-                guard draftText.isEmpty, pendingAttachments.isEmpty,
+                guard !hasDraft, pendingAttachments.isEmpty,
                       activePastedTextDrafts.isEmpty else { return }
             }
             stopStreaming(returnQueuedToDraft: false)
@@ -11226,13 +15064,16 @@ final class ChatStore {
         if pendingCredentialSubmissionID != nil {
             cancelComposerCredentialPreflight()
         }
-        if let activeSessionID,
-           cancelTaskCenterRetryAdmission(
-               sessionID: activeSessionID,
-               reason: "*⏹ 已停止重试*"
-           ) {
-            onStreamingStopped?()
-            return
+        if let activeSessionID {
+            // 只按这次重试自己的回合身份取消它名下的审批卡；不带身份的回调会把别的会话的卡一起拒绝。
+            let retryIdentity = activeTaskCenterRetryAdmissions[activeSessionID]?.executionIdentity
+            if cancelTaskCenterRetryAdmission(
+                sessionID: activeSessionID,
+                reason: "*⏹ 已停止重试*"
+            ) {
+                if let retryIdentity { onTurnStreamingStopped?(retryIdentity) }
+                return
+            }
         }
         if let activeSessionID,
            let preflight = ordinaryAutoCompactionTasks.removeValue(forKey: activeSessionID) {
@@ -11277,6 +15118,8 @@ final class ChatStore {
         for entry in goalReviewTasks.values { entry.task.cancel() }
         for sessionID in pendingGoalContinuationSessions { cancelGoalContinuation(sessionID) }
         stopAllStreaming(reason: "*⏹ 已由安全锁终止*")
+        // 安全锁终止必须立刻落盘（D-RECOVERY-10）：等后台写盘队列把终态写完再返回。
+        flushPendingSessionPersistence()
     }
 
     /// Capture every session before retiring identities. A logical stream end
@@ -11386,6 +15229,13 @@ final class ChatStore {
         }
         for messageIndex in streamingIndices {
             let settledMessageID = sessions[sessionIndex].messages[messageIndex].id
+            // 取回终止前已在流里、但被扣住尚未显示的已脱敏尾部（此处不重建原文）。
+            if let closing = credentialBroker.finalizeStream(
+                messageID: settledMessageID, current: sessions[sessionIndex].messages[messageIndex].content) {
+                sessions[sessionIndex].messages[messageIndex].setProjectedContent(
+                    closing.text, extendsPrevious: closing.extendsPrevious)
+            }
+            finalizeThinkingTail(sessionIndex: sessionIndex, messageIndex: messageIndex)
             credentialBroker.finishStream(messageID: settledMessageID)
             sessions[sessionIndex].messages[messageIndex].isStreaming = false
             sessions[sessionIndex].messages[messageIndex].content += "\n\n" + reason
@@ -11410,6 +15260,12 @@ final class ChatStore {
                 sessionID: sessionID?.uuidString ?? "", turnID: 0, messageID: writebackMessageID
             )
         }
+    }
+
+    /// 测试入口：把会话登记为“正在跑定时任务回合”（只登记 scheduledSessionBusy，不登记 streamingTasks，
+    /// 与真实定时任务回合一致），用于验证归档守卫。
+    func installScheduledSessionBusyForTests(sessionID: UUID) {
+        scheduledSessionBusy.insert(sessionID)
     }
 
     /// 程序性停止当前生成（会话切换/编辑/压缩/新消息优先等）。
@@ -11513,7 +15369,9 @@ final class ChatStore {
         if let stoppedIdentity = activeExecutionIdentities[sessionID] {
             markExecutionExplicitlyStopped(stoppedIdentity)
         }
-        let messageID = sessions.first(where: { $0.id == sessionID })?.messages.last?.id
+        // 用写回身份里的消息 id 定位流式气泡；没有身份（旧引擎）才退回末条消息。
+        let messageID = activeWritebackIdentities[sessionID].flatMap { UUID(uuidString: $0.messageID) }
+            ?? sessions.first(where: { $0.id == sessionID })?.messages.last?.id
         if let scopedStop = onTurnStreamingStopped {
             if let identity = activeExecutionIdentities[sessionID] {
                 scopedStop(identity)
@@ -11562,6 +15420,14 @@ final class ChatStore {
            let messageIndex = lookupMessageIndex(in: sessionIndex, matching: messageID),
            sessions[sessionIndex].messages[messageIndex].isStreaming {
             sessions[sessionIndex].messages[messageIndex].isStreaming = false
+            // 停止与现状一致：已渲染给用户的文字（含流式中被扣住的尾部）以脱敏后的形态保留；
+            // 合并器里尚未渲染的文字照旧丢弃。
+            if let closing = credentialBroker.finalizeStream(
+                messageID: messageID, current: sessions[sessionIndex].messages[messageIndex].content) {
+                sessions[sessionIndex].messages[messageIndex].setProjectedContent(
+                    closing.text, extendsPrevious: closing.extendsPrevious)
+            }
+            finalizeThinkingTail(sessionIndex: sessionIndex, messageIndex: messageIndex)
             if appendInterruptedHint {
                 sessions[sessionIndex].messages[messageIndex].wasInterrupted = true
             }
@@ -11713,14 +15579,33 @@ final class ChatStore {
                 safe.content = credentialBroker.protect(message.content)
                 return safe
             }
-        let historySnapshot = Self.providerHistoryExcludingQuarantinedMedia(
-            protectedHistory,
-            currentMediaSourceMessageID: mediaSourceMessageID
-        )
+        // 其它会话的回复：作为数据放进本轮最后一条用户消息（不进系统提示），
+        // 本轮成功结束后才从队列清掉；失败或取消时下一回合还能带入。
+        let pendingSessionReplies = sessionID.flatMap {
+            SessionMessagingHub.shared.peekReplyContext(forSession: $0.uuidString)
+        }
+        let historySnapshot = Self.historyAppendingSessionReplies(
+            Self.providerHistoryExcludingQuarantinedMedia(
+                protectedHistory,
+                currentMediaSourceMessageID: mediaSourceMessageID
+            ), replyText: pendingSessionReplies?.text)
         activeWritebackIdentities[sessionID] = identity
         activeExecutionIdentities[sessionID] = executionIdentity
         let admittedComposerPolicyFacts = composerPolicyFacts
         let admittedDialoguePolicyInvalidation = dialoguePolicyInvalidation
+        // 目标受阻（等用户决定）时，用户直接回复就是答复：先把目标恢复为进行中，本回合照常计入目标。
+        // 预算已用尽时 resume 会被拒绝，目标保持受阻，不强行恢复。
+        if let sessionID, admission?.isInteractiveUserSubmission == true, admission?.drivesConversationGoal == true,
+           composerSnapshot.mode.supportsConversationGoal,
+           !dormantConversationGoalSessions.contains(sessionID), let sessionStore,
+           let blocked = sessionStore.loadSession(id: sessionID.uuidString)?.goal,
+           blocked.sessionID == sessionID, blocked.status == .blocked,
+           let resumed = try? sessionStore.controlConversationGoal(
+               sessionID: sessionID, goalID: blocked.id, action: .resume) {
+            if activeSessionID == sessionID { selectedConversationGoal = resumed }
+            conversationGoalReminderDates[sessionID] = resumed.reminderDueAt
+            refreshConversationGoalSidebarStatus(sessionID, goal: resumed)
+        }
         let measuredGoal = sessionID.flatMap { sessionID -> ConversationGoalState? in
             guard admission?.drivesConversationGoal == true,
                   composerSnapshot.mode.supportsConversationGoal,
@@ -12065,7 +15950,8 @@ final class ChatStore {
             now: Date(), goalObjective: measuredGoal?.objective,
             projectDirectory: sessionID.flatMap { id in sessions.first { $0.id == id }?.workingDirectory },
             modelID: provider.model.id, mode: composerSnapshot.mode,
-            previousTurnInterrupted: previousAssistantWasInterrupted, includesGoalReporting: true
+            previousTurnInterrupted: previousAssistantWasInterrupted, includesGoalReporting: true,
+            sessionID: sessionID?.uuidString
         ) : nil
         if mm01Scenario == nil, let unsavedMemoryFactReason {
             pastedTextActionFeedback = unsavedMemoryFactReason
@@ -12246,6 +16132,12 @@ final class ChatStore {
                     } else if held?.contains(Self.skillRejectedNoticeMarker) == true {
                         self.sessionContinuationNotice = projectNote
                     }
+                    if rejectedSkills.isEmpty, let sessionID,
+                       let hint = self.takeUnapprovedSkillHint(
+                           sessionID: sessionID, ids: prepared.prompt.unapprovedMatchedSkillIDs) {
+                        let current = self.sessionContinuationNotice
+                        self.sessionContinuationNotice = current.map { $0 + "；" + hint } ?? hint
+                    }
                 }
                 if let sessionID {
                     self.adoptMemoryPreparation(prepared.prompt, sessionID: sessionID)
@@ -12261,6 +16153,18 @@ final class ChatStore {
                     try checkProviderPreparation()
                     if let reason = begin.denialReason { throw MinisCore.HookPromptRejection(reason: reason) }
                     hookTurnContext = begin.additionalContext
+                }
+                // 外部技能（磁盘上的 ~/.claude/skills 等，用户确认过的）：实时读取，标明“外部”。
+                // 扫描和读文件放到后台线程做（目录有缓存，没改的文件不重读）。
+                if let catalog = self.externalSkillCatalog {
+                    let skillProjectRoot = preprocessInput.trustedProjectRoot
+                    let skillMessage = historyText
+                    let external = await Task.detached(priority: .userInitiated) {
+                        catalog.promptFragment(projectRoot: skillProjectRoot, userMessage: skillMessage)
+                    }.value
+                    if let external {
+                        hookTurnContext = (hookTurnContext.map { $0 + "\n\n" } ?? "") + external
+                    }
                 }
                 let backgroundResults = (sessionID.flatMap { self.pendingBackgroundResults[$0] } ?? [])
                     .filter { !self.explicitlyStoppedExecutions.contains($0.executionIdentity) }
@@ -12363,7 +16267,8 @@ final class ChatStore {
                     let estimatedOccupancy = ContextWindowPolicy.estimateInput(
                         messages: providerHistory.map { $0.asLLMMessage() },
                         systemPrompt: turnSystemPromptSnapshot,
-                        anchor: occupancySample.flatMap(Self.contextAnchor(of:))) ?? Int.max
+                        anchor: occupancySample.flatMap(Self.contextAnchor(of:)),
+                        toolSchemaTokens: Self.builtinToolSchemaTokens) ?? Int.max
                     let alreadyJudged = sessionID.flatMap { self.compactionJudgedRevision[$0] }
                         .map { $0 == inFlightRevision } ?? false
                     // An exhausted pause quota still enters the ordinary Engine
@@ -12382,6 +16287,8 @@ final class ChatStore {
                               inFlightHistory.dropLast().last?.id == mediaSourceMessageID else {
                             throw OrdinaryAutoCompactionError.unverifiedHistory
                         }
+                        MinisCore.HookRuntime.installed?.notifyEvent(
+                            .preCompact, sessionID: sessionID.uuidString, fields: ["trigger": "auto"])
                         let stillCurrent: @MainActor () -> Bool = { [self] in
                             !Task.isCancelled
                                 && self.acceptsWriteback(sessionID: sessionID, identity: identity)
@@ -12482,9 +16389,6 @@ final class ChatStore {
                             expectedInMemoryRevision = inFlightRevision
                             canonicalProjectionSource = nil
                         }
-                        // This transcript version is judged from here on, whether the
-                        // attempt compacts or is refused (success advances the version).
-                        self.compactionJudgedRevision[sessionID] = inFlightRevision
                         var compacted = false
                         do {
                             compacted = try await self.performCompaction(
@@ -12506,7 +16410,22 @@ final class ChatStore {
                             compacted = false
                             compactionRefusedBeforeSending = true
                             pendingCompactionRefusedNotice = true
+                        } catch let failure where !Task.isCancelled
+                                    && MinisCore.AgentLoop.isRecoverableAutomaticCompactionFailure(failure) {
+                            // C3-05: a failed summary request (rate limit, timeout, offline) or a
+                            // checkpoint/fact check that did not pass is not a reason to fail a
+                            // send that is still below 95% of the window. Same handling as a
+                            // refusal: one quiet line, the send goes on, and the loop's admission
+                            // still blocks at >= 95%.
+                            compacted = false
+                            compactionRefusedBeforeSending = true
+                            pendingCompactionRefusedNotice = true
                         }
+                        // This transcript version is judged once the attempt has answered,
+                        // whether it compacted or was refused (success advances the version);
+                        // a cancelled or conflicted attempt must not make the next send on
+                        // the same version skip compaction (the scheduled path does the same).
+                        self.compactionJudgedRevision[sessionID] = inFlightRevision
                         if compacted {
                             compactedBeforeSending = true
                             guard self.acceptsWriteback(sessionID: sessionID, identity: identity),
@@ -12547,10 +16466,11 @@ final class ChatStore {
                                 safe.content = self.credentialBroker.protect(message.content)
                                 return safe
                             }
-                            providerHistory = Self.providerHistoryExcludingQuarantinedMedia(
-                                protected,
-                                currentMediaSourceMessageID: mediaSourceMessageID
-                            )
+                            providerHistory = Self.historyAppendingSessionReplies(
+                                Self.providerHistoryExcludingQuarantinedMedia(
+                                    protected,
+                                    currentMediaSourceMessageID: mediaSourceMessageID
+                                ), replyText: pendingSessionReplies?.text)
                         } else {
                             guard stillCurrent() else { throw CancellationError() }
                             // R8 (C3): compaction was due, the attempt returned without
@@ -12683,16 +16603,13 @@ final class ChatStore {
                     // decision S2); the App supplies window, trigger and the last
                     // reported occupancy. No trigger fact (nil threshold) or the MM01
                     // field lane keeps the loop exactly as before.
-                    if mm01Scenario == nil,
-                       let admissionThreshold = self.resolvedAutoCompactionThreshold(in: effectiveSettingsSnapshot) {
-                        let admissionWindow = sessionID.flatMap { self.latestContextWindows[$0] }
-                            ?? provider.model.contextWindowTokens
+                    if mm01Scenario == nil {
                         let anchor = compactedBeforeSending ? nil
                             : self.matchingOccupancySample(
                                 sessionID: sessionID, providerID: route?.providerID ?? providerID,
                                 modelID: modelID).flatMap(Self.contextAnchor(of:))
-                        if let admission = ContextAdmissionConfig(
-                            windowTokens: admissionWindow, triggerFraction: admissionThreshold,
+                        if let admission = self.contextAdmissionConfig(
+                            sessionID: sessionID, model: provider.model, settings: effectiveSettingsSnapshot,
                             initialAnchor: anchor,
                             // A refusal above, or an attempt already made on this
                             // transcript version, must not be retried by the loop.
@@ -12954,8 +16871,36 @@ final class ChatStore {
             } else if acceptedGoalAbort, didFail, !didSettleGoalTurn {
                 self.pauseInterruptedManualGoal(turnTerminalizer.manualGoal, reason: .unsettledFailure)
             }
-            MinisCore.HookRuntime.installed?.notifyStop(sessionID: sessionID?.uuidString ?? "",
-                reason: didCancel ? "cancelled" : (didFail ? "failed" : "completed"))
+            if !didFail, !didCancel, !Task.isCancelled, let sessionID,
+               let hookRuntime = MinisCore.HookRuntime.installed {
+                // 对齐 Claude Code：正常结束的回合等待 Stop 钩子；钩子返回 block 就带着它的
+                // 指示再续跑一轮。续跑那一轮的 Stop 钩子会看到 stop_hook_active=true，
+                // 它再 block 也不会继续，所以每回合最多续跑一次。
+                let wasContinuation = self.stopHookContinuedSessions.remove(sessionID) != nil
+                // 触发这一轮的是别的会话的信封就取它的层数；本轮是续跑就沿用上次记下的。
+                let currentHop = self.sessions.first(where: { $0.id == sessionID })
+                    .flatMap { $0.messages.last(where: { $0.role == .user }) }
+                    .flatMap { SessionMessageEnvelope.parse($0.content)?.hop }
+                    ?? self.stopContinuationHops[sessionID] ?? 0
+                self.stopContinuationHops.removeValue(forKey: sessionID)
+                if let instruction = await hookRuntime.stopAwaiting(
+                    sessionID: sessionID.uuidString, reason: "completed", stopHookActive: wasContinuation),
+                   !wasContinuation {
+                    self.stopHookContinuedSessions.insert(sessionID)
+                    if currentHop > 0 { self.stopContinuationHops[sessionID] = currentHop }
+                    self.queuedComposerMessages.append(QueuedComposerMessage(
+                        sessionID: sessionID, text: Self.stopContinuationPrefix + instruction,
+                        attachments: [], pastedDrafts: []))
+                }
+            } else {
+                // 续跑失败或被取消：清掉续跑标记，下一回合不再当成续跑。
+                if let sessionID {
+                    self.stopHookContinuedSessions.remove(sessionID)
+                    self.stopContinuationHops.removeValue(forKey: sessionID)
+                }
+                MinisCore.HookRuntime.installed?.notifyStop(sessionID: sessionID?.uuidString ?? "",
+                    reason: didCancel ? "cancelled" : (didFail ? "failed" : "completed"))
+            }
             await self.syncBudgetStatus(for: sessionID)
             // A loop-ceiling turn is a normal goal turn: its claim is reviewed,
             // started like any other at the turn's final transcript revision.
@@ -12981,6 +16926,11 @@ final class ChatStore {
                         executionIdentity: executionIdentity
                     )
                     if succeeded {
+                        // 本轮成功用掉了其它会话的回复，这时才清出队列。
+                        if let pendingSessionReplies {
+                            SessionMessagingHub.shared.discardReplies(
+                                forSession: sessionID.uuidString, ids: pendingSessionReplies.ids)
+                        }
                         let measured = recordMeasuredGoalTurn(.completed)
                         goalTurnCompletedNormally = measured
                         if measured {
@@ -13024,9 +16974,13 @@ final class ChatStore {
                     self.pendingResponseNotifications.removeValue(forKey: executionIdentity)
                 }
                 if !didFail, !didCancel, !Task.isCancelled,
-                   let sessionID, self.activeSessionID == sessionID,
-                   !self.pausedComposerQueueSessions.contains(sessionID) {
-                    _ = self.sendNextQueuedComposer(automatically: true)
+                   let sessionID, !self.pausedComposerQueueSessions.contains(sessionID) {
+                    if self.activeSessionID == sessionID {
+                        _ = self.sendNextQueuedComposer(automatically: true)
+                    } else if self.queuedComposerMessages.contains(where: { $0.sessionID == sessionID }) {
+                        // 用户切到了别的会话：回合在后台正常结束，排队消息等用户切回来时补发（S-03）。
+                        self.queueResumeOnReturnSessions.insert(sessionID)
+                    }
                 }
                 if let sessionID {
                     self.settleGoalContinuationAfterTurn(
@@ -13597,7 +17551,7 @@ final class ChatStore {
         // canonical execution. Ordinary tool errors can still be recovered;
         // later successful child/tool results cannot erase a failed parent.
         var orchestrationFailed = false
-        let display = ChatStreamFrameCoalescer { [weak self] text in
+        let display = ChatStreamFrameCoalescer(render: { [weak self] text in
             guard let self, !Task.isCancelled,
                   self.streamingTasks[sessionID]?.isCancelled == false,
                   self.acceptsWriteback(sessionID: sessionID, identity: identity),
@@ -13605,7 +17559,15 @@ final class ChatStore {
             return self.updateMessageContent(
                 sessionID: sessionID, messageID: messageID, identity: identity, append: text
             )
-        }
+        }, renderThinking: { [weak self] text in
+            // 思考片段与正文共用同一个 16ms 合并器，写回前过同样的闸门。
+            guard let self, !Task.isCancelled,
+                  self.streamingTasks[sessionID]?.isCancelled == false,
+                  self.acceptsWriteback(sessionID: sessionID, identity: identity),
+                  self.toolLifecycleConsumer === approvalConsumer else { return false }
+            return self.appendThinking(
+                sessionID: sessionID, messageID: messageID, identity: identity, text: text)
+        })
         // Flush received text on ordinary completion or provider error, before
         // the caller adds its terminal marker. Stop/retired identities discard
         // pending text through the same writeback/cancellation gates.
@@ -13623,14 +17585,12 @@ final class ChatStore {
         // Scope is exactly this consume invocation; final, Stop and restore do
         // not retain an identity-free cache or any durable message bookkeeping.
         var immediateTraceMessageIDs = Set<UUID>()
-        // AJ-52 极简模式：不逐字展示过程，只显示「⏳ 生成中…」状态指示器，流结束一次性上屏最终结果。
+        var excerptWindow = CrossTurnExcerptWindow()
+        // AJ-52 极简模式：不逐字展示过程，流结束一次性上屏最终结果。生成期间正文保持为空，
+        // 由转录渲染层显示「⏳ 生成中…」；中途停止时正文仍为空，不会留下占位文字。
         let isConcise = outputMode == .concise
-        if isConcise {
-            guard self.replaceMessageContent(
-                sessionID: sessionID, messageID: messageID, identity: identity,
-                with: "⏳ 生成中…"
-            ) else { return false }
-        }
+        var thinkingStartedAt: Date?
+        var thinkingSecondsRecorded = false
         for try await event in stream {
             if Task.isCancelled || !self.acceptsWriteback(sessionID: sessionID, identity: identity) {
                 break
@@ -13657,12 +17617,30 @@ final class ChatStore {
                 }
             }
             switch event {
-            case .textDelta(let t), .thinkingDelta(let t):
+            case .thinkingDelta(let t):
                 if !didMarkFirstToken {
                     didMarkFirstToken = true
                     _ = markTurnFirstTokenReceived(
                         sessionID: sessionID, messageID: messageID
                     )
+                }
+                if !isConcise, !t.isEmpty {
+                    if thinkingStartedAt == nil { thinkingStartedAt = Date() }
+                    _ = display.appendThinking(t)
+                }
+            case .textDelta(let t):
+                if !didMarkFirstToken {
+                    didMarkFirstToken = true
+                    _ = markTurnFirstTokenReceived(
+                        sessionID: sessionID, messageID: messageID
+                    )
+                }
+                if let started = thinkingStartedAt, !thinkingSecondsRecorded {
+                    thinkingSecondsRecorded = true
+                    // 先把合并器里尚未写入的思考文字写完，再记耗时（只发生一次）。
+                    if !isConcise { guard display.flush() else { return false } }
+                    _ = appendThinking(sessionID: sessionID, messageID: messageID, identity: identity,
+                                       text: "", seconds: Date().timeIntervalSince(started))
                 }
                 if isConcise {
                     conciseBuffer += t
@@ -13752,7 +17730,8 @@ final class ChatStore {
                               transcript, fact: fact, sessionID: sessionID,
                               messageID: messageID, identity: identity,
                               executionIdentity: executionIdentity,
-                              immediateTraceMessageIDs: &immediateTraceMessageIDs
+                              immediateTraceMessageIDs: &immediateTraceMessageIDs,
+                              excerptWindow: &excerptWindow
                           ) else { return false }
                     consumedOrchestrationReceipts.insert(fact.receiptID)
                 }
@@ -13771,6 +17750,8 @@ final class ChatStore {
                 // 由工具事件卡展示，二者互补不重复。
                 if countedToolCalls.insert(fact.toolCallID).inserted {
                     _ = noteTurnToolCallCompleted(sessionID: sessionID, messageID: messageID)
+                    // R3-10：工具完成是离散边界，另存一份半截回复（节流，不进逐字路径）。
+                    journalInflightReply(sessionID: sessionID)
                 }
             case .usage(let usage):
                 observeUsage(usage)
@@ -13834,9 +17815,16 @@ final class ChatStore {
             return count
         }
         let blockedCount = nonExecutionReasonsByID.count - dryRunCount
+        // 只展示固定中文分类，不带路径、参数或模型原文。
+        let blockedCategoryTexts = Set(nonExecutionReasonsByID.values.compactMap { reason -> String? in
+            if case .blockedByPolicy(let category) = reason { return category.displayText }
+            return nil
+        }).sorted()
+        let blockedReasonSuffix = blockedCategoryTexts.isEmpty
+            ? "" : "原因：" + blockedCategoryTexts.joined(separator: "、") + "。"
         let nonExecutionNotice = [
             dryRunCount > 0 ? "计划模式：\(dryRunCount) 项工具调用未执行。" : nil,
-            blockedCount > 0 ? "执行前拦截：\(blockedCount) 项工具调用未执行。" : nil
+            blockedCount > 0 ? "执行前拦截：\(blockedCount) 项工具调用未执行。" + blockedReasonSuffix : nil
         ].compactMap { $0 }.joined(separator: "\n")
         if !Task.isCancelled && self.acceptsWriteback(sessionID: sessionID, identity: identity) {
             guard self.toolLifecycleConsumer === approvalConsumer else {
@@ -13867,7 +17855,7 @@ final class ChatStore {
     /// Maps typed MCP discovery failures to fixed, secret-free user guidance.
     /// Raw transport errors and server configuration details never enter the
     /// assistant transcript.
-    private static func mcpDiscoveryNotice(
+    static func mcpDiscoveryNotice(
         for failure: AgentToolCatalogDiscoveryFailure
     ) -> String {
         switch failure {
@@ -13875,7 +17863,15 @@ final class ChatStore {
             return "MCP 工具未授权，已继续使用内置工具。请在设置中授权后重试。"
         case .configuration:
             return "MCP 配置无效，已继续使用内置工具。请在设置中检查配置后重试。"
-        case .collision, .protocolError, .timeout, .transport, .unknown:
+        case .timeout:
+            return "MCP 服务响应超时，已继续使用内置工具。请确认该服务已启动、网络正常，再到设置中刷新工具列表。"
+        case .protocolError:
+            return "MCP 服务返回的工具定义无法识别（例如工具参数格式不受支持），已继续使用内置工具。请到设置的 MCP 页面查看该服务的工具定义，或升级、停用该服务后再刷新。"
+        case .transport:
+            return "无法连接 MCP 服务（服务未运行或连接已中断），已继续使用内置工具。请检查服务进程或网络后，到设置中刷新工具列表。"
+        case .collision:
+            return "多个 MCP 服务提供了同名工具，已继续使用内置工具。请到设置中停用其中一个服务或为服务改名后再刷新。"
+        case .unknown:
             return "MCP 工具发现失败，已继续使用内置工具。请在设置中刷新工具列表后重试。"
         }
     }
@@ -13975,7 +17971,13 @@ final class ChatStore {
         if goal.status != .awaitingReview { goalReviewTasks[sessionID]?.task.cancel() }
         // Pause and stop take effect at once, including a held continuation;
         // resume starts the goal again at once when the session is idle.
-        if action == .resume { armGoalContinuationFromUserControl(goal) } else { cancelGoalContinuation(sessionID) }
+        switch action {
+        case .resume: armGoalContinuationFromUserControl(goal)
+        case .pause, .stop: cancelGoalContinuation(sessionID)
+        case .clearBlockers: break
+        }
+        // 暂停要立刻生效：和输入框的"停止"一样中断正在跑的回合（目标已先落盘为暂停，不会再续跑）。
+        if action == .pause, streamingTasks[sessionID] != nil { stopStreaming() }
         selectedConversationGoal = goal
         conversationGoalReminderDates[sessionID] = goal.reminderDueAt
         refreshConversationGoalSidebarStatus(sessionID, goal: goal)
@@ -14170,6 +18172,25 @@ final class ChatStore {
 
     static let planModeGoalNotice = "目标已设定；当前是仅计划模式，这个模式下不会自动续跑。"
 
+    /// `/goal clear|pause|resume`（整词、不分大小写）是控制子命令；其余文字都是目标内容。
+    nonisolated static func goalSubcommandControl(_ argument: String) -> SessionStore.ConversationGoalControl? {
+        switch argument.lowercased() {
+        case "clear": .stop
+        case "pause": .pause
+        case "resume": .resume
+        default: nil
+        }
+    }
+
+    nonisolated static func goalSubcommandDoneNotice(_ control: SessionStore.ConversationGoalControl) -> String {
+        switch control {
+        case .stop: "已清除当前目标。"
+        case .pause: "已暂停当前目标。"
+        case .resume: "已恢复当前目标。"
+        case .clearBlockers: "已清除待办。"
+        }
+    }
+
     /// Starting, resuming or switching a goal on starts its next turn at once
     /// when the session is idle; otherwise it is only marked as waiting.
     private func armGoalContinuationFromUserControl(_ goal: ConversationGoalState) {
@@ -14353,7 +18374,7 @@ final class ChatStore {
             return false
         }
         // An unsent draft belongs to the user and is never replaced or sent.
-        guard draftText.isEmpty, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty else { return false }
+        guard !hasDraft, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty else { return false }
         let prompt = Self.goalContinuationPrompt(for: goal)
         let wasUserArmed = userArmedGoalContinuationSessions.contains(sessionID)
         let epoch = goalContinuationEpochs[sessionID, default: 0]
@@ -14378,6 +18399,88 @@ final class ChatStore {
             self.refreshConversationGoalSidebarStatus(sessionID)
         }, goalContinuation: true)
         refreshConversationGoalSidebarStatus(sessionID, goal: goal)
+        return true
+    }
+
+    // MARK: 后台任务完成后自动续跑
+
+    /// 自动续跑发出的那条通知文字。完成结果本身（后台命令的退出状态、后台子任务的摘要）
+    /// 走已有的上下文注入通道随本轮带上，不写进这条文字。
+    nonisolated static let backgroundCompletionContinuationPrompt =
+        "【系统通知】后台任务已完成，结果已附在本轮上下文里。请据此继续未完成的工作；如果没有后续工作，简短说明结果即可。"
+    /// 同一会话连续自动续跑的次数上限；用户发过话后重新计数。
+    static let maxConsecutiveBackgroundAutoContinuations = 3
+    @ObservationIgnored private var backgroundAutoContinueTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// 从转录末尾往前数连续的自动续跑通知条数；遇到用户自己发的消息就停（即用户发话后清零）。
+    static func consecutiveBackgroundAutoContinuations(in messages: [ChatMessageUI]) -> Int {
+        var count = 0
+        for message in messages.reversed() where message.role == .user {
+            guard message.content.hasPrefix(backgroundCompletionContinuationPrompt) else { return count }
+            count += 1
+        }
+        return count
+    }
+
+    private func hasPendingBackgroundCompletions(_ sessionID: UUID) -> Bool {
+        (pendingBackgroundResults[sessionID] ?? []).contains { !explicitlyStoppedExecutions.contains($0.executionIdentity) }
+            || !(pendingBackgroundShellFinishes[sessionID] ?? []).isEmpty
+    }
+
+    /// 排一次判断：稍等片刻让刚结束的回合收尾、切换会话落定，再看会话是否空闲。
+    /// 开关关闭或没有待注入结果时什么都不做；每个会话同一时刻最多排一个。
+    private func scheduleBackgroundCompletionContinuation(sessionID: UUID) {
+        guard backgroundAutoContinueEnabledProvider?() == true,
+              backgroundAutoContinueTasks[sessionID] == nil,
+              hasPendingBackgroundCompletions(sessionID) else { return }
+        backgroundAutoContinueTasks[sessionID] = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.backgroundAutoContinueTasks.removeValue(forKey: sessionID)
+            self.attemptBackgroundCompletionContinuation(sessionID: sessionID)
+        }
+    }
+
+    /// 后台命令或后台子任务完成后，会话空闲且没有别的事占着，就以一条通知文字开一轮续跑。
+    /// 走和用户发送完全相同的提交路径：预算、权限模式、审批、模型就绪检查照常生效；
+    /// 绕过档按"别的会话投递"的口径降为手动审批（用户当时不一定在场）。
+    /// 只处理当前打开的会话：后台会话的无人值守运行不会带上这些待注入结果，
+    /// 所以其它会话的结果保持待注入，等用户回到该会话（下一条消息或回合结束）再带上。
+    @discardableResult
+    func attemptBackgroundCompletionContinuation(sessionID: UUID) -> Bool {
+        guard backgroundAutoContinueEnabledProvider?() == true,
+              activeSessionID == sessionID,
+              let thread = sessions.first(where: { $0.id == sessionID }),
+              !isCanonicalWriteIsolated(sessionID),
+              hasPendingBackgroundCompletions(sessionID),
+              Self.consecutiveBackgroundAutoContinuations(in: thread.messages)
+                  < Self.maxConsecutiveBackgroundAutoContinuations
+        else { return false }
+        // 用户刚停掉的回合、失败的回合都不自动接着跑。
+        guard !pausedComposerQueueSessions.contains(sessionID),
+              thread.messages.last(where: { $0.role == .assistant })?.wasInterrupted != true,
+              resolvedExecutionSnapshot(for: sessionID)?.state != .failed else { return false }
+        // 空闲且没有别的事：与目标续跑同一组条件；用户的草稿、附件、排队消息优先，不抢。
+        guard !isActiveSessionGenerating, activeExecutionIdentities[sessionID] == nil,
+              !scheduledSessionBusy.contains(sessionID),
+              !isActiveSessionBudgetResetting, !blocksComposerStreamingActions,
+              !isComposerCredentialPreflightPending, !isComposerAttachmentPreflightPending,
+              pendingComposerCommand == nil, !isEditingMessage,
+              goalReviewTasks[sessionID] == nil, !budgetIsOverLimit,
+              activeQueuedComposerMessages.isEmpty,
+              !hasDraft, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty else { return false }
+        let prompt = Self.backgroundCompletionContinuationPrompt
+        draftText = prompt
+        literalComposerDraftBySessionID[activeSessionID] = prompt
+        submitComposer(onAdmission: { [weak self] accepted in
+            // 没能变成消息就被拒绝（例如预检期间用户开始输入）：只把这段通知文字从它所在会话的
+            // 草稿里拿掉，保留用户自己打的内容；结果仍在待注入队列里，下一条消息会带上。
+            guard !accepted, let self,
+                  let restored = Self.draftRemovingRefusedGoalContinuation(
+                      self.draftTextBySessionID[sessionID] ?? "", prompt: prompt)
+            else { return }
+            self.setDraftText(restored, for: sessionID)
+        }, includeBackgroundShellCompletions: true, deliveredFromOtherSession: true)
         return true
     }
 
@@ -14489,6 +18592,30 @@ final class ChatStore {
 
     private var executionStateURL: URL?
     private var composerCommandStateURL: URL?
+
+    /// R3-10：回合进行中的半截回复日志。回合中不能把会话写进正史文件
+    /// （回合内自动压缩要求磁盘正史与回合开始时完全一致，否则压缩被拒），
+    /// 所以在工具完成这种离散边界另存一份小文件；上次退出时仍在运行的会话重启后
+    /// 据此补回已生成的内容并标为已中断。与回合绑定：用户消息的位置和摘要对不上不采用。
+    private struct InflightReplyEntry: Codable, Equatable {
+        let sessionID: UUID
+        let userIndex: Int
+        let userDigest: String
+        let content: String
+        /// 助手消息创建时间（回合开始），不是写日志的时间。
+        let messageTimestamp: Date
+        let savedAt: Date
+        /// 回合标识（执行记录里的 taskID，含每次发送各自的随机尝试号）。恢复时必须与
+        /// 上次退出时仍在运行的那一轮一致：对同一条用户消息重新生成时，上一轮的旧条目
+        /// 不会被当成新一轮的内容补回。
+        let taskID: String?
+    }
+    private struct InflightReplyEnvelope: Codable {
+        let entries: [InflightReplyEntry]
+    }
+    private nonisolated static let inflightReplyMinInterval: TimeInterval = 3
+    private var inflightReplyURL: URL?
+    @ObservationIgnored private var inflightReplies: [UUID: InflightReplyEntry] = [:]
     /// Sidecar ownership map for attachments that the Core transcript model
     /// cannot represent (generic files/text and UI names for media).
     private var attachmentReadFailures: Set<UUID> = []
@@ -14699,7 +18826,7 @@ final class ChatStore {
     private func isUntouchedBootstrapSession(_ session: ChatThread) -> Bool {
         session.id == bootstrapSessionID
             && session.messages.count == 1
-            && session.messages.first?.content == Self.welcomeText
+            && Self.isWelcomeText(session.messages.first?.content)
     }
 
     /// 装配 B1d SessionStore：加载磁盘会话并与装配前的内存会话对账合并，
@@ -14708,6 +18835,8 @@ final class ChatStore {
     /// E7：同时装配 SessionManager（归档/恢复），并加载磁盘归档会话。
     @discardableResult
     func attachPersistence(_ store: SessionStore, badgeStore: SessionBadgeStore = .shared) -> Bool {
+        // 先等已交出的后台写盘完成，装配读到的是最新磁盘状态。
+        flushPendingSessionPersistence()
         let admission = PersistenceTransactionFence.read([store.persistenceDomain])
         defer { admission.release() }
         do { try PersistenceTransactionFence.requireLiveRead(store.persistenceDomain) }
@@ -14735,6 +18864,7 @@ final class ChatStore {
         sessionStore = store
         sessionManager = manager
         executionStateURL = store.directory.appendingPathComponent("chat-execution-state.json")
+        inflightReplyURL = store.directory.appendingPathComponent("chat-inflight-reply.json")
         composerCommandStateURL = store.directory.appendingPathComponent(
             "chat-composer-command-state.json"
         )
@@ -14835,9 +18965,13 @@ final class ChatStore {
                sessions.contains(where: { $0.id == previousActiveSessionID }) {
                 activeSessionID = previousActiveSessionID
             } else {
-                activeSessionID = restored.first?.id
+                // 回到上次查看的会话；找不到（已删除或归档）再用列表第一个。
+                let lastViewedID = preferencesDefaults.string(forKey: Self.lastActiveSessionDefaultsKey)
+                    .flatMap(UUID.init(uuidString:))
+                activeSessionID = restored.first(where: { $0.id == lastViewedID })?.id ?? restored.first?.id
             }
         }
+        persistsLastActiveSession = true
         // E7：加载磁盘归档（_archive 目录）→ UI 归档分组
         archivedSessions = (sessionManager?.archivedSessions() ?? []).map {
             restoreSessionAttachments(from: $0, in: store.directory, legacy: legacyAttachments)
@@ -14845,6 +18979,9 @@ final class ChatStore {
         loadExecutionState()
         loadComposerCommandState()
         loadPastedTextDrafts()
+        // 会话落盘保持同步：压缩校验、续聊恢复、分叉等路径会紧接着读盘核对规范转录，
+        // 后台延迟写会让它们读到旧内容（误隔离会话、丢附件诊断）。性能靠"只写变化的会话"，
+        // 触发点都是发消息、回合结束、切换会话等离散操作，流式逐字不触发。
         onSessionsChanged = { [weak self] in _ = self?.persistSessions() }
         if !preAttachSurvivors.isEmpty {
             // RECOVERY-10：对账即刻落盘。只在内存里合并的话，下一次任何
@@ -15001,10 +19138,150 @@ final class ChatStore {
                         unread: sessions.first(where: { $0.id == snapshot.sessionID })?.unread ?? false
                     )
                 }
+                recoverInterruptedReplies(
+                    runningTurns: envelope.snapshots
+                        .filter { validSessionIDs.contains($0.sessionID) && $0.state == .running }
+                        .map { (sessionID: $0.sessionID, taskID: $0.taskID) })
                 persistExecutionState()
             }
         } catch {
             logManager.error("加载会话执行状态失败：\(error)", category: "Persistence")
+        }
+    }
+
+    /// 用户消息在持久化转录里的位置（不含 system）与内容摘要，用来把半截回复日志
+    /// 绑定到“哪一轮”。
+    private static func inflightUserBinding(
+        _ transcript: [ChatMessageUI], userIndex: Int
+    ) -> (index: Int, digest: String) {
+        let position = transcript[..<userIndex].filter { $0.role != .system }.count
+        return (position, ChatVideoFrame.digest(Data(transcript[userIndex].asLLMMessage().content.utf8)))
+    }
+
+    /// R3-10：工具完成后另存当前回合已生成的回复（至少隔 3 秒，只覆盖该会话那一条；
+    /// 不写会话正史，不在逐字路径上调用）。一轮回复会在每次工具调用处分成几段助手消息，
+    /// 日志记的是这一轮全部段落（按顺序空行拼接），崩溃后补回成一条已中断的回复。
+    func journalInflightReply(sessionID: UUID?) {
+        guard let sessionID, let url = inflightReplyURL,
+              executionBySessionID[sessionID]?.state == .running,
+              let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        let now = Date()
+        if let last = inflightReplies[sessionID],
+           now.timeIntervalSince(last.savedAt) < Self.inflightReplyMinInterval { return }
+        let transcript = sessions[sessionIndex].messages
+        guard let userIndex = transcript.lastIndex(where: { $0.role == .user }) else { return }
+        let replies = transcript[(userIndex + 1)...].filter { $0.role == .assistant && !$0.content.isEmpty }
+        guard let first = replies.first,
+              let admission = admitPersistence(writing: true) else { return }
+        defer { admission.release() }
+        let binding = Self.inflightUserBinding(transcript, userIndex: userIndex)
+        inflightReplies[sessionID] = InflightReplyEntry(
+            sessionID: sessionID, userIndex: binding.index, userDigest: binding.digest,
+            content: replies.map(\.content).joined(separator: "\n\n"),
+            messageTimestamp: first.timestamp, savedAt: now,
+            taskID: executionBySessionID[sessionID]?.taskID)
+        // 已不在运行的会话不再保留（正常结束的回合已由正史落盘）。
+        inflightReplies = inflightReplies.filter { executionBySessionID[$0.key]?.state == .running }
+        do {
+            let data = try JSONEncoder().encode(
+                InflightReplyEnvelope(entries: Array(inflightReplies.values)))
+            try data.write(to: url, options: .atomic)
+        } catch {
+            logManager.error("保存回合中的半截回复失败：\(error)", category: "Persistence")
+        }
+    }
+
+    /// 回合收尾或会话删除后清掉半截回复日志里不再有用的条目：会话已不在运行、已不存在，
+    /// 或条目属于已结束的上一轮（重新生成后 taskID 不同）。挂在执行状态落盘处
+    /// （回合收尾、会话删除都会走），只在内存里确有条目被去掉时才写一次文件；
+    /// 日志空了就删文件。调用方已持有持久化准入。
+    private func pruneInflightReplies() {
+        guard let url = inflightReplyURL else { return }
+        let kept = inflightReplies.filter {
+            guard let execution = executionBySessionID[$0.key], execution.state == .running else { return false }
+            return execution.taskID == $0.value.taskID
+        }
+        guard kept.count != inflightReplies.count else { return }
+        inflightReplies = kept
+        do {
+            if kept.isEmpty {
+                if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            } else {
+                let data = try JSONEncoder().encode(InflightReplyEnvelope(entries: Array(kept.values)))
+                try data.write(to: url, options: .atomic)
+            }
+        } catch {
+            logManager.error("清理回合中的半截回复日志失败：\(error)", category: "Persistence")
+        }
+    }
+
+    /// R3-10：重启时，对“上次退出时仍在运行”的会话，把最后一轮的助手回复标为已中断；
+    /// 回复没落盘（只剩用户消息）时，按回合日志补回已生成的内容。
+    /// 日志与回合绑定（用户消息位置+摘要），对不上不采用；已落盘的半截内容比日志长时保留落盘版本。
+    private func recoverInterruptedReplies(runningTurns: [(sessionID: UUID, taskID: String?)]) {
+        guard let url = inflightReplyURL else { return }
+        var journal: [UUID: InflightReplyEntry] = [:]
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                let envelope = try JSONDecoder().decode(
+                    InflightReplyEnvelope.self, from: try Data(contentsOf: url))
+                journal = Dictionary(envelope.entries.map { ($0.sessionID, $0) },
+                                     uniquingKeysWith: { _, latest in latest })
+            } catch {
+                logManager.error("读取回合中的半截回复失败：\(error)", category: "Persistence")
+            }
+        }
+        var changed = false
+        for (sessionID, runningTaskID) in runningTurns {
+            guard let index = sessions.firstIndex(where: { $0.id == sessionID }),
+                  let userIndex = sessions[index].messages.lastIndex(where: { $0.role == .user })
+            else { continue }
+            let transcript = sessions[index].messages
+            let binding = Self.inflightUserBinding(transcript, userIndex: userIndex)
+            // 条目要同时对上用户消息和"上次退出时仍在运行的那一轮"，上一轮的旧条目不采用。
+            let entry = journal[sessionID].flatMap {
+                $0.userIndex == binding.index && $0.userDigest == binding.digest
+                    && $0.taskID == runningTaskID ? $0 : nil
+            }
+            let tail = transcript.indices.last(where: { $0 > userIndex && transcript[$0].role == .assistant })
+            if let tail {
+                // 日志是整轮拼接；只有落盘里这一轮恰好只有一段助手回复时才拿日志补全它。
+                let replyCount = transcript[(userIndex + 1)...].filter { $0.role == .assistant }.count
+                if let entry, replyCount == 1, entry.content.hasPrefix(transcript[tail].content),
+                   entry.content.count > transcript[tail].content.count {
+                    sessions[index].messages[tail].replaceContent(entry.content)
+                }
+                sessions[index].messages[tail].wasInterrupted = true
+            } else if let entry, !entry.content.isEmpty {
+                var reply = ChatMessageUI(
+                    role: .assistant, content: entry.content, timestamp: entry.messageTimestamp)
+                reply.wasInterrupted = true
+                sessions[index].messages.append(reply)
+            } else {
+                // 纯文字回复在生成中被杀：没有落盘的助手消息，也没有日志条目（日志只在工具完成时写）。
+                // 不往正史里塞空助手消息，只把执行状态标成失败，让侧栏和对话末尾出现现有的“重试”。
+                if let previous = executionBySessionID[sessionID] {
+                    executionBySessionID[sessionID] = ExecutionSnapshot(
+                        sessionID: sessionID,
+                        turnID: previous.turnID,
+                        taskID: previous.taskID,
+                        state: .failed,
+                        updatedAt: previous.updatedAt,
+                        failureReason: "上次回复在生成中被中断，可重试",
+                        executionIdentity: previous.executionIdentity
+                    )
+                }
+                continue
+            }
+            sessions[index].transcriptRevision &+= 1
+            changed = true
+        }
+        if changed, !persistSessions() { return }
+        // 已处理或已过期的日志不再保留，免得同一条消息在下次崩溃时被误用。
+        if FileManager.default.fileExists(atPath: url.path) {
+            do { try FileManager.default.removeItem(at: url) } catch {
+                logManager.error("清理回合中的半截回复日志失败：\(error)", category: "Persistence")
+            }
         }
     }
 
@@ -15013,6 +19290,8 @@ final class ChatStore {
         guard let admission = admitPersistence(writing: true) else { return false }
         defer { admission.release() }
 
+        // 回合收尾、会话删除、新一轮开始都会走到这里：顺手清掉半截回复日志里过期的条目。
+        pruneInflightReplies()
         guard let executionStateURL else { return false }
         let validSessionIDs = Set(sessions.map(\.id))
         let snapshots = executionBySessionID.values
@@ -15055,9 +19334,31 @@ final class ChatStore {
         }
     }
 
+    /// 会话落盘专用串行队列：主线程只交出值类型快照，写盘（含原子替换）在这里完成。
+    /// 全进程共用一条队列：任何实例装配/同步落盘前都能等到其它实例已交出的写入。
+    nonisolated private static let sessionWriteQueueShared = DispatchQueue(
+        label: "com.miniscanvas.session-persist", qos: .utility)
+    private var sessionWriteQueue: DispatchQueue { Self.sessionWriteQueueShared }
+    /// 已落盘（或已交给写盘队列）的会话快照；与内存相等的会话本轮不再编码写盘。
+    @ObservationIgnored private var persistedThreadMirror: [UUID: ChatThread] = [:]
+
+
+    /// 等待已交出的写盘任务全部完成（退出、需要读盘一致性的同步路径调用）。
+    func flushPendingSessionPersistence() {
+        sessionWriteQueue.sync {}
+    }
+
+    /// 与内存集合比较后，磁盘孤儿候选：曾落盘/加载过、现已不在内存的会话 ID。
+    private func orphanCandidateIDs(currentIDs: Set<String>) -> Set<String> {
+        knownPersistedSessionIDs.subtracting(currentIDs)
+    }
+
     @discardableResult
     private func persistSessions(checkingAttachmentsFor sessionID: UUID? = nil) -> Bool {
         guard sessionStore != nil else { return false }
+        let perf = PerformanceSignposts.begin(.persistSessions); defer { perf.end() }
+        // 先等后台已交出的写盘完成，保证本同步路径的读盘与顺序一致。
+        flushPendingSessionPersistence()
         guard let admission = admitPersistence(writing: true) else {
             hasUnsavedSessionChanges = true
             return false
@@ -15072,10 +19373,18 @@ final class ChatStore {
         // UUID text is case-insensitive: an on-disk lowercase id is the same
         // session as the in-memory uppercase `uuidString`, never an orphan.
         let currentIDs = Set(sessions.map { $0.id.uuidString.lowercased() })
-        let orphanIDs = store.listSessions().filter {
-            $0.parentSessionID == nil && !currentIDs.contains($0.id.lowercased())
-                && knownPersistedSessionIDs.contains($0.id.lowercased())
-        }.map(\.id)
+        // 孤儿只可能出自「曾知道、现不在内存」的会话；没有候选就不读盘列全部会话。
+        let candidateIDs = orphanCandidateIDs(currentIDs: currentIDs)
+        var orphanIDs: [String] = []
+        if !candidateIDs.isEmpty {
+            let onDisk = store.listSessions()
+            orphanIDs = onDisk.filter {
+                $0.parentSessionID == nil && candidateIDs.contains($0.id.lowercased())
+            }.map(\.id)
+            // 磁盘上已不存在的候选无需再比对，避免每次保存都重新列盘。
+            let onDiskIDs = Set(onDisk.map { $0.id.lowercased() })
+            knownPersistedSessionIDs.subtract(candidateIDs.filter { !onDiskIDs.contains($0) })
+        }
         if let manager = sessionManager, canonicalWriteIsolatedSessions.isEmpty {
             let deletionService = SessionDeletionService(manager: manager)
             for id in orphanIDs {
@@ -15096,7 +19405,7 @@ final class ChatStore {
             logManager.error(
                 "跳过删除磁盘孤儿会话：SessionManager 尚未装配", category: "Persistence")
         }
-        // 全量 upsert（UI 消息 → LLMMessage，system 提示不落盘）
+        // 只写变化过的会话（UI 消息 → LLMMessage，system 提示不落盘）
         for session in sessions {
             knownPersistedSessionIDs.insert(session.id.uuidString.lowercased())
             if canonicalWriteIsolatedSessions.contains(session.id)
@@ -15104,6 +19413,7 @@ final class ChatStore {
                 didPersistEverySession = false
                 continue
             }
+            if persistedThreadMirror[session.id] == session { continue }
             do {
                 guard try store.updateSessionUnlessTranscriptIsNewer(session.asPersisted()) else {
                     didPersistEverySession = false
@@ -15118,16 +19428,24 @@ final class ChatStore {
             // Write App metadata only after this session's transcript succeeds.
             // If the old metadata could not be read, an empty projection must
             // not replace it. Other sessions can still write their own files.
-            guard !attachmentReadFailures.contains(session.id) else { continue }
+            guard !attachmentReadFailures.contains(session.id) else {
+                persistedThreadMirror[session.id] = session
+                continue
+            }
             do {
                 try ChatAttachmentPersistence.save(session: session, to: store.directory)
                 attachmentWriteFailures.remove(session.id)
+                persistedThreadMirror[session.id] = session
             } catch {
                 if attachmentWriteFailures.insert(session.id).inserted {
                     logManager.error(
                         "会话附件归属写入失败：\(error)", category: "Persistence")
                 }
             }
+        }
+        let liveIDs = Set(sessions.map(\.id))
+        if persistedThreadMirror.count > liveIDs.count {
+            persistedThreadMirror = persistedThreadMirror.filter { liveIDs.contains($0.key) }
         }
         hasUnsavedSessionChanges = !didPersistEverySession
         guard let sessionID else { return didPersistEverySession }
@@ -15140,12 +19458,14 @@ final class ChatStore {
         legacy: Result<[String: [ChatAttachmentPersistence.MessageRecord]], Error>? = nil
     ) -> ChatThread {
         do {
-            let records = try ChatAttachmentPersistence.load(
+            // 归属记录和消息时间来自同一个分片：读一次、解码一次。
+            let (records, times) = try ChatAttachmentPersistence.loadSessionRecordsAndTimes(
                 forSessionID: persisted.id, from: directory, legacy: legacy)
             if let id = UUID(uuidString: persisted.id) {
                 attachmentReadFailures.remove(id)
             }
-            return ChatAttachmentPersistence.restoreAttachments(from: persisted, records: records)
+            return ChatAttachmentPersistence.restoreAttachments(
+                from: persisted, records: records, messageTimes: times)
         } catch {
             if let id = UUID(uuidString: persisted.id) {
                 attachmentReadFailures.insert(id)
@@ -15248,6 +19568,7 @@ final class ChatStore {
     /// 恢复当前会话的草稿到输入框（会话指针恢复，等价 ComfyUI useWorkflowTabState）
     private func restoreDraftForActiveSession() {
         guard let drafts = draftStore, let sessionID = activeSessionID else { return }
+        restorePendingAttachmentReferences(sessionID: sessionID)
         // This process already owns the latest accepted value, including an
         // explicit empty draft. Disk recovery is only for an unloaded session;
         // a newly constructed ChatStore starts with no such entries.
@@ -15303,10 +19624,32 @@ final class ChatStore {
         let entered = record.modelContextWindows.flatMap { windows in
             windows[id] ?? record.modelNames.first { canonicalModelID($0) == id }.flatMap { windows[$0] }
         }
+        let enteredMaxOutput = record.modelMaxOutputTokens.flatMap { limits in
+            limits[id] ?? record.modelNames.first { canonicalModelID($0) == id }.flatMap { limits[$0] }
+        }
+        // 与内置清单同名的模型（例如自定义服务商接 DeepSeek 思考模型）沿用清单的思考内容回传字段，
+        // 否则思考加工具调用时下一次请求缺 reasoning_content 会被服务端拒绝。
+        let builtinReasoningField = LLMModel.allModels.first { $0.id == id }?.interleavedReasoningField
         let model = LLMModel(
             id: id, displayName: displayName ?? id, provider: provider ?? record.name,
-            contextWindow: entered.flatMap { $0 > 0 ? $0 : nil })
+            modalityOverride: declaredInputModality(record: record, modelID: id),
+            contextWindow: entered.flatMap { $0 > 0 ? $0 : nil },
+            maxOutputTokens: enteredMaxOutput.flatMap { $0 > 0 ? $0 : nil },
+            interleavedReasoningField: builtinReasoningField)
         return applyingDeepSeekFlashVision(to: model, baseURL: record.baseURL, wire: record.protocolType)
+    }
+
+    /// 自定义供应商模型的输入模态：用户在供应商记录里的声明优先，未声明按模型名推断
+    /// （`ModelModalityInference`）。图片、音频都不支持时返回 nil，沿用 LLMModel 对未知
+    /// 供应商的纯文本默认。声明键按记录里的模型名原样或规范化后匹配。
+    nonisolated static func declaredInputModality(record: EnvVarEntry, modelID: String) -> ModelModality? {
+        let declaredName = record.modelNames.first { canonicalModelID($0) == modelID } ?? modelID
+        let image = record.supportsImageInput(modelID: declaredName)
+        let audio = record.supportsAudioInput(modelID: declaredName)
+        guard image || audio else { return nil }
+        var result: ModelModality = image ? .vision : .textOnly
+        if audio { result.formUnion(.audioInput) }
+        return result
     }
 
     nonisolated private static func applyingDeepSeekFlashVision(
@@ -15919,6 +20262,13 @@ final class ChatStore {
                     .map { LLMModel(id: $0.modelID, displayName: $0.modelID + " · 本地", provider: type.runtimeProviderID) }
             }
             return fieldBuiltinModels(for: type).compactMap { model in
+                if isUncheckedChatModel(providerID: providerID, modelID: model.id) {
+                    return LLMModel(
+                        id: model.id,
+                        displayName: "\(model.id) · 未检查",
+                        provider: model.provider
+                    )
+                }
                 guard let item = adapter.item(
                     providerID: providerID,
                     modelID: Self.canonicalModelID(model.id)
@@ -15943,7 +20293,7 @@ final class ChatStore {
         let configuredModelIDs = Set(
             record.modelNames.map(Self.canonicalModelID)
         )
-        return adapter
+        let checked = adapter
             .selectableItems(forProviderID: providerID)
             .filter { configuredModelIDs.contains($0.modelID) }
             .map { item in
@@ -15954,6 +20304,86 @@ final class ChatStore {
                     record: record, modelID: item.modelID,
                     displayName: displayName, provider: item.providerID)
             }
+        // 已应用但从未检查的模型：可选，标“未检查”，首次发送前先做一次连接检查。
+        let canonicalProvider = ProviderReadinessRevision.canonicalProviderID(providerID)
+        let unchecked = adapter.projection.items
+            .filter {
+                $0.providerID == canonicalProvider && $0.isUncheckedApplied
+                    && configuredModelIDs.contains($0.modelID)
+                    && isUncheckedChatModel(providerID: providerID, modelID: $0.modelID)
+            }
+            .map { item in
+                Self.customProviderModel(
+                    record: record, modelID: item.modelID,
+                    displayName: "\(item.modelID) · 未检查", provider: item.providerID)
+            }
+        return checked + unchecked
+    }
+
+    /// 发送前就绪预检未通过时的提示：有失败类别就写“原因 + 下一步”，没有就给通用说明。
+    nonisolated static func readinessFailureFeedback(
+        category: ProviderReadinessFailureCategory?, providerName: String? = nil,
+        isChatGPTAccount: Bool = false
+    ) -> String {
+        let prefix = providerName.map { "「\($0)」：" } ?? ""
+        guard let category else {
+            return prefix + "连接检查未通过；请打开连接设置查看后重试。草稿已保留。"
+        }
+        // ChatGPT 账号没有 API Key：失败应指向“重新登录 / 检查套餐用量”，而不是“核对 Key”。
+        if isChatGPTAccount {
+            switch category {
+            case .unauthorized, .missingCredential:
+                return prefix + "ChatGPT 登录已失效或未登录。请到“设置 → 模型供应商”重新登录 ChatGPT 账号。草稿已保留。"
+            case .permissionDenied, .rateLimited:
+                return prefix + "ChatGPT 套餐暂时不可用或用量已满。请到 ChatGPT 设置 → 用量检查套餐，必要时重新登录，或稍后再试。草稿已保留。"
+            default:
+                break
+            }
+        }
+        let message = HTTPStatusMessages.providerReadinessMessage(for: category)
+        return prefix + "\(message.zh)。\(message.suggestionZH)。草稿已保留。"
+    }
+
+    /// 发送前预检失败时记下失败的供应商，输入框上方的提示据此给“去修复”按钮。
+    private(set) var readinessFailureRepair: (feedback: String, providerID: String)?
+
+    /// 已应用但从未检查的模型（选择器里可选并标“未检查”）。只放宽选择器与手动选择；
+    /// 它不是就绪证据：发送前的就绪预检、运行时就绪门与回退候选仍只认已通过检查的模型。
+    func isUncheckedChatModel(providerID: String, modelID: String) -> Bool {
+        guard let providerReadinessStore else { return false }
+        let canonicalID = Self.pickerModelID(modelID, providerID: providerID)
+        let type = Self.readinessProviderType(providerID)
+        if let type {
+            guard type != .local, Self.chatProviderTypes.contains(type) else { return false }
+        }
+        guard ChatModelPickerProjection(records: providerReadinessStore.records)
+                .item(providerID: providerID, modelID: canonicalID)?.isUncheckedApplied == true,
+              isChatModelConfigured(providerID: providerID, modelID: canonicalID) else { return false }
+        if let type {
+            guard let record = boundBuiltinRecord(for: type, in: providerRecordsSource?() ?? []),
+                  schedulerCredentialVersionSource?(record.name) != nil else { return false }
+        }
+        return true
+    }
+
+    /// 选中“未检查”的模型：不带就绪回执，只写选择；首次发送前由发送链路做一次就绪预检。
+    private func applyUncheckedChatModel(providerID: String, modelID canonicalModelID: String) -> Bool {
+        if let type = Self.readinessProviderType(providerID), Self.chatProviderTypes.contains(type) {
+            guard fieldBuiltinModels(for: type).contains(where: { $0.id == canonicalModelID }) else { return false }
+            selectedProviderType = type
+            selectedCustomProvider = nil
+            selectedModelID = canonicalModelID
+            persistSessionModelSelection(providerRaw: type.rawValue, modelID: canonicalModelID)
+        } else {
+            guard let record = configuredCustomProvider(providerID: providerID),
+                  record.protocolType != .other else { return false }
+            selectedCustomProvider = record
+            selectedProviderType = nil
+            selectedModelID = canonicalModelID
+            persistSessionModelSelection(providerRaw: "custom." + record.name, modelID: canonicalModelID)
+        }
+        lastChatModelApplyReceipt = nil
+        return true
     }
 
     func canSelectChatModel(providerID: String, modelID: String) -> Bool {
@@ -15972,6 +20402,128 @@ final class ChatStore {
                 && isChatModelConfigured(providerID: item.providerID, modelID: item.modelID)
                 && allowsReadinessSelection(item: item, records: records)
         }
+    }
+
+    /// 已添加了供应商、但没有任何可用模型时，返回第一个需要修复的供应商显示名（供“去修复”卡片用）。
+    var providerNeedingRepairName: String? {
+        guard let record = Self.providerRecordNeedingRepair(
+            records: providerRecordsSource?() ?? [],
+            readiness: providerReadinessStore?.records ?? [])
+        else { return nil }
+        return ProviderDisplayLabel.resolve(record: record)
+    }
+
+    /// 输入框上方“连接卡”是否显示：没有任何供应商时显示“连接一个模型”；
+    /// 有供应商时只在连接检查真的失败过才显示“需要修复”。只是“未检查”不打扰（首次发送会自动检查）。
+    var shouldShowModelConnectionCard: Bool {
+        let records = providerRecordsSource?() ?? []
+        let candidates = records.filter { $0.isProviderRecord && $0.protocolType != .other }
+        if candidates.isEmpty { return true }
+        let readiness = providerReadinessStore?.records ?? []
+        return candidates.contains { record in
+            let own = readiness.filter { $0.providerID.caseInsensitiveCompare(record.name) == .orderedSame }
+            return !own.contains { $0.status == .passed } && own.contains { $0.errorCategory != nil }
+        }
+    }
+
+    /// 已添加供应商、但还没有任何检查结果也没有失败（例如导入后没跑检查）：
+    /// 不显示大卡片，只给输入框上方一行轻提示，告诉用户首次发送前会自动检查。
+    var shouldShowUncheckedProviderHint: Bool {
+        guard !shouldShowModelConnectionCard else { return false }
+        let records = (providerRecordsSource?() ?? []).filter { $0.isProviderRecord && $0.protocolType != .other }
+        guard !records.isEmpty else { return false }
+        let readiness = providerReadinessStore?.records ?? []
+        return !records.contains { record in
+            readiness.contains { $0.providerID.caseInsensitiveCompare(record.name) == .orderedSame && $0.status == .passed }
+        }
+    }
+
+    /// 要修复的供应商：优先是连接检查真正失败的那个（有失败类别且没有通过的模型），
+    /// 其次是还没有任何通过模型的，最后才是第一个。多个供应商并存时不再总指向第一个。
+    nonisolated static func providerRecordNeedingRepair(
+        records: [EnvVarEntry],
+        readiness: [ProviderReadinessPersistenceRecord]
+    ) -> EnvVarEntry? {
+        let candidates = records.filter { $0.isProviderRecord && $0.protocolType != .other }
+        func rows(_ record: EnvVarEntry) -> [ProviderReadinessPersistenceRecord] {
+            readiness.filter { $0.providerID.caseInsensitiveCompare(record.name) == .orderedSame }
+        }
+        if let failed = candidates.first(where: { record in
+            let own = rows(record)
+            return !own.contains { $0.status == .passed } && own.contains { $0.errorCategory != nil }
+        }) { return failed }
+        if let unready = candidates.first(where: { !rows($0).contains { $0.status == .passed } }) {
+            return unready
+        }
+        return candidates.first
+    }
+
+    /// 演示模式下自动选中第一个已就绪的模型（优先沿用已验证的全局默认，其次按目录顺序），
+    /// 并同步为新会话默认。连接成功后不再停留在“演示模式”，也不用回选择器重选。
+    @discardableResult
+    func adoptFirstReadyChatModelIfDemo() -> Bool {
+        guard selectedProvider == nil, let providerReadinessStore else { return false }
+        if activeIndex.map({ sessions[$0].providerTypeRaw != nil && !(sessions[$0].providerTypeRaw ?? "").isEmpty }) == true {
+            return false
+        }
+        // 用户在设置里指定了默认供应商和模型时先用它（要求已通过连接检查），
+        // 不拿目录里排在前面的模型顶替。
+        if let general = SettingsCenter.active?.settings.general,
+           general.defaultProviderID?.isEmpty == false,
+           applyDefaultProviderModel(general: general) {
+            return true
+        }
+        // 默认是自定义供应商、但它当时没通过检查：留在原状态，不把消息悄悄改发给别家（计费和数据去向会变）。
+        if Self.defaultCustomProviderBlocksFallback(
+            defaultProviderID: SettingsCenter.active?.settings.general.defaultProviderID,
+            records: providerRecordsSource?() ?? []) {
+            return false
+        }
+        let records = providerReadinessStore.records
+        for item in ChatModelPickerProjection(records: records).items {
+            guard item.isSelectable,
+                  Self.pickerModelID(item.modelID, providerID: item.providerID) == item.modelID,
+                  isChatModelConfigured(providerID: item.providerID, modelID: item.modelID),
+                  allowsReadinessSelection(item: item, records: records),
+                  applyChatModel(providerID: item.providerID, modelID: item.modelID) else { continue }
+            adoptCurrentSelectionAsNewSessionDefault()
+            if let tier = selectedModelID.flatMap({ id in
+                ModelSpeedTier.tier(for: LLMModel(id: id, displayName: id, provider: item.providerID))
+            }) { modelSpeedTier = tier }
+            return true
+        }
+        return false
+    }
+
+    /// 用户指定的默认供应商是仍存在的自定义供应商时，演示模式下不得回落到“第一个就绪的别家”。
+    nonisolated static func defaultCustomProviderBlocksFallback(
+        defaultProviderID: String?, records: [EnvVarEntry]
+    ) -> Bool {
+        guard let id = defaultProviderID, id.hasPrefix("custom.") else { return false }
+        let name = String(id.dropFirst("custom.".count))
+        return records.contains { $0.isProviderRecord && $0.name.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    /// 在选择器里选定的模型同步为新会话的默认，新建会话不再回到演示模式。
+    /// - Parameter persistToSettings: 用户在选择器里亲手选定时为 true，同时写入设置里的默认供应商/模型，
+    ///   重启后仍沿用（与 Claude Code 的 /model 一致）；自动采用第一个就绪模型时不写，不覆盖用户的显式默认。
+    func adoptCurrentSelectionAsNewSessionDefault(persistToSettings: Bool = false) {
+        guard selectedProviderType != nil || selectedCustomProvider != nil else { return }
+        defaultProviderType = selectedProviderType
+        defaultCustomProvider = selectedCustomProvider
+        defaultModelID = selectedModelID
+        guard persistToSettings, let center = SettingsCenter.active, let modelID = selectedModelID else { return }
+        let tag: String
+        if let custom = selectedCustomProvider {
+            tag = "custom." + custom.name
+        } else if let type = selectedProviderType {
+            tag = type.rawValue
+        } else {
+            return
+        }
+        guard center.defaultProviderID != tag || center.defaultModelID != modelID else { return }
+        center.defaultProviderID = tag
+        center.defaultModelID = modelID
     }
 
     private func isChatModelConfigured(providerID: String, modelID canonicalModelID: String) -> Bool {
@@ -15997,6 +20549,9 @@ final class ChatStore {
     @discardableResult
     func applyChatModel(providerID: String, modelID: String) -> Bool {
         let canonicalModelID = Self.pickerModelID(modelID, providerID: providerID)
+        if isUncheckedChatModel(providerID: providerID, modelID: canonicalModelID) {
+            return applyUncheckedChatModel(providerID: providerID, modelID: canonicalModelID)
+        }
         guard canSelectChatModel(providerID: providerID, modelID: canonicalModelID) else {
             return false
         }
@@ -16368,6 +20923,7 @@ final class ChatStore {
                 record.baseURL ?? ""
             )
             config.apiKey = credential
+            config.applyNetworkOptions(from: record)
             model = Self.customProviderModel(
                 record: record, modelID: selectedModelID,
                 displayName: modelDisplayName(from: selectedModelID),
@@ -16484,6 +21040,7 @@ final class ChatStore {
                 config.customBaseURL = current.baseURL
                 config.appendV1Suffix = !DeepSeekProviderContract.isCanonicalBaseURL(current.baseURL ?? "")
                 config.apiKey = credential
+                config.applyNetworkOptions(from: current)
                 construction = FrozenProviderConstruction(config: config,
                     model: Self.customProviderModel(
                         record: current, modelID: expectedItem.modelID,
@@ -16699,6 +21256,7 @@ final class ChatStore {
             record.baseURL ?? ""
         )
         config.apiKey = credential
+        config.applyNetworkOptions(from: record)
         let runtimeModel = Self.customProviderModel(
             record: record, modelID: modelID,
             displayName: modelDisplayName(from: modelID), provider: type.runtimeProviderID)
@@ -16835,6 +21393,7 @@ final class ChatStore {
         )
         config.attemptCheckpointDirectory = responsesAttemptCheckpointDirectory
         config.customBaseURL = record.baseURL
+        config.applyNetworkOptions(from: record)
         config.controlledFieldLoopbackOnly = controlledFieldLoopbackAllowed
             && record.protocolType == .openaiCompatible
         // The canonical DeepSeek settings record uses the bare official host;
@@ -16872,15 +21431,30 @@ final class ChatStore {
 
     static let welcomeText = """
     欢迎使用 MinisCanvas！连接模型后即可开始对话。
-    也可以选择 Mock 预览消息与附件。
 
     **快捷键**：在“设置 → 快捷键”查看当前绑定并按需修改。
     """
 
+    /// 旧版欢迎语（提到 Mock）。已持久化的旧会话仍要被识别为“未触碰的欢迎壳”。
+    static let legacyWelcomeTexts: [String] = [
+        """
+        欢迎使用 MinisCanvas！连接模型后即可开始对话。
+        也可以选择 Mock 预览消息与附件。
+
+        **快捷键**：在“设置 → 快捷键”查看当前绑定并按需修改。
+        """
+    ]
+
+    /// 当前或旧版欢迎语。
+    static func isWelcomeText(_ text: String?) -> Bool {
+        guard let text else { return false }
+        return text == welcomeText || legacyWelcomeTexts.contains(text)
+    }
+
     static let systemPrompt = safetyFloorPrompt + "\n\n" + """
     你是 MinisCanvas 助手，运行在 macOS 原生应用的聊天界面。回答简洁、准确。
     """ + "\n\n" + """
-    需要读取本应用其它会话的内容时，调用 `session_read`（`metadata` 或 `messages`）；每次调用都会弹出审批卡，由用户决定是否允许。`session_read` 只读，绝不能发送、重试、编辑、删除、归档、恢复或切换会话。
+    需要读取本应用其它会话的内容时，调用 `session_read`（`metadata` 或 `messages`）；读当前会话自己的内容免审批，读其它会话会弹出审批卡，由用户决定是否允许。`session_read` 只读，绝不能发送、重试、编辑、删除、归档、恢复或切换会话。
     """
 
     /// 每回合的环境信息：当前日期、项目目录、会话目标（2026-11-15 用户批准）。
@@ -16909,7 +21483,8 @@ final class ChatStore {
     static func turnEnvironmentPrompt(
         now: Date, goalObjective: String?, projectDirectory: String?, timeZone: TimeZone = .current,
         modelID: String? = nil, mode: ComposerTaskMode? = nil, scheduled: Bool = false,
-        previousTurnInterrupted: Bool = false, includesGoalReporting: Bool = true
+        previousTurnInterrupted: Bool = false, includesGoalReporting: Bool = true,
+        sessionID: String? = nil
     ) -> String {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
@@ -16925,6 +21500,9 @@ final class ChatStore {
                 + (Self.gitBranchDescription(projectDirectory: projectDirectory) ?? "项目目录不是 git 仓库。"))
         }
         if let modelID, !modelID.isEmpty { lines.append("当前模型：" + modelID) }
+        if let sessionID, !sessionID.isEmpty {
+            lines.append("当前会话 ID：" + sessionID + "。上下文被压缩后需要原文细节时，可用 session_read（scope=messages，session_id 填这个 ID）读取本会话原文，读自己的会话免审批。")
+        }
         if let goalObjective, !goalObjective.isEmpty {
             let reporting = includesGoalReporting && !scheduled
                 ? "。本回合的工作应服务于这个目标；目标确实完成时，用 goal_update 报告完成并附上证据。" : ""
@@ -16991,6 +21569,11 @@ final class ChatStore {
     }
 
     private static func executionFailureKind(for error: Error) -> ExecutionFailureKind? {
+        if Self.isTerminalContextWindowFailure(error) { return .contextLength }
+        if let llm = error as? LLMError {
+            if llm.isQuotaExhausted { return .quota }
+            if llm.isAuthorizationFailure { return .authorization }
+        }
         guard let loop = error as? AgentLoopError else { return nil }
         switch loop {
         case .budgetExhausted: return .budgetPause
@@ -17005,6 +21588,11 @@ final class ChatStore {
     /// 项目会话的错误可能被包装为只带文案的失败信封，所以按固定文案识别。
     static func unattendedUserErrorMessage(_ error: Error) -> String {
         let message = userErrorMessage(error)
+        // 后台、项目回合没有“压缩后重试”按钮：窗口已满时改说该怎么办。
+        // 错误可能被包装成只带文案的信封，所以按前台那句固定文字识别（带类型的错误也走这一句）。
+        if AgentLoopError.isContextWindowFullForegroundDescription(message) {
+            return AgentLoopError.contextWindowFullDelegatedDescription(subagent: false)
+        }
         guard message == AgentLoopError.outputTruncated.localizedDescription else { return message }
         return "回复因达到单次输出上限被截断；无人值守任务中的半截文本未保存，本次运行按失败处理。可缩小任务范围或分段后重新运行。"
     }
@@ -17022,13 +21610,16 @@ final class ChatStore {
             return envelope.failureMessage
         }
         if (error as? AgentLoopError) == .budgetExhausted {
-            return "本会话累计用量已达上限，已暂停。可以在新会话继续；原会话保留。"
+            return Self.budgetPauseMessage
         }
         if let llm = error as? MinisCore.LLMError {
             if case .httpStatus(code: 401, detail: _) = llm {
                 return "❌ API Key 无效或已过期（401）：请检查 API Key 是否已在设置中为对应供应商正确配置。"
             }
-            return llm.friendlyMessage(locale: Locale(identifier: "zh_CN"))
+            // ChatGPT 账号的本地固定文案（用量上限、需重新登录、账号不符合条件等）原样显示，
+            // 不被"请检查供应商配置"盖掉。
+            if let guidance = ChatGPTAccountErrors.fixedGuidance(for: llm) { return guidance }
+            return UserFacingErrorText.stripEnglishTag(llm.friendlyMessage(locale: Locale(identifier: "zh_CN")))
         }
         if let cloud = error as? MinisCore.CloudBackendError {
             switch cloud {
@@ -17063,8 +21654,9 @@ final class ChatStore {
         // Provider 之外裸抛出的 URLError 也必须走同一套中文分类映射，
         // 避免把「The operation couldn't be completed…」这类系统原文直接展示给用户。
         if let urlError = error as? URLError {
-            return MinisCore.LLMError.networkError(underlying: urlError)
-                .friendlyMessage(locale: Locale(identifier: "zh_CN"))
+            return UserFacingErrorText.stripEnglishTag(
+                MinisCore.LLMError.networkError(underlying: urlError)
+                    .friendlyMessage(locale: Locale(identifier: "zh_CN")))
         }
         if error is ProviderBufferedResponsePolicyError || error is ProviderChatResponseShapePolicyError {
             return ProviderErrorDiagnosticProjectionPolicy.project(error)
@@ -17118,58 +21710,113 @@ final class ChatStore {
         // Closed App enums contain no payload; retain a fixed diagnostic category.
         if let failure = error as? ProjectSessionAppError {
             switch failure {
-            case .grantUnavailable: return "执行校验未通过（PROJECT:grantUnavailable），本次请求未完成。"
-            case .grantChanged: return "执行校验未通过（PROJECT:grantChanged），本次请求未完成。"
-            case .sourceUnavailable: return "执行校验未通过（PROJECT:sourceUnavailable），本次请求未完成。"
-            case .conflictingReplay: return "执行校验未通过（PROJECT:conflictingReplay），本次请求未完成。"
-            case .persistenceUncertain: return "执行校验未通过（PROJECT:persistenceUncertain），本次请求未完成。"
+            case .grantUnavailable: return Self.executionValidationMessage(.reauthorize, code: "PROJECT:grantUnavailable")
+            case .grantChanged: return Self.executionValidationMessage(.reauthorize, code: "PROJECT:grantChanged")
+            case .sourceUnavailable: return Self.executionValidationMessage(.changed, code: "PROJECT:sourceUnavailable")
+            case .conflictingReplay: return Self.executionValidationMessage(.changed, code: "PROJECT:conflictingReplay")
+            case .persistenceUncertain: return Self.executionValidationMessage(.uncertain, code: "PROJECT:persistenceUncertain")
             case .targetUnavailable: return AgentTaskPublicFailureCategory.projectTargetUnavailable.message
-            case .runUnavailable: return "执行校验未通过（PROJECT:runUnavailable），本次请求未完成。"
-            case .busy: return "执行校验未通过（PROJECT:busy），本次请求未完成。"
-            case .creationNotAuthorized: return "执行校验未通过（PROJECT:creationNotAuthorized），本次请求未完成。"
+            case .runUnavailable: return Self.executionValidationMessage(.changed, code: "PROJECT:runUnavailable")
+            case .busy: return Self.executionValidationMessage(.retryable, code: "PROJECT:busy")
+            case .creationNotAuthorized: return Self.executionValidationMessage(.reauthorize, code: "PROJECT:creationNotAuthorized")
             }
         }
         if let failure = error as? ChatTurnRuntimeSnapshotError {
             switch failure {
             case .missingRequiredSnapshot: return AgentTaskPublicFailureCategory.chatRuntimeMissingRequiredSnapshot.message
-            case .identityMismatch: return "执行校验未通过（CHAT-RUNTIME:identityMismatch），本次请求未完成。"
-            case .invalidExecutionIdentity: return "执行校验未通过（CHAT-RUNTIME:invalidExecutionIdentity），本次请求未完成。"
+            case .identityMismatch: return Self.executionValidationMessage(.changed, code: "CHAT-RUNTIME:identityMismatch")
+            case .invalidExecutionIdentity: return Self.executionValidationMessage(.changed, code: "CHAT-RUNTIME:invalidExecutionIdentity")
             }
         }
         if let failure = error as? ScheduledSubmissionError {
             switch failure {
-            case .targetUnavailable: return "执行校验未通过（SCHEDULED:targetUnavailable），本次请求未完成。"
-            case .anchorChanged: return "执行校验未通过（SCHEDULED:anchorChanged），本次请求未完成。"
-            case .policyUnavailable: return "执行校验未通过（SCHEDULED:policyUnavailable），本次请求未完成。"
-            case .busy: return "执行校验未通过（SCHEDULED:busy），本次请求未完成。"
-            case .duplicateEffect: return "执行校验未通过（SCHEDULED:duplicateEffect），本次请求未完成。"
-            case .unsupportedCommand: return "执行校验未通过（SCHEDULED:unsupportedCommand），本次请求未完成。"
-            case .incompleteStream: return "执行校验未通过（SCHEDULED:incompleteStream），本次请求未完成。"
-            case .effectUncertain: return "执行校验未通过（SCHEDULED:effectUncertain），本次请求未完成。"
+            case .targetUnavailable: return Self.executionValidationMessage(.changed, code: "SCHEDULED:targetUnavailable")
+            case .anchorChanged: return Self.executionValidationMessage(.reauthorize, code: "SCHEDULED:anchorChanged")
+            case .policyUnavailable: return Self.executionValidationMessage(.reauthorize, code: "SCHEDULED:policyUnavailable")
+            case .busy: return Self.executionValidationMessage(.retryable, code: "SCHEDULED:busy")
+            case .duplicateEffect: return Self.executionValidationMessage(.uncertain, code: "SCHEDULED:duplicateEffect")
+            case .unsupportedCommand: return Self.executionValidationMessage(.changed, code: "SCHEDULED:unsupportedCommand")
+            case .incompleteStream: return Self.executionValidationMessage(.retryable, code: "SCHEDULED:incompleteStream")
+            case .effectUncertain: return Self.executionValidationMessage(.uncertain, code: "SCHEDULED:effectUncertain")
             }
         }
         if let failure = error as? AgentLoopChatEngine.ContextManifestConsumptionError {
             switch failure {
-            case .missingSession: return "执行校验未通过（CHAT-CONTEXT:missingSession），本次请求未完成。"
-            case .providerMismatch: return "执行校验未通过（CHAT-CONTEXT:providerMismatch），本次请求未完成。"
-            case .modelMismatch: return "执行校验未通过（CHAT-CONTEXT:modelMismatch），本次请求未完成。"
-            case .sessionMismatch: return "执行校验未通过（CHAT-CONTEXT:sessionMismatch），本次请求未完成。"
-            case .snapshotMismatch: return "执行校验未通过（CHAT-CONTEXT:snapshotMismatch），本次请求未完成。"
-            case .rejected: return "执行校验未通过（CHAT-CONTEXT:rejected），本次请求未完成。"
-            case .malformed: return "执行校验未通过（CHAT-CONTEXT:malformed），本次请求未完成。"
-            case .persistenceFailed: return "执行校验未通过（CHAT-CONTEXT:persistenceFailed），本次请求未完成。"
-            case .invalidExecutionIdentity: return "执行校验未通过（CHAT-CONTEXT:invalidExecutionIdentity），本次请求未完成。"
-            case .executionIdentityRejected: return "执行校验未通过（CHAT-CONTEXT:executionIdentityRejected），本次请求未完成。"
-            case .executionWritebackRejected: return "执行校验未通过（CHAT-CONTEXT:executionWritebackRejected），本次请求未完成。"
-            case .contextSettingsScopeMismatch: return "执行校验未通过（CHAT-CONTEXT:contextSettingsScopeMismatch），本次请求未完成。"
-            case .invalidContextSettings: return "执行校验未通过（CHAT-CONTEXT:invalidContextSettings），本次请求未完成。"
+            case .missingSession: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:missingSession")
+            case .providerMismatch: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:providerMismatch")
+            case .modelMismatch: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:modelMismatch")
+            case .sessionMismatch: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:sessionMismatch")
+            case .snapshotMismatch: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:snapshotMismatch")
+            case .rejected: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:rejected")
+            case .malformed: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:malformed")
+            case .persistenceFailed: return Self.executionValidationMessage(.retryable, code: "CHAT-CONTEXT:persistenceFailed")
+            case .invalidExecutionIdentity: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:invalidExecutionIdentity")
+            case .executionIdentityRejected: return Self.executionValidationMessage(.changed, code: "CHAT-CONTEXT:executionIdentityRejected")
+            case .executionWritebackRejected: return Self.executionValidationMessage(.uncertain, code: "CHAT-CONTEXT:executionWritebackRejected")
+            case .contextSettingsScopeMismatch: return Self.executionValidationMessage(.reauthorize, code: "CHAT-CONTEXT:contextSettingsScopeMismatch")
+            case .invalidContextSettings: return Self.executionValidationMessage(.reauthorize, code: "CHAT-CONTEXT:invalidContextSettings")
             case .contextLengthExceeded: return "当前上下文已超过设置的长度上限，本次请求未执行。请缩短输入或在新会话继续。"
             }
         }
         // 第七版旅程：拒绝 shell 后落到这里却看不出是哪种错误。只记类型名（不含内容），供复现定位。
+        let category = unknownErrorCategory(error)
         os.Logger(subsystem: "com.miniscanvas.chat", category: "unknown-error")
-            .error("CHAT-UNKNOWN type=\(String(reflecting: type(of: error)), privacy: .public)")
-        return "操作未完成（CHAT-UNKNOWN）。请重试；若重复出现，请输入 /doctor 打开环境诊断，导出诊断包并附上此错误信息。"
+            .error("CHAT-UNKNOWN category=\(category.rawValue, privacy: .public) type=\(String(reflecting: type(of: error)), privacy: .public)")
+        return unknownErrorMessage(category)
+    }
+
+    /// 执行校验失败的四类处置。内部代码只放括号末尾，主句只说发生了什么与下一步。
+    enum ExecutionValidationClass { case retryable, reauthorize, uncertain, changed }
+
+    static func executionValidationMessage(_ kind: ExecutionValidationClass, code: String) -> String {
+        switch kind {
+        case .retryable:
+            return "执行校验暂未通过：系统正忙或所需资源暂不可用，本次请求未完成。请稍后重试（\(code)）。"
+        case .reauthorize:
+            return "执行校验未通过：授权或权限设置已发生变化，本次请求未执行。请重新确认授权后再发起（\(code)）。"
+        case .uncertain:
+            return "本次操作可能已经执行，但结果无法确认。请先查看结果，不要直接重发（\(code)）。"
+        case .changed:
+            return "执行校验未通过：会话、模型或目标已发生变化，本次请求未执行。请确认当前选择后重新发起（\(code)）。"
+        }
+    }
+
+    /// 未归类错误的粗分：权限 / 配置 / 存储 / 内部。只看错误域与错误码，不读取错误内容。
+    enum UnknownErrorCategory: String { case permission, configuration, storage, internalFailure = "internal" }
+
+    nonisolated static func unknownErrorCategory(_ error: Error) -> UnknownErrorCategory {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, [NSFileReadNoPermissionError, NSFileWriteNoPermissionError].contains(ns.code) {
+            return .permission
+        }
+        if ns.domain == NSPOSIXErrorDomain, [Int(EACCES), Int(EPERM)].contains(ns.code) { return .permission }
+        if error is DecodingError || error is EncodingError { return .configuration }
+        if ns.domain == NSCocoaErrorDomain, (3840...3851).contains(ns.code) || (4864...4866).contains(ns.code) {
+            return .configuration
+        }
+        if ns.domain == NSCocoaErrorDomain,
+           ns.code == NSFileNoSuchFileError || (256...642).contains(ns.code) {
+            return .storage
+        }
+        if ns.domain == NSPOSIXErrorDomain,
+           [Int(ENOSPC), Int(ENOENT), Int(EIO), Int(EROFS), Int(EDQUOT)].contains(ns.code) {
+            return .storage
+        }
+        return .internalFailure
+    }
+
+    nonisolated static func unknownErrorMessage(_ category: UnknownErrorCategory) -> String {
+        let doctor = "若重复出现，请输入 /doctor 打开环境诊断，导出诊断包并附上此错误信息"
+        switch category {
+        case .permission:
+            return "操作未完成：没有权限访问所需的文件或目录。请在系统设置或应用的授权中确认访问权限后重试；\(doctor)（CHAT-UNKNOWN:permission）。"
+        case .configuration:
+            return "操作未完成：配置或数据格式无法识别。请在设置中检查相关配置后重试；\(doctor)（CHAT-UNKNOWN:configuration）。"
+        case .storage:
+            return "操作未完成：读写本地存储失败（文件缺失、磁盘空间不足或只读）。请检查磁盘空间与文件位置后重试；\(doctor)（CHAT-UNKNOWN:storage）。"
+        case .internalFailure:
+            return "操作未完成：应用内部出现未归类的错误。请重试；\(doctor)（CHAT-UNKNOWN:internal）。"
+        }
     }
 
     private static func fallbackRouterErrorMessage(
@@ -17238,7 +21885,7 @@ final class ChatStore {
     ) -> String {
         let label: String
         switch kind {
-        case .unconfigured: label = "未配置 Provider 或凭据缺失"
+        case .unconfigured: label = "未配置服务商或凭据缺失"
         case .unauthorized: label = "认证失败"
         case .permissionDenied: label = "权限被拒"
         case .notFound: label = "模型或接口不存在"
@@ -17284,19 +21931,35 @@ extension ChatStore {
     /// Search the in-memory active and archived projections using the Core
     /// stable locator. App-only system messages are excluded exactly as they
     /// are at the persistence boundary; tool envelopes never become snippets.
-    func searchMessageResults(query: String, limit: Int = 20) -> [SessionSearchResult] {
+    func searchMessageResults(query: String, limit: Int = 100) -> [SessionSearchResult] {
+        let perf = PerformanceSignposts.begin(.sessionSearch); defer { perf.end() }
+        return Self.searchMessageResults(in: sessionSearchSnapshot(), query: query, limit: limit)
+    }
+
+    /// 搜索用的会话快照（值类型副本）：主线程只负责取快照与排序，检索可放后台。
+    struct SessionSearchSnapshot: @unchecked Sendable {
+        fileprivate let sources: [(thread: ChatThread, isArchived: Bool)]
+    }
+
+    func sessionSearchSnapshot() -> SessionSearchSnapshot {
+        SessionSearchSnapshot(sources: sessionsSorted.map { ($0, false) }
+            + archivedSessions.sorted { lhs, rhs in
+                if lhs.pinned != rhs.pinned { return lhs.pinned }
+                return lhs.updatedAt > rhs.updatedAt
+            }.map { ($0, true) })
+    }
+
+    nonisolated static func searchMessageResults(
+        in snapshot: SessionSearchSnapshot, query: String, limit: Int
+    ) -> [SessionSearchResult] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty, limit > 0 else { return [] }
 
         let locator = SessionHistoryLocator()
-        let sources = sessionsSorted.map { ($0, false) }
-            + archivedSessions.sorted { lhs, rhs in
-                if lhs.pinned != rhs.pinned { return lhs.pinned }
-                return lhs.updatedAt > rhs.updatedAt
-            }.map { ($0, true) }
         var results: [SessionSearchResult] = []
 
-        for (thread, isArchived) in sources {
+        for (thread, isArchived) in snapshot.sources {
+            if Task.isCancelled { return results }
             let persisted = thread.asPersisted()
             let uiMessages = thread.messages.filter { $0.role != .system }
             let matches = locator.search(
@@ -17310,7 +21973,7 @@ extension ChatStore {
                 let uiMessage = uiMessages[match.transcriptIndex]
                 guard let safeContent = SessionSearchSafeText.displayText(for: uiMessage),
                       safeContent.localizedCaseInsensitiveContains(needle) else { continue }
-                let safeSnippet = SessionSearchSafeText.sanitized(match.snippet)
+                let safeSnippet = SessionSearchSafeText.snippet(around: needle, in: safeContent)
                 guard !safeSnippet.isEmpty else { continue }
                 let safeMatchedText = match.matchedText.map(SessionSearchSafeText.sanitized)
                 results.append(SessionSearchResult(

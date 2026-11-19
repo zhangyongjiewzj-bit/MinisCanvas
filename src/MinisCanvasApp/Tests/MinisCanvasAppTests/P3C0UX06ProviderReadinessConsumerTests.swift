@@ -18,9 +18,9 @@ struct P3C0UX06ProviderReadinessConsumerTests {
                     body: "models for sk-ux06-secret-1234",
                     modelIDs: ["mock-alpha", "mock-beta"]
                 ),
-                .minimalModelRequest("mock-alpha"): .init(
+                .minimalModelRequest("configured-model"): .init(
                     statusCode: 200,
-                    body: "alpha response using sk-ux06-secret-1234"
+                    body: "configured response using sk-ux06-secret-1234"
                 ),
                 .minimalModelRequest("mock-beta"): .init(
                     statusCode: 200,
@@ -49,14 +49,14 @@ struct P3C0UX06ProviderReadinessConsumerTests {
         #expect(report.authentication.status == .passed)
         #expect(report.modelDiscovery.status == .passed)
         #expect(report.discoveredModelIDs == ["mock-alpha", "mock-beta"])
-        #expect(report.modelChecks.map(\.modelID) == ["mock-alpha", "mock-beta"])
+        // 只测用户保存的模型（不拿目录里别的模型顶替），不逐个全测。
+        #expect(report.modelChecks.map(\.modelID) == ["configured-model"])
         #expect(report.modelChecks.allSatisfy { $0.status == .passed })
         #expect(report.state == .mock)
         let maskedSecret = ContentSecretRedactor.mask("sk-ux06-secret-1234")
         #expect(report.redactedResult.contains("authenticated with \(maskedSecret)"))
         #expect(report.redactedResult.contains("models for \(maskedSecret)"))
-        #expect(report.redactedResult.contains("alpha response using \(maskedSecret)"))
-        #expect(report.redactedResult.contains("beta response using \(maskedSecret)"))
+        #expect(report.redactedResult.contains("configured response using \(maskedSecret)"))
         #expect(!report.redactedResult.contains("sk-ux06-secret-1234"))
         #expect(report.modelChecks.allSatisfy {
             $0.redactedResult.contains(maskedSecret)
@@ -66,8 +66,7 @@ struct P3C0UX06ProviderReadinessConsumerTests {
             .reachability,
             .authentication,
             .modelDiscovery,
-            .minimalModelRequest("mock-alpha"),
-            .minimalModelRequest("mock-beta")
+            .minimalModelRequest("configured-model")
         ])
     }
 
@@ -146,7 +145,7 @@ struct P3C0UX06ProviderReadinessConsumerTests {
             name: "UX06_MODELS_API_KEY",
             apiKey: "sk-ux06-models-1234",
             baseURL: "https://mock.example/v1",
-            modelNames: [],
+            modelNames: ["mock-pass", "mock-fail"],
             protocolType: .openaiCompatible
         ))
 
@@ -161,6 +160,61 @@ struct P3C0UX06ProviderReadinessConsumerTests {
         #expect(report.modelChecks[1].status == .failed)
         #expect(report.state == .unverified)
         #expect(report.modelChecks[1].redactedResult.contains("server failure"))
+    }
+
+    @Test("中转站没有 /models（404）时不报鉴权失败，改用一次最小对话请求，且不逐个全测")
+    func missingModelsEndpointFallsBackToMinimalChatRequest() async throws {
+        let transport = UX06MockProviderReadinessTransport(
+            responses: [
+                .reachability: .init(statusCode: 200),
+                .authentication: .init(statusCode: 404),
+                .modelDiscovery: .init(statusCode: 404),
+                .minimalModelRequest("relay-a"): .init(statusCode: 200, body: "ok")
+            ]
+        )
+        let center = try makeCenter(transport: transport, deployment: .mock)
+        #expect(center.saveProvider(
+            name: "UX06_RELAY_API_KEY",
+            apiKey: "sk-ux06-relay-1234",
+            baseURL: "http://192.168.1.20:3000/v1",
+            modelNames: ["relay-a", "relay-b", "relay-c", "relay-d"],
+            protocolType: .openaiCompatible
+        ))
+
+        let report = try #require(
+            await center.checkProviderReadiness(forProviderName: "UX06_RELAY_API_KEY")
+        )
+
+        #expect(report.authentication.status == .passed)
+        #expect(report.modelDiscovery.status == .passed)
+        #expect(report.modelChecks.map(\.modelID).first == "relay-a")
+        let operations = await transport.operations()
+        #expect(!operations.contains(.modelDiscovery))
+        #expect(operations.contains(.minimalModelRequest("relay-a")))
+        // 已填写的模型最多检查 3 个，不会把整个目录逐个全测。
+        #expect(operations.filter { if case .minimalModelRequest = $0 { return true } else { return false } }.count <= 4)
+    }
+
+    @Test("本机服务不填 Key 也能保存并检查连接（内部用占位值）")
+    func localServiceSavesWithoutAPIKey() async throws {
+        let transport = UX06MockProviderReadinessTransport(
+            responses: [.modelDiscovery: .init(statusCode: 200, modelIDs: ["llama3.3"])]
+        )
+        let center = try makeCenter(transport: transport, deployment: .mock)
+        #expect(center.saveProvider(
+            name: "OLLAMA_API_KEY",
+            credential: .replace(ProviderEndpointPolicy.localPlaceholderAPIKey),
+            baseURL: "http://localhost:11434/v1",
+            modelNames: ["llama3.3"],
+            protocolType: .openaiCompatible
+        ))
+        let state = await center.probeProviderDraft(
+            providerID: "OLLAMA_API_KEY",
+            apiKey: "",
+            baseURL: "http://localhost:11434/v1",
+            protocolType: .openaiCompatible
+        )
+        #expect(state == .loaded(["llama3.3"]))
     }
 
     @Test("remote deployment 即使 mock transport 全通过也保持未验证")

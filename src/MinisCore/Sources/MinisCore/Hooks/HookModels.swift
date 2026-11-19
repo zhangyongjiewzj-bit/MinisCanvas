@@ -16,6 +16,12 @@ public enum HookEvent: String, Codable, Sendable, CaseIterable {
     case userPromptSubmit = "UserPromptSubmit"
     case sessionStart = "SessionStart"
     case stop = "Stop"
+    /// 以下四个事件对齐 Claude Code，只做观察（不改变决策）：
+    /// 通知、子代理结束、压缩前、会话结束。
+    case notification = "Notification"
+    case subagentStop = "SubagentStop"
+    case preCompact = "PreCompact"
+    case sessionEnd = "SessionEnd"
 
     /// Only tool events consult `HookDefinition.matcher`.
     public var usesToolMatcher: Bool { self == .preToolUse || self == .postToolUse }
@@ -24,18 +30,23 @@ public enum HookEvent: String, Codable, Sendable, CaseIterable {
 public enum HookSource: String, Codable, Sendable {
     case user
     case project
+    /// 读取自 Claude Code 格式的 settings.json（用户级、项目级、项目本地级）。
+    case claudeSettings
 }
 
 /// One configured hook command.
 public struct HookDefinition: Codable, Sendable, Equatable, Identifiable {
-    public static let defaultTimeoutSeconds: Double = 10
+    public static let defaultTimeoutSeconds: Double = 60
     public static let maximumTimeoutSeconds: Double = 120
     public static let maximumCommandLength = 4096
 
     public var id: String
     public var event: HookEvent
     /// Tool-name filter for PreToolUse / PostToolUse: nil, "" or "*" match every
-    /// tool; otherwise exact names separated by "|" (not a regular expression).
+    /// tool; otherwise a regular expression that must match the whole tool name
+    /// (对齐 Claude Code，例如 "Edit|Write"、"file_.*"). The old exact-name list
+    /// "a|b" is also a valid regular expression and keeps working; an invalid
+    /// expression matches nothing.
     public var matcher: String?
     public var command: String
     public var timeoutSeconds: Double?
@@ -71,7 +82,7 @@ public struct HookDefinition: Codable, Sendable, Equatable, Identifiable {
         self.enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 
-    /// Timeout actually applied: the configured value, clamped; default 10 s.
+    /// Timeout actually applied: the configured value, clamped; default 60 s.
     public var effectiveTimeout: TimeInterval {
         guard let value = timeoutSeconds, value.isFinite, value > 0 else {
             return Self.defaultTimeoutSeconds
@@ -92,10 +103,29 @@ public struct HookDefinition: Codable, Sendable, Equatable, Identifiable {
         guard let raw = matcher?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty, raw != "*" else { return true }
         guard let toolName else { return false }
-        return raw.split(separator: "|").contains {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines) == toolName
+        // Claude Code 的钩子按它的工具名写（Bash、Edit……）；本 App 的工具名不同，两套名字都认。
+        var candidates = [toolName] + Self.claudeCodeToolNames[toolName, default: []]
+        let claudeName = HookPayload.claudeToolName(toolName)
+        if !candidates.contains(claudeName) { candidates.append(claudeName) }
+        // 旧写法：以 "|" 分隔的精确名字（允许两侧有空格）。
+        let alternatives = raw.split(separator: "|").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        if candidates.contains(where: { alternatives.contains($0) }) { return true }
+        guard let expression = try? NSRegularExpression(pattern: "^(?:" + raw + ")$") else { return false }
+        return candidates.contains { name in
+            expression.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
         }
     }
+
+    /// 本 App 工具名 -> 对应的 Claude Code 工具名。
+    static let claudeCodeToolNames: [String: [String]] = [
+        "shell_execute": ["Bash"],
+        "file_read": ["Read"],
+        "file_write": ["Write"],
+        "file_edit": ["Edit", "MultiEdit"],
+        "file_grep": ["Grep"],
+        "file_glob": ["Glob"],
+        "web_fetch": ["WebFetch"],
+    ]
 }
 
 /// On-disk shape shared by the user file and the project file.

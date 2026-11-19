@@ -195,7 +195,8 @@ struct Goal18InteractionTests {
         let disabled = ComposerTaskMode.allCases.filter { !ComposerModeAvailability.isEnabled($0, ceiling: .l1) }
         #expect(Set(disabled) == Set([.autoEdit, .auto, .bypassPermission]))
         #expect(ComposerTaskMode.allCases.allSatisfy { !ComposerModeAvailability.isEnabled($0, ceiling: nil) })
-        #expect(ComposerModeAvailability.explanation(.auto, ceiling: .l1).contains("L3"))
+        let explanation = ComposerModeAvailability.explanation(.auto, ceiling: .l1)
+        #expect(explanation.contains("权限上限") && !explanation.contains("L3"))
     }
 
     @Test func explicitPersistedInterruptChoiceSurvivesNewQueueDefault() throws {
@@ -235,6 +236,19 @@ struct Goal18InteractionTests {
         #expect(restored.fileCheckpointsEnabled)
     }
 
+    /// E2：后台任务完成后自动续跑默认开；显式关闭会保存；旧 JSON 没有这个字段时按默认开。
+    @Test func backgroundAutoContinueDefaultsOnAndPreservesExplicitOff() throws {
+        #expect(AgentSettings.default.backgroundAutoContinueEnabled)
+        var saved = AgentSettings.default
+        saved.backgroundAutoContinueEnabled = false
+        let encoded = try JSONEncoder().encode(saved)
+        #expect(try JSONDecoder().decode(AgentSettings.self, from: encoded).backgroundAutoContinueEnabled == false)
+        var legacy = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        legacy.removeValue(forKey: "backgroundAutoContinueEnabled")
+        let restored = try JSONDecoder().decode(AgentSettings.self, from: JSONSerialization.data(withJSONObject: legacy))
+        #expect(restored.backgroundAutoContinueEnabled)
+    }
+
     @Test func toolEventKindsUseKeylineWithoutChangingTheirSemanticLabels() throws {
         let candidateIdentity: MinisCore.ConversationEventIdentity? = MinisCore.ConversationEventIdentity(
             sessionID: "test-session", turnID: "1", taskID: "test-task", attempt: 1, scopeID: "test-scope")
@@ -262,7 +276,7 @@ struct Goal18InteractionTests {
             kind: .tool, status: .failed, summary: "diagnostic only", toolName: "file_write",
             toolTargetDisplay: "output.md", errorCategory: .tool)
         let failure = ToolEventCard.displayModel(for: failed)
-        #expect(failure.summary.contains("请查看结果后重试"))
+        #expect(failure.summary.contains("请查看结果详情后重试"))  // 11/16 工具失败提示写明阶段与下一步
         #expect(failure.errorCategory == nil)
         #expect(!failure.accessibilityLabel.contains("错误 tool"))
         let denied = MinisCore.ConversationEvent(id: "denied", identity: identity, sequence: 2, occurredAt: Date(),
@@ -352,30 +366,27 @@ struct Goal18InteractionTests {
         #expect(shown == "replacement")
     }
 
-    @Test("Directory hints and detached directory classification never send a folder", arguments: [false, true])
-    func directoryAttachmentRejected(hinted: Bool) async throws {
+    @Test("A folder becomes a path reference, never read as bytes", arguments: [false, true])
+    func directoryAttachmentIsPathReference(hinted: Bool) async throws {
         let (chat, provider, root) = try smallP1AttachmentFixture(vision: false)
         defer { chat.stopAllStreamingForSafety() }
         let directory = root.appendingPathComponent("folder", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = URL(fileURLWithPath: directory.path, isDirectory: hinted)
         let staged = chat.addAttachments(urls: [url])
-        if hinted {
-            #expect(staged.isEmpty && chat.pendingAttachments.isEmpty)
-        } else {
-            let attachment = try #require(staged.first)
+        let attachment = try #require(staged.first)
+        if !hinted {
             let owner = try #require(chat.activeSessionID)
-            let preparation = try #require(chat.attachmentPreparationTask(for: attachment, sessionID: owner))
-            chat.draftText = "keep this draft"
-            chat.submitComposer()
-            _ = await preparation.value
-            try await waitForSmallP1Attachment { !chat.isComposerAttachmentPreflightPending }
-            #expect(chat.pendingAttachments.isEmpty)
-            #expect(chat.draftText == "keep this draft")
+            if let preparation = chat.attachmentPreparationTask(for: attachment, sessionID: owner) {
+                _ = await preparation.value
+            }
         }
+        let current = try #require(chat.pendingAttachments.first)
+        #expect(chat.pendingAttachments.count == 1)
+        #expect(current.status == .ready && current.kind == .file)
+        #expect(current.mimeType == ChatStore.directoryAttachmentMimeType)
+        #expect(ChatStore.composeUserContent(text: "", attachments: [current]).contains("这是目录"))
         #expect(provider.calls.isEmpty)
-        #expect(chat.messages.allSatisfy { $0.role != .user })
-        #expect(chat.pastedTextActionFeedback?.contains("文件夹不能作为附件") == true)
     }
 
     @Test("Attachment failures distinguish encoding, byte limit and unreadable file", arguments: ["encoding", "size", "missing"])
@@ -386,11 +397,11 @@ struct Goal18InteractionTests {
         let expected: String
         switch kind {
         case "encoding":
-            try Data([0xff, 0xfe, 0xff]).write(to: url)
+            try Data([0xff, 0xff, 0xfe]).write(to: url)
             expected = "UTF-8"
         case "size":
             try Data(repeating: 0, count: ChatStore.maxBinaryAttachmentBytes + 1).write(to: url)
-            expected = "25MB"
+            expected = "自动转换失败"  // 超过 25 MB 的图片先尝试转码；全零字节不是可解码图片，转码失败
         default: expected = "无法读取"
         }
         _ = chat.addAttachments(urls: [url])

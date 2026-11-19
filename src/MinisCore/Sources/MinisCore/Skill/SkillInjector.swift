@@ -181,36 +181,8 @@ public final class SkillInjector: @unchecked Sendable {
         }
         var scored: [(skill: Skill, score: Int, trustRank: Int)] = []
         for skill in candidates where injectable.contains(skill.id) {
-            let nameLower = skill.name.lowercased()
-            var score = 0
-
-            // Whole-word name hit.
-            if messageTokens.contains(nameLower) || containsWholePhrase(nameLower, in: message) {
-                score += 10
-            }
-
-            // Description token hits (skip very short tokens and pure CJK runs
-            // which produce useless single chars).
-            let descTokens = tokenize(skill.description.lowercased())
-            for token in descTokens where token.count >= 3 && !isMostlyCJK(token) {
-                if messageTokens.contains(token) || message.contains(token) {
-                    score += 2
-                }
-            }
-
-            // 2026-11-15 第七版：描述写成"用途。触发：词、词……"时，二字组只在用途上计分，
-            // 触发词按整个词组匹配，命中一个就够门槛；没有"触发："的描述保持原来的打分。
-            let descriptionParts = skill.description.lowercased().components(separatedBy: "触发：")
-            for bigram in cjkBigrams(descriptionParts[0]) where messageBigrams.contains(bigram) {
-                score += 1
-            }
-            if descriptionParts.count > 1 {
-                let triggers = descriptionParts[1].split(whereSeparator: { "、，,;；".contains($0) })
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "。"))) }
-                for phrase in triggers where phrase.count >= 2 && message.contains(phrase) {
-                    score += 2
-                }
-            }
+            let score = matchScore(for: skill, message: message,
+                                   messageTokens: messageTokens, messageBigrams: messageBigrams)
 
             // P2-5: only skills meeting the minimum score threshold qualify.
             if score >= minimumScore {
@@ -232,6 +204,74 @@ public final class SkillInjector: @unchecked Sendable {
             }
             .prefix(maxInjectedSkills)
             .map(\.skill)
+    }
+
+    private func matchScore(
+        for skill: Skill,
+        message: String,
+        messageTokens: Set<String>,
+        messageBigrams: Set<String>
+    ) -> Int {
+        let nameLower = skill.name.lowercased()
+        var score = 0
+
+        // Whole-word name hit.
+        if messageTokens.contains(nameLower) || containsWholePhrase(nameLower, in: message) {
+            score += 10
+        }
+
+        // Description token hits (skip very short tokens and pure CJK runs
+        // which produce useless single chars).
+        let descTokens = tokenize(skill.description.lowercased())
+        for token in descTokens where token.count >= 3 && !isMostlyCJK(token) {
+            if messageTokens.contains(token) || message.contains(token) {
+                score += 2
+            }
+        }
+
+        // 2026-11-15 第七版：描述写成"用途。触发：词、词……"时，二字组只在用途上计分，
+        // 触发词按整个词组匹配，命中一个就够门槛；没有"触发："的描述保持原来的打分。
+        let descriptionParts = skill.description.lowercased().components(separatedBy: "触发：")
+        for bigram in cjkBigrams(descriptionParts[0]) where messageBigrams.contains(bigram) {
+            score += 1
+        }
+        if descriptionParts.count > 1 {
+            let triggers = descriptionParts[1].split(whereSeparator: { "、，,;；".contains($0) })
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "。"))) }
+            for phrase in triggers where phrase.count >= 2 && message.contains(phrase) {
+                score += 2
+            }
+        }
+        return score
+    }
+
+    /// 已启用、与消息匹配（同一套打分与门槛），但因未在当前会话/项目批准而不可注入的技能 id。
+    /// 只用于给用户一条轻提示；不读正文，不进入发给模型的内容。
+    public func unapprovedMatchingSkillIDs(
+        for userMessage: String,
+        within scope: MemoryScope? = nil,
+        limit: Int = 3
+    ) -> [String] {
+        guard maxInjectedSkills > 0 else { return [] }
+        let message = userMessage.lowercased()
+        let messageTokens = Set(tokenize(message))
+        let messageBigrams = Set(cjkBigrams(message))
+        let registry = SkillRegistry(store: store)
+        guard registry.revision == registryFingerprint else { return [] }
+        let candidates = store.allSkills()
+        let injectable = store.injectableSkills(candidates, within: scope) { skill, raw in
+            registry.rejection(for: skill, content: raw) == nil
+        }
+        return candidates
+            .filter { $0.isEnabled && !injectable.contains($0.id) }
+            .filter {
+                matchScore(for: $0, message: message, messageTokens: messageTokens,
+                           messageBigrams: messageBigrams) >= minimumScore
+            }
+            .map(\.id)
+            .sorted()
+            .prefix(limit)
+            .map { $0 }
     }
 
     // MARK: - Injection
@@ -312,13 +352,33 @@ public final class SkillInjector: @unchecked Sendable {
         return candidates.filter { injectable.contains($0.id) }
     }
 
-    /// 2026-11-15 提示词方案 v2：每回合常驻的技能目录（名字 + 一句话用途）。
-    /// 只列当前作用域可注入的技能；正文仍按相关性注入。
-    public func catalogFragment(within scope: MemoryScope? = nil, maxCharacters: Int = 600) -> String? {
+    /// 2026-11-15 提示词方案 v2：每回合常驻的技能目录（名称 + 一句话用途）。
+    /// 对齐 Claude Code：目录常驻列出全部可用技能，并告诉模型可以用 skill_read 按名称读全文。
+    /// 只列当前作用域可注入的技能；正文仍按相关性注入。预算不够时，与 `userMessage`
+    /// 相关的技能排在前面，其余按原顺序，最后注明还有几个没列出。
+    public func catalogFragment(
+        within scope: MemoryScope? = nil,
+        maxCharacters: Int = 4_000,
+        userMessage: String? = nil
+    ) -> String? {
         guard maxInjectedSkills > 0 else { return nil }
-        let skills = injectableCandidates(within: scope)
+        var skills = injectableCandidates(within: scope)
         guard !skills.isEmpty else { return nil }
-        let open = "<skill_catalog>\n可用技能（名称：用途）。与任务相关的技能正文会另行附上：\n"
+        if let userMessage, !userMessage.isEmpty {
+            let relevant = matchingSkills(for: userMessage, within: scope).map(\.id)
+            if !relevant.isEmpty {
+                let rank = Dictionary(uniqueKeysWithValues: relevant.enumerated().map { (pair) in (pair.element, pair.offset) })
+                skills = skills.enumerated().sorted { lhs, rhs in
+                    switch (rank[lhs.element.id], rank[rhs.element.id]) {
+                    case let (a?, b?): return a < b
+                    case (.some, .none): return true
+                    case (.none, .some): return false
+                    case (.none, .none): return lhs.offset < rhs.offset
+                    }
+                }.map(\.element)
+            }
+        }
+        let open = "<skill_catalog>\n可用技能（名称：用途）。与任务相关的技能正文会另行附上；其余技能需要时，调用 skill_read 工具并传入技能名称（skillID）读取全文：\n"
         let close = "</skill_catalog>"
         var body = ""
         var listed = 0
@@ -326,14 +386,21 @@ public final class SkillInjector: @unchecked Sendable {
             // 描述里"触发："之后是给匹配用的触发词，目录里只显示前面的用途。
             let purpose = (skill.description.components(separatedBy: "触发：").first ?? skill.description)
                 .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: "。")))
-            let line = "- " + xmlEscape(skill.name, attribute: false)
+            // skill_read 要的是技能 id；名称与 id 不同时一并写出，模型才叫得对。
+            let label = skill.name == skill.id
+                ? xmlEscape(skill.name, attribute: false)
+                : xmlEscape(skill.id, attribute: false) + "（" + xmlEscape(skill.name, attribute: false) + "）"
+            let line = "- " + label
                 + (purpose.isEmpty ? "" : "：" + xmlEscape(String(purpose.prefix(60)), attribute: false)) + "\n"
-            if open.count + body.count + line.count + close.count + 16 > maxCharacters { break }
+            // 预留“另有 N 个”提示行的位置。
+            if open.count + body.count + line.count + close.count + 64 > maxCharacters { break }
             body += line
             listed += 1
         }
         guard listed > 0 else { return nil }
-        if listed < skills.count { body += "（另有 \(skills.count - listed) 个未列出）\n" }
+        if listed < skills.count {
+            body += "（另有 \(skills.count - listed) 个技能未列出，可用 skill_read 按名称读取）\n"
+        }
         return open + body + close
     }
 
@@ -621,6 +688,43 @@ public final class SkillInjector: @unchecked Sendable {
             // the final fragment fits within maxInjectedCharacters.
             let markerReserve = omittedMarker(for: matched.count).count
             if xml.count + block.count + headerClose.count + markerReserve > maxInjectedCharacters {
+                // 对齐 Claude Code：放不下整篇时不整篇丢弃，改注入开头部分并提示用 skill_read 读全文。
+                // 剩余空间太小（不足 Self.minimumTruncatedBodyCharacters）时仍按原规则省略。
+                let open = "<skill name=\"\(escapedName)\">\n"
+                let note = truncationNote(for: skill)
+                let fixed = xml.count + open.count + note.count + "</skill>\n".count
+                    + headerClose.count + markerReserve + 1
+                let room = maxInjectedCharacters - fixed
+                if room >= Self.minimumTruncatedBodyCharacters {
+                    var take = min(room, body.count)
+                    var truncatedBlock = ""
+                    while take > 0 {
+                        let head = String(body.prefix(take))
+                        truncatedBlock = open + xmlEscape(head, attribute: false) + "\n" + note + "</skill>\n"
+                        let excess = xml.count + truncatedBlock.count + headerClose.count + markerReserve
+                            - maxInjectedCharacters
+                        if excess <= 0 { break }
+                        take -= max(1, excess)
+                    }
+                    if take >= Self.minimumTruncatedBodyCharacters {
+                        xml += truncatedBlock
+                        injectedNames.append(skill.name)
+                        receipts.append(SkillInjectionReceipt(
+                            receiptID: Self.stableReceiptID(
+                                skillID: skill.id,
+                                version: skill.version,
+                                contentHash: contentHash,
+                                reason: nil
+                            ),
+                            skillID: skill.id,
+                            version: skill.version,
+                            contentHash: contentHash,
+                            matchedTerms: terms,
+                            injectedCharacters: truncatedBlock.count
+                        ))
+                        continue
+                    }
+                }
                 omitted += 1
                 receipts.append(SkillInjectionReceipt(
                     receiptID: Self.stableReceiptID(
@@ -725,6 +829,13 @@ public final class SkillInjector: @unchecked Sendable {
             result = result.replacingOccurrences(of: "\"", with: "&quot;")
         }
         return result
+    }
+
+    /// 总预算下被截断的技能至少要保留这么多正文，否则不如省略。
+    static let minimumTruncatedBodyCharacters = 400
+
+    private func truncationNote(for skill: Skill) -> String {
+        "…（全文较长，此处只注入开头部分；需要完整内容请调用 skill_read，skillID：\(xmlEscape(skill.id, attribute: false))）\n"
     }
 
     private func omittedMarker(for count: Int) -> String {

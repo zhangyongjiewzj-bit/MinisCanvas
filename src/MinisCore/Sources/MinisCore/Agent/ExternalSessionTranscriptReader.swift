@@ -384,7 +384,11 @@ enum ExternalSessionTranscriptReader {
 
     // MARK: Message pages
 
+    /// 工具调用与结果每条最多这么多字符（参数、结果只给摘要）。
+    static let toolItemMaxCharacters = 1_500
+
     static func readPage(_ file: SessionFile, cursor: String?, limit: Int, maxChars: Int,
+                         includeTools: Bool = false,
                          knownSecrets: [String], limits: ExternalSessionReadLimits) throws -> MessagePage {
         let descriptor = try openFile(file)
         defer { Darwin.close(descriptor) }
@@ -416,17 +420,22 @@ enum ExternalSessionTranscriptReader {
             }
             if let message = file.map.message(from: row, fileSessionID: file.id) {
                 raw.append(message)
-                if raw.count >= limit { return false }
             }
-            return true
+            // 游标按整行前进：一行里的所有块都装进这一页（页可能略超 limit），避免页尾丢掉本行后面的块。
+            if includeTools {
+                raw.append(contentsOf: file.map.toolItems(from: row, fileSessionID: file.id))
+            }
+            return raw.count < limit
         }
 
         let items: [MessageItem] = raw.enumerated().map { position, message in
             let capped = message.text.utf8.count > 400_000 ? String(message.text.prefix(100_000)) : message.text
             let redacted = ContentSecretRedactor.redact(capped, knownSecrets: knownSecrets)
-            let truncated = redacted.count > maxChars || capped.count != message.text.count
+            let isTool = message.role == "tool_call" || message.role == "tool_result"
+            let cap = isTool ? min(maxChars, Self.toolItemMaxCharacters) : maxChars
+            let truncated = redacted.count > cap || capped.count != message.text.count
             return MessageItem(index: startIndex + position, role: message.role,
-                               text: String(redacted.prefix(maxChars)), truncated: truncated)
+                               text: String(redacted.prefix(cap)), truncated: truncated)
         }
 
         var current = stat()

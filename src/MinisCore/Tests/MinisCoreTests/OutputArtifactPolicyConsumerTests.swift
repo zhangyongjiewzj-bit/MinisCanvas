@@ -45,11 +45,11 @@ struct OutputArtifactPolicyConsumerTests {
         try Data("line 1\nline 2\nline 3\nline 4".utf8).write(to: file)
         let executor = BuiltinToolExecutor(allowedRoot: root, deniedRoots: [])
         let cases: [(offset: Int, lines: Int, length: Int, expected: String)] = [
-            (2, 2, 200, "line 2\nline 3"),
-            (-2, -1, 200, "line 1"),
-            (0, 0, 200, "line 1"),
-            (1, 1, 0, "l\n…[truncated at 1 chars]"),
-            (1, 1, -1, "l\n…[truncated at 1 chars]")
+            (2, 2, 200, "     2\tline 2\n     3\tline 3"),
+            (-2, -1, 200, "     1\tline 1"),
+            (0, 0, 200, "     1\tline 1"),
+            (1, 1, 0, "     1\tl\n…[truncated at 1 chars; line 1 is longer than max_length, raise max_length to read more]"),
+            (1, 1, -1, "     1\tl\n…[truncated at 1 chars; line 1 is longer than max_length, raise max_length to read more]")
         ]
         for item in cases {
             let input: [String: Any] = ["path": file.path, "offset": item.offset,
@@ -77,7 +77,7 @@ struct OutputArtifactPolicyConsumerTests {
         let boxed = try await executor.execute(name: "file_read", input: [
             "path": file.path, "offset": NSNumber(value: 2),
             "lines": NSNumber(value: 2), "max_length": NSNumber(value: 200)])
-        #expect(native == "line 2\nline 3")
+        #expect(native == "     2\tline 2\n     3\tline 3")
         #expect(boxed == native)
     }
 
@@ -97,8 +97,9 @@ struct OutputArtifactPolicyConsumerTests {
             let direct = try await executor.execute(name: "file_read", input: input)
             let frozen = try ComposerToolInput(input).toolExecutionDictionary
             let throughFrozen = try await executor.execute(name: "file_read", input: frozen)
-            #expect(direct == content)
-            #expect(throughFrozen == content)
+            let numbered = "     1\tline 1\n     2\tline 2\n     3\tline 3\n     4\tline 4"
+            #expect(direct == numbered)
+            #expect(throughFrozen == numbered)
         }
     }
 
@@ -160,7 +161,7 @@ struct OutputArtifactPolicyConsumerTests {
         try await ToolOutputArtifactSessionScope.$current.withValue(scope) {
             let read = try await executor(deny: false).execute(callID: "owned-read", name: "file_read",
                 input: ["path": artifact.fileURL.path, "offset": 2, "lines": 2, "max_length": 200])
-            #expect(read == "line 2\nline 3")
+            #expect(read == "     2\tline 2\n     3\tline 3")
             await #expect(throws: ComposerAuthorizationError.approvalDenied("Capability is blocked by approval policy")) {
                 _ = try await executor(deny: true).execute(callID: "explicit-deny", name: "file_read",
                     input: ["path": artifact.fileURL.path])

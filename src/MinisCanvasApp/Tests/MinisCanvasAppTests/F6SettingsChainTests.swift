@@ -241,7 +241,7 @@ struct F6SettingsChainTests {
         let engine = try! #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
         #expect(engine.loop.maxIterations == 50)           // AgentSettings.default（H07）
         #expect(engine.toolTimeoutSeconds == 300)          // AgentSettings.default
-        #expect(engine.fallbackEnabled == true)            // AgentSettings.default
+        #expect(engine.fallbackEnabled == false)           // AgentSettings.default（跨供应商自动回退默认关闭，2026-11-16）
         #expect(engine.concurrentToolLimit == 4)           // AgentSettings.default
         #expect(engine.hasProviderRuntimeRoute == true)
     }

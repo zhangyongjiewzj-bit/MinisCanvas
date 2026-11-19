@@ -111,6 +111,16 @@ enum GlobalComposer {
     static func acceptedSlashDraft(
         current: String, entry: ComposerSlashMenuEntry, registry: CommandRegistry
     ) -> (text: String, shouldSend: Bool) {
+        if let custom = entry.customCommand {
+            // 自定义命令：用户已经在命令名后面写了参数就原样保留并发送，否则补全成 "/名称"。
+            let typed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowered = typed.lowercased()
+            let hasTypedArguments = lowered.hasPrefix("/\(entry.id) ")
+                && !typed.dropFirst(entry.id.count + 1).trimmingCharacters(in: .whitespaces).isEmpty
+            if hasTypedArguments { return (typed, entry.state == .available) }
+            // 需要参数的命令只补全并留一个尾随空格，等用户接着写参数。
+            return entry.shouldSendOnAccept ? ("/\(custom.name)", true) : ("/\(custom.name) ", false)
+        }
         let parsed = MinisCore.CommandParser().parse(current, registry: registry)
         let exact = parsed.matchScore == 100 && parsed.command?.id == entry.id
         let text = exact ? current : "/\(entry.id)"
@@ -126,12 +136,14 @@ enum GlobalComposer {
         for input: String,
         registry: CommandRegistry,
         sessionState: ComposerSlashSessionState,
-        canvasAvailable: Bool
+        canvasAvailable: Bool,
+        customCommands: [CustomSlashCommand] = []
     ) -> [ComposerSlashMenuEntry] {
         ComposerSlashCommandMenu.entries(
             matching: input,
             registry: registry,
-            sessionState: sessionState
+            sessionState: sessionState,
+            customCommands: customCommands
         ).filter { entry in
             if canvasAvailable { return true }
             if AppCommandCatalog.phase3DisabledCanvasSlashIDs.contains(entry.id),
@@ -152,7 +164,8 @@ enum GlobalComposer {
         contextKey: () -> String,
         registry: () -> CommandRegistry,
         sessionState: () -> ComposerSlashSessionState,
-        canvasAvailable: () -> Bool
+        canvasAvailable: () -> Bool,
+        customCommands: () -> [CustomSlashCommand] = { [] }
     ) -> [ComposerSlashMenuEntry] {
         let whitespace = CharacterSet.whitespacesAndNewlines
         guard input.unicodeScalars.first(where: { !whitespace.contains($0) })?.value == 47 else {
@@ -163,7 +176,8 @@ enum GlobalComposer {
             for: input,
             registry: registry(),
             sessionState: sessionState(),
-            canvasAvailable: canvasAvailable()
+            canvasAvailable: canvasAvailable(),
+            customCommands: customCommands()
         )
     }
 
@@ -249,18 +263,18 @@ enum GlobalComposer {
 
 /// P3-UI-03「Composer 按宽度折叠」的唯一折叠裁决（纯函数，可单测）。
 ///
-/// 阈值只来自 `AdaptiveLayoutPolicy`（A7-A 单一策略源，见
-/// Layout/AdaptiveLayoutPolicy.swift）：compact/medium 把策略/辅助控件收进
-/// 溢出呈现，regular/wide 保持既有内联布局。本类型不定义任何数值断点，
-/// 也不改变任何控件的行为——折叠只改变呈现位置。
+/// 输入框面板自身的可用宽度（面板宽度扣两侧内边距）决定折叠，不再拿它去套
+/// 主窗口宽度类（窗口 800/1100 的断点与面板宽度不是一回事：两侧栏展开时窗口很宽、
+/// 面板却很窄）。
+///
+/// 阈值依据（原生宿主实测）：默认字号下内联主控件行实际约 622pt 宽，取 660 留余量；
+/// 字号放大时控件行同比变宽，阈值乘以排版内容缩放（不低于 1 倍）。
+/// 低于阈值就收进溢出弹层，折叠只改变呈现位置，不改变任何控件行为。
 enum GlobalComposerWidthPolicy {
-    static func collapsesPolicyControls(usableWidth: CGFloat) -> Bool {
-        switch AdaptiveLayoutPolicy.widthClass(for: Double(max(0, usableWidth))) {
-        case .compact, .medium:
-            return true
-        case .regular, .wide:
-            return false
-        }
+    static let inlineMinimumUsableWidth: CGFloat = 660
+
+    static func collapsesPolicyControls(usableWidth: CGFloat, contentScale: CGFloat = 1) -> Bool {
+        usableWidth < inlineMinimumUsableWidth * max(1, contentScale)
     }
 }
 
@@ -380,6 +394,17 @@ private struct ConversationGoalBudgetButton: View {
 
 /// 全局底部对话条：输入框 + 📎 附件 + 🎯 选中节点徽标 + 发送/停止。
 /// 位于 ContentView 三栏之下通栏，聊天 / 画布 / 文档视图都能看到并使用。
+/// 无障碍值依赖“能否发送”（读草稿）：在修饰器自己的 body 里订阅草稿，
+/// 按键只重算这个修饰器，不让 GlobalComposerView 外壳失效。
+private struct ComposerDraftAccessibilityValue: ViewModifier {
+    let chat: ChatStore
+    let value: () -> String
+    func body(content: Content) -> some View {
+        _ = chat.composerDraft.revision
+        return content.accessibilityValue(value())
+    }
+}
+
 struct GlobalComposerView: View {
     @Bindable var bridge: BridgeStore
     @Bindable var chat: ChatStore
@@ -390,15 +415,20 @@ struct GlobalComposerView: View {
     /// E11 文件拖放悬停（输入区高亮提示）
     @State private var showInputHistorySearch = false
     @State private var isDropTargeted = false
+    /// G-10：原生输入框是否持有焦点（由 NSTextView 的 first responder 变化回调），只驱动外框描边。
+    @State private var isInputFocused = false
     @State private var goalObjective = ""
     @State private var showsGoalInput = false
     @State private var goalActionFailed = false
+    @State private var goalActionFailureText = "未能更新会话目标。"
     @State private var pendingGoalSessionBudgetReset: SessionBudgetResetTarget?
     /// AJ-1 插件 / 技能选择器 popover（复用 U4 PluginSkillPickerPopover）
     @State private var showPickerPopover = false
     @State private var pastedTextEditorState: PastedTextEditorState?
     @State private var slashCompletionSelectedCommandID: String?
     @State private var slashCompletionDismissedContextKey: String?
+    @State private var atMentionSelectedID: String?
+    @State private var atMentionDismissedDraft: String?
     /// P3-UI-03：容器实测的控件行可用宽度（pt）。nil 表示首帧测量尚未完成，
     /// 测量完成前保持内联呈现，策略控件在任何时刻都不会闪失。
     @State private var composerUsableWidth: CGFloat?
@@ -551,6 +581,8 @@ struct GlobalComposerView: View {
                                 }
                                 .textSelection(.enabled)
                             }
+                            Button("已处理，清除待办") { controlGoal(.clearBlockers, goal: goal) }
+                                .accessibilityIdentifier("composer.goal-clear-blockers")
                         }
                     }
                     .font(.caption)
@@ -591,7 +623,7 @@ struct GlobalComposerView: View {
                 }
             }
             if goalActionFailed {
-                Text("未能更新会话目标。").font(.caption).foregroundStyle(.secondary)
+                Text(goalActionFailureText).font(.caption).foregroundStyle(.secondary)
             }
         }
         .buttonStyle(.borderless)
@@ -690,6 +722,19 @@ struct GlobalComposerView: View {
             goalActionFailed = false
         } catch {
             goalActionFailed = true
+            goalActionFailureText = Self.goalActionFailureMessage(for: error)
+        }
+    }
+
+    /// 目标栏操作失败时给出原因，而不是只说"未能更新"。
+    static func goalActionFailureMessage(for error: Error) -> String {
+        switch error as? SessionStore.ConversationGoalError {
+        case .unavailable:
+            "未能更新会话目标：当前会话暂时不能操作目标（会话刚切换或存储不可用），请稍后重试。"
+        case .invalidTransition:
+            "未能更新会话目标：目标当前的状态不允许这个操作（例如已有进行中的目标，或预算已用尽需先调高）。"
+        case nil:
+            "未能更新会话目标：输入的内容或预算不合法，请检查后重试。"
         }
     }
 
@@ -708,10 +753,18 @@ struct GlobalComposerView: View {
 
         VStack(spacing: ComposerLayoutMetrics.stackSpacing) {
             InlineInteractionHost(chat: chat)
-            if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty {
-                ProviderConnectionCard {
+            if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty,
+               chat.shouldShowModelConnectionCard {
+                ProviderConnectionCard(repairProviderName: chat.providerNeedingRepairName) {
                     bridge.deepLinkHandler.handle(.openSettings(id: ProviderConnectionRoute.id))
                 }
+            }
+            if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty,
+               chat.shouldShowUncheckedProviderHint {
+                Text("模型服务商还没检查过连接，首次发送前会自动检查。")
+                    .font(typography?.status ?? .caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("composer.provider.unchecked-hint")
             }
             ComposerContextNoticeView(chat: chat, bridge: bridge)
             if let sessionID = chat.activeSessionID, chat.isPersistenceReady {
@@ -787,11 +840,21 @@ struct GlobalComposerView: View {
                         ? "composer.provider.cancel-send" : "composer.credential.cancel-send")
                 }
             } else if let feedback = chat.pastedTextActionFeedback {
-                Text(feedback)
-                    .font(typography?.status ?? .caption)
-                    .foregroundStyle(theme?.statusWarning ?? .orange)
-                    .accessibilityIdentifier("composer.pasted-text.feedback")
-                    .accessibilityAddTraits(.isStaticText)
+                HStack(spacing: 8) {
+                    Text(feedback)
+                        .font(typography?.status ?? .caption)
+                        .foregroundStyle(theme?.statusWarning ?? .orange)
+                        .accessibilityIdentifier("composer.pasted-text.feedback")
+                        .accessibilityAddTraits(.isStaticText)
+                    if let repair = chat.readinessFailureRepair, repair.feedback == feedback {
+                        Button("去修复") {
+                            ProviderConnectionRoute.preferredProviderID = repair.providerID
+                            bridge.deepLinkHandler.handle(.openSettings(id: ProviderConnectionRoute.id))
+                        }
+                        .buttonStyle(.link)
+                        .accessibilityIdentifier("composer.readiness.repair")
+                    }
+                }
             }
             if let failure = chat.composerCommandValidationFailure,
                failure.sessionID == chat.activeSessionID {
@@ -809,8 +872,12 @@ struct GlobalComposerView: View {
             if !chat.selectedPickerItems.isEmpty {
                 PickerSelectionChips(chat: chat)
             }
-            if !slashSuggestions.isEmpty {
-                slashCompletionMenu
+            // 斜杠菜单与 @ 菜单读逐字符草稿：隔离在 ComposerDraftScope 内，按键不再重算整个输入区外壳。
+            ComposerDraftScope(chat: chat) {
+                Group {
+                    slashCompletionSection
+                    atMentionSection
+                }
             }
             // AJ-67：两行布局（原单行 HStack 中按钮左右挤压输入框，918px 宽时占位符已被截断）。
             // ① 上方主控件行：权限/模式 + 模型 + 📎 附件 + 🧩 插件（左对齐小图标按钮）；
@@ -827,19 +894,27 @@ struct GlobalComposerView: View {
                         Button {
                             showPolicyOverflowPopover.toggle()
                         } label: {
-                            MinisIconView(
-                                .settings,
-                                state: showPolicyOverflowPopover ? .active : .normal,
-                                size: MinisIconTokens.defaultSize
-                            )
+                            HStack(spacing: 4) {
+                                MinisIconView(
+                                    .settings,
+                                    state: showPolicyOverflowPopover ? .active : .normal,
+                                    size: MinisIconTokens.defaultSize
+                                )
+                                Text(ComposerPolicyPresentation.modeLabel(chat.composerPolicySelection.mode))
+                                    .font(.system(size: 11))
+                                    .lineLimit(1)
+                                    .foregroundStyle(.secondary)
+                            }
                             .frame(
-                                width: ComposerLayoutMetrics.iconButtonHitSize,
-                                height: ComposerLayoutMetrics.iconButtonHitSize
+                                minWidth: ComposerLayoutMetrics.iconButtonHitSize,
+                                minHeight: ComposerLayoutMetrics.iconButtonHitSize
                             )
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .help("Composer 策略控件已按宽度折叠（点按展开权限模式和工作量）")
-                        .accessibilityLabel("Composer 策略控件（已折叠）")
+                        .help("输入设置已按宽度收起（点按展开任务模式、工作量和思考强度）")
+                        .accessibilityLabel("输入设置（已收起）")
+                        .accessibilityValue(ComposerPolicyPresentation.modeLabel(chat.composerPolicySelection.mode))
                         .accessibilityIdentifier("composer.policy.overflow")
                         .popover(isPresented: $showPolicyOverflowPopover, arrowEdge: .top) {
                             ComposerPolicyControls(chat: chat, modeShortcutBinding: bridge.shortcutStore.binding(for: .composerMode))
@@ -860,24 +935,6 @@ struct GlobalComposerView: View {
                 .layoutPriority(1)
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("composer.policy")
-
-                // Keep credential entry with the compact primary controls so
-                // the input row is reserved for draft text and send/stop.
-                Button {
-                    if let sessionID = chat.activeSessionID {
-                        chat.credentialBroker.beginSecureEntry(sessionID: sessionID)
-                    }
-                } label: {
-                    MinisIconView(.lock, size: MinisIconTokens.defaultSize)
-                        .frame(
-                            width: ComposerLayoutMetrics.iconButtonHitSize,
-                            height: ComposerLayoutMetrics.iconButtonHitSize
-                        )
-                }
-                .buttonStyle(.plain)
-                .help("安全输入凭据")
-                .accessibilityLabel("安全输入凭据")
-                .accessibilityIdentifier("composer.credential.secure-entry")
 
                 // E24 模型按钮（Codex/Hermes 风格）：档位图标 + 模型短名，点击弹 Popover 模型选择面板，
                 // 与侧栏 ChatModelMenu 共用 ModelPickerPanel（F9-ui 三级状态机 ① Provider → ② 模型 → ③ 速度档位确认），
@@ -946,6 +1003,24 @@ struct GlobalComposerView: View {
                 }
 
                 Spacer(minLength: 8)
+
+                // 安全输入凭据入口放在控件行最右，与审批模式按钮隔开，避免误点。
+                Button {
+                    if let sessionID = chat.activeSessionID {
+                        chat.credentialBroker.beginSecureEntry(sessionID: sessionID)
+                    }
+                } label: {
+                    MinisIconView(.lock, size: MinisIconTokens.defaultSize)
+                        .frame(
+                            width: ComposerLayoutMetrics.iconButtonHitSize,
+                            height: ComposerLayoutMetrics.iconButtonHitSize
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("安全输入凭据")
+                .accessibilityLabel("安全输入凭据")
+                .accessibilityIdentifier("composer.credential.secure-entry")
+                .padding(.leading, 8)
             }
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("composer.primary-row.global")
@@ -964,13 +1039,19 @@ struct GlobalComposerView: View {
 
             // ② 下方输入行：输入框独占剩余宽度（ComposerScrollField 内部 .frame(maxWidth: .infinity) 撑满），
             //    右侧仅发送/停止按钮，无其他控件挤压输入区。
+            // 输入行读逐字符草稿（draftText 绑定、发送可用态）：隔离在 ComposerDraftScope 内，
+            // 与伴随栏一致；外层 body 只在非草稿状态变化时重算。
+            ComposerDraftScope(chat: chat) {
             HStack(spacing: ComposerLayoutMetrics.controlSpacing) {
                 ComposerScrollField(
                     text: $chat.draftText,
                     font: .systemFont(ofSize: typography?.composerBodySize ?? 13),
-                    placeholder: "输入消息，/ 查看命令，@ 选择技能",
+                    placeholder: "输入消息，/ 查看命令，@ 引用技能或项目文件",
                     onSend: {
-                        guard canSend else { return }
+                        guard canSend else {
+                            chat.noteComposerSendBlockedByAttachments()
+                            return
+                        }
                         if chat.canSubmitPresentedToolApprovalFromKeyboard {
                             send(fromKeyboard: true)
                         } else if chat.isActiveSessionGenerating {
@@ -981,6 +1062,7 @@ struct GlobalComposerView: View {
                     },
                     onPaste: { chat.interceptCredentialPaste($0) || PastedTextComposerConsumer.accept($0, in: chat) },
                     onCommandKey: { handleNativeComposerKey($0) },
+                    onCursorChange: { chat.noteComposerCursor($0) },
                     historySearchBinding: mainPane == .chat ? bridge.shortcutStore.binding(for: .inputHistorySearch) : nil,
                     onCommandReturn: {
                         let canFlushQueue = chat.isActiveSessionGenerating
@@ -990,13 +1072,19 @@ struct GlobalComposerView: View {
                             && !chat.isComposerAttachmentPreflightPending
                             && !chat.blocksComposerStreamingActions
                             && chat.canSubmitComposerAttachments
-                        guard canSend || canFlushQueue else { return }
+                        guard canSend || canFlushQueue else {
+                            chat.noteComposerSendBlockedByAttachments()
+                            return
+                        }
                         if chat.isActiveSessionGenerating && !chat.canSubmitPresentedToolApprovalFromKeyboard {
                             chat.interruptAndSend(flushingQueued: true)
                         } else { send(fromKeyboard: true) }
                     },
                     onInterruptAndSend: {
-                        guard canSend else { return }
+                        guard canSend else {
+                            chat.noteComposerSendBlockedByAttachments()
+                            return
+                        }
                         chat.interruptAndSend()
                     },
                     onStop: {
@@ -1009,9 +1097,12 @@ struct GlobalComposerView: View {
                     focusSessionID: chat.activeSessionID,
                     inputAccessibilityIdentifier: "composer.global.input",
                     nativeDraft: chat.nativeComposerDraft(),
-                    onRememberNativeDraft: chat.rememberFocusedNativeDraft
+                    onRememberNativeDraft: chat.rememberFocusedNativeDraft,
+                    onFocusChange: { focused in
+                        if isInputFocused != focused { isInputFocused = focused }
+                    }
                 )
-                .help("输入指令或对话（生成中回车排队；⌘⇧⏎ 打断并发送；Esc 停止并将队列退回输入框；⌥⏎ 换行）")
+                .help("输入指令或对话（生成中回车排队；⌘⇧⏎ 打断并发送；Esc 停止并将队列退回输入框；⇧⏎ 或 ⌥⏎ 换行）")
                 .sheet(isPresented: $showInputHistorySearch) {
                     if mainPane == .chat {
                         ComposerInputHistorySearch(chat: chat, redactor: bridge.productionTranscriptRedactor)
@@ -1069,6 +1160,12 @@ struct GlobalComposerView: View {
                           ?? "发送（\(bridge.shortcutStore.binding(for: .sendMessage).displayString)）")
                 }
             }
+            .onChange(of: chat.draftText) { old, new in
+                // 输入框刚进入斜杠状态（菜单即将打开）时重读自定义命令，改了命令文件马上生效。
+                if new.hasPrefix("/"), !old.hasPrefix("/") { chat.refreshCustomSlashCommands() }
+                chat.updateFileMentionSuggestions()
+            }
+            }
         }
         .background {
             Button("") { stopFocusedObject() }
@@ -1080,6 +1177,8 @@ struct GlobalComposerView: View {
         .background(
             RoundedRectangle(cornerRadius: ComposerLayoutMetrics.cornerRadius, style: .continuous)
                 .fill(composerSurfaceFill)
+                // 轻阴影让卡片与外层同色底带分层；静态参数，不随输入重算。
+                .shadow(color: composerShadowColor, radius: 6, x: 0, y: 1)
         )
         .overlay(
             RoundedRectangle(cornerRadius: ComposerLayoutMetrics.cornerRadius, style: .continuous)
@@ -1099,29 +1198,36 @@ struct GlobalComposerView: View {
         .frame(maxWidth: composerColumnMaxWidth)
         .padding(.horizontal, 12)
         .frame(maxWidth: .infinity)
-        // Keep the docked Composer flush with ContentView's status bar. The
-        // status bar uses the same semantic secondary surface, so an outer
-        // material cannot introduce a theme-dependent background strip.
+        // 输入区外框与对话区同一底色（主背景）：窗口放大后左右两侧不再露出一条
+        // 不同色的横带；上缘加一段很短的渐隐，正文滚到输入区时淡出而不是被一刀切断。
+        // 渐隐是静态图层，不随内容重算。
         .padding(.top, 8)
         .padding(.bottom, 0)
-        .background(
-            theme?.aj38.backgroundSecondary.swiftUIColor
-                ?? Color(nsColor: .underPageBackgroundColor).opacity(0.5)
-        )
+        .background(composerBandColor)
+        .overlay(alignment: .top) {
+            LinearGradient(colors: [composerBandColor.opacity(0), composerBandColor],
+                           startPoint: .top, endPoint: .bottom)
+                .frame(height: 14)
+                .offset(y: -14)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
         .font(typography?.composerControl ?? .body)
         // E11 拖放：文件拖到输入区 → 自动添加为附件
-        .dropDestination(for: URL.self) { urls, _ in
-            chat.addAttachments(urls: urls)
-            return true
+        .dropDestination(for: ComposerDropItem.self) { items, _ in
+            // 本地文件与浏览器拖来的图片数据都走统一落地函数；网页链接提示先保存到本地。
+            chat.addDroppedItems(items)
         } isTargeted: { targeted in
             isDropTargeted = targeted
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("composer.global")
         .accessibilityLabel("全局对话输入区")
-        .accessibilityValue(composerAccessibilityValue)
+        .modifier(ComposerDraftAccessibilityValue(chat: chat) { composerAccessibilityValue })
         .onChange(of: chat.activeSessionID) { _, _ in
             resetSlashCompletionSelection()
+            atMentionSelectedID = nil
+            atMentionDismissedDraft = nil
         }
         .sheet(isPresented: credentialSheetBinding) {
             ChatCredentialCardView(chat: chat)
@@ -1131,9 +1237,9 @@ struct GlobalComposerView: View {
         }
     }
 
-    /// 输入卡片外观；原生输入框的聚焦信号未接入 SwiftUI，聚焦态暂不触发。
+    /// 输入卡片外观；聚焦态来自原生输入框的 first responder 回调。
     private var composerSurface: ComposerSurfaceStyle? {
-        theme.map { ComposerSurfaceStyle.resolve(palette: $0.aj38, isFocused: false, isDropTargeted: isDropTargeted) }
+        theme.map { ComposerSurfaceStyle.resolve(palette: $0.aj38, isFocused: isInputFocused, isDropTargeted: isDropTargeted) }
     }
 
     private var composerSurfaceFill: Color {
@@ -1148,6 +1254,17 @@ struct GlobalComposerView: View {
 
     private var composerSurfaceStrokeWidth: CGFloat {
         composerSurface?.strokeWidth ?? 1.5
+    }
+
+    /// 阴影色：按主题底色明暗取黑色的不同浓度（深色底上需更浓才看得出）。
+    private var composerShadowColor: Color {
+        guard let background = theme?.aj38.backgroundPrimary else { return Color.black.opacity(0.10) }
+        let luminance = 0.299 * background.r + 0.587 * background.g + 0.114 * background.b
+        return Color.black.opacity(luminance < 0.5 ? 0.40 : 0.09)
+    }
+
+    private var composerBandColor: Color {
+        theme?.aj38.backgroundPrimary.swiftUIColor ?? Color(nsColor: .windowBackgroundColor)
     }
 
     private var composerColumnMaxWidth: CGFloat {
@@ -1173,14 +1290,15 @@ struct GlobalComposerView: View {
 
     /// P3-UI-03：当前实测宽度下是否把策略控件折叠进溢出呈现。
     /// 首帧测量前（nil）保持内联，控件不闪失；裁决委托
-    /// GlobalComposerWidthPolicy，只消费 AdaptiveLayoutPolicy 的宽度类。
+    /// GlobalComposerWidthPolicy，按面板自身可用宽度判断。
     private var collapsesPolicyControls: Bool {
         guard let composerUsableWidth else { return false }
-        return GlobalComposerWidthPolicy.collapsesPolicyControls(usableWidth: composerUsableWidth)
+        return GlobalComposerWidthPolicy.collapsesPolicyControls(
+            usableWidth: composerUsableWidth, contentScale: CGFloat(typography?.contentScale ?? 1))
     }
 
     /// 面板实测宽度扣除两侧 `ComposerLayoutMetrics.outerPadding` 后即控件/输入行
-    /// 的真实可用宽度。这是几何换算，不是新增断点；阈值仍只来自策略源。
+    /// 的真实可用宽度，交给 GlobalComposerWidthPolicy 的面板级阈值裁决。
     private func applyComposerPanelWidth(_ panelWidth: CGFloat) {
         let usable = max(0, panelWidth - 2 * ComposerLayoutMetrics.outerPadding)
         guard composerUsableWidth != usable else { return }
@@ -1198,14 +1316,18 @@ struct GlobalComposerView: View {
     }
 
     private var slashSessionState: ComposerSlashSessionState {
-        ComposerSlashSessionState(
+        var reasons = GlobalComposer.commandReadinessReasons(
+            registry: chat.registeredComposerCommandRegistry,
+            bridge: bridge
+        )
+        if !chat.activeSessionHasProjectRoot {
+            reasons["init"] = "普通会话没有项目目录，/init 不知道把 CLAUDE.md 写到哪里；请在项目会话里使用"
+        }
+        return ComposerSlashSessionState(
             isStreaming: chat.isActiveSessionStreaming,
             hasPendingComposerCommand: chat.pendingComposerCommand != nil,
             hasActiveSession: chat.activeSessionID != nil,
-            unavailableReasonsByCommandID: GlobalComposer.commandReadinessReasons(
-                registry: chat.registeredComposerCommandRegistry,
-                bridge: bridge
-            )
+            unavailableReasonsByCommandID: reasons
         )
     }
 
@@ -1216,12 +1338,19 @@ struct GlobalComposerView: View {
             contextKey: { slashCompletionContextKey },
             registry: { chat.registeredComposerCommandRegistry },
             sessionState: { slashSessionState },
-            canvasAvailable: { bridge.canvasIfAvailable != nil }
+            canvasAvailable: { bridge.canvasIfAvailable != nil },
+            customCommands: { chat.slashMenuCustomCommands }
         )
     }
 
-    private var slashSuggestions: [CommandDefinition] {
-        slashMenuEntries.map(\.completionCommand)
+    /// One evaluation of the slash projection per body pass. The entries are
+    /// passed down to the menu instead of being recomputed by each row.
+    @ViewBuilder
+    private var slashCompletionSection: some View {
+        let entries = slashMenuEntries
+        if !entries.isEmpty {
+            slashCompletionMenu(entries: entries)
+        }
     }
 
     /// Highlighted row, resolved from the bound command identity so a
@@ -1249,7 +1378,7 @@ struct GlobalComposerView: View {
         if key == .historySearch { showInputHistorySearch = true; return true }
         if chat.handleInputHistoryKey(key) { return true }
         let entries = slashMenuEntries
-        guard !entries.isEmpty else { return false }
+        guard !entries.isEmpty else { return handleAtMentionKey(key) }
         let suggestions = entries.map(\.completionCommand)
 
         if case .shiftTab = key {
@@ -1329,10 +1458,131 @@ struct GlobalComposerView: View {
         }
     }
 
-    private var slashCompletionMenu: some View {
-        ScrollView {
+    // MARK: @ 引用（技能 + 当前项目文件）
+
+    private struct AtMentionItem: Identifiable {
+        let id: String
+        let title: String
+        let subtitle: String
+        let skill: PickerCatalogItem?
+        let path: String?
+        var mcpResource: MCPResourceItem? = nil
+        var referencesDirectory = false
+    }
+
+    /// 草稿末尾是 @ 词时的候选：先技能（目录里按名称包含匹配，至多 5 个），再项目文件。
+    private var atMentionItems: [AtMentionItem] {
+        let draft = chat.draftText
+        guard !draft.hasPrefix("/"), atMentionDismissedDraft != draft,
+              let query = chat.activeAtMentionQuery else { return [] }
+        let needle = query.lowercased()
+        let skills = chat.pickerCatalog.filter { item in
+            item.isEnabled
+                && !chat.selectedPickerItems.contains(where: { $0.id == item.id })
+                && (needle.isEmpty || item.name.lowercased().contains(needle))
+        }.prefix(5).map {
+            AtMentionItem(id: "skill:\($0.id)", title: "@\($0.name)", subtitle: "技能 · \($0.detail)",
+                          skill: $0, path: nil)
+        }
+        let files = chat.fileMentionSuggestions.flatMap { path -> [AtMentionItem] in
+            let item = AtMentionItem(id: "file:\(path)",
+                          title: ChatStore.fileMentionTitle(path),
+                          subtitle: (path.hasSuffix("/") ? "目录（回车进入）· " : "文件 · ") + path, skill: nil, path: path)
+            guard path.hasSuffix("/") else { return [item] }
+            let reference = AtMentionItem(id: "dir-ref:\(path)",
+                          title: ChatStore.fileMentionTitle(path),
+                          subtitle: "引用此目录 · " + path, skill: nil, path: path, referencesDirectory: true)
+            return [item, reference]
+        }
+        let mcpResources = chat.mcpResourceSuggestions.map {
+            AtMentionItem(id: "mcp:\($0.id)", title: $0.title,
+                          subtitle: "MCP 资源 · \($0.serverName) · \($0.uri)",
+                          skill: nil, path: nil, mcpResource: $0)
+        }
+        return Array(skills) + files + mcpResources
+    }
+
+    @ViewBuilder
+    private var atMentionSection: some View {
+        let items = atMentionItems
+        if !items.isEmpty {
+            let selected = items.firstIndex { $0.id == atMentionSelectedID } ?? 0
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        Button { acceptAtMention(item) } label: {
+                            HStack(spacing: 8) {
+                                Text(item.title).font(.system(.body, design: .monospaced)).lineLimit(1)
+                                Text(item.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(index == selected ? Color.accentColor.opacity(0.12) : Color.clear)
+                        .accessibilityIdentifier("composer.at-mention.\(index)")
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+            }
+            .frame(maxHeight: 220)
+            .accessibilityIdentifier("composer.at-mention-completions")
+        }
+    }
+
+    private func acceptAtMention(_ item: AtMentionItem) {
+        atMentionSelectedID = nil
+        if let skill = item.skill {
+            chat.acceptSkillMention(skill)
+        } else if let path = item.path {
+            if item.referencesDirectory {
+                _ = chat.acceptDirectoryMention(path)
+            } else {
+                _ = chat.acceptFileMention(path)
+            }
+        } else if let resource = item.mcpResource {
+            chat.acceptMCPResourceMention(resource)
+        }
+    }
+
+    /// ↑↓ 选择、Tab 或回车确认、Esc 关闭；没有 @ 候选时返回 false，按键照常处理。
+    private func handleAtMentionKey(_ key: ComposerNativeKey) -> Bool {
+        let items = atMentionItems
+        guard !items.isEmpty else { return false }
+        let index = items.firstIndex { $0.id == atMentionSelectedID } ?? 0
+        switch key {
+        case .up:
+            atMentionSelectedID = items[max(0, index - 1)].id
+            return true
+        case .down:
+            atMentionSelectedID = items[min(items.count - 1, index + 1)].id
+            return true
+        case .tab:
+            acceptAtMention(items[index])
+            return true
+        case .returnKey(let option):
+            guard !option, !chat.canSubmitPresentedToolApprovalFromKeyboard else { return false }
+            acceptAtMention(items[index])
+            return true
+        case .escape:
+            atMentionDismissedDraft = chat.draftText
+            return true
+        case .shiftTab, .historySearch:
+            return false
+        }
+    }
+
+    private func slashCompletionMenu(entries: [ComposerSlashMenuEntry]) -> some View {
+        let selectedIndex = ComposerSlashCommandMenu.selectedIndex(
+            for: slashCompletionSelectedCommandID,
+            in: entries
+        ) ?? 0
+        return ScrollView {
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(slashMenuEntries.enumerated()), id: \.element.id) { index, command in
+                ForEach(Array(entries.enumerated()), id: \.element.id) { index, command in
                     Button {
                         let accepted = GlobalComposer.acceptedSlashDraft(
                             current: chat.draftText, entry: command,
@@ -1347,7 +1597,7 @@ struct GlobalComposerView: View {
                             HStack(spacing: 8) {
                                 Text("/\(command.id)")
                                     .font(.system(.body, design: .monospaced))
-                                Text(command.descriptor.zhTitle)
+                                Text(command.customCommand?.argumentHint ?? command.descriptor.zhTitle)
                                     .foregroundStyle(.secondary)
                                 Spacer(minLength: 0)
                                 Text(command.state.label)
@@ -1359,7 +1609,8 @@ struct GlobalComposerView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
-                            let detail = command.descriptor.risk?.displayLabel ?? "注册命令"
+                            let detail = command.customCommand.map { "\($0.source.displayName)命令" }
+                                ?? command.descriptor.risk?.displayLabel ?? "注册命令"
                             let trailing = command.stateReason
                                 ?? "\(command.descriptor.argumentSummary) · \(detail)"
                             Text([command.executionSummary, trailing].compactMap { $0 }.joined(separator: " · "))
@@ -1373,14 +1624,14 @@ struct GlobalComposerView: View {
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
-                        index == (slashCompletionSelectedIndex ?? 0)
+                        index == selectedIndex
                             ? Color.accentColor.opacity(0.12)
                             : Color.clear
                     )
                     .accessibilityIdentifier("composer.slash.\(command.id)")
                     .accessibilityLabel("/\(command.id) \(command.descriptor.zhTitle) \(command.descriptor.enTitle) \(command.descriptor.zhSummary)")
                     .accessibilityValue(command.accessibilityValue(
-                        isSelected: index == (slashCompletionSelectedIndex ?? 0)
+                        isSelected: index == selectedIndex
                     ))
                 }
             }
@@ -1395,8 +1646,8 @@ struct GlobalComposerView: View {
     private func slashStateColor(_ state: ComposerSlashCommandState) -> Color {
         switch state {
         case .available: .secondary
-        case .requiresApproval: .orange
-        case .blocked: .red
+        case .requiresApproval: theme?.statusWarningText ?? AppStatusColor.warning
+        case .blocked: theme?.statusDangerText ?? AppStatusColor.danger
         }
     }
 
@@ -1404,7 +1655,10 @@ struct GlobalComposerView: View {
     private func send(ownedTicket: OwnedMMActionTicket? = nil, fromKeyboard: Bool = false) {
         let ready = canSend
         chat.recordComposerSendInvocation(canSend: ready)
-        guard ready else { return }
+        guard ready else {
+            chat.noteComposerSendBlockedByAttachments()
+            return
+        }
         if let ownedTicket {
             OwnedMMOutboundContext.$action.withValue(ownedTicket) { chat.submitComposer() }
         } else if fromKeyboard {
@@ -1425,6 +1679,8 @@ struct GlobalComposerView: View {
                 }
             }
         }
+        .onAppear { chat.autoTranscribeAudioDraftsIfNeeded() }
+        .onChange(of: mediaReadiness) { _, _ in chat.autoTranscribeAudioDraftsIfNeeded() }
     }
 
     private func pendingAttachmentChip(
@@ -1441,6 +1697,8 @@ struct GlobalComposerView: View {
                 activeSessionID: chat.activeSessionID,
                 pendingAttachments: chat.pendingAttachments
             )
+            // 音频转写控件另起一行，避免撑出输入框宽度、把"预览/移除"挤出可见区。
+            VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 if let nsImage = thumbnail {
                     Image(nsImage: nsImage)
@@ -1458,12 +1716,15 @@ struct GlobalComposerView: View {
                         .lineLimit(1)
                     // 两阶段状态可见（P3-COMP-04）：pending/failed 行内显示状态文案；
                     // ready 时副标题为"大小 · 类型名"，kindLabel 不再被 size 抑制。
-                    if let statusText = att.statusText {
+                    // 失败原因只在下方的就绪说明行显示一次（警告色），这里不再重复。
+                    if att.status == .failed {
+                        EmptyView()
+                    } else if let statusText = att.statusText {
                         Text(statusText)
                             .font(typography?.caption2 ?? .system(size: 9))
                             .foregroundStyle(.tertiary)
                     } else {
-                        Text("\(ComposerAttachmentPresentation.typeLabel(for: att)) · \(att.size.map { ChatStore.formatByteCount($0) } ?? "未知大小")")
+                        Text(ComposerAttachmentPresentation.subtitle(for: att))
                             .font(typography?.caption2 ?? .system(size: 9))
                             .foregroundStyle(.tertiary)
                     }
@@ -1493,6 +1754,16 @@ struct GlobalComposerView: View {
                     for: att, mediaReadiness: mediaReadiness
                 ))
                 .accessibilityIdentifier("composer.attachment.info.\(att.id.uuidString)")
+                if att.fileURL != nil,
+                   ChatStore.canConvertToPathReference(att) {
+                    Button("改为路径引用") {
+                        chat.convertPendingAttachmentToPathReference(id: att.id)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(theme?.statusWarning ?? Color.orange)
+                    .help("不读取内容，只把文件路径发给模型，由模型用 file_read 读取")
+                    .accessibilityIdentifier("composer.attachment.convert-to-reference.\(att.id.uuidString)")
+                }
                 Button("预览") {
                     GlobalComposer.previewPendingAttachment(
                         att, expectedSessionID: sourceSessionID,
@@ -1521,6 +1792,10 @@ struct GlobalComposerView: View {
                 .buttonStyle(.plain)
                 .help("移除附件")
             }
+            if att.kind == .audio {
+                AudioTranscriptionChipControls(chat: chat, attachment: att)
+            }
+            }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(
@@ -1534,7 +1809,7 @@ struct GlobalComposerView: View {
     private func pickFiles() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
+        panel.canChooseDirectories = true
         panel.canChooseFiles = true
         panel.allowedContentTypes = [.item]
         if panel.runModal() == .OK {

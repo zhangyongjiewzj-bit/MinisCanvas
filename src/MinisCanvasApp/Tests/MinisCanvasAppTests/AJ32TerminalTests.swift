@@ -73,7 +73,7 @@ struct AJ32TerminalTests {
     }
 
     @Test func deniedCommandBlocked() {
-        for name in ["open", "osascript", "screencapture", "sudo", "shutdown", "reboot", "dd", "launchctl"] {
+        for name in ["shutdown", "reboot", "halt", "dd", "mkfs", "mount"] {
             #expect(TerminalGuard.classify("\(name) x").kind == .denied, "\(name) 应为 denied")
         }
     }
@@ -139,7 +139,7 @@ struct AJ32TerminalTests {
     @Test func deniedCommandAppearsInOutputWithoutRunning() {
         let store = TerminalStore()
         store.cwd = "/tmp"
-        store.input = "open https://example.com"
+        store.input = "shutdown now"
         store.submit()
         #expect(store.pendingConfirmation == nil)
         #expect(store.output.contains("命令被拒绝"))

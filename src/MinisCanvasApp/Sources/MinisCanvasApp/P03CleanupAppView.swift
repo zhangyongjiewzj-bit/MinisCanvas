@@ -26,7 +26,22 @@ struct P03CleanupAppView: View {
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("p03-cleanup.approval-stages")
             ScrollView {
-                if controller.rows.isEmpty { Text("当前没有已捕获的残留隔离资源。") }
+                if controller.rows.isEmpty && controller.leftovers.isEmpty { Text("当前没有已捕获的残留隔离资源。") }
+                if let recordsError = controller.recordsError {
+                    Text(recordsError).foregroundStyle(.orange).padding(10)
+                }
+                ForEach(controller.leftovers) { record in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("上次运行遗留：任务 \(record.taskID)")
+                        Text(record.workingDirectory).textSelection(.enabled)
+                        Text("分支：\(record.branch)")
+                        Text("重启后已无法自动清理（清理授权不会保存）。请在访达中核对目录内是否有要保留的改动，再自行删除；分支需要时用 git 手动处理。")
+                            .foregroundStyle(.secondary)
+                        Button("已处理，移除此记录") { controller.dismissLeftover(record.id) }
+                    }
+                    .padding(10)
+                    Divider()
+                }
                 ForEach(controller.rows) { row in
                     VStack(alignment: .leading, spacing: 6) {
                         Text("任务：\(row.snapshot.allocation.identity.taskID)")

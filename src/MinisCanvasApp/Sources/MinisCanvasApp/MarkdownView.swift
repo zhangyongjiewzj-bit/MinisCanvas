@@ -116,6 +116,8 @@ enum MarkdownParser {
                 return .code(language: language, code: code)
             case .list(let items, _):
                 return .list(items: items)
+            case .nestedList(let items):
+                return .list(items: items.map(\.text))
             case .blockquote(let s):
                 return .paragraph(s)
             case .table(let header, let rows):
@@ -157,8 +159,8 @@ struct InlineMarkdownText: View {
         for run in attr.runs {
             if run.inlinePresentationIntent?.contains(.code) == true {
                 attr[run.range].font = .system(size: baseSize - 1, design: .monospaced)
-                attr[run.range].backgroundColor = Color(nsColor: .quaternaryLabelColor).opacity(0.3)
-                attr[run.range].foregroundColor = Color(nsColor: .systemOrange)
+                attr[run.range].backgroundColor = theme?.stroke.opacity(0.6) ?? Color(nsColor: .quaternaryLabelColor).opacity(0.3)
+                attr[run.range].foregroundColor = theme?.aj38.accent.swiftUIColor ?? Color(nsColor: .systemOrange)
             }
             if run.link != nil {
                 attr[run.range].foregroundColor = theme?.aj38.accent.swiftUIColor ?? Color.accentColor
@@ -181,9 +183,21 @@ struct CodeBlockView: View {
     let language: String?
     let code: String
     var baseSize: CGFloat = 13
+    /// 对话流式中为 true：长行换行（与完成后的原生文本一致）。其余场景保持横向滚动。
+    var wrapsLongLines = false
 
     @State private var copied = false
     @Environment(\.themeTokens) private var theme
+
+    private var codeText: some View {
+        Text(code.isEmpty ? " " : code)
+            .font(.system(size: max(9, baseSize - 1), design: .monospaced))
+            .textSelection(.enabled)
+            .foregroundStyle(theme?.textPrimary ?? Color(nsColor: .textColor))
+            .padding(.horizontal, 10)
+            .padding(.vertical, ChatReadingLayout.codeVerticalPadding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -225,23 +239,24 @@ struct CodeBlockView: View {
             Divider()
                 .opacity(0.4)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(code.isEmpty ? " " : code)
-                    .font(.system(size: max(9, baseSize - 1), design: .monospaced))
-                    .textSelection(.enabled)
-                    .foregroundStyle(Color(nsColor: .textColor))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, ChatReadingLayout.codeVerticalPadding)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            if wrapsLongLines {
+                // 流式中的代码块与完成后的原生文本一致：长行在块内换行、不出横向滚动，
+                // 完成瞬间不会因换行方式切换而重排、改变消息高度。
+                codeText
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    codeText
+                }
             }
         }
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .textBackgroundColor).opacity(0.55))
+                .fill((theme?.surfaceRaised ?? Color(nsColor: .textBackgroundColor)).opacity(0.55))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .quaternaryLabelColor).opacity(0.25), lineWidth: 1)
+                .stroke(theme?.stroke ?? Color(nsColor: .quaternaryLabelColor).opacity(0.25), lineWidth: 1)
         )
     }
 }
@@ -250,6 +265,7 @@ struct CodeBlockView: View {
 
 /// 引用块：左侧强调条 + 弱化背景。
 struct BlockquoteView: View {
+    @Environment(\.themeTokens) private var theme
     let text: String
     var baseSize: CGFloat = 13
 
@@ -261,7 +277,7 @@ struct BlockquoteView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color(nsColor: .textBackgroundColor).opacity(0.35))
+                    .fill((theme?.surfaceRaised ?? Color(nsColor: .textBackgroundColor)).opacity(0.35))
             )
             .overlay(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 1)
@@ -301,10 +317,33 @@ struct MarkdownListView: View {
     }
 }
 
+/// 嵌套列表：按层级缩进，有序项保留起始序号。
+struct MarkdownNestedListView: View {
+    let items: [MarkdownListItem]
+    var baseSize: CGFloat = 13
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: ChatReadingLayout.listItemSpacing) {
+            ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+                HStack(alignment: .firstTextBaseline, spacing: ChatReadingLayout.listMarkerSpacing) {
+                    Text(item.ordered ? "\(item.number)." : (item.level == 0 ? "•" : "◦"))
+                        .font(.system(size: max(10, baseSize - 1), weight: .semibold, design: item.ordered ? .monospaced : .default))
+                        .foregroundStyle(.secondary)
+                        .frame(width: item.ordered ? 26 : 12, alignment: .trailing)
+                    InlineMarkdownText(text: item.text, baseSize: baseSize)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.leading, CGFloat(item.level) * 18)
+            }
+        }
+    }
+}
+
 // MARK: - 表格
 
 /// 表格：Grid 布局，表头加粗 + 底部分隔线，单元格支持行内样式。
 struct MarkdownTableView: View {
+    @Environment(\.themeTokens) private var theme
     let header: [String]
     let rows: [[String]]
     var baseSize: CGFloat = 13
@@ -321,7 +360,7 @@ struct MarkdownTableView: View {
             .padding(.vertical, 6)
             .overlay(alignment: .bottom) {
                 Rectangle()
-                    .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.35))
+                    .fill(theme?.stroke ?? Color(nsColor: .quaternaryLabelColor).opacity(0.35))
                     .frame(height: 1)
             }
 
@@ -340,11 +379,11 @@ struct MarkdownTableView: View {
         .padding(ChatReadingLayout.tablePadding)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(nsColor: .textBackgroundColor).opacity(0.35))
+                .fill((theme?.surfaceRaised ?? Color(nsColor: .textBackgroundColor)).opacity(0.35))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(Color(nsColor: .quaternaryLabelColor).opacity(0.25), lineWidth: 1)
+                .stroke(theme?.stroke ?? Color(nsColor: .quaternaryLabelColor).opacity(0.25), lineWidth: 1)
         )
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -360,9 +399,11 @@ struct MarkdownTableView: View {
 
 /// 分隔线：细横线，深浅色背景下均可见。
 struct MarkdownDividerView: View {
+    @Environment(\.themeTokens) private var theme
+
     var body: some View {
         Rectangle()
-            .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.4))
+            .fill(theme?.stroke ?? Color(nsColor: .quaternaryLabelColor).opacity(0.4))
             .frame(height: 1)
             .padding(.vertical, 4)
     }
@@ -375,6 +416,7 @@ struct MarkdownDividerView: View {
 struct MarkdownBlockView: View {
     let block: MinisCore.MarkdownBlock
     var baseSize: CGFloat = 13
+    var wrapsCodeLines = false
 
     var body: some View {
         switch block {
@@ -386,11 +428,13 @@ struct MarkdownBlockView: View {
         case .paragraph(let t):
             InlineMarkdownText(text: t, baseSize: baseSize)
         case .codeBlock(let language, let code):
-            CodeBlockView(language: language, code: code, baseSize: baseSize)
+            CodeBlockView(language: language, code: code, baseSize: baseSize, wrapsLongLines: wrapsCodeLines)
         case .blockquote(let t):
             BlockquoteView(text: t, baseSize: baseSize)
         case .list(let items, let ordered):
             MarkdownListView(items: items, ordered: ordered, baseSize: baseSize)
+        case .nestedList(let items):
+            MarkdownNestedListView(items: items, baseSize: baseSize)
         case .table(let header, let rows):
             MarkdownTableView(header: header, rows: rows, baseSize: baseSize)
         case .divider:
@@ -422,6 +466,8 @@ struct MarkdownBlockView: View {
 struct MarkdownTextView: View {
     let text: String
     var baseSize: CGFloat = 13
+    /// 流式中的对话正文传 true：代码块长行换行，与完成后的原生文本一致。
+    var wrapsCodeLines = false
     @State private var cache = MarkdownRenderCache()
 
     var body: some View {
@@ -440,7 +486,7 @@ struct MarkdownTextView: View {
             } else {
                 VStack(alignment: .leading, spacing: ChatReadingLayout.blockSpacing) {
                     ForEach(MarkdownRenderCache.indexed(blocks), id: \.renderID) { entry in
-                        MarkdownBlockView(block: entry.block, baseSize: baseSize)
+                        MarkdownBlockView(block: entry.block, baseSize: baseSize, wrapsCodeLines: wrapsCodeLines)
                     }
                 }
                 .frame(maxWidth: ChatReadingLayout.maxContentWidth, alignment: .leading)

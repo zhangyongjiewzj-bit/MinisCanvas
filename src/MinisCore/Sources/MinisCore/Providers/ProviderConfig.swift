@@ -17,6 +17,8 @@ public struct ProviderConfig: Identifiable, Codable, Hashable, Sendable {
     public var apiKey: String?
     public var attemptCheckpointDirectory: URL?
     public var controlledFieldLoopbackOnly: Bool
+    /// 自定义请求头与代理；缺省 = 无自定义头、跟随系统代理。
+    public var networkOptions: ProviderNetworkOptions = .default
 
     public init(
         id: String = UUID().uuidString,
@@ -49,7 +51,7 @@ public struct ProviderConfig: Identifiable, Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case id, label, providerType, runtimeProviderID, credentialType, isEnabled
-        case createdAt, customBaseURL, appendV1Suffix, apiKeyEnvVar
+        case createdAt, customBaseURL, appendV1Suffix, apiKeyEnvVar, networkOptions
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,6 +71,7 @@ public struct ProviderConfig: Identifiable, Codable, Hashable, Sendable {
         if apiKeyEnvVar == nil, Self.isDeepSeekAlias(encodedProvider) {
             apiKeyEnvVar = encodedProvider
         }
+        networkOptions = try values.decodeIfPresent(ProviderNetworkOptions.self, forKey: .networkOptions) ?? .default
         apiKey = nil
         attemptCheckpointDirectory = nil
         controlledFieldLoopbackOnly = false
@@ -86,6 +89,8 @@ public struct ProviderConfig: Identifiable, Codable, Hashable, Sendable {
         try values.encodeIfPresent(customBaseURL, forKey: .customBaseURL)
         try values.encode(appendV1Suffix, forKey: .appendV1Suffix)
         try values.encodeIfPresent(apiKeyEnvVar, forKey: .apiKeyEnvVar)
+        // 只在非默认时写，保持旧配置字节形态不变。
+        if !networkOptions.isDefault { try values.encode(networkOptions, forKey: .networkOptions) }
     }
 
     public static func canonicalProviderType(from value: String) -> ProviderType {
@@ -130,6 +135,7 @@ public struct ProviderConfig: Identifiable, Codable, Hashable, Sendable {
             result.apiKeyEnvVar = other.apiKeyEnvVar
         }
         if Self.nonemptyTrimmed(apiKey) == nil { result.apiKey = other.apiKey }
+        if networkOptions.isDefault { result.networkOptions = other.networkOptions }
         return result
     }
 

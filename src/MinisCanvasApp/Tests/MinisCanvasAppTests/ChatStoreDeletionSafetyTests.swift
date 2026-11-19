@@ -75,6 +75,36 @@ struct ChatStoreDeletionSafetyTests {
         #expect(try Data(contentsOf: activeURL) == original)
     }
 
+    /// MC4-027：归档会在停回复之前先检查磁盘；一定会失败的情形（归档目录被文件占住、已有同名文件）
+    /// 返回原因，archiveSession 不停止回复、会话保持原状。
+    @Test func archivePreflightRejectsBlockedArchiveDirectoryBeforeStoppingAnything() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("archive-preflight-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = SessionStore(directory: root)
+        let chat = ChatStore()
+        #expect(chat.attachPersistence(store))
+        chat.newSession()
+        let id = try #require(chat.activeSessionID)
+        chat.appendUser("归档预检")
+        #expect(chat.archiveDiskPreflightFailure(id: id) == nil)
+
+        let manager = SessionManager(store: store)
+        // 归档目录位置被一个普通文件占住：目录建不出来。
+        try Data("blocker".utf8).write(to: manager.archiveDirectory)
+        #expect(chat.archiveDiskPreflightFailure(id: id) != nil)
+        #expect(!chat.archiveSession(id: id))
+        #expect(chat.sessions.contains { $0.id == id })
+        #expect(chat.activeSessionID == id)
+        try FileManager.default.removeItem(at: manager.archiveDirectory)
+
+        // 归档目录里已有同名文件。
+        try FileManager.default.createDirectory(at: manager.archiveDirectory, withIntermediateDirectories: true)
+        try Data("dup".utf8).write(to: manager.archiveDirectory.appendingPathComponent("\(id.uuidString).json"))
+        #expect(chat.archiveDiskPreflightFailure(id: id) != nil)
+        #expect(!chat.archiveSession(id: id))
+        #expect(chat.sessions.contains { $0.id == id })
+    }
+
     private let now = Date(timeIntervalSince1970: 3_000)
     private let expiredAt = Date(timeIntervalSince1970: 1)
     private let unexpiredAt = Date(timeIntervalSince1970: 4_000_000_000)

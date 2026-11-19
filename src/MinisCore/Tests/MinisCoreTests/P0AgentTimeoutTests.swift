@@ -15,7 +15,45 @@ struct P0AgentTimeoutTests {
         let orchestrator = SecureAgentLoopFactory.makeOrchestrator(
             approvalDelegate: P0ApproveAllDelegate()
         )
-        #expect(orchestrator.childTimeout == SecureAgentLoopFactory.defaultTimeout)
+        #expect(orchestrator.childTimeout == SecureAgentLoopFactory.defaultChildTimeout)
+    }
+
+    @Test("child tasks are no longer capped at 16 requests or 300 seconds")
+    func childLimitsFollowTheMainSession() {
+        #expect(AgentOrchestrator.hardMaxChildTimeout >= 3600)
+        #expect(AgentOrchestrator.hardMaxChildBudgetRequests > 16)
+        #expect(AgentOrchestrator(childTimeout: 1800).childTimeout == 1800)
+        let orchestrator = SecureAgentLoopFactory.makeOrchestrator(approvalDelegate: P0ApproveAllDelegate())
+        #expect(orchestrator.maxIterationsPerTask == AgentOrchestrator.hardMaxIterationsPerTask)
+    }
+
+    @Test("sub-agent dispatch and MCP tools are not cut by the other-tool timeout")
+    func orchestrateAndMCPAreExcludedFromOtherToolTimeout() {
+        var loop = SecureAgentLoopFactory.make(approvalGate: ApprovalGate())
+        loop.timeout = 900
+        loop.otherToolTimeout = 1
+        #expect(loop.toolTimeout(for: OrchestrationToolExecutor.toolName) == nil)
+        #expect(loop.toolTimeout(for: "mcp_server_tool") == nil)
+        #expect(loop.toolTimeout(for: "file_read") == 1)
+        #expect(loop.toolTimeout(for: "shell_execute") == 900)
+    }
+
+    @Test("F-08: a child loop's single request and ordinary tools keep the main-chat limits, not the 2 hour task limit")
+    func childLoopKeepsRequestAndToolLimitsSeparateFromTaskDeadline() {
+        let full = AgentOrchestrator.childLoopTimeouts(taskTimeout: AgentOrchestrator.hardMaxChildTimeout)
+        #expect(full.request == 900)
+        #expect(full.otherTool == 300)
+        // 子任务自己剩余的时间更短时，单次请求和工具不能比它还长。
+        let short = AgentOrchestrator.childLoopTimeouts(taskTimeout: 120)
+        #expect(short.request == 120 && short.otherTool == 120)
+        // 装到循环上之后：普通工具 300 秒，命令行和浏览器仍按请求时限，派发和 MCP 不受限。
+        var loop = SecureAgentLoopFactory.make(approvalGate: ApprovalGate())
+        loop.timeout = full.request
+        loop.otherToolTimeout = full.otherTool
+        #expect(loop.toolTimeout(for: "file_read") == 300)
+        #expect(loop.toolTimeout(for: "shell_execute") == 900)
+        #expect(loop.toolTimeout(for: OrchestrationToolExecutor.toolName) == nil)
+        #expect(AgentOrchestrator.hardMaxChildTimeout == 7200)
     }
 
     @Test("tool timeout returns before an executor that ignores cancellation")

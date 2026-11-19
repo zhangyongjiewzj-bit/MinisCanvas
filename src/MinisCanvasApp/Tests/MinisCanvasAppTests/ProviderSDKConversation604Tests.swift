@@ -52,7 +52,7 @@ private final class Provider604Wire: URLProtocol, @unchecked Sendable {
             let response = HTTPURLResponse(url: url, statusCode: 200,
                 httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "text/event-stream"])!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            let text = held ? "partial604" : "completed604"
+            let text = held ? "partial604 " : "completed604"
             let delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\(text)\"},\"finish_reason\":null}]}\n\n"
             client?.urlProtocol(self, didLoad: Data(delta.utf8))
             if !held {

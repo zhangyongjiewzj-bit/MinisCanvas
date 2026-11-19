@@ -163,7 +163,9 @@ struct Policy08BudgetBoundary2923Tests {
                     #expect(reopened.facts.isEmpty)
                     #expect(observation.refusals.count == iterations)
                     #expect(observation.refusals.map(\.0) == (1...iterations).map { "boundary-call-\($0)" })
-                    #expect(observation.refusals.allSatisfy { $0.1 == .blockedBeforeExecution })
+                    // U-17：拦截带固定原因分类，随场景对应授权错误。
+                    let expectedCategory: ToolBlockCategory = scenario == "noGrant" ? .notGranted : .needsApproval
+                    #expect(observation.refusals.allSatisfy { $0.1 == .blockedByPolicy(expectedCategory) })
                     let refusal = scenario == "noGrant"
                         ? ComposerAuthorizationError.missingCapabilityGrant("file_read")
                         : ComposerAuthorizationError.approvalRequired("file_read")

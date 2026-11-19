@@ -25,6 +25,18 @@ private struct ComposerSyntheticVideoSource: MediaVideoFrameSource {
     }
 }
 
+/// 画面不动的视频：请求 3 秒处取到的仍是 1 秒处那一帧（系统录屏的行为）。
+private struct ComposerStillVideoSource: MediaVideoFrameSource {
+    func durationSeconds() async throws -> Double { 6 }
+
+    func pngFrame(at seconds: Double, maxPixelSize: Int) async throws -> MediaVideoFrameSample {
+        let actual: Double = seconds < 5 ? 1.125 : 5.125
+        return MediaVideoFrameSample(
+            pngData: try ComposerMediaFixtures589.png(color: actual / 6),
+            actualSeconds: actual, pixelWidth: 8, pixelHeight: 8)
+    }
+}
+
 @Suite("D-MULTIMODAL-06 App video frame consumer")
 @MainActor
 struct ComposerVideoFrameConsumerTests {
@@ -67,7 +79,7 @@ struct ComposerVideoFrameConsumerTests {
         #expect(frames.map(\.timecodeSeconds) == [1.125, 3.125, 5.125])
         #expect(frames.map(\.pixelWidth) == [8, 8, 8])
         #expect(frames.reduce(0) { $0 + ($1.pngData?.count ?? 0) } <= 2_097_152)
-        #expect(attachment.statusText?.contains("00:03.125") == true)
+        #expect(attachment.statusText?.contains("至 00:05.125") == true)
         #expect(ComposerAttachmentPresentation.status(for: attachment) == .sampledVideoFrames)
         let accessibility = ComposerAttachmentPresentation.accessibilityValue(for: attachment)
         #expect(accessibility.contains("00:01.125"))
@@ -641,5 +653,97 @@ private final class VideoOwnedRequestProtocol: URLProtocol, @unchecked Sendable 
             body.append(buffer, count: count)
         }
         return body
+    }
+}
+
+extension ComposerVideoFrameConsumerTests {
+    @Test("M-08: a still video whose samples land on the same frame is ready with the distinct frames only")
+    func stillVideoKeepsDistinctFramesInsteadOfFailing() async throws {
+        let attachment = await ChatStore.resolveVideoAttachment(
+            id: UUID(), url: fixtureURL, name: "still.mp4", mime: "video/mp4", size: nil,
+            source: ComposerStillVideoSource())
+        #expect(attachment.status == .ready)
+        let frames = try #require(attachment.videoFrames)
+        #expect(frames.map(\.timecodeSeconds) == [1.125, 5.125])
+        #expect(attachment.videoImageAttachments?.count == 2)
+        #expect(attachment.occupiesVideoPayloadSlots)
+    }
+
+    @Test("M-09: video frame validation is reused for identical frames but never for changed bytes or audio")
+    func videoValidationMemoIsKeyedOnEveryInput() async throws {
+        let attachment = await resolved()
+        let first = try #require(attachment.videoImageAttachments)
+        let second = try #require(attachment.videoImageAttachments)
+        #expect(first.map(\.data) == second.map(\.data))
+
+        // 同一个 id、同一批摘要，但第 2 帧换了字节：必须重新校验并判不合格，不能沿用上次的"合格"。
+        var frames = try #require(attachment.videoFrames)
+        let other = try ComposerMediaFixtures589.png(color: 0.9)
+        frames[1] = frames[1].withPayload(other)
+        let tampered = ChatAttachment(
+            id: attachment.id, kind: .file, fileName: attachment.fileName, fileType: .video,
+            mimeType: attachment.mimeType, size: attachment.size, fileURL: attachment.fileURL,
+            videoFrames: frames, videoContext: attachment.videoContext)
+        #expect(tampered.videoImageAttachments == nil)
+        // 原附件仍然合格。
+        #expect(attachment.videoImageAttachments?.count == 3)
+    }
+
+    @Test("frame count grows with duration: about one per ten seconds, between 3 and 12")
+    func frameCountGrowsWithDuration() {
+        #expect(ChatStore.videoFrameCountFor(duration: 2) == 3)
+        #expect(ChatStore.videoFrameCountFor(duration: 45) == 5)
+        #expect(ChatStore.videoFrameCountFor(duration: 600) == 12)
+        let times = ChatStore.videoFrameTimes(duration: 120, count: 12)
+        #expect(times.count == 12)
+        #expect(times == times.sorted())
+        #expect((times.first ?? 0) > 0 && (times.last ?? 999) < 120)
+    }
+
+    @Test("a model without image input gets a path reference; one without audio loses only the soundtrack")
+    func videoAdaptsToModelCapabilities() async throws {
+        let video = await resolved()
+        let reference = ChatStore.adaptingVideo(video, supported: .textOnly)
+        #expect(reference.attachment.videoFrames == nil)
+        #expect(reference.attachment.status == .ready)
+        #expect(reference.attachment.fileURL == video.fileURL)
+        #expect(reference.note?.contains("路径引用") == true)
+        #expect(ChatStore.adaptingVideo(video, supported: .vision).note == nil)
+
+        let audio = MediaVideoAudioTrack(startSeconds: 0, endSeconds: 1, data: Data(repeating: 1, count: 100))
+        let context = MediaVideoSupplementaryContext(
+            durationSeconds: 6, audioState: .extracted, subtitleState: .absent, audio: audio, subtitles: [])
+        let withAudio = ChatAttachment(
+            id: video.id, kind: .file, fileName: video.fileName, fileType: .video, mimeType: video.mimeType,
+            fileURL: video.fileURL, videoFrames: video.videoFrames, videoContext: context)
+        let stripped = ChatStore.adaptingVideo(withAudio, supported: .vision)
+        #expect(stripped.attachment.videoFrames?.count == 3)
+        #expect(stripped.attachment.videoContext?.audio == nil)
+        #expect(stripped.attachment.videoContext?.audioState == .unavailable)
+        #expect(stripped.note?.contains("音轨") == true)
+        #expect(ChatStore.adaptingVideo(withAudio, supported: .vision.union(.audioInput)).note == nil)
+    }
+
+    @Test("containers AVFoundation cannot decode become a path reference without a frame attempt")
+    func unsupportedContainerBecomesPathReference() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("w1-mkv-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("clip.mkv")
+        try Data([0, 1, 2, 3]).write(to: url)
+        let chat = ChatStore()
+        // A frame attempt would fail this factory and leave the item failed.
+        chat.videoFrameSourceFactory = { _ in throw MediaVideoExtractionFailure.unreadableSource }
+        chat.addAttachments(urls: [url])
+        for _ in 0..<200 where chat.pendingAttachments.first?.status == .pending
+            || chat.pastedTextActionFeedback == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let item = try #require(chat.pendingAttachments.first)
+        #expect(item.status == .ready && item.fileType == .video && item.videoFrames == nil)
+        #expect(chat.canSubmitComposerAttachments)
+        #expect(chat.pastedTextActionFeedback?.contains("路径引用") == true)
+        let content = ChatStore.composeUserContent(text: "", attachments: [item])
+        #expect(content.contains(url.path) && content.contains("ffmpeg"))
     }
 }

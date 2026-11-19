@@ -13,7 +13,7 @@ struct ComposerPolicyContractTests {
     func nativeChoiceCommitContract() throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let baseButton = try fixture.button("Composer 任务模式")
+        let baseButton = try fixture.button("任务模式")
         let button = try #require(baseButton as? ComposerPolicyIdentityButton)
         let menu = try #require(button.menu as? ComposerPolicyChoiceMenu)
         let original = fixture.chat.composerPolicySelection
@@ -69,7 +69,7 @@ struct ComposerPolicyContractTests {
     func nativeAppKitChoicePersists(route: PolicyMenuNativeOpen) throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try #require(fixture.button("Composer 工作量") as? ComposerPolicyIdentityButton)
+        let button = try #require(fixture.button("工作量") as? ComposerPolicyIdentityButton)
         let menu = try #require(button.menu as? ComposerPolicyChoiceMenu)
         let original = fixture.chat.composerPolicySelection
         let forwarding = try PolicyMenuActionCounter(button: button)
@@ -107,7 +107,7 @@ struct ComposerPolicyContractTests {
     func nativeChoiceCancellationClosesActionLease() throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try #require(fixture.button("Composer 工作量") as? ComposerPolicyIdentityButton)
+        let button = try #require(fixture.button("工作量") as? ComposerPolicyIdentityButton)
         let menu = try #require(button.menu as? ComposerPolicyChoiceMenu)
         let original = fixture.chat.composerPolicySelection
         // AX can return false before AppKit starts its asynchronous tracking.
@@ -140,7 +140,7 @@ struct ComposerPolicyContractTests {
     func nativeChoiceRejectsChangedWitness(change: PolicyMenuNativeInvalidation) throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try #require(fixture.button("Composer 工作量") as? ComposerPolicyIdentityButton)
+        let button = try #require(fixture.button("工作量") as? ComposerPolicyIdentityButton)
         let menu = try #require(button.menu as? ComposerPolicyChoiceMenu)
         let original = fixture.chat.composerPolicySelection
         #expect(button.performNativeOwnedChoice { choice in
@@ -211,7 +211,7 @@ struct ComposerPolicyContractTests {
         let draft = fixture.chat.draftText
         let messages = fixture.chat.messages.map(\.id)
         #expect(fixture.buttons("Composer 审批范围").isEmpty)
-        for (label, index) in [("Composer 任务模式", 1), ("Composer 工作量", 2)] {
+        for (label, index) in [("任务模式", 1), ("工作量", 2)] {
             let button = try fixture.button(label)
             let menu = try #require(button.menu)
             let selected = button.indexOfSelectedItem
@@ -222,7 +222,7 @@ struct ComposerPolicyContractTests {
             })
             var expected = original
             switch label {
-            case "Composer 任务模式": expected.mode = ComposerTaskMode.allCases[index]
+            case "任务模式": expected.mode = ComposerTaskMode.allCases[index]
             default: expected.effort = ComposerEffort.allCases[index]
             }
             #expect(fixture.chat.composerPolicySelection == expected)
@@ -243,7 +243,7 @@ struct ComposerPolicyContractTests {
     func productionMenuForeignWindowRejected() throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try fixture.button("Composer 任务模式")
+        let button = try fixture.button("任务模式")
         let menu = try #require(button.menu)
         let foreign = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 310, height: 260),
                                styleMask: [.titled], backing: .buffered, defer: false)
@@ -259,7 +259,7 @@ struct ComposerPolicyContractTests {
     func productionMenuReplacementRejected() throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try fixture.button("Composer 任务模式")
+        let button = try fixture.button("任务模式")
         let originalMenu = try #require(button.menu)
         button.menu = NSMenu(title: "foreign")
         #expect(fixture.failure(button, originalMenu) == "BUTTON_MENU_MISMATCH")
@@ -270,7 +270,7 @@ struct ComposerPolicyContractTests {
     func productionMenuStaleGenerationRejected() throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try fixture.button("Composer 任务模式")
+        let button = try fixture.button("任务模式")
         let menu = try #require(button.menu)
         #expect(fixture.failure(button, menu) == nil)
         fixture.expectRejected(button, menu, currentGeneration: false)
@@ -280,7 +280,7 @@ struct ComposerPolicyContractTests {
     func productionMenuClosedWindowRejected() throws {
         let fixture = try PolicyMenuOwnerContractFixture()
         defer { fixture.close() }
-        let button = try fixture.button("Composer 任务模式")
+        let button = try fixture.button("任务模式")
         let menu = try #require(button.menu)
         fixture.window.close()
         #expect(fixture.failure(button, menu) != nil)
@@ -1127,7 +1127,7 @@ private final class PolicyMenuOwnerContractFixture {
         window.setAccessibilityIdentifier("uf03-owned-" + caseID)
         window.orderFront(nil)
         host.layoutSubtreeIfNeeded()
-        do { _ = try button("Composer 任务模式") }
+        do { _ = try button("任务模式") }
         catch { window.close(); throw error }
     }
 

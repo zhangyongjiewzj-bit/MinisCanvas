@@ -155,4 +155,24 @@ struct ChatHistoryPreprocessing3072Tests {
         #expect(text == "history3072-complete")
         #expect(await recorder.requests == [input.map { $0.asLLMMessage() }])
     }
+
+    @Test func providerHistoryDropsTheDisplayedErrorLineButKeepsModelText() throws {
+        let kept = ChatMessageUI(role: .assistant, content: "已完成前半部分\n\n**错误**（服务商）: 网络请求未完成")
+        let errorOnly = ChatMessageUI(role: .assistant, content: "\n\n**错误**：额度不足")
+        let user = ChatMessageUI(role: .user, content: "你好")
+        let messages = try ChatHistoryPreprocessor.projectProviderHistory([user, errorOnly, kept])
+        #expect(messages.count == 2)
+        #expect(messages.last?.content == "已完成前半部分")
+        // 画面上的错误行不受影响。
+        #expect(kept.content.contains("**错误**"))
+    }
+
+    @Test func markdownExportUsesDisplayContentAndSkipsWelcome() {
+        let redactor = ChatTranscriptRedactor(secretValues: [])
+        let welcome = ChatMessageUI(role: .assistant, content: ChatStore.welcomeText)
+        let markdown = SessionMarkdownExport.markdown(
+            title: "导出", messages: [welcome, ChatMessageUI(role: .user, content: "你好")], redactor: redactor)
+        #expect(!markdown.contains(ChatStore.welcomeText))
+        #expect(markdown.contains("你好"))
+    }
 }

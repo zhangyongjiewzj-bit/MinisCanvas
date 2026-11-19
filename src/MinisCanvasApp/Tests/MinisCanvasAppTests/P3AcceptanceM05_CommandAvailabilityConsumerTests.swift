@@ -110,7 +110,7 @@ struct P3AcceptanceM05_CommandAvailabilityConsumerTests {
             snapshot: snapshot,
             facts: facts
         )
-        #expect(noExecutor.contains("当前阻断：暂不可用，请在设置→智能体调整自主权上限。"))
+        #expect(noExecutor.contains("当前阻断：暂不可用，请在设置→智能体调整最高模式。"))
         #expect(!noExecutor.contains("合成配置阻断"))
         #expect(center.pendingAdjudication == nil)
     }

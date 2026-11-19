@@ -453,7 +453,7 @@ struct FloatingMenuRow: View {
                     Image(systemName: icon)
                         .font(.system(size: 12))
                         .frame(width: 16)
-                        .foregroundStyle(role == .destructive ? Color.red.opacity(0.9) : textColor.opacity(0.75))
+                        .foregroundStyle(role == .destructive ? (theme?.statusDanger ?? AppStatusColor.danger).opacity(0.9) : textColor.opacity(0.75))
                 case .none:
                     EmptyView()
                 }

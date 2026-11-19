@@ -19,6 +19,8 @@ private final class FactContextProvider: LLMProvider, ProviderRuntimeConfigurati
     private(set) var streamCallCount = 0
     var dialogueUsage: LLMUsage?
     var beforeDialogueResponse: (@Sendable () async throws -> Void)?
+    /// 摘要请求返回之前执行（模拟摘要期间任务换了状态）。
+    var beforeSummaryResponse: (@Sendable () async throws -> Void)?
     private func captureProviderArguments2932(
         messages: [LLMMessage], systemPrompt: String?, tools: [AgentToolDefinition]?,
         maxTokens: Int, temperature: Double?
@@ -48,6 +50,7 @@ private final class FactContextProvider: LLMProvider, ProviderRuntimeConfigurati
             tools: nil, maxTokens: maxTokens, temperature: temperature)
         requests.append(messages)
         summaryRequests.append(messages)
+        try await beforeSummaryResponse?()
         return try response()
     }
 
@@ -258,7 +261,10 @@ struct CompactionProductionFactConsumerTests {
         try await runAutomatic(f, engine: engine, provider: provider)
         let checkpoint = try #require(try f.sessions.loadLatestCompactionCheckpoint(sessionID: source.id))
         #expect(checkpoint.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion)
-        #expect(checkpoint.retentionFacts?.count == 2)
+        // 压缩后只带未完成的任务；账本里已成功的回执（read-done）不再进背景。
+        #expect(checkpoint.retentionFacts?.count == 1)
+        #expect(checkpoint.retentionFacts?.first?.kind == .unfinishedTask)
+        #expect(checkpoint.retentionFacts?.contains { $0.source?.effect != nil } == false)
         #expect(checkpoint.sourceTranscriptRevision == source.transcriptRevision)
         #expect(checkpoint.retentionFacts?.allSatisfy { $0.source?.matchesTranscript(source.messages) == true } == true)
         #expect(provider.summaryRequests.count == 1)
@@ -271,7 +277,8 @@ struct CompactionProductionFactConsumerTests {
         // summary request whole, and the continued request carries only the summary.
         #expect(provider.summaryRequests.flatMap { $0 }.contains { $0.content.contains("Earlier authorization was read-only") })
         #expect(continued.contains { $0.content.contains("<context-summary>") })
-        #expect(continued.contains { $0.content.contains(oldFacts[0].receiptID) })
+        #expect(continued.contains { $0.content.contains("compare-open") })
+        #expect(!continued.contains { $0.content.contains(oldFacts[0].receiptID) })
         #expect(Compactor.hasMaterialRequestReduction(from: source.messages, to: continued))
         #expect(await tracker.budget.usedRequests == provider.requests.count)
         #expect(await tracker.pendingRequestCount == 0)
@@ -282,6 +289,61 @@ struct CompactionProductionFactConsumerTests {
         #expect(restarted.loadSession(id: source.id)?.messages == source.messages)
         #expect(try ChatSessionBridge.resumeCanonicalMessages(sessionStore: restarted,
             sessionID: source.id, taskStore: f.tasks, effectLedger: f.ledger) == checkpoint.replacementHistory)
+    }
+
+    /// F-03：回合内压缩的摘要请求进行期间，本会话的任务换了状态（排队改成运行）。
+    /// 提交后重读重建的背景和检查点里存的不同，这不算不一致：压缩照常成功，不隔离会话，回合继续。
+    @Test func taskStateChangingDuringTheSummaryDoesNotFailTheInLoopCompactionOrIsolateTheSession() async throws {
+        let f = try fixture(currentWriteGrant: true)
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let source = try #require(f.sessions.loadSession(id: f.id.uuidString))
+        let provider = FactContextProvider()
+        provider.proposeWritePath = f.root.appendingPathComponent("auto-must-not-exist.txt").path
+        let tasks = f.tasks
+        provider.beforeSummaryResponse = {
+            _ = try tasks.startRun(taskID: "compare-open", parentID: "parent", runID: "compare-run")
+        }
+        let (engine, _) = automaticEngine(f)
+        try await runAutomatic(f, engine: engine, provider: provider)
+        let checkpoint = try #require(try f.sessions.loadLatestCompactionCheckpoint(sessionID: source.id))
+        #expect(checkpoint.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion)
+        // 检查点里存的是摘要请求之前取的状态（排队）；之后重建的背景是运行中。
+        #expect(checkpoint.retentionFacts?.contains { $0.text.contains("status=queued") } == true)
+        let rebuilt = try ChatSessionBridge.resumeCanonicalMessages(sessionStore: f.sessions,
+            sessionID: source.id, taskStore: f.tasks, effectLedger: f.ledger)
+        #expect(rebuilt.contains { $0.content.contains("status=running") })
+        #expect(ChatSessionBridge.resumedMatchesCheckpoint(rebuilt, checkpoint: checkpoint, live: []))
+        #expect(provider.dialogueRequests.count == 2)
+        // 会话没有被隔离：规范记录原样还在。
+        #expect(f.sessions.loadSession(id: source.id)?.messages == source.messages)
+    }
+
+    @Test func resumedBackgroundComparisonIgnoresTheBackgroundButNotTheSummaryOrTail() {
+        let summary = LLMMessage(role: .user, content: "<context-summary>\n摘要\n</context-summary>")
+        let oldBackground = LLMMessage(role: .user, content: "<retained-store-facts>\nstatus=queued\n</retained-store-facts>")
+        let newBackground = LLMMessage(role: .user, content: "<retained-store-facts>\nstatus=running\n</retained-store-facts>")
+        let tail = [LLMMessage(role: .user, content: "问"), LLMMessage(role: .assistant, content: "答")]
+        let live = [LLMMessage(role: .assistant, content: "实时")]
+        let checkpoint = CompactionCheckpoint(
+            schemaVersion: CompactionCheckpoint.lossySummarySchemaVersion, sessionID: "s",
+            sourceTranscriptRevision: 1, resultTranscriptRevision: 2, compactedThroughMessageID: "m",
+            compactedMessageRange: 0..<3, summaryMessage: summary,
+            replacementHistory: [summary, oldBackground] + tail, projectionRecentCount: tail.count,
+            contentDigest: "")
+        #expect(ChatSessionBridge.resumedMatchesCheckpoint(
+            [summary, newBackground] + tail + live, checkpoint: checkpoint, live: live))
+        // 背景没有了（任务都结束了）也算一致。
+        #expect(ChatSessionBridge.resumedMatchesCheckpoint([summary] + tail + live, checkpoint: checkpoint, live: live))
+        // 摘要或尾部不同仍然不一致。
+        let otherSummary = LLMMessage(role: .user, content: "<context-summary>\n别的\n</context-summary>")
+        #expect(!ChatSessionBridge.resumedMatchesCheckpoint(
+            [otherSummary, newBackground] + tail + live, checkpoint: checkpoint, live: live))
+        #expect(!ChatSessionBridge.resumedMatchesCheckpoint(
+            [summary, newBackground, tail[0], LLMMessage(role: .assistant, content: "改过")] + live,
+            checkpoint: checkpoint, live: live))
+        // 多出来的不是背景的消息不算。
+        #expect(!ChatSessionBridge.resumedMatchesCheckpoint(
+            [summary, LLMMessage(role: .user, content: "夹带")] + tail + live, checkpoint: checkpoint, live: live))
     }
 
     @Test func secondBudgetAutoRebuildsFromCanonicalAfterLongNewConversation() async throws {
@@ -319,10 +381,13 @@ struct CompactionProductionFactConsumerTests {
         #expect(second.sourceTranscriptRevision == source.transcriptRevision)
         #expect(provider.dialogueRequests.first == previousModel)
         #expect(provider.summaryRequests.count == 1)
-        #expect(provider.summaryRequests.flatMap { $0 }.contains { $0.content.contains("observed coefficient 31") })
+        // 长02：第二次摘要基于上一份摘要，已覆盖的原始消息不再重复送入，新增内容照常送入。
+        #expect(provider.summaryRequests.flatMap { $0 }.contains { $0.content.contains("【此前摘要") })
+        #expect(provider.summaryRequests.flatMap { $0 }.contains { $0.content.contains("New alternative 20") })
         #expect(!provider.summaryRequests.flatMap { $0 }.contains { $0.content.contains("<context-summary>") })
-        #expect(second.retentionFacts?.allSatisfy { $0.source?.matchesTranscript(source.messages) == true } == true)
-        #expect(second.retentionFacts?.contains { $0.kind == .taskState && $0.text.contains("status=succeeded") } == true)
+        // 任务已成功结束、回执也都成功：第二次压缩不再带任何事实，背景消息随之消失。
+        #expect(second.retentionFacts == [])
+        #expect(!second.replacementHistory.contains { $0.content.contains("<retained-store-facts>") })
         let lastDialogue = try #require(provider.dialogueRequests.last)
         #expect(!lastDialogue.contains { $0.content.contains("status=queued") })
         #expect(Compactor.hasMaterialRequestReduction(from: previousModel, to: second.replacementHistory))
@@ -671,7 +736,7 @@ struct CompactionProductionFactConsumerTests {
             let checkpoint = try #require(try f.sessions.loadLatestCompactionCheckpoint(sessionID: f.id.uuidString))
             #expect(checkpoint.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion)
             #expect(checkpoint.sourceTranscriptRevision > before.transcriptRevision)
-            #expect(checkpoint.retentionFacts?.count == 2)
+            #expect(checkpoint.retentionFacts?.count == 1)   // 只有未完成的任务，成功回执不带
             #expect(checkpoint.retentionFacts?.allSatisfy { $0.source?.matchesTranscript(
                 Array(canonical.messages.dropLast())) == true } == true)
             #expect(summary.summaryRequests.count == 1)
@@ -833,12 +898,22 @@ struct CompactionProductionFactConsumerTests {
         try await manualEntryFeedsNextProductionRequest405(requiresComposerApproval: false)
     }
 
+    // 11/16 用户决定：用户 /compact 免卡，本测试改为非用户来源（恢复/直接评估）的 compact：
+    // 仍挂审批卡，批准后喂给下一次真实请求，且审批只消费一次。
     @Test("405 approved Composer compact feeds the next actual request and consumes approval once")
     func approvedComposerCompactFeedsNextProductionRequestAndConsumesApproval405() async throws {
         try await manualEntryFeedsNextProductionRequest405(requiresComposerApproval: true)
     }
 
-    private func manualEntryFeedsNextProductionRequest405(requiresComposerApproval: Bool) async throws {
+    // 11/16 用户决定：用户自己键入的 /compact 直接执行、无审批卡，同样喂给下一次真实请求。
+    @Test("405 user-typed Composer compact runs without approval and feeds the next actual request")
+    func userTypedComposerCompactFeedsNextProductionRequestWithoutApproval405() async throws {
+        try await manualEntryFeedsNextProductionRequest405(requiresComposerApproval: true, userOwnCompact: true)
+    }
+
+    private func manualEntryFeedsNextProductionRequest405(
+        requiresComposerApproval: Bool, userOwnCompact: Bool = false
+    ) async throws {
         let f = try fixture(currentWriteGrant: true)
         defer { try? FileManager.default.removeItem(at: f.root) }
         // Retain the real production engine/stores. An unlimited pause policy
@@ -858,7 +933,13 @@ struct CompactionProductionFactConsumerTests {
             chat.composerPolicySelection = .init(mode: .manual, approvalScope: .request,
                 effort: .standard, bypassModeConfirmed: false)
             chat.onComposerCommandPolicy = { request, snapshot in
-                center.evaluate(request: request, snapshot: snapshot, facts: chat.composerPolicyFacts)
+                if userOwnCompact {
+                    return center.evaluate(request: request, snapshot: snapshot, facts: chat.composerPolicyFacts)
+                }
+                // 清空“用户提交”标记，模拟恢复自磁盘/非用户来源的 compact。
+                return ChatStore.$userComposerCommandRequestID.withValue(nil) {
+                    center.evaluate(request: request, snapshot: snapshot, facts: chat.composerPolicyFacts)
+                }
             }
             center.canReplayIntoComposer = {
                 chat.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -870,16 +951,22 @@ struct CompactionProductionFactConsumerTests {
             }
             chat.draftText = "/compact"
             chat.submitComposer()
-            #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
-            #expect(chat.pendingComposerCommand?.commandID == "compact")
-            #expect(center.pendingAdjudication?.commandID == "compact")
-            #expect(summaryProvider.requests.isEmpty)
-            #expect(chat.messages(forSession: f.id)?.filter { $0.role != .system } == before)
-            #expect(center.approveCurrentAdjudication())
-            #expect(center.lastResolution?.outcome == .approvedExecuted)
-            #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
-            #expect(chat.pendingComposerCommand == nil)
-            #expect(center.pendingAdjudication == nil)
+            if userOwnCompact {
+                #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+                #expect(chat.pendingComposerCommand == nil)
+                #expect(center.pendingAdjudication == nil)
+            } else {
+                #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
+                #expect(chat.pendingComposerCommand?.commandID == "compact")
+                #expect(center.pendingAdjudication?.commandID == "compact")
+                #expect(summaryProvider.requests.isEmpty)
+                #expect(chat.messages(forSession: f.id)?.filter { $0.role != .system } == before)
+                #expect(center.approveCurrentAdjudication())
+                #expect(center.lastResolution?.outcome == .approvedExecuted)
+                #expect(chat.lastComposerCommandReceipt?.disposition == .execute)
+                #expect(chat.pendingComposerCommand == nil)
+                #expect(center.pendingAdjudication == nil)
+            }
         } else {
             // ContextPanelView.onCompact calls this exact default-argument
             // entry. This is an App-host action test, not a native button click.
@@ -893,7 +980,7 @@ struct CompactionProductionFactConsumerTests {
         #expect(checkpoint.schemaVersion == CompactionCheckpoint.lossySummarySchemaVersion)
         #expect(checkpoint.sourceTranscriptRevision == source.transcriptRevision)
         #expect(checkpoint.projectionSpans == nil)
-        #expect(checkpoint.retentionFacts?.count == 2)
+        #expect(checkpoint.retentionFacts?.count == 1)   // 只有未完成的任务，成功回执不带
         #expect(checkpoint.retentionFacts?.allSatisfy { $0.source?.matchesTranscript(source.messages) == true } == true)
         #expect(summaryProvider.summaryRequests.count == 1)
         #expect(summaryProvider.dialogueRequests.isEmpty)
@@ -901,10 +988,10 @@ struct CompactionProductionFactConsumerTests {
             // M13: once the approved /compact has an outcome, the bottom-right
             // projection must no longer claim the command is still executing.
             var projected = center.projection?.text
-            for _ in 0..<100 where projected?.contains("正通过规范 Composer 路径执行") == true {
+            for _ in 0..<100 where projected?.contains("正通过规范路径执行") == true {
                 try await Task.sleep(for: .milliseconds(20)); projected = center.projection?.text
             }
-            #expect(projected?.contains("正通过规范 Composer 路径执行") != true)
+            #expect(projected?.contains("正通过规范路径执行") != true)
         }
         #expect(summaryProvider.streamCallCount == 0)
         #expect(!summaryProvider.requests.flatMap { $0 }.contains { $0.content == "/compact" })
@@ -947,7 +1034,7 @@ struct CompactionProductionFactConsumerTests {
         #expect(continued.filter { $0.toolCalls.contains { $0.id == "new-write" } }.count == 1)
         #expect(continued.filter { $0.toolCallID == "new-write" }.count == 1)
         #expect(continued.contains { $0.toolCallID == "new-write" && $0.content.contains("dry-run") })
-        #expect(continued.contains { $0.content.contains(oldFacts[0].receiptID) })
+        #expect(!continued.contains { $0.content.contains(oldFacts[0].receiptID) })
         #expect(f.executor.count == 0)
         #expect(f.ledger.facts == oldFacts)
         #expect(!FileManager.default.fileExists(atPath: writePath.path))
@@ -967,7 +1054,9 @@ struct CompactionProductionFactConsumerTests {
         #expect(Array(reopenedView.suffix(2)) == Array(canonical.messages.suffix(2)))
         #expect(reopenedView.count == modelView.count + 2)
 
-        if let center {
+        // 第二次提交用来验证"批准只消费一次、再提交要重新审批"，只适用于非用户来源的 compact；
+        // 11/16 起用户自己提交的 /compact 免卡，那条路径由默认参数的用例覆盖这段断言。
+        if let center, !userOwnCompact {
             chat.draftText = "/compact"
             chat.submitComposer()
             #expect(chat.lastComposerCommandReceipt?.disposition == .pending)
@@ -1044,7 +1133,7 @@ struct CompactionProductionFactConsumerTests {
         #expect(secondProvider.dialogueRequests.count == 2)
         #expect(secondProvider.summaryRequests.count == 1)
         let summaryInput = secondProvider.summaryRequests.flatMap { $0 }
-        #expect(summaryInput.contains { $0.content.contains("observed coefficient 31") })
+        #expect(summaryInput.contains { $0.content.contains("【此前摘要") })
         #expect(summaryInput.contains { $0.content.contains("Second ordinary option 50") })
         #expect(!summaryInput.contains { $0.content.contains("<context-summary>") })
         let secondUI = try #require(chat.messages(forSession: f.id)?.filter { $0.role != .system })
@@ -1237,7 +1326,7 @@ struct CompactionProductionFactConsumerTests {
         let provider = FactContextProvider()
         let compacted = try await result(f, provider: provider)
         #expect(compacted.refusalReason == nil)
-        #expect(compacted.retentionFacts?.count == 2)
+        #expect(compacted.retentionFacts?.count == 1)   // 只有未完成的任务，成功回执不带
         let canonical = try #require(f.sessions.loadSession(id: f.id.uuidString))
         _ = try ChatSessionBridge.saveCanonicalCompactionCheckpoint(sessionStore: f.sessions,
             sessionID: f.id.uuidString, sourceMessages: canonical.messages,
@@ -1262,7 +1351,7 @@ struct CompactionProductionFactConsumerTests {
         #expect(provider.requests.count > providerRequestsBefore)
         let input = try #require(provider.requests.last)
         #expect(input.contains { $0.content.contains("compare-open") })
-        #expect(input.contains { $0.content.contains(factsBefore[0].receiptID) })
+        #expect(!input.contains { $0.content.contains(factsBefore[0].receiptID) })
         // Lossy summary: the old turn text went to the summary request, not into the next input.
         #expect(provider.summaryRequests.flatMap { $0 }.contains { $0.content.contains("Earlier authorization was read-only") })
         #expect(input.last?.content == f.history.last?.content)
@@ -1385,14 +1474,21 @@ struct CompactionProductionFactConsumerTests {
                 sourceMessages: canonical.messages, result: candidate)
         }
         let valid = try await result(f, provider: FactContextProvider())
+        // 摘要请求进行期间任务从排队变成运行（状态变了）：事实只要求任务还在、归属没变，
+        // 提交仍然有效；下一轮恢复时背景按账本重建。
         _ = try f.tasks.startRun(taskID: "compare-open", parentID: "parent", runID: "changed-run")
-        #expect(!f.engine.validateCompactionFacts(valid.retentionFacts ?? []))
+        #expect(f.engine.validateCompactionFacts(valid.retentionFacts ?? []))
+        // 被捕获的任务在账本里找不到（不是同一个任务库）才拒绝，且什么都不写。
         #expect(throws: SessionStoreError.invalidCompactionCheckpoint(canonical.id)) {
             try ChatSessionBridge.saveCanonicalCompactionCheckpoint(sessionStore: f.sessions,
                 sessionID: canonical.id, sourceMessages: canonical.messages, result: valid,
-                taskStore: f.tasks, effectLedger: f.ledger)
+                taskStore: AgentTaskStore(), effectLedger: f.ledger)
         }
         #expect(try f.sessions.loadLatestCompactionCheckpoint(sessionID: canonical.id) == nil)
+        _ = try ChatSessionBridge.saveCanonicalCompactionCheckpoint(sessionStore: f.sessions,
+            sessionID: canonical.id, sourceMessages: canonical.messages, result: valid,
+            taskStore: f.tasks, effectLedger: f.ledger)
+        #expect(try f.sessions.loadLatestCompactionCheckpoint(sessionID: canonical.id) != nil)
     }
 
     @Test func resumedTaskStateIsRebuiltAfterCanonicalTerminalTransition() async throws {
@@ -1415,11 +1511,45 @@ struct CompactionProductionFactConsumerTests {
         let restoredLedger = try ToolExecutionFactLedger(persistenceURL: f.root.appendingPathComponent("effects.json"))
         let model = try ChatSessionBridge.resumeCanonicalMessages(sessionStore: restoredSessions,
             sessionID: canonical.id, taskStore: restoredTasks, effectLedger: restoredLedger)
+        // 任务已成功结束：既不再显示成未完成，也不留"已成功"记录；成功的回执同样不在背景里。
         #expect(!model.contains { $0.content.contains("status=queued") })
-        #expect(model.contains { $0.content.contains("status=succeeded") })
-        #expect(model.contains { $0.content.contains("read-done") })
+        #expect(!model.contains { $0.content.contains("status=succeeded") })
+        #expect(!model.contains { $0.content.contains("read-done") })
+        #expect(!model.contains { $0.content.contains("<retained-store-facts>") })
+        #expect(model.contains { $0.content.contains("<context-summary>") })
         #expect(restoredLedger.facts.count == 1)
         #expect(restoredSessions.loadSession(id: canonical.id)?.messages == canonical.messages)
+    }
+
+    /// 旧版本留下的检查点里有已成功的回执：恢复时仍要把旧背景逐字比对通过（格式没变），
+    /// 然后按当前口径重建背景——成功的回执不再出现，未完成的任务照旧。
+    @Test func oldCheckpointRetainingSucceededReceiptStillResumesAndDropsItFromRebuiltBackground() async throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let canonical = try #require(f.sessions.loadSession(id: f.id.uuidString))
+        let effect = try #require(f.ledger.facts.first)
+        #expect(effect.status == .succeeded)
+        let digest = try #require(CompactionCheckpoint.digestOfSourcePrefix(canonical.messages))
+        let oldSource = CompactionFactSource(sessionID: canonical.id,
+            transcriptRevision: canonical.transcriptRevision, transcriptDigest: digest, effect: effect)
+        var oldFacts = CompactionFactCapture.capture(sessionID: canonical.id,
+            revision: canonical.transcriptRevision, messages: canonical.messages,
+            taskStore: f.tasks, effectLedger: nil)
+        oldFacts.append(CompactionRetainedFact(kind: oldSource.kind, text: oldSource.backgroundText, source: oldSource))
+        let old = try await LossySummaryCompaction.compact(messages: canonical.messages, keepRecent: 1,
+            provider: FactContextProvider(), retentionFacts: oldFacts)
+        #expect(old.refusalReason == nil)
+        #expect(old.messages.contains { $0.content.contains(effect.receiptID) })
+        _ = try #require(try ChatSessionBridge.saveCanonicalCompactionCheckpoint(sessionStore: f.sessions,
+            sessionID: canonical.id, sourceMessages: canonical.messages, result: old,
+            taskStore: f.tasks, effectLedger: f.ledger))
+        let resumed = try ChatSessionBridge.resumeCanonicalMessages(sessionStore: f.sessions,
+            sessionID: canonical.id, taskStore: f.tasks, effectLedger: f.ledger)
+        #expect(!resumed.contains { $0.content.contains(effect.receiptID) })
+        #expect(resumed.contains { $0.content.contains("compare-open") })
+        #expect(resumed.count == old.messages.count)
+        #expect(resumed.first == old.messages.first)
+        #expect(resumed.last == old.messages.last)
     }
 
     @Test func wrongSessionOrRevisionCannotCertifyFactsAndEmptyFactsStillCompact() async throws {
@@ -1568,7 +1698,8 @@ struct CompactionProductionFactConsumerTests {
             history: canonical.messages.map { $0.asChatMessageUI() }, systemPrompt: "test", keepRecent: 1,
             sourceSessionID: canonical.id, sourceTranscriptRevision: canonical.transcriptRevision)
         #expect(compacted.refusalReason == nil)
-        #expect(compacted.retentionFacts?.contains { $0.source?.effect == dispatched } == true)
+        // 已成功的写入回执不再放进压缩背景；"不重复执行"由账本的重复派发拒绝保证（见下面的 replay 断言）。
+        #expect(compacted.retentionFacts?.contains { $0.source?.effect != nil } == false)
         #expect(compacted.retentionFacts?.contains { $0.source?.task?.taskID == "compare-open" } == true)
         let checkpoint = try #require(try ChatSessionBridge.saveCanonicalCompactionCheckpoint(
             sessionStore: f.sessions, sessionID: canonical.id, sourceMessages: canonical.messages,
@@ -1600,7 +1731,7 @@ struct CompactionProductionFactConsumerTests {
         #expect(summarized2932.contains { $0.content.contains("Earlier authorization was read-only") })
         #expect(resumed.contains { $0.content.contains("<context-summary>") })
         #expect(resumed.contains { $0.content.contains("compare-open") })
-        #expect(resumed.contains { $0.content.contains(dispatched.receiptID) })
+        #expect(!resumed.contains { $0.content.contains(dispatched.receiptID) })
         #expect(resumed.last == canonical.messages.last)
         #expect(Compactor.hasMaterialRequestReduction(from: canonical.messages, to: resumed))
         try retainValue2932(resumed, root: f.root, name: "resumed-model-messages.json")
@@ -1747,7 +1878,7 @@ struct CompactionProductionFactConsumerTests {
             $0.kind == .unfinishedTask && $0.source?.task?.taskID == taskID
                 && $0.source?.task?.status == .running
         } == true)
-        #expect(compacted.retentionFacts?.contains { $0.source?.effect == dispatched } == true)
+        #expect(compacted.retentionFacts?.contains { $0.source?.effect != nil } == false)
         let checkpoint = try #require(try ChatSessionBridge.saveCanonicalCompactionCheckpoint(
             sessionStore: f.sessions, sessionID: canonical.id, sourceMessages: canonical.messages,
             expectedTranscriptRevision: canonical.transcriptRevision, result: compacted,
@@ -1773,18 +1904,24 @@ struct CompactionProductionFactConsumerTests {
             tasks: reopenedTasks, ledger: reopenedLedger, grantsWrite: false),
             sessions: reopenedSessions, provider: next, turnID: 2551)
         let request = try #require(next.dialogueRequests.first)
-        let background = try #require(request.first { $0.content.contains("<retained-store-facts>") })
         // Older turns are summarized by the model (lossy): their text went whole to the summary request.
         let summarized2550 = compactionProvider2550.summaryRequests.flatMap { $0 }
         #expect(summarized2550.contains { $0.content.contains("Goal: compare repair choices") })
         #expect(summarized2550.contains { $0.content.contains("Keep the original title") })
         #expect(summarized2550.contains { $0.content.contains("Earlier authorization was read-only") })
         #expect(request.contains { $0.content.contains("<context-summary>") })
-        #expect(background.content.contains(taskID))
-        #expect(background.content.contains("status=running") == !cancelledAfterCheckpoint)
-        #expect(background.content.contains("status=cancelled") == cancelledAfterCheckpoint)
-        #expect(background.content.contains(dispatched.receiptID))
-        #expect(background.content.contains("No authorization, no tool invocation, no effect replay"))
+        // 已成功的写入回执不再进背景；背景只剩仍未完成的任务，任务取消后连背景也不再出现。
+        #expect(!request.contains { $0.content.contains(dispatched.receiptID) })
+        #expect(!request.contains { $0.content.contains("status=cancelled") })
+        if cancelledAfterCheckpoint {
+            #expect(!request.contains { $0.content.contains("<retained-store-facts>") })
+            #expect(!request.contains { $0.content.contains("status=running") })
+        } else {
+            let background = try #require(request.first { $0.content.contains("<retained-store-facts>") })
+            #expect(background.content.contains(taskID))
+            #expect(background.content.contains("status=running"))
+            #expect(background.content.contains("No authorization, no tool invocation, no effect replay"))
+        }
         let feedback = try #require(next.dialogueRequests.last?.first {
             $0.role == .tool && $0.toolCallID == "new-write"
         })
@@ -1831,9 +1968,10 @@ struct CompactionProductionFactConsumerTests {
         provider.proposeWritePath = marker.path
         try await runEffect1985(f, engine: effectEngine1985(f, sessions: restarted, tasks: tasks,
             ledger: ledger, grantsWrite: false), sessions: restarted, provider: provider, turnID: 1988)
+        // 压缩后不再带已成功的回执；权限已移除时新写入仍被拒，且不是被当成重复派发。
         #expect(provider.dialogueRequests.first?.contains {
             $0.content.contains(dispatched.receiptID)
-        } == true)
+        } == false)
         let feedback = try #require(provider.dialogueRequests.last?.first {
             $0.role == .tool && $0.toolCallID == "new-write"
         })

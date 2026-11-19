@@ -130,7 +130,7 @@ struct EnvVarImportPreviewConsumer147Tests {
 
         // 文案 + 图标逐字节不变，且各恰一次。
         #expect(
-            source.components(separatedBy: "Label { Text(\"从进程导入\") } icon: { MinisIconView(.download, size: 14) }")
+            source.components(separatedBy: "Label { Text(\"导入本机环境变量\") } icon: { MinisIconView(.download, size: 14) }")
                 .count - 1 == 1
         )
         // accessibilityIdentifier 不变且仍唯一（外部旅程/AX 脚本无感）。

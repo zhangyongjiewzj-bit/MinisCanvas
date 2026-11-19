@@ -126,7 +126,7 @@ struct WP3TerminalContextProductionConsumerTests {
             workdir: root.path
         )
         let policySnapshot = TerminalPolicySnapshot(settings: TerminalPolicySettings(
-            automaticAllowCommands: ["echo", "sudo"],
+            automaticAllowCommands: ["echo", "halt"],
             confirmationCommands: ["git"],
             userDeniedCommands: ["echo"]
         ))

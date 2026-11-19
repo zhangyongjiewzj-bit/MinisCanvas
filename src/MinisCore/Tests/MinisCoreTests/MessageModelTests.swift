@@ -199,7 +199,7 @@ struct MessageModelTests {
         // Speech needs an explicit supported turn snapshot; unknown defaults
         // stay out of the model catalog. MCP tools are dynamic (async discovery).
         // Approved N-02 adds the session-local todo_write tool to the default catalog.
-        #expect(tools.map(\.name) == ["file_grep", "file_glob", "todo_write", "shell_execute", "shell_output", "shell_stop", "file_read", "file_write", "file_edit", "file_delete", "session_read", "external_session_read", "external_session_send", "context_compact", "browser"])
+        #expect(tools.map(\.name) == ["file_grep", "file_glob", "todo_write", "shell_execute", "shell_output", "shell_stop", "file_read", "file_write", "file_edit", "file_delete", "session_read", "external_session_read", "external_session_send", "session_send", "task_board", "context_compact", "browser"])
         #expect(tools.allSatisfy { !$0.description.isEmpty })
         for tool in tools {
             for req in tool.required {

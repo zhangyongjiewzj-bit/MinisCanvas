@@ -49,7 +49,7 @@ struct ExplicitShellConfirmationApprovalTests {
             _ = try BuiltinToolExecutor.validateShellPolicy(command: "git status", snapshot: snapshot)
         }
         #expect(throws: ToolExecutorError.self) {
-            _ = try BuiltinToolExecutor.validateShellPolicy(command: "sudo ls", snapshot: explicitSnapshot())
+            _ = try BuiltinToolExecutor.validateShellPolicy(command: "halt ls", snapshot: explicitSnapshot())
         }
     }
 
@@ -58,8 +58,9 @@ struct ExplicitShellConfirmationApprovalTests {
         let executor = ComposerPolicyEnforcedToolExecutor(base: probe, controller: controller(), approvalGate: ApprovalGate())
         #expect(try await executor.execute(callID: "ordinary-git", name: "shell_execute", input: input) == "synthetic-effect")
         #expect(probe.executions == 1)
+        // 自动档：只读命令免问，每个子命令都要过效果检查；含非只读子命令的复合输入仍要问。
         let compound = try await executor.authorizationDecision(callID: "ordinary-compound", capability: "shell_execute",
-            input: ComposerToolInput(["command": "echo one; echo two"]))
+            input: ComposerToolInput(["command": "echo one; curl https://example.com"]))
         #expect(compound.decision == .requestApproval(requiresSecondConfirmation: false))
         #expect(probe.executions == 1)
     }
@@ -95,7 +96,8 @@ struct ExplicitShellConfirmationApprovalTests {
                 #expect(saved.pattern == "git status")
                 let matched = try #require(rules.match(capability: "shell_execute", input: input, facts: facts))
                 #expect(matched.id == saved.id)
-                // The historical rule really can replace an ordinary, non-explicit prompt.
+                // 普通（非显式确认）情形下，这条历史规则在自动档里能免去弹卡；git status 本身属只读命令，
+                // 自动档（用户 2026-11-16 决定）已先按只读放行，所以结果里不再带规则 ID。
                 let ordinary = ComposerPolicyEnforcedToolExecutor(base: ExplicitShellProbe(), controller: seed,
                     approvalGate: ApprovalGate(policyByTool: ["shell_execute": .alwaysAsk]),
                     hookHandler: { invocation in ComposerHookResult(verdict: .allow,
@@ -103,7 +105,6 @@ struct ExplicitShellConfirmationApprovalTests {
                 let allowed = try await ordinary.authorizationDecision(callID: "historical-" + prior,
                     capability: "shell_execute", input: frozen)
                 #expect(allowed.decision == .execute)
-                #expect(allowed.rule?.id == saved.id)
             }
             if prior == "scoped" || prior == "all" {
                 try await controller.recordApproval(capability: "shell_execute", input: frozen)

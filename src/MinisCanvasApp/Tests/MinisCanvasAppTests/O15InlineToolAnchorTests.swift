@@ -45,7 +45,7 @@ final class O15InlineToolAnchorTests: XCTestCase {
     func testLegacyMessagesAndReplacedTextDoNotInventOldBoundaries() throws {
         var message = ChatMessageUI(role: .assistant, content: "e\u{301}")
         message.captureInlineToolAnchor(for: key("read"))
-        message.content = "é"
+        message.replaceContent("é")
         XCTAssertTrue(message.inlineToolAnchors.isEmpty)
         var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: Any])
         object.removeValue(forKey: "inlineToolAnchors")

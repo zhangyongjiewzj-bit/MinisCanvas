@@ -55,4 +55,20 @@ struct BypassOpenSettingsTests {
         chat.composerPolicySelection.mode = .bypassPermission
         #expect(chat.composerPolicySelection.mode == .bypassPermission)
     }
+
+    @Test("unconfirmed bypass is treated as manual approval until confirmed")
+    func unconfirmedBypassFallsBackToManualApproval() {
+        let chat = ChatStore()
+        chat.restoreComposerPolicy(ComposerPolicySettings(
+            mode: .bypassPermission, approvalScope: .workspace, effort: .high, bypassModeConfirmed: false))
+        // 选择本身保留（用户还能去确认），但提交按手动审批处理并给出提示标志。
+        #expect(chat.composerPolicySelection.mode == .bypassPermission)
+        #expect(chat.composerBypassUnconfirmedFallbackActive)
+        #expect(chat.effectiveComposerSelection.mode == .manual)
+        // 确认后提示消失、提交快照仍是绕过，行为不变。
+        chat.composerPolicySelection.bypassModeConfirmed = true
+        #expect(!chat.composerBypassUnconfirmedFallbackActive)
+        #expect(chat.effectiveComposerSelection.mode == .bypassPermission)
+        #expect(chat.effectiveComposerSelection.bypassModeConfirmed)
+    }
 }

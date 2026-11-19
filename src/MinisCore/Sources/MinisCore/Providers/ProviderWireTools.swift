@@ -31,14 +31,7 @@ public extension AgentToolDefinition {
     var responsesToolDict: [String: Any] {
         var properties: [String: Any] = [:]
         for (name, parameter) in parameters {
-            var schema: [String: Any] = ["type": parameter.type.rawValue]
-            if !parameter.description.isEmpty {
-                schema["description"] = parameter.description
-            }
-            if let enumValues = parameter.enumValues {
-                schema["enum"] = enumValues
-            }
-            properties[name] = schema
+            properties[name] = parameter.wireSchema
         }
         return [
             "type": "function",

@@ -537,26 +537,29 @@ struct MCPModelTests {
         let object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
 
         #expect(first == second)
-        #expect(data.count <= 96)
+        #expect(first.count <= 96)
         #expect(object["truncated"] as? Bool == true)
+        #expect(object["total_characters"] as? Int == remote.count)
         #expect(!first.contains("nested-secret"))
         #expect(!first.contains("item-secret"))
 
         let tiny = MCPOutputLimiter.project(remote, to: 8)
         let tinyData = try #require(tiny.data(using: .utf8))
-        #expect(tinyData.count <= 8)
+        #expect(tiny.count <= 8)
         #expect((try? JSONSerialization.jsonObject(with: tinyData)) != nil)
     }
 
-    @Test func outputLimiterUsesUTF8ByteBoundForUnicodeAndStreams() {
+    @Test func outputLimiterCountsCharactersNotBytesForUnicodeAndStreams() {
         let text = String(repeating: "界", count: 100)
         let bounded = MCPOutputLimiter.limit(text, to: 32)
         let streamed = MCPOutputLimiter.limit([text, text], to: 32)
         let manyChunks = MCPOutputLimiter.limit((0..<100).map { _ in text }, to: 64)
 
-        #expect(bounded.utf8.count <= 32)
-        #expect(streamed.utf8.count <= 32)
-        #expect(manyChunks.utf8.count <= 64)
+        #expect(bounded.count <= 32)
+        #expect(streamed.count <= 32)
+        #expect(manyChunks.count <= 64)
+        // Chinese keeps as many characters as ASCII would, not a third of them.
+        #expect(bounded.hasPrefix(String(repeating: "界", count: 10)))
         #expect(bounded.hasSuffix(MCPOutputLimiter.truncationMarker))
         #expect(streamed.hasSuffix(MCPOutputLimiter.truncationMarker))
         #expect(manyChunks.hasSuffix(MCPOutputLimiter.truncationMarker))
@@ -571,7 +574,7 @@ struct MCPModelTests {
         let output = MCPOutputLimiter.limit(chunks, to: 512)
         let data = try #require(output.data(using: .utf8))
 
-        #expect(data.count <= 512)
+        #expect(output.count <= 512)
         #expect((try? JSONSerialization.jsonObject(with: data)) != nil)
         #expect(!output.contains("split-secret"))
         #expect(!output.contains("c2VjcmV0LXRva2VuLWJ5dGVz"))
@@ -703,24 +706,36 @@ struct MCPModelTests {
             includingMCPFrom: StaticCatalogBridge(tools: [valid])
         )
         let validDefinition = try #require(validCatalog.first { $0.name == valid.fullName })
-        #expect(validDefinition.parameters["amount"]?.type == .integer)
+        #expect(validDefinition.parameters["amount"]?.type == .number)
         #expect(validDefinition.parameters["flag"]?.type == .boolean)
         #expect(validDefinition.required == ["amount"])
 
+        // 11/16 对齐 Claude Code：schema 尽量宽容接受（数组参数、required 里不存在的名字都能用），
+        // 只有结构本身无法使用的工具才被跳过，且只跳过它自己、不拖垮整张工具表。
+        let arrayParam = MCPBoundTool(
+            fullName: "mcp_catalog_array",
+            serverID: "catalog-array",
+            tool: MCPTool(
+                name: "array",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "items": .object(["type": .string("array")]),
+                    ]),
+                    "required": .array([.string("missing")]),
+                ])
+            )
+        )
+        let tolerantCatalog = try await AgentToolCatalog.makeTools(
+            includingMCPFrom: StaticCatalogBridge(tools: [arrayParam, valid])
+        )
+        let arrayDefinition = try #require(tolerantCatalog.first { $0.name == arrayParam.fullName })
+        #expect(arrayDefinition.parameters["items"]?.type == .array)
+        #expect(arrayDefinition.required.isEmpty)
+        #expect(tolerantCatalog.contains { $0.name == valid.fullName })
+
+        // 结构本身损坏的 schema：该工具被跳过，其余工具照常可用。
         let malformed: [MCPBoundTool] = [
-            MCPBoundTool(
-                fullName: "mcp_catalog_invalid_array",
-                serverID: "catalog-invalid-array",
-                tool: MCPTool(
-                    name: "array",
-                    inputSchema: .object([
-                        "type": .string("object"),
-                        "properties": .object([
-                            "items": .object(["type": .string("array")]),
-                        ]),
-                    ])
-                )
-            ),
             MCPBoundTool(
                 fullName: "mcp_catalog_invalid_container",
                 serverID: "catalog-invalid-container",
@@ -729,20 +744,6 @@ struct MCPModelTests {
                     inputSchema: .object([
                         "type": .string("object"),
                         "properties": .string("not-an-object"),
-                    ])
-                )
-            ),
-            MCPBoundTool(
-                fullName: "mcp_catalog_invalid_required",
-                serverID: "catalog-invalid-required",
-                tool: MCPTool(
-                    name: "required",
-                    inputSchema: .object([
-                        "type": .string("object"),
-                        "properties": .object([
-                            "declared": .object(["type": .string("string")]),
-                        ]),
-                        "required": .array([.string("missing")]),
                     ])
                 )
             ),
@@ -759,12 +760,13 @@ struct MCPModelTests {
         for tool in malformed {
             let stateBox = DiscoveryStateBox()
             let catalog = try await AgentToolCatalog.makeTools(
-                includingMCPFrom: StaticCatalogBridge(tools: [tool]),
+                includingMCPFrom: StaticCatalogBridge(tools: [tool, valid]),
                 orchestration: nil,
                 onDiscoveryState: { stateBox.append($0) }
             )
             #expect(!catalog.contains { $0.name == tool.fullName })
-            #expect(stateBox.snapshot == [.discovering, .failed(.protocolError)])
+            #expect(catalog.contains { $0.name == valid.fullName })
+            #expect(stateBox.snapshot == [.discovering, .succeeded(toolCount: 1)])
         }
     }
 
@@ -5250,6 +5252,15 @@ struct MCPToolBridgeTests {
         registry.disconnectAll()
     }
 
+    /// T-03：模型收到的报错要说清"结果已丢弃、操作可能已生效、先核实"，而不是系统默认的"操作无法完成"。
+    @Test func retiredRuntimeErrorExplainsDiscardedResultToTheModel() {
+        let identity = MCPToolInvocationIdentity(correlationID: "c", attemptID: "a")
+        let text = MCPToolInvocationFenceError.runtimeRetired(identity).localizedDescription
+        #expect(text.contains("可能已经在服务器上生效"))
+        #expect(text.contains("核实"))
+        #expect(!text.contains("MCPToolInvocationFenceError"))
+    }
+
     @Test func registryBridgesToolsAndDispatchesCalls() async throws {
         let (manager, _) = try makeManager()
         let echo = MCPServer(id: "echo", name: "Echo", type: .http, url: "http://127.0.0.1:1")
@@ -5495,6 +5506,35 @@ struct MCPToolBridgeTests {
         #expect(calls.value == 1)
         registry.disconnectAll()
         oldTurn.disconnectAll()
+    }
+
+    @Test func schemaChangeRevokesOnlyTheChangedToolAndNewToolsStayUnauthorized() async throws {
+        let (manager, _) = try makeManager()
+        let server = MCPServer(id: "schema-per-tool", name: "Schema Per Tool", type: .http, url: "http://127.0.0.1:1")
+        try manager.addServer(server)
+        try manager.authorizeServer(id: server.id)
+        let stable = MCPTool(name: "stable", inputSchema: .object(["type": .string("object")]))
+        let tools = MCPToolsBox([schemaBoundGreet("string"), stable])
+        let calls = MCPToolCallCounter()
+        let factory = schemaBoundClientFactory(tools: tools, calls: calls)
+        _ = try await manager.discoverTools(serverID: server.id, clientFactory: factory)
+        try manager.authorizeTools(serverID: server.id, toolNames: ["greet", "stable"])
+        #expect(manager.isToolAuthorized(serverID: server.id, toolName: "stable"))
+
+        // 新增工具：已授权工具不受影响，新工具默认未授权。
+        let extra = MCPTool(name: "extra", inputSchema: .object(["type": .string("object")]))
+        tools.replace([schemaBoundGreet("string"), stable, extra])
+        _ = try await manager.discoverTools(serverID: server.id, clientFactory: factory)
+        #expect(manager.isToolAuthorized(serverID: server.id, toolName: "greet"))
+        #expect(manager.isToolAuthorized(serverID: server.id, toolName: "stable"))
+        #expect(!manager.isToolAuthorized(serverID: server.id, toolName: "extra"))
+
+        // 只有定义变了的工具被撤销。
+        tools.replace([schemaBoundGreet("integer"), stable, extra])
+        _ = try await manager.discoverTools(serverID: server.id, clientFactory: factory)
+        #expect(!manager.isToolAuthorized(serverID: server.id, toolName: "greet"))
+        #expect(manager.isToolAuthorized(serverID: server.id, toolName: "stable"))
+        #expect(manager.schemaNarrowedToolCount(serverID: server.id) == 1)
     }
 
     @Test func unknownMCPNameStillRejectsWithoutToolCall() async throws {

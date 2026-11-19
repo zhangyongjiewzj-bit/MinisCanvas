@@ -52,7 +52,9 @@ struct SettingsSETAHumanPersistenceResetTests {
         confirmationCommands: ["mkdir", "touch", "cp", "mv", "rm", "git", "curl", "wget", "swift", "swiftc",
             "xcodebuild", "brew", "cargo", "python3", "python", "chmod", "chown", "kill", "pkill", "sed",
             "awk", "tar", "unzip", "zip", "plutil", "defaults", "install", "ln", "env", "printenv",
-            "npm", "npx", "node", "pnpm", "yarn", "make", "pytest", "go", "gh", "jq", "rg", "uv", "docker"],
+            "npm", "npx", "node", "pnpm", "yarn", "make", "pytest", "go", "gh", "jq", "rg", "uv", "docker",
+            // open 等已从硬拒绝改为走审批（对齐 Claude Code），进入默认确认表。
+            "open", "osascript", "screencapture", "killall", "sudo", "security", "launchctl", "diskutil"],
         userDeniedCommands: [], explicitConfirmationCommands: [], confirmationProvenanceVersion: 1)
 
     /// Decode only the explicitly named public field. The file is this leaf's
@@ -79,9 +81,9 @@ struct SettingsSETAHumanPersistenceResetTests {
     /// reset=true also checks those fourteen R fields after the HUMAN reset.
     private func verify(_ c: SettingsCenter, disk: [String: Any], reset: Bool, root: URL) throws {
         try check("general.theme-preset", path: "general.themePreset", actual: c.themePreset,
-                  expected: reset ? ThemePreset.system : .light, disk: disk)
+                  expected: reset ? ThemePreset.light : .system, disk: disk)
         try check("general.appearance", path: "general.appearance", actual: c.appearance,
-                  expected: reset ? Appearance.system : .light, disk: disk)
+                  expected: Appearance.system, disk: disk)   // 两个预设都投影为 system（跟随系统明暗）
         try check("general.accent-theme", path: "general.accentTheme", actual: c.accentTheme,
                   expected: AccentTheme.pseudo, disk: disk)
         try check("general.default-provider-id", path: "general.defaultProviderID", actual: c.defaultProviderID,
@@ -97,7 +99,7 @@ struct SettingsSETAHumanPersistenceResetTests {
         try check("agent.child-concurrency-enabled-session-count", path: "agent.childConcurrencyEnabledSessionCount",
                   actual: c.childConcurrencyEnabledSessionCount, expected: reset ? 1 : 3, disk: disk)
         try check("agent.fallback-enabled", path: "agent.fallbackEnabled", actual: c.fallbackEnabled,
-                  expected: reset, disk: disk)
+                  expected: !reset, disk: disk)
         try check("agent.persona-enabled", path: "agent.personaEnabled", actual: c.personaEnabled,
                   expected: !reset, disk: disk)
         try check("agent.persona", path: "agent.persona", actual: c.persona,
@@ -175,7 +177,7 @@ struct SettingsSETAHumanPersistenceResetTests {
         let allowed = root.appendingPathComponent("allowed").path
         let denied = root.appendingPathComponent("allowed/blocked").path
         let mounted = root.appendingPathComponent("mounted").path
-        c.themePreset = .light
+        c.themePreset = .system   // 默认已是产品主题，所以种子值取「跟随系统」，重置后回到产品主题
         c.defaultProviderID = "openai"
         c.defaultModelID = "gpt-4o-mini"
         c.modelSpeedTier = .quality
@@ -188,7 +190,7 @@ struct SettingsSETAHumanPersistenceResetTests {
         c.childConcurrencyUserSelected = 8
         c.childConcurrencyEnabledSessionCount = 3
         c.autoCompactThreshold = 0.9
-        c.fallbackEnabled = false
+        c.fallbackEnabled = true  // 默认已改为关闭，所以种子值取开启，重置后回到关闭
         c.personaEnabled = true
         c.applyPersonaPreset(.creative)
         c.persona = seededPersona
@@ -247,7 +249,7 @@ struct SettingsSETAHumanPersistenceResetTests {
         c.idleTabTimeoutMinutes = 5
         c.uiBaseFontSize = 18
         // Terminal hard-deny is immutable even through the public human setter.
-        c.terminalPolicySettings = TerminalPolicySettings(automaticAllowCommands: ["echo", "sudo"],
+        c.terminalPolicySettings = TerminalPolicySettings(automaticAllowCommands: ["echo", "halt"],
             confirmationCommands: ["git"], userDeniedCommands: ["rm"])
         #expect(c.terminalPolicySettings == seededTerminal)
 

@@ -286,13 +286,71 @@ struct ToolExecutorPathNormalizationTests {
         let fixture = try makeFixture()
         let subject = executor(for: fixture)
         let malformed = fixture.root.appendingPathComponent("not-utf8.txt")
-        // 无 NUL 字节，避开 fileIsBinary；也不是合法 UTF-8。
-        try Data([0xFF, 0xFE, 0x41]).write(to: malformed)
+        // 无 NUL 字节，避开 fileIsBinary；也不是合法 UTF-8；不以 UTF-16 BOM（FF FE / FE FF）开头。
+        try Data([0xFF, 0xFF, 0x41]).write(to: malformed)
 
         await #expect(
             throws: ToolExecutorError.readFailed("File is not valid UTF-8 text: \(malformed.path)")
         ) {
             _ = try await subject.execute(name: "file_read", input: ["path": malformed.path])
         }
+    }
+
+    /// MC4-021：超过 8 MiB 的带 BOM UTF-16 文本（纯中文、没有 NUL 字节）按文本分页读取，
+    /// 头读、尾读都不是乱码也不报二进制。
+    @Test func largeBOMUTF16TextReadsAsTextHeadAndTail() async throws {
+        let fixture = try makeFixture()
+        let subject = executor(for: fixture)
+        var text = ""
+        var count = 0
+        var utf16Units = 0
+        while utf16Units * 2 < 8 * 1024 * 1024 + 4096 {
+            count += 1
+            let line = "第\(count)行：你好世界\n"
+            text += line
+            utf16Units += line.utf16.count
+        }
+        var data = Data([0xFF, 0xFE])
+        data.append(text.data(using: .utf16LittleEndian)!)
+        let file = fixture.root.appendingPathComponent("big-utf16.txt")
+        try data.write(to: file)
+
+        let head = try await subject.execute(name: "file_read", input: ["path": file.path, "lines": 3])
+        #expect(head.contains("第1行：你好世界") && head.contains("第3行：你好世界"))
+        #expect(!head.contains("第4行："))
+        let tail = try await subject.execute(
+            name: "file_read", input: ["path": file.path, "direction": "tail", "lines": 2])
+        #expect(tail.contains("第\(count)行：你好世界"))
+        let middle = try await subject.execute(
+            name: "file_read", input: ["path": file.path, "offset": 100_000, "lines": 2])
+        #expect(middle.contains("第100000行：你好世界"))
+    }
+
+    /// MC4-021 剩余：无 BOM、几乎没有 NUL 的纯中文 UTF-16 大文件，过去按 UTF-8 解成乱码或报非 UTF-8。回退后头读会抛错。
+    @Test func largeBOMlessChineseUTF16LittleEndianReadsAsText() async throws {
+        let fixture = try makeFixture()
+        let subject = executor(for: fixture)
+        let line = "你好世界今天天气很好我们一起去看海\n"
+        let text = String(repeating: line, count: 8 * 1024 * 1024 / (line.utf16.count * 2) + 4096)
+        let file = fixture.root.appendingPathComponent("big-utf16-nobom.txt")
+        try text.data(using: .utf16LittleEndian)!.write(to: file)
+        #expect(BuiltinToolExecutor.largeFileUTF16Layout(head: Data(try Data(contentsOf: file).prefix(8192)))
+            == BuiltinToolExecutor.LargeFileUTF16Layout(bigEndian: false, bomLength: 0))
+
+        let head = try await subject.execute(name: "file_read", input: ["path": file.path, "lines": 2])
+        #expect(head.contains("你好世界今天天气很好我们一起去看海"))
+        let tail = try await subject.execute(
+            name: "file_read", input: ["path": file.path, "direction": "tail", "lines": 2])
+        #expect(tail.contains("你好世界今天天气很好我们一起去看海"))
+    }
+
+    @Test func utf16BlockConversionKeepsSurrogatePairsAcrossBlocks() throws {
+        let bytes = "a😀b".data(using: .utf16LittleEndian)!   // 61 00 3D D8 00 DE 62 00
+        var carry = Data()
+        let first = try #require(BuiltinToolExecutor.utf16BlockToUTF8(Data(bytes.prefix(3)), bigEndian: false, carry: &carry))
+        #expect(String(decoding: first, as: UTF8.self) == "a")
+        let second = try #require(BuiltinToolExecutor.utf16BlockToUTF8(Data(bytes.dropFirst(3)), bigEndian: false, carry: &carry))
+        #expect(String(decoding: second, as: UTF8.self) == "😀b")
+        #expect(carry.isEmpty)
     }
 }

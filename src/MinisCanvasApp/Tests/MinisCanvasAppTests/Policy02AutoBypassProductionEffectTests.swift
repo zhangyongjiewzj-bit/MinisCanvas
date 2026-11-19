@@ -7,12 +7,21 @@ private actor Policy02Approval: ApprovalDelegate {
     private var approvalsLeft: Int
     private let confirmationAllowed: Bool
     private(set) var requests: [ApprovalRequest] = []
-    init(approvals: Int, confirmationAllowed: Bool = true) {
+    /// 先无条件拒绝的请求个数：未确认的绕过现在按手动审批走（会产生请求），
+    /// 用它拒绝这些请求，避免吃掉后面真正要批准的额度。
+    private var denialsLeft: Int
+    init(approvals: Int, confirmationAllowed: Bool = true, denyFirst: Int = 0) {
         approvalsLeft = approvals
+        denialsLeft = denyFirst
         self.confirmationAllowed = confirmationAllowed
     }
     func requestApproval(_ request: ApprovalRequest) async -> ApprovalDecision {
         requests.append(request)
+        if denialsLeft > 0 {
+            denialsLeft -= 1
+            return ApprovalDecision(approved: false, reason: "synthetic user denial",
+                confirmed: false, requestID: request.requestID, bindingDigest: request.identityDigest)
+        }
         let allow = approvalsLeft > 0
         if allow { approvalsLeft -= 1 }
         return ApprovalDecision(approved: allow, reason: allow ? nil : "synthetic user denial",
@@ -217,20 +226,19 @@ struct Policy02AutoBypassProductionEffectTests {
         #expect(await approval.requests.isEmpty)
         #expect(bridge.composerApprovalReceipts.isEmpty)
         let engine = try #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.toolExecutionFactLedger.facts.count == 1)
-        #expect(engine.toolExecutionFactLedger.facts.first?.toolCallID == "auto-effect")
-        #expect(engine.toolExecutionFactLedger.facts.first?.status == .succeeded)
+        // 2026-11-16：授权根外的写改为逐次审批（不再预先拦截）；没人批准，所以文件未变，
+        // 账本里该调用是失败记录，根内那次仍是唯一的成功记录。
+        #expect(engine.toolExecutionFactLedger.facts.count == 2)
+        #expect(engine.toolExecutionFactLedger.facts.filter { $0.status == .succeeded }.map(\.toolCallID) == ["auto-effect"])
+        #expect(engine.toolExecutionFactLedger.facts.first { $0.toolCallID == "auto-outside" }?.status == .failed)
         #expect(engine.toolExecutionFactLedger.pendingReceipts.isEmpty)
         let restored = try reopened(bridge)
         #expect(restored.messages == bridge.chat.messages.map { $0.asLLMMessage() })
-        #expect(restored.messages.contains {
-            $0.role == .assistant && $0.content.contains("执行前拦截：1 项工具调用未执行")
-        })
         #expect(try Data(contentsOf: target) == Data("real-auto-effect".utf8))
     }
 
     @Test func bypassNeedsComposerConfirmationThenCallBoundApprovalForRealEffect() async throws {
-        let root = try makeRoot(), provider = Policy02Provider(), approval = Policy02Approval(approvals: 1)
+        let root = try makeRoot(), provider = Policy02Provider(), approval = Policy02Approval(approvals: 1, denyFirst: 1)
         let fixture = try makeBridge(root: root, provider: provider, approval: approval)
         defer { withExtendedLifetime(fixture) {} }
         let bridge = fixture.bridge
@@ -238,9 +246,11 @@ struct Policy02AutoBypassProductionEffectTests {
         let blocked = try await submit(bridge, provider, replies: [
             call("bypass-unconfirmed", "file_write", ["path": unconfirmed.path, "content": "forbidden"])
         ], mode: .bypassPermission)
+        // 2026-11-18（a350e70e）：未确认的绕过按手动审批走——必须产生审批请求；没人批准（桩拒绝）就没有效果。
         #expect((try terminal(blocked, id: "bypass-unconfirmed")).1)
         #expect(!FileManager.default.fileExists(atPath: unconfirmed.path))
-        #expect(await approval.requests.isEmpty)
+        let unconfirmedRequests = await approval.requests
+        #expect(unconfirmedRequests.count == 1 && unconfirmedRequests.first?.toolName == "file_write")
         #expect(bridge.composerApprovalReceipts.isEmpty)
 
         try #require(fixture.settings.updatePolicyRuntimeDefaults(ProductionPolicyDefaults(autonomyLevel: .l3)))
@@ -267,29 +277,33 @@ struct Policy02AutoBypassProductionEffectTests {
         #expect(snapshot.mode == .bypassPermission && snapshot.bypassModeConfirmed)
         #expect(!(try terminal(request, id: "bypass-allowed")).1)
         #expect(!(try terminal(request, id: "bypass-second")).1)
-        #expect((try terminal(request, id: "bypass-credential")).1)
+        // 2026-11-16：绕过档读 .env 不再直接拒绝，改为弹卡询问；批准后只读这一个文件，且输出不含明文密钥。
+        #expect(!(try terminal(request, id: "bypass-credential")).1)
         #expect(!(try terminal(request, id: "bypass-credential")).0.contains("POLICY02_SYNTHETIC_SECRET=protected"))
         #expect(try String(contentsOf: allowed, encoding: .utf8) == "real-bypass-effect")
         #expect(try String(contentsOf: second, encoding: .utf8) == "second-effect")
         #expect(try String(contentsOf: credential, encoding: .utf8) == "POLICY02_SYNTHETIC_SECRET=protected")
-        #expect(await approval.requests.isEmpty)
-        #expect(bridge.composerApprovalReceipts.isEmpty)
+        // 请求共两个：未确认那次的 file_write（已被拒）、读 .env 的 file_read（已批准）。
+        let credentialRequests = await approval.requests.filter { $0.toolName == "file_read" }
+        #expect(credentialRequests.count == 1)
+        #expect(await approval.requests.count == 2)
+        #expect(!FileManager.default.fileExists(atPath: unconfirmed.path))
+        #expect(bridge.composerApprovalReceipts.count == 1)
         let engine = try #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.toolExecutionFactLedger.facts.count == 2)
-        #expect(Set(engine.toolExecutionFactLedger.facts.map(\.toolCallID)) == ["bypass-allowed", "bypass-second"])
-        #expect(engine.toolExecutionFactLedger.facts.allSatisfy { $0.status == .succeeded })
+        // 账本：被拒的未确认调用在执行前就被挡下，不产生执行记录；只有另外三次成功记录。
+        #expect(engine.toolExecutionFactLedger.facts.count == 3)
+        #expect(Set(engine.toolExecutionFactLedger.facts.filter { $0.status == .succeeded }.map(\.toolCallID))
+            == ["bypass-allowed", "bypass-second", "bypass-credential"])
+        #expect(engine.toolExecutionFactLedger.facts.first { $0.toolCallID == "bypass-unconfirmed" } == nil)
         #expect(engine.toolExecutionFactLedger.pendingReceipts.isEmpty)
         let restored = try reopened(bridge)
         #expect(restored.messages == bridge.chat.messages.map { $0.asLLMMessage() })
-        #expect(restored.messages.contains {
-            $0.role == .assistant && $0.content.contains("执行前拦截：1 项工具调用未执行")
-        })
         #expect(try Data(contentsOf: allowed) == Data("real-bypass-effect".utf8))
     }
 
     @Test func bypassRejectsApprovalWithoutSecondConfirmationBeforeEffect() async throws {
         let root = try makeRoot(), provider = Policy02Provider()
-        let approval = Policy02Approval(approvals: 1, confirmationAllowed: false)
+        let approval = Policy02Approval(approvals: 0, confirmationAllowed: false)
         let fixture = try makeBridge(root: root, provider: provider, approval: approval)
         defer { withExtendedLifetime(fixture) {} }
         let bridge = fixture.bridge
@@ -304,8 +318,10 @@ struct Policy02AutoBypassProductionEffectTests {
         let request = try await submit(bridge, provider, replies: [
             call("bypass-no-second", "file_write", ["path": target.path, "content": "forbidden"])
         ], mode: .bypassPermission, bypassConfirmed: fixture.settings.composerPolicy.bypassModeConfirmed)
+        // 未确认的绕过按手动审批走：必须产生审批请求；没人批准（桩拒绝）就没有效果。
         #expect((try terminal(request, id: "bypass-no-second")).1)
         #expect(!FileManager.default.fileExists(atPath: target.path))
+        #expect(await approval.requests.count == 1)
 
         try #require(fixture.settings.updatePolicyRuntimeDefaults(ProductionPolicyDefaults(autonomyLevel: .l3)))
         #expect(!SkillBypassRiskConfirmation.confirm([], riskConfirmed: false,
@@ -319,10 +335,11 @@ struct Policy02AutoBypassProductionEffectTests {
         ], mode: .bypassPermission, bypassConfirmed: fixture.settings.composerPolicy.bypassModeConfirmed)
         #expect((try terminal(unacknowledged, id: "bypass-no-consent")).1)
         #expect(!FileManager.default.fileExists(atPath: target.path))
-        #expect(await approval.requests.isEmpty)
+        #expect(await approval.requests.count == 2)
+        #expect(await approval.requests.allSatisfy { $0.toolName == "file_write" })
         #expect(bridge.composerApprovalReceipts.isEmpty)
         let engine = try #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.toolExecutionFactLedger.facts.isEmpty)
+        #expect(engine.toolExecutionFactLedger.facts.filter { $0.status == .succeeded }.isEmpty)
         #expect(engine.toolExecutionFactLedger.pendingReceipts.isEmpty)
         let restored = try reopened(bridge)
         #expect(restored.messages == bridge.chat.messages.map { $0.asLLMMessage() })

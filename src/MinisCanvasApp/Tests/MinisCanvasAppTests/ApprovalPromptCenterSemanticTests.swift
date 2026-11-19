@@ -411,11 +411,14 @@ struct ApprovalPresentationAction682Tests {
             effectID: "reused-public-call-682", scope: "request",
             payloadDigest: try #require(ApprovalAuthorizationContext.payloadDigest(for: input)),
             expiresAt: Date().addingTimeInterval(60), policyRevision: "policy-682",
-            grantEpoch: "epoch-682", toolName: "file_write"
+            grantEpoch: "epoch-682", toolName: "file_delete"
         )
         let gate = ApprovalGate(delegate: ApprovalPromptDelegate(center: center),
             onApprovalReceipt: { receipt in await MainActor.run { probe.receipts.append(receipt) } })
-        _ = try await gate.gate(tool: "file_write", input: input, context: context)
+        // 2026-11-16 起只有不可逆操作才需要第二次确认；普通 file_write 已是一次点击。
+        // 这个夹具要验证的是“两步确认”的绑定，所以用不可逆的 file_delete 作为门控名称，
+        // 确认前后是否出现写入副作用仍由下面的 BuiltinToolExecutor 证明。
+        _ = try await gate.gate(tool: "file_delete", input: input, context: context)
         let executor = BuiltinToolExecutor(allowedRoot: root)
         _ = try await executor.execute(name: "file_write", input: input)
     }
@@ -548,6 +551,21 @@ struct ApprovalPresentationAction682Tests {
                 .contains(where: { $0.contains("owned preview body") }))
             #expect(request.inputSummary == "<redacted>" && request.filePreview == preview)
         }
+    }
+
+    @Test("子智能体审批卡：目标行显示子任务标题（前 3 个，超出写等 N 个任务），原因说明会派出子智能体")
+    func orchestrateCardShowsTaskTitles() {
+        var request = ApprovalRequest(id: "orch-card", toolName: "orchestrate", inputSummary: "<redacted>",
+            riskLevel: .medium, requiresApproval: true, approvalScope: "request")
+        request.displayTaskTitles = ["整理报告", "核对数据"]
+        let two = ApprovalSummaryPresentation(request: request)
+        #expect(two.target == "子任务：整理报告、核对数据")
+        #expect(two.reason.contains("派出子智能体"))
+        request.displayTaskTitles = ["甲", "乙", "丙", "丁", "戊"]
+        #expect(ApprovalSummaryPresentation(request: request).target == "子任务：甲、乙、丙 等 5 个任务")
+        // 没有标题时回退到原来的通用写法。
+        request.displayTaskTitles = []
+        #expect(ApprovalSummaryPresentation(request: request).target == "工具：orchestrate")
     }
 
     @Test("第七版：删除审批卡自己写明普通档是永久删除，不依赖模型预告")
@@ -1032,6 +1050,185 @@ struct Goal18ApprovalPresentationTests {
         #expect(!(await waiter.value).approved)
     }
 
+    /// A-1（2026-11-17 审查）：必须点击批准的卡片，⌘回车不批准；普通卡片 ⌘回车照常批准。
+    @Test func commandReturnNeverApprovesExplicitClickCards() async throws {
+        let center = ApprovalPromptCenter()
+        var sensitive = ApprovalRequest(id: "cmd-return-sensitive", toolName: "file_read",
+            inputSummary: "synthetic .env", riskLevel: .medium, requiresApproval: true)
+        sensitive.requiresExplicitClick = true
+        let blocked = Task { await center.present(sensitive) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(550))
+        #expect(center.keyboardApprovalBlocked)
+        center.handleCommandReturn()
+        #expect(center.pendingRequest?.id == "cmd-return-sensitive")
+        center.actionsForPresentedRequest().deny()
+        #expect(!(await blocked.value).approved)
+
+        let ordinary = Task { await center.present(ApprovalRequest(id: "cmd-return-ordinary", toolName: "file_read",
+            inputSummary: "synthetic", riskLevel: .low, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(550))
+        #expect(!center.keyboardApprovalBlocked)
+        center.handleCommandReturn()
+        #expect((await ordinary.value).approved)
+    }
+
+    /// R3-P-03：回车作用于当前焦点项。表格覆盖用户已定规则：普通卡回车批准（由 handleReturn 决定）、
+    /// 拒绝理由框聚焦时回车 = 带理由拒绝、等待时长输入框聚焦时回车交还系统、⌘回车在时长框里被吞掉。
+    @Test func returnKeyOutcomeTable() {
+        typealias Outcome = ApprovalPromptCenter.ReturnKeyOutcome
+        func outcome(command: Bool = false, duration: Bool = false, note: Bool = false) -> Outcome {
+            ApprovalPromptCenter.returnKeyOutcome(isCommand: command, durationOwnsKeyboard: duration, denialNoteFocused: note)
+        }
+        #expect(outcome() == .plainReturn)
+        #expect(outcome(command: true) == .commandReturn)
+        #expect(outcome(note: true) == .denyWithReason)
+        // 理由框里 ⌘回车也只会拒绝，绝不批准。
+        #expect(outcome(command: true, note: true) == .denyWithReason)
+        #expect(outcome(duration: true) == .ignored)
+        #expect(outcome(command: true, duration: true) == .consumed)
+        #expect(outcome(duration: true, note: true) == .ignored)
+    }
+
+    /// P3：回车作用于有焦点的按钮；没有按钮焦点（或焦点在“允许”）才按卡片默认。
+    @Test func returnKeyOutcomeFollowsTheFocusedButton() {
+        typealias Outcome = ApprovalPromptCenter.ReturnKeyOutcome
+        func outcome(_ focus: ApprovalPromptCenter.ReturnFocus?, command: Bool = false,
+                     duration: Bool = false, note: Bool = false) -> Outcome {
+            ApprovalPromptCenter.returnKeyOutcome(
+                isCommand: command, durationOwnsKeyboard: duration, denialNoteFocused: note, focus: focus)
+        }
+        #expect(outcome(nil) == .plainReturn)
+        #expect(outcome(.allow) == .plainReturn)
+        #expect(outcome(.deny) == .denyFocused)
+        #expect(outcome(.denyWithNote) == .openDenialNote)
+        #expect(outcome(.viewTaskCenter) == .viewTaskCenter)
+        // ⌘回车、理由框、等待时长输入框的优先级不受按钮焦点影响。
+        #expect(outcome(.denyWithNote, command: true) == .commandReturn)
+        #expect(outcome(.viewTaskCenter, note: true) == .denyWithReason)
+        #expect(outcome(.denyWithNote, duration: true) == .ignored)
+    }
+
+    /// P3 接线：回车键到动作的完整分发（视图 onKeyPress 只做一次调用）。
+    @Test func returnKeyDispatchRunsTheFocusedButtonAndNeverApprovesOnWrongFocus() async throws {
+        let center = ApprovalPromptCenter()
+        let first = Task { await center.present(ApprovalRequest(id: "return-dispatch-1", toolName: "file_read",
+            inputSummary: "synthetic", riskLevel: .low, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(550))
+        var openedNote = 0
+        var viewedTaskCenter = 0
+        func press(_ focus: ApprovalPromptCenter.ReturnFocus?, duration: Bool = false) -> Bool {
+            center.handleReturnKey(
+                isCommand: false, durationOwnsKeyboard: duration, denialNoteFocused: false, focus: focus,
+                openDenialNote: { openedNote += 1 }, viewTaskCenter: { viewedTaskCenter += 1 })
+        }
+        // “拒绝并说明…”：打开理由框，请求仍在等用户。
+        #expect(press(.denyWithNote))
+        #expect(openedNote == 1 && viewedTaskCenter == 0)
+        #expect(center.pendingRequest?.id == "return-dispatch-1")
+        // “在任务中心查看”：执行该按钮，请求仍在等用户，没有批准。
+        #expect(press(.viewTaskCenter))
+        #expect(openedNote == 1 && viewedTaskCenter == 1)
+        #expect(center.pendingRequest?.id == "return-dispatch-1")
+        // 等待时长输入框里的回车交还系统，什么都不做。
+        #expect(!press(.denyWithNote, duration: true))
+        #expect(openedNote == 1)
+        // “拒绝”：拒绝。
+        #expect(press(.deny))
+        #expect(!(await first.value).approved)
+
+        // 没有按钮焦点：普通卡按默认批准。
+        let second = Task { await center.present(ApprovalRequest(id: "return-dispatch-2", toolName: "file_read",
+            inputSummary: "synthetic", riskLevel: .low, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(550))
+        #expect(press(nil))
+        #expect((await second.value).approved)
+    }
+
+    /// P3 视图接线（纯函数已测、焦点绑定无法在这里挂载时用源码核对）：两个按钮必须登记各自的焦点，
+    /// 回车必须经 `handleReturnKey` 带上当前焦点，回退成只看“拒绝”时这里会变红。
+    @Test func approvalViewBindsFocusForEveryButtonAndRoutesReturnThroughTheDispatcher() throws {
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MinisCanvasApp/ApprovalPromptCenter.swift")
+        let source = try String(contentsOf: file, encoding: .utf8)
+        #expect(source.contains(".focused($focusedAction, equals: .deny)"))
+        #expect(source.contains(".focused($focusedAction, equals: .allow)"))
+        #expect(source.contains(".focused($focusedAction, equals: .denyWithNote)"))
+        #expect(source.contains(".focused($focusedAction, equals: .viewTaskCenter)"))
+        #expect(source.contains("center.handleReturnKey("))
+        #expect(source.contains("focus: focusedAction"))
+        #expect(source.contains("viewTaskCenter: onViewTaskCenter"))
+        #expect(!source.contains("handleReturn(focusOnDeny: focusedAction == .deny)"))
+    }
+
+    @Test func returnOnFocusedDenyButtonDeniesAndOtherwiseApproves() async throws {
+        let center = ApprovalPromptCenter()
+        let focusedDeny = Task { await center.present(ApprovalRequest(id: "return-focus-deny", toolName: "file_read",
+            inputSummary: "synthetic", riskLevel: .low, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(550))
+        #expect(!center.keyboardApprovalBlocked)
+        center.handleReturn(focusOnDeny: true)
+        let denied = await focusedDeny.value
+        #expect(!denied.approved)
+
+        let focusedAllow = Task { await center.present(ApprovalRequest(id: "return-focus-allow", toolName: "file_read",
+            inputSummary: "synthetic", riskLevel: .low, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(550))
+        center.handleReturn(focusOnDeny: false)
+        #expect((await focusedAllow.value).approved)
+    }
+
+    /// R3-P-02：请求不属于当前会话时，卡片首行写来源会话，范围不再写"当前会话"。
+    @Test func approvalSummaryNamesTheOriginSessionWhenItIsNotTheCurrentOne() {
+        let request = ApprovalRequest(id: "origin-summary", toolName: "file_write", inputSummary: "synthetic",
+            riskLevel: .high, requiresApproval: true, approvalScope: "session")
+        let own = ApprovalSummaryPresentation(request: request)
+        #expect(own.originNotice == nil)
+        #expect(own.scope == "范围：当前会话")
+        let other = ApprovalSummaryPresentation(request: request, originSessionTitle: "整理发票")
+        #expect(other.originNotice == "来自会话：《整理发票》")
+        #expect(other.scope == "范围：该会话")
+        #expect(!other.scope.contains("当前会话"))
+        #expect(ApprovalSummaryPresentation(request: request, originSessionTitle: "  ").originNotice == "来自另一个会话")
+    }
+
+    /// R3-P-02 接线：来源会话标题由会话库按当前会话给出，三处卡片入口（弹窗、任务中心上的弹窗、行内卡）
+    /// 都必须把它传给卡片，少传一处，那一处的卡片就又不写来源了。
+    @Test func originSessionTitleComesFromTheStoreAndAllThreeCardEntriesPassIt() throws {
+        let chat = ChatStore()
+        let first = try #require(chat.activeSessionID)
+        chat.newSession()
+        let second = try #require(chat.activeSessionID)
+        let firstTitle = try #require(chat.sessions.first { $0.id == first }?.title)
+        #expect(chat.approvalOriginSessionTitle(requestSessionID: second.uuidString) == nil)
+        #expect(chat.approvalOriginSessionTitle(requestSessionID: first.uuidString) == firstTitle)
+        #expect(chat.approvalOriginSessionTitle(requestSessionID: UUID().uuidString) == "")
+        #expect(chat.approvalOriginSessionTitle(requestSessionID: nil) == nil)
+        #expect(chat.approvalOriginSessionTitle(requestSessionID: "not-a-session-id") == nil)
+
+        let file = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MinisCanvasApp/ContentView.swift")
+        let source = try String(contentsOf: file, encoding: .utf8)
+        let entries = source.components(separatedBy: "ApprovalPromptView(").count - 1
+        let passed = source.components(
+            separatedBy: "bridge.chat.approvalOriginSessionTitle(requestSessionID: request.sessionID)").count - 1
+        #expect(entries == 3, "弹窗、任务中心上的弹窗、行内卡片三处入口")
+        #expect(passed == entries)
+        // 行内卡片再把标题交给真正的卡片。
+        let center = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MinisCanvasApp/ApprovalPromptCenter.swift")
+        #expect(try String(contentsOf: center, encoding: .utf8).contains(
+            "originSessionTitle: originSessionTitle, dismissesOnDisappear: false)"))
+    }
+
     @Test func inlineDefaultsOffAndFreshReturnCannotApprove() async {
         let center = ApprovalPromptCenter()
         #expect(!center.inlineApprovalEnabled)
@@ -1046,7 +1243,40 @@ struct Goal18ApprovalPresentationTests {
         #expect(!(await waiter.value).approved)
     }
 
-    @Test func fallbackRetainsWaiterAndOldInlineCallbacksAreStale() async {
+    @Test func interactiveTimeoutDeniesWithVisibleReason() async {
+        let center = ApprovalPromptCenter()
+        center.applyPersistedPresentation(inline: true, expiration: 300)
+        #expect(center.expirationInterval == 300)
+        let waiter = Task { await center.present(ApprovalRequest(id: "timeout-reason", toolName: "file_write",
+            inputSummary: "synthetic", riskLevel: .high, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        #expect(center.pendingRequest != nil)
+        #expect(center.pendingExpirationDisplayDeadline != nil)
+        center.expirePending()
+        let decision = await waiter.value
+        #expect(!decision.approved && decision.status == .expired)
+        #expect(decision.reason == "超时未处理，已拒绝")
+    }
+
+    @Test func denyWithNoteSendsTheNoteToTheModelAndDefaultNeverAutoDenies() async {
+        let center = ApprovalPromptCenter()
+        // 对齐 Claude Code：默认不自动拒绝，审批卡一直等用户。
+        #expect(center.expirationInterval == 0)
+        let waiter = Task { await center.present(ApprovalRequest(id: "deny-note", toolName: "file_write",
+            inputSummary: "synthetic", riskLevel: .high, requiresApproval: true)) }
+        for _ in 0..<100 where center.pendingRequest == nil { await Task.yield() }
+        #expect(center.pendingRequest != nil)
+        #expect(center.pendingExpirationDisplayDeadline == nil)
+        center.denialNote = "  请改写 src 目录下的文件  "
+        center.actionsForPresentedRequest().deny()
+        let decision = await waiter.value
+        #expect(!decision.approved)
+        #expect(decision.reason == ApprovalPromptCenter.userDenialReason + "：请改写 src 目录下的文件")
+        #expect(center.denialNote.isEmpty)
+        #expect(ApprovalDecisionStatusLedger.Observation(status: decision.status, reason: decision.reason).isUserDenial)
+    }
+
+        @Test func fallbackRetainsWaiterAndOldInlineCallbacksAreStale() async {
         let center = ApprovalPromptCenter()
         center.inlineApprovalEnabled = true
         center.inlineHostAvailable = true

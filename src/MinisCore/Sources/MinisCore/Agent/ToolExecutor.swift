@@ -2,6 +2,7 @@ import Foundation
 import CoreFoundation
 import Darwin
 import CryptoKit
+import ImageIO
 
 /// The result of querying one recovered built-in file_write receipt. Only a
 /// receipt-bound durable completion can produce a successful canonical fact.
@@ -9,6 +10,42 @@ public enum FileWriteReconciliationResult: Equatable, Sendable {
     case notExecuted
     case unknown
     case succeeded(ToolExecutionFact)
+}
+
+// MARK: - Relative path input
+
+/// File tools accept `~/…` and project-relative paths and resolve them against
+/// the current working directory before any policy or authorization check, so
+/// every later stage still sees one absolute path.
+enum ToolPathResolution {
+    static let toolNames: Set<String> = [
+        "file_read", "file_grep", "file_glob", "file_write", "file_edit", "file_delete"
+    ]
+
+    /// Absolute spelling of a relative or `~` path; nil when the path is already
+    /// absolute, contains `..`, names another user's home, or has no base.
+    static func absolutePath(for raw: String, workingDirectory: String?) -> String? {
+        guard !raw.isEmpty, !raw.hasPrefix("/") else { return nil }
+        let base: String
+        let relative: String
+        if raw == "~" {
+            base = NSHomeDirectory(); relative = ""
+        } else if raw.hasPrefix("~/") {
+            base = NSHomeDirectory(); relative = String(raw.dropFirst(2))
+        } else if raw.hasPrefix("~") {
+            return nil
+        } else {
+            guard let workingDirectory, workingDirectory.hasPrefix("/") else { return nil }
+            base = workingDirectory; relative = raw
+        }
+        var components: [Substring] = []
+        for component in relative.split(separator: "/", omittingEmptySubsequences: true) {
+            if component == ".." { return nil }
+            if component != "." { components.append(component) }
+        }
+        let tail = components.joined(separator: "/")
+        return tail.isEmpty ? base : (base.hasSuffix("/") ? base + tail : base + "/" + tail)
+    }
 }
 
 // MARK: - Protocol
@@ -244,6 +281,8 @@ public enum ToolExecutorError: Error, Equatable, Sendable {
     case toolNotConfigured(String)
     /// A high-risk call reached the loop without an approval decision.
     case approvalRequired(String)
+    /// 浏览器属于当前打开的会话；发起调用的会话已不是它（例如切到了别的会话）。
+    case browserSessionUnavailable
 }
 
 extension ToolExecutorError {
@@ -282,6 +321,8 @@ extension ToolExecutorError: LocalizedError {
             message = "终端命令已被拒绝：\(reason)"
         case .toolNotConfigured(let name): message = "工具尚未配置执行器：\(name)"
         case .approvalRequired(let name): message = "执行工具前需要审批：\(name)"
+        case .browserSessionUnavailable:
+            message = "浏览器只属于当前打开的会话，这个会话已不在前台，浏览器调用被拒绝；请切回该会话后再重试。"
         }
         return ContentSecretRedactor.redact(message, knownSecrets: ModelShellEnvironment.knownCredentialValues())
     }
@@ -792,12 +833,13 @@ private final class ToolOperationTimeoutWatchdog: Sendable {
 /// - `file_read` / `file_write` / `file_edit` / `file_delete` — direct file access,
 ///   with all paths confined to `allowedRoot` (path traversal / symlink
 ///   escapes rejected).
-/// - `web_search` — NOT wired to any backend (P3-P1-05 honest-failure
-///   contract). It is absent from `defaultRegisteredToolNames()`, so default
-///   calls fail closed at the whitelist gate with `unknownTool` (error-class
-///   `is_error` tool_result in `AgentLoop`); a consumer that still registers
-///   the name explicitly gets `toolNotConfigured` at dispatch. It never
-///   returns a fake-success prose string.
+/// - `web_search` — backed by `WebSearchService` (E1) only when the composition
+///   root passes `webSearch:`. It stays absent from `defaultRegisteredToolNames()`,
+///   so default calls fail closed at the whitelist gate with `unknownTool`
+///   (error-class `is_error` tool_result in `AgentLoop`); a consumer that
+///   registers the name without a service, or whose search settings are
+///   unusable, gets `toolNotConfigured` at dispatch. It never returns a
+///   fake-success prose string.
 ///
 /// Composed native tools (B1j) — each optional, dispatch happens in
 /// `execute(name:)` by tool name:
@@ -892,11 +934,20 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
 
     /// Shared registry also observed by the background-command UI.
     public let backgroundShells: BackgroundShellRegistry = .shared
+    /// shell 命令结束后登记的“命令生成（未经写入验证）”产物，与台账里已证实的写入分开。
+    public let commandGeneratedArtifacts = CommandGeneratedArtifactLog()
 
     /// Root directory that file tools may touch. Everything else is rejected.
     private let webFetchTransport: WebFetchTransport?
     public var webFetchAvailable: Bool { webFetchTransport != nil }
     internal var webFetchPinnedConfiguration: WebFetchPinnedConfiguration? { webFetchTransport?.pinnedConfiguration }
+    /// E1: nil unless the composition root wired a search service.
+    private let webSearchService: WebSearchService?
+    /// A search service was composed (the name may be registered). Says nothing about
+    /// whether the user's settings are usable; see `webSearchAvailable`.
+    public var webSearchConfigured: Bool { webSearchService != nil }
+    /// Composed and the user's settings are usable right now: only then is the tool advertised.
+    public var webSearchAvailable: Bool { webSearchService?.isAvailable == true }
 
     private let configuredAllowedRoot: URL
     public let sessionDerivedRoot: Bool
@@ -1040,11 +1091,13 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         terminalPolicySnapshot: TerminalPolicySnapshot = .default,
         sessionReadKnownSecretsProvider: @escaping @Sendable () -> [String] = { [] },
         sessionDerivedRoot: Bool = false,
-        webFetch: WebFetchTransport? = nil
+        webFetch: WebFetchTransport? = nil,
+        webSearch: WebSearchService? = nil
     ) {
         self.configuredAllowedRoot = allowedRoot.standardizedFileURL
         self.sessionDerivedRoot = sessionDerivedRoot
         self.webFetchTransport = webFetch
+        self.webSearchService = webSearch
         self.skillMaintenance = skillMaintenance
         self.configuredDeniedRoots = deniedRoots?.map { $0.standardizedFileURL }
         let privateFloor = appPrivateDeniedRoots
@@ -1122,7 +1175,8 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             terminalPolicySnapshot: configuration.terminalPolicySnapshot,
             sessionReadKnownSecretsProvider: sessionReadKnownSecretsProvider,
             sessionDerivedRoot: sessionDerivedRoot,
-            webFetch: webFetchTransport
+            webFetch: webFetchTransport,
+            webSearch: webSearchService
         )
         copy.mutableState.withLock { $0 = configuration }
         return copy
@@ -1189,6 +1243,15 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
 
     public func execute(name: String, input: [String: Any]) async throws -> String {
         try Task.checkCancellation()
+        var input = input
+        if ToolPathResolution.toolNames.contains(name), let raw = input["path"] as? String,
+           !raw.isEmpty, !raw.hasPrefix("/") {
+            guard let absolute = ToolPathResolution.absolutePath(
+                for: raw, workingDirectory: effectiveWorkingDirectory.path) else {
+                throw ToolExecutorError.invalidParameter("path 需要绝对路径（不能含 ..）：\(raw)")
+            }
+            input["path"] = absolute
+        }
         try await validateChildWorkspace(name: name, input: input)
         let configuration = mutableState.withLock { $0 }
         // P1-1 工具白名单强制：任何未注册工具名在 dispatch 前被拒绝。
@@ -1207,7 +1270,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         switch name {
         case SkillMaintenanceTool.readName:
             guard let skillMaintenance else { throw ToolExecutorError.toolNotConfigured(name) }
-            return try skillMaintenance.read(input: input)
+            return try await skillMaintenance.readIncludingExternal(input: input)
         case "skill_create", "skill_update", "skill_delete":
             guard let request = SkillMaintenanceApprovalContext.request,
                   request.toolName == name, request.inputDigest == (try ComposerToolInput(input)).digest,
@@ -1245,7 +1308,14 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         case ExternalSessionToolNames.send:
             return try await ExternalSessionSendTool.execute(
                 input: input, roots: externalSessionRoots,
-                knownSecrets: sessionReadKnownSecretsProvider())
+                knownSecrets: sessionReadKnownSecretsProvider(),
+                attachmentPaths: try sessionAttachments(input: input).map(\.path))
+        case SessionMessagingTool.toolName:
+            return try await SessionMessagingTool.execute(
+                input: input, knownSecrets: sessionReadKnownSecretsProvider(),
+                attachments: try sessionAttachments(input: input))
+        case TaskBoardTool.toolName:
+            return try await TaskBoardTool.execute(input: input)
         case "web_fetch":
             guard let raw = input["url"] as? String, !raw.isEmpty else {
                 throw ToolExecutorError.missingParameter("url")
@@ -1255,16 +1325,16 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                   let host = url.host, !host.isEmpty else { throw ToolExecutorError.invalidParameter("url") }
             guard let webFetchTransport else { throw ToolExecutorError.toolNotConfigured("web_fetch") }
             let content = try await webFetchTransport.fetch(url)
-            let result: [String: String] = ["url": ContentSecretRedactor.redact(raw), "untrustedPageContent": content]
-            let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
-            return String(decoding: data, as: UTF8.self)
+            return try webFetchEnvelope(url: raw, content: content)
         case "web_search":
-            // P3-P1-05: un-wired capability. Reachable only when a consumer
-            // registered the name explicitly (it is absent from the default
-            // whitelist). Fail with the existing typed error path so the
-            // agent loop records an error-class (is_error) tool_result —
-            // never a prose string that would look like a successful search.
-            throw ToolExecutorError.toolNotConfigured("web_search")
+            // E1: dispatches only when a search service was composed AND the
+            // user's search settings are usable (the service itself throws
+            // toolNotConfigured otherwise). With no service — the default, and
+            // any consumer that registered the name explicitly — it still
+            // fails with the typed error (error-class tool_result), never a
+            // prose string that would look like a successful search.
+            guard let webSearchService else { throw ToolExecutorError.toolNotConfigured("web_search") }
+            return try await webSearchService.execute(input: input)
         default:
             // Composed native tools.
             if name == BrowserTool.toolName || name == BrowserTool.legacyToolName {
@@ -1347,7 +1417,9 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             let roots = ["file_read", "file_grep", "file_glob"].contains(name) ? scope.readRoots : scope.writeRoots
             let hasReadApproval = ["file_read", "file_grep", "file_glob"].contains(name)
                 && ApprovedFileReadScope.permits(tool: name, path: physical)
-            guard (roots.contains(where: { physical == $0 || physical.hasPrefix($0 + "/") }) || hasReadApproval),
+            let hasWriteApproval = ["file_write", "file_edit"].contains(name)
+                && ApprovedFileWriteScope.permits(tool: name, path: physical)
+            guard (roots.contains(where: { physical == $0 || physical.hasPrefix($0 + "/") }) || hasReadApproval || hasWriteApproval),
                   !scope.deniedRoots.contains(where: { PolicyRuntimePathBoundary.foldedCandidate(physical, isWithin: $0) }) else {
                 throw ToolExecutorError.pathViolation(raw)
             }
@@ -1458,6 +1530,8 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         try ToolFileMutationScope.validateSingleLinkedTarget(physical)
         // Revalidate the exact approved snapshot after waiting for the lock.
         try ApprovalFilePreviewContext.current?.validateCurrent()
+        // 先读再改：执行锁内再复核一次（审批预检之前已查过一次）。
+        try verifyReadBeforeMutation(name: name, physical: physical, input: input)
         try Task.checkCancellation()
         var checked = input
         checked["path"] = physical
@@ -1486,7 +1560,11 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         if name == "file_delete", ChildDeletionReviewPreparationContext.current != nil, !fileCheckpointsEnabled {
             throw ToolExecutorError.writeFailed("检查点配置已变化，本次删除未执行。")
         }
-        if fileCheckpointsEnabled {
+        // 真密钥文件（.env、密钥、凭据目录）的编辑：允许，但不留检查点备份
+        // （备份会把密钥正文复制进检查点存储）；审批卡已写明改动不可撤销。
+        // 删除仍要备份，由检查点存储按原规则拒绝。
+        let skipSecretCheckpoint = name != "file_delete" && SensitiveFilePolicy.isUncheckpointedSecretFile(physical)
+        if fileCheckpointsEnabled, !skipSecretCheckpoint {
             guard let store = fileCheckpointStore else {
                 throw ToolExecutorError.writeFailed("检查点存储不可用，本次文件改动未执行。")
             }
@@ -1504,15 +1582,19 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                 guard let old = checked["old_string"] as? String, !old.isEmpty,
                       let new = checked["new_string"] as? String else { throw ToolExecutorError.invalidParameter("edit strings") }
                 let data = try readFileDataOrDenial(at: url, path: physical)
+                if FileImporter.isPDF(data: data, pathExtension: url.pathExtension) {
+                    throw ToolExecutorError.editFailed("PDF 无法编辑：\(physical)。请另存为文本或 Markdown 后再改，或用 file_write 新建文件。")
+                }
                 guard let text = String(data: data, encoding: .utf8) else { throw ToolExecutorError.fileIsBinary(physical) }
-                let count = text.components(separatedBy: old).count - 1
-                guard count > 0 else {
-                    throw ToolExecutorError.editFailed("old_string not found in \(physical)")
-                }
-                guard count == 1 || checked["replace_all"] as? Bool == true else {
+                let edited: String
+                switch Self.matchAndReplaceEdit(in: text, old: old, new: new, replaceAll: checked["replace_all"] as? Bool == true) {
+                case .notFound:
+                    throw ToolExecutorError.editFailed(Self.editNotFoundDetail(path: physical, text: text, old: old))
+                case .ambiguous:
                     throw ToolExecutorError.editFailed("old_string must identify one location, or use replace_all=true")
+                case .replaced(let result, _, _):
+                    edited = result
                 }
-                let edited = text.replacingOccurrences(of: old, with: new)
                 guard !Self.introducesRedactedFileMask(from: text, to: edited) else {
                     throw ToolExecutorError.editFailed(Self.redactedFileMutationMessage)
                 }
@@ -1565,6 +1647,14 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                 : try runFileDelete(checked)
         }
         if let checkpoint { try checkpoint.store.commit(checkpoint.id) }
+        // 写入/编辑成功后，本会话视为已读到最新版本；删除后清除记录。
+        if let session = fileReadRecordSessionID {
+            if name == "file_delete" {
+                FileReadRecordStore.shared.forget(sessionID: session, path: physical)
+            } else {
+                FileReadRecordStore.shared.recordRead(sessionID: session, path: physical)
+            }
+        }
         return result
     }
 
@@ -1842,14 +1932,28 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
     func externalSessionApprovalSummary(input: [String: Any]) async throws -> String {
         try await ExternalSessionSendTool.approvalSummary(
             input: input, roots: externalSessionRoots,
-            knownSecrets: sessionReadKnownSecretsProvider())
+            knownSecrets: sessionReadKnownSecretsProvider(),
+            attachmentPaths: try sessionAttachments(input: input).map(\.path))
+    }
+
+    /// session_send / external_session_send 的文件附件：每个路径都过读取授权根和敏感文件检查，
+    /// 越权或敏感时整个调用被拒绝，不静默丢掉附件。
+    func sessionAttachments(input: [String: Any]) throws -> [SessionAttachmentFiles.Resolved] {
+        let paths = try SessionAttachmentFiles.requestedPaths(input)
+        guard !paths.isEmpty else { return [] }
+        return try SessionAttachmentFiles.resolve(paths: paths) { raw in
+            try Self.resolveAllowedPath(
+                raw, allowedRoot: allowedRoot, additionalAllowedRoots: additionalAllowedRoots,
+                deniedRoots: deniedRoots)
+        }
     }
 
     // MARK: - shell_execute
 
     private static func makePipeReader(
         _ handle: FileHandle,
-        lifetime: ShellPipeReaderLifetime
+        lifetime: ShellPipeReaderLifetime,
+        onChunk: (@Sendable (Data) -> Void)? = nil
     ) -> Task<Data, Never> {
         let descriptor = dup(handle.fileDescriptor)
         guard descriptor >= 0 else {
@@ -1861,7 +1965,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let maxBytes = shellOutputLimit
         return Task.detached(priority: .userInitiated) {
             let reader = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
-            return await readPipeData(reader, maxBytes: maxBytes, lifetime: lifetime)
+            return await readPipeData(reader, maxBytes: maxBytes, lifetime: lifetime, onChunk: onChunk)
         }
     }
 
@@ -1884,7 +1988,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                 throw ToolExecutorError.invalidParameter("此工具不保持目录，请使用 cwd 参数；一次执行一条命令。")
             }
         }
-        guard let value = input["cwd"] else { return effectiveWorkingDirectory }
+        guard let value = ShellToolInput.explicitWorkingDirectory(input) else { return effectiveWorkingDirectory }
         guard let raw = value as? String, raw.hasPrefix("/") else {
             throw ToolExecutorError.invalidParameter("cwd（请提供授权目录内的绝对路径）")
         }
@@ -2006,7 +2110,8 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             // 变量拼接、相对路径等间接写法；可靠兜底是 macOS 系统完整性保护。
             if let reason = BypassSystemFloor.shellViolation(command: command)
                 ?? SensitiveFilePolicy.credentialShellViolation(command: command)
-                ?? BypassAppDataFloor.shellMentionViolation(command: command) {
+                ?? BypassAppDataFloor.shellMentionViolation(command: command)
+                ?? ShellNestedCommandInspector.violation(command: command) {
                 throw ToolExecutorError.shellRejected(reason)
             }
             // 用户自己在终端策略里设置的拒绝命令（userDeniedCommands）在绕过下继续生效
@@ -2018,12 +2123,26 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         } else {
             let policySnapshot = terminalPolicySnapshot
             let disposition = try Self.validateShellPolicy(command: command, snapshot: policySnapshot)
+            // 只读免问的命令（od、hexdump、xxd、strings 等不在终端策略放行表里）没有用户当场批准，
+            // 但授权时已过效果检查器，下面 recheckViolation 在执行前会再过一次同一个检查器。
             if disposition == .unknown,
-               !ApprovedShellCallScope.permits(input: input) {
+               !ApprovedShellCallScope.permits(input: input),
+               ApprovedShellCallScope.effectRecheck == nil {
                 throw ToolExecutorError.approvalRequired("shell_execute")
             }
         }
         let directory = try shellWorkingDirectory(input)
+        // 规则命中、计划模式或自动档免问的调用没有用户当场批准：真正执行前对同一条命令
+        // 再过一次效果检查器（路径包含、敏感文件、授权根），防止检查之后路径被换成符号链接。
+        if let reason = ApprovedShellCallScope.recheckViolation(input: input, workingDirectory: directory.path) {
+            throw ToolExecutorError.shellRejected("原先放行的规则或免问条件已不满足（\(reason)）。请重新发起，由你确认。")
+        }
+        // 绕过档：命令的操作数命中敏感文件（.env、密钥、凭据）时，没有用户当场批准的调用不执行（审批卡在授权阶段已弹）。
+        if BypassOpenScope.isActive, SensitiveFilePolicy.credentialProtectionEnabled,
+           !ApprovedShellCallScope.permits(input: input),
+           let reason = ShellEffectGuard.sensitiveOperandViolation(command: command, workingDirectory: directory.path) {
+            throw ToolExecutorError.shellRejected(reason)
+        }
         if try Self.wantsBackground(input) {
             return try await startBackgroundShell(command: command, input: input)
         }
@@ -2050,6 +2169,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                 seconds: budget.executionSeconds, stdout: Data(), stderr: Data(), limit: Self.shellOutputLimit))
         }
 
+        let commandStartedAt = Date()
         let shell: SpawnedShell
         do {
             // Foundation's Process exposes no pre-exec process-group hook.
@@ -2069,8 +2189,16 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         // drain deadline so a broken child cannot hold this tool indefinitely.
         let shellPID = shell.pid
         let readerLifetime = ShellPipeReaderLifetime()
-        let stdoutTask = Self.makePipeReader(shell.stdout, lifetime: readerLifetime)
-        let stderrTask = Self.makePipeReader(shell.stderr, lifetime: readerLifetime)
+        // 前台实时输出：只给界面的进度通道（不进工具结果、不起新一轮）；
+        // 由调用方通过 ShellLiveOutput.sink 提供，限速限量并先脱敏。
+        let liveRelay = ShellLiveOutput.sink.map {
+            ShellLiveOutputRelay(sink: $0, knownSecrets: ModelShellEnvironment.knownCredentialValues())
+        }
+        defer { liveRelay?.finish() }
+        let stdoutTask = Self.makePipeReader(shell.stdout, lifetime: readerLifetime,
+            onChunk: liveRelay.map { relay in { @Sendable data in relay.feed(data, isStderr: false) } })
+        let stderrTask = Self.makePipeReader(shell.stderr, lifetime: readerLifetime,
+            onChunk: liveRelay.map { relay in { @Sendable data in relay.feed(data, isStderr: true) } })
 
         // Keep the watchdog off the cooperative executor. The affected
         // MinisCore suite runs blocking fixtures in parallel; an async
@@ -2151,18 +2279,25 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         await readerLifetime.beginFinalDrain(gracePeriod: Self.shellDrainGracePeriod)
         let stdoutData = await stdoutTask.value
         let stderrData = await stderrTask.value
-        let stdoutText = String(data: stdoutData, encoding: .utf8)
-        let stderrText = String(data: stderrData, encoding: .utf8)
-        let stdout = ContentSecretRedactor.redact(stdoutText ?? "", knownSecrets: ModelShellEnvironment.knownCredentialValues())
-        let stderr = ContentSecretRedactor.redact(stderrText ?? "", knownSecrets: ModelShellEnvironment.knownCredentialValues())
-        let captureComplete = await readerLifetime.outputComplete()
-        let outputComplete = captureComplete && stdoutText != nil && stderrText != nil
+        // Lossy decoding: a stray non-UTF-8 byte becomes U+FFFD instead of
+        // blanking the whole stream (same decoding the timeout path uses).
+        let stdoutText = String(decoding: stdoutData, as: UTF8.self)
+        let stderrText = String(decoding: stderrData, as: UTF8.self)
+        let stdout = ContentSecretRedactor.redact(stdoutText, knownSecrets: ModelShellEnvironment.knownCredentialValues())
+        let stderr = ContentSecretRedactor.redact(stderrText, knownSecrets: ModelShellEnvironment.knownCredentialValues())
+        let outputComplete = await readerLifetime.outputComplete()
 
         if timedOut {
             throw shellTimeoutError(seconds: budget.executionSeconds, stdout: stdoutData, stderr: stderrData)
         }
+        let generated = CommandGeneratedArtifacts.detect(
+            command: command, workingDirectory: directory, startedAt: commandStartedAt)
+        if !generated.isEmpty {
+            let sessionKey = AgentExecutionContext.current?.currentConversationID ?? fileChangeSessionID
+            if !sessionKey.isEmpty { commandGeneratedArtifacts.record(sessionID: sessionKey, paths: generated) }
+        }
         return try shellResult(command: command, exitCode: shellExitCode(exitStatus), stdout: stdout, stderr: stderr,
-            outputComplete: outputComplete)
+            outputComplete: outputComplete, commandGeneratedFiles: generated)
     }
 
     /// Preserve timeout as the primary failure even when the secondary log write fails.
@@ -2183,9 +2318,36 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         return .shellTimeout(detail + artifactDetail)
     }
 
+    /// web_fetch text longer than this is cut inline; the full text is saved to a
+    /// session file the model can page through with file_read.
+    private static let webFetchInlineCharacters = 40_000
+
+    private func webFetchEnvelope(url: String, content: String) throws -> String {
+        var result: [String: Any] = ["url": ContentSecretRedactor.redact(url)]
+        let total = content.count
+        if total <= Self.webFetchInlineCharacters {
+            result["untrustedPageContent"] = content
+        } else {
+            let limit = Self.webFetchInlineCharacters
+            let redacted = ContentSecretRedactor.redact(content,
+                knownSecrets: ModelShellEnvironment.knownCredentialValues())
+            result["untrustedPageContent"] = String(redacted.prefix(limit))
+            result["content_truncated"] = true
+            result["total_characters"] = total
+            if let artifact = try? persistShellOutput(redacted, threshold: limit) {
+                result["full_content_path"] = artifact.fileURL.path
+                result["note"] = "页面全文共 \(total) 字符，这里只给出前 \(limit) 字符。全文已保存到 full_content_path，需要后面的内容时用 file_read（offset、lines）分段读取。"
+            } else {
+                result["note"] = "页面全文共 \(total) 字符，这里只给出前 \(limit) 字符，全文未能保存。需要其余部分时，请改用能指定页面片段的方式（如浏览器工具）。"
+            }
+        }
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
     /// Called only with output that has already passed through the secret redactor.
-    private func persistShellOutput(_ redactedOutput: String) throws -> ToolOutputArtifact? {
-        guard redactedOutput.count > 30_000 else { return nil }
+    private func persistShellOutput(_ redactedOutput: String, threshold: Int = 30_000) throws -> ToolOutputArtifact? {
+        guard redactedOutput.count > threshold else { return nil }
         guard let session = ToolOutputArtifactSessionScope.current,
               session.sessionStorageRoot.isFileURL else {
             throw ToolExecutorError.toolNotConfigured("会话输出存储")
@@ -2195,12 +2357,12 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let directory = try Self.resolveAllowedPath(proposed.path,
             allowedRoot: session.sessionStorageRoot, additionalAllowedRoots: [], deniedRoots: [])
         guard directory.path == proposed.path else { throw ToolExecutorError.pathViolation(proposed.path) }
-        return try store.persistIfLarge(redactedOutput: redactedOutput)
+        return try store.persistIfLarge(redactedOutput: redactedOutput, thresholdCharacters: threshold)
     }
 
     /// Pure outcome formatting plus authorized output-file persistence; no shell spawn.
     func shellResult(command: String, exitCode: Int32, stdout: String, stderr: String,
-        outputComplete: Bool = false) throws -> String {
+        outputComplete: Bool = false, commandGeneratedFiles: [String] = []) throws -> String {
         let stdoutArtifact = try persistShellOutput(stdout)
         let stderrArtifact = try persistShellOutput(stderr)
         var envelope: [String: Any] = [
@@ -2215,6 +2377,10 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                                  "utf8_bytes": artifact.byteCount, "capture_scope": "retained_shell_output",
                                  "capture_limit_bytes": Self.shellOutputLimit] as [String: Any]
             }
+        }
+        if !commandGeneratedFiles.isEmpty {
+            envelope["command_generated_files"] = ["status": CommandGeneratedArtifacts.statusLabel,
+                                                   "paths": commandGeneratedFiles] as [String: Any]
         }
         let gitFields = GitWorkflowProjection.sessionFields(command: command, exitCode: exitCode, stdout: stdout, stderr: stderr)
         if !gitFields.isEmpty { envelope["git_workflow"] = gitFields }
@@ -2307,13 +2473,21 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             backgroundShells.abandon(id: id)
             throw error
         }
+        // 后台命令结束时也登记命令生成的产物（与前台命令同一判定，同样标"未经写入验证"）。
+        let artifactLog = commandGeneratedArtifacts
+        let backgroundStartedAt = Date()
+        backgroundShells.addFinishHook(id: id) {
+            let generated = CommandGeneratedArtifacts.detect(
+                command: command, workingDirectory: directory, startedAt: backgroundStartedAt)
+            if !generated.isEmpty { artifactLog.record(sessionID: sessionKey, paths: generated) }
+        }
         return try Self.backgroundJSON([
             "background": true,
             "task_id": id,
             "status": BackgroundShellState.running.wireName,
-            "timeout_seconds": timeout,
+            "timeout_seconds": (timeout > 0 ? timeout as Any : NSNull() as Any),
             "max_timeout_seconds": backgroundShells.maximumTimeoutSeconds,
-            "note": "用 shell_output 读取输出与状态，或用 shell_stop 停止；会话结束或应用退出时也会终止命令。",
+            "note": "命令没有时间上限，会一直运行到自己结束、被 shell_stop 停止，或应用退出（退出时会终止命令）。用 shell_output 读取输出与状态。",
         ])
     }
 
@@ -2372,7 +2546,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             "task_id": snapshot.id,
             "status": snapshot.state.wireName,
             "elapsed_seconds": Int(snapshot.elapsed()),
-            "timeout_seconds": snapshot.timeoutSeconds,
+            "timeout_seconds": (snapshot.timeoutSeconds > 0 ? snapshot.timeoutSeconds as Any : NSNull() as Any),
         ]
         if let code = snapshot.exitCode { object["exit_code"] = Int(code) } else { object["exit_code"] = NSNull() }
         if let note = snapshot.endNote { object["note"] = note }
@@ -2686,7 +2860,58 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         return nil
     }
 
+    /// Files up to this size are read into memory; larger text files are read in
+    /// blocks (head) or from the end (tail) so a log file never fills memory.
+    private static let fileReadInMemoryLimit = 8 * 1024 * 1024
+    private static let fileReadTailWindowBytes = 4 * 1024 * 1024
+    private static let fileReadHeadScanLimit = 512 * 1024 * 1024
+    private static let fileReadDefaultMaxLength = 30_000
+
+    /// 读取记录用的会话键；会话未接线（空串）时不记录、也不强制“先读再改”。
+    private var fileReadRecordSessionID: String? {
+        // 优先用本次调用自己的会话（执行上下文里的会话）：执行器上的会话键是界面当前打开的会话，
+        // 后台会话的回合会读错键。预检与锁内复核、读与写都走这一个来源；
+        // 没有执行上下文时退回执行器自己的会话键；未接线（空串）不强制“先读再改”。
+        if let own = AgentExecutionContext.current?.currentConversationID, !own.isEmpty { return own }
+        let own = fileChangeSessionID
+        return own.isEmpty ? nil : own
+    }
+
+    /// 登记“本会话已读过此文件的当前版本”。file_read 成功后自动调用；
+    /// 用户随消息附上的文件、@ 引用的文件也由 App 经此登记为已读。
+    public func markFileRead(path: String, sessionID: String? = nil) {
+        // 只做登记（不读出、不返回内容）；调用方是已通过授权的 file_read，
+        // 或用户自己附上/@ 引用的文件。写入时仍要过完整的路径与审批检查。
+        guard let session = sessionID.flatMap({ $0.isEmpty ? nil : $0 }) ?? fileReadRecordSessionID else { return }
+        let physical = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        // 可能在主线程上调用：只同步记大小和修改时间，内容摘要放后台补算。
+        FileReadRecordStore.shared.recordReadDeferringDigest(sessionID: session, path: physical)
+    }
+
+    /// 先读再改：读取之后文件被外部改动则拒绝并提示重读；从未读过的文件放行编辑，
+    /// 但整体覆盖已有的非空文件必须先读。审批预检之前和执行锁内各调用一次。
+    private func verifyReadBeforeMutation(name: String, physical: String, input: [String: Any]) throws {
+        guard name == "file_write" || name == "file_edit", let session = fileReadRecordSessionID else { return }
+        var info = stat()
+        guard stat(physical, &info) == 0, (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else { return }
+        switch FileReadRecordStore.shared.status(sessionID: session, path: physical) {
+        case .current:
+            return
+        case .modifiedSinceRead:
+            throw ToolExecutorError.writeFailed("文件在你读取之后被改动过（可能是用户或其他任务）：\(physical)。本次未修改；请先用 file_read 重新读取，再据最新内容修改。")
+        case .neverRead:
+            guard name == "file_write", (input["append"] as? Bool) != true, info.st_size > 0 else { return }
+            throw ToolExecutorError.writeFailed("覆盖已有文件前请先用 file_read 读取它：\(physical)。本次未修改；用户随消息附上或 @ 引用的文件视为已读。")
+        }
+    }
+
     private func runFileRead(_ input: [String: Any]) throws -> String {
+        let result = try performFileRead(input)
+        if let path = input["path"] as? String, !path.isEmpty { markFileRead(path: path) }
+        return result
+    }
+
+    private func performFileRead(_ input: [String: Any]) throws -> String {
         guard let path = input["path"] as? String, !path.isEmpty else {
             throw ToolExecutorError.missingParameter("path")
         }
@@ -2704,6 +2929,11 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             }
             throw error
         }
+        let offset = max(1, Self.fileReadInteger(input["offset"]) ?? 1)
+        let maxLines = Self.fileReadInteger(input["lines"]).map { max(1, $0) }
+        let maxLength = max(1, Self.fileReadInteger(input["max_length"]) ?? Self.fileReadDefaultMaxLength)
+        let direction = (input["direction"] as? String) ?? "head"
+
         let url: URL
         let data: Data
         if let ownedData {
@@ -2714,52 +2944,380 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw ToolExecutorError.fileNotFound(path)
             }
+            let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.intValue ?? 0
+            if size > Self.fileReadInMemoryLimit {
+                let head = try readFileHead(at: url, path: path, count: 8192)
+                if !FileImporter.isPDF(data: head, pathExtension: url.pathExtension) {
+                    if input["page_start"] != nil || input["page_count"] != nil {
+                        throw ToolExecutorError.invalidParameter("page_start/page_count 仅适用于 PDF 文件")
+                    }
+                    return try readLargeTextFile(url: url, path: path, size: size, head: head,
+                        offset: offset, maxLines: maxLines, maxLength: maxLength, direction: direction)
+                }
+                // 大 PDF 不设字节上限：file_read 按 page_start/page_count 分页读，输出由 max_length 限长（对齐 Claude Code 大 PDF 分页读）。
+            }
             data = try readFileDataOrDenial(at: url, path: path)
         }
         if ownedData == nil, FileImporter.isPDF(data: data, pathExtension: url.pathExtension) {
+            if (input["as_images"] as? Bool) == true {
+                return try FileImporter.readPDFAsImages(data: data, input: input)
+            }
             return try FileImporter.readPDF(data: data, input: input)
+        }
+        if (input["as_images"] as? Bool) == true {
+            throw ToolExecutorError.invalidParameter("as_images 仅适用于 PDF 文件；图片文件会直接提供给模型")
         }
         if input["page_start"] != nil || input["page_count"] != nil {
             throw ToolExecutorError.invalidParameter("page_start/page_count 仅适用于 PDF 文件")
         }
-        // Reject binary files (NUL byte heuristic).
-        if data.contains(0) {
+        // BOM-marked UTF-16 is text even though it is full of NUL bytes: decode it before the binary check.
+        let utf16Text = ReadOnlyFileSearch.decodeUTF16WithBOM(data)
+        // Reject binary files (NUL byte heuristic); images get an explanation.
+        if utf16Text == nil,
+           data.contains(0) || { if let kind = Self.imageKind(head: data.prefix(16)) { return kind != "bmp" }; return false }() {
+            if let image = Self.describeImage(head: data.prefix(16), url: url, byteCount: data.count, data: data) {
+                return image
+            }
             throw ToolExecutorError.fileIsBinary(path)
         }
-        guard let decoded = String(data: data, encoding: .utf8) else {
+        // BOM UTF-16 first, then UTF-8, then GB18030 (covers GBK/GB2312) for legacy Chinese files.
+        guard let decoded = utf16Text ?? ReadOnlyFileSearch.decodeText(data) else {
             throw ToolExecutorError.readFailed("File is not valid UTF-8 text: \(path)")
         }
         let text = ownedData == nil ? decoded : ContentSecretRedactor.redact(decoded,
             knownSecrets: ModelShellEnvironment.knownCredentialValues())
+        return Self.renderFileRead(text: text, offset: offset, maxLines: maxLines, maxLength: maxLength,
+            direction: direction, windowStartLine: nil, totalLines: nil, textIsComplete: true, scanNote: nil)
+    }
 
-        let offset = max(1, Self.fileReadInteger(input["offset"]) ?? 1)
-        let maxLines = Self.fileReadInteger(input["lines"]).map { max(1, $0) }
-        let maxLength = max(1, Self.fileReadInteger(input["max_length"]) ?? 15_000)
-        let direction = (input["direction"] as? String) ?? "head"
+    private func readFileHead(at url: URL, path: String, count: Int) throws -> Data {
+        do {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            return try handle.read(upToCount: count) ?? Data()
+        } catch {
+            if Self.isPermissionRefusal(error) { throw ToolExecutorError.permissionDenied(path) }
+            throw error
+        }
+    }
 
-        let lines = text.components(separatedBy: "\n")
+    /// Block-wise read of a text file too large for memory. A head read scans
+    /// forward to `offset` and stops once the requested window is full; a tail
+    /// read decodes only the last few MiB.
+    private func readLargeTextFile(url: URL, path: String, size: Int, head: Data,
+                                   offset: Int, maxLines: Int?, maxLength: Int,
+                                   direction: String) throws -> String {
+        let utf16 = Self.largeFileUTF16Layout(head: head)
+        if utf16 == nil, head.contains(0) {
+            let imageData = size <= Self.fileReadImageMaxBytes ? try? Data(contentsOf: url) : nil
+            if let image = Self.describeImage(head: head.prefix(16), url: url, byteCount: size, data: imageData) { return image }
+            throw ToolExecutorError.fileIsBinary(path)
+        }
+        let handle: FileHandle
+        do { handle = try FileHandle(forReadingFrom: url) } catch {
+            if Self.isPermissionRefusal(error) { throw ToolExecutorError.permissionDenied(path) }
+            throw error
+        }
+        defer { try? handle.close() }
+        let sizeNote = "file is \(size) bytes"
+        if direction == "tail" {
+            var window = min(size, Self.fileReadTailWindowBytes)
+            var data: Data
+            if let utf16 {
+                // UTF-16：窗口起止对齐到 2 字节，截掉被切开的代理对，再转成 UTF-8 走同一套按行处理。
+                let end = size & ~1
+                window = min(end - utf16.bomLength, Self.fileReadTailWindowBytes) & ~1
+                try handle.seek(toOffset: UInt64(end - window))
+                let raw = try handle.read(upToCount: window) ?? Data()
+                var carry = Data()
+                var units = Data(raw)
+                if units.count >= 2 {
+                    let first = utf16.bigEndian ? UInt16(units[units.startIndex]) << 8 | UInt16(units[units.startIndex + 1])
+                        : UInt16(units[units.startIndex + 1]) << 8 | UInt16(units[units.startIndex])
+                    if (0xDC00...0xDFFF).contains(first) { units = Data(units.dropFirst(2)) }
+                }
+                guard let converted = Self.utf16BlockToUTF8(units, bigEndian: utf16.bigEndian, carry: &carry) else {
+                    throw ToolExecutorError.readFailed("File is not valid UTF-16 text: \(path)")
+                }
+                data = converted
+            } else {
+                try handle.seek(toOffset: UInt64(size - window))
+                data = try handle.read(upToCount: window) ?? Data()
+            }
+            let startsMidFile = size - window > (utf16.map { $0.bomLength + (size & 1) } ?? 0)
+            if startsMidFile, let newline = data.firstIndex(of: 10) {
+                data = Data(data[(newline + 1)...]) // drop the partial first line
+            }
+            guard !data.contains(0), let text = ReadOnlyFileSearch.decodeText(data) else {
+                throw ToolExecutorError.readFailed("File is not valid UTF-8 text: \(path)")
+            }
+            return Self.renderFileRead(text: text, offset: 1, maxLines: maxLines, maxLength: maxLength,
+                direction: "tail", windowStartLine: nil, totalLines: nil, textIsComplete: false,
+                scanNote: "\(sizeNote); only the last \(window) bytes were read, line numbers are unknown")
+        }
+        let collectCap = maxLength * 4 + 4096
+        let lastWanted = maxLines.map { offset + $0 - 1 }
+        var lineNumber = 1
+        var collected = Data()
+        var pending = Data()
+        var scanned = 0
+        var windowFilled = false
+        var reachedEnd = false
+        var utf16Carry = Data()
+        if let utf16 { try handle.seek(toOffset: UInt64(utf16.bomLength)) }
+        // UTF-16 按 4 MiB 块读取并转成 UTF-8（块边界的半个代理对留到下一块），之后与 UTF-8 文件同一套按行扫描。
+        func nextBlock() throws -> Data? {
+            guard let raw = try handle.read(upToCount: 4 * 1024 * 1024), !raw.isEmpty else { return nil }
+            guard let utf16 else { return raw }
+            guard let converted = Self.utf16BlockToUTF8(raw, bigEndian: utf16.bigEndian, carry: &utf16Carry) else {
+                throw ToolExecutorError.readFailed("File is not valid UTF-16 text: \(path)")
+            }
+            return converted
+        }
+        scan: while scanned < Self.fileReadHeadScanLimit {
+            guard let block = try nextBlock(), !block.isEmpty else {
+                reachedEnd = true
+                break
+            }
+            scanned += block.count
+            var lineStart = block.startIndex
+            while let newline = block[lineStart...].firstIndex(of: 10) {
+                var line = pending
+                pending.removeAll(keepingCapacity: true)
+                line.append(block[lineStart..<newline])
+                if lineNumber >= offset {
+                    collected.append(line)
+                    collected.append(10)
+                }
+                lineNumber += 1
+                lineStart = newline + 1
+                if let lastWanted, lineNumber > lastWanted { windowFilled = true; break scan }
+                if collected.count > collectCap { windowFilled = true; break scan }
+            }
+            pending.append(block[lineStart...])
+            if pending.count > 64 * 1024 * 1024 {
+                throw ToolExecutorError.readFailed("File has a line longer than 64 MiB: \(path)")
+            }
+        }
+        var totalLines: Int?
+        if reachedEnd {
+            if !pending.isEmpty {
+                if lineNumber >= offset { collected.append(pending) }
+                lineNumber += 1
+            }
+            totalLines = lineNumber - 1
+        } else if !windowFilled {
+            throw ToolExecutorError.readFailed("offset is too far into a \(size)-byte file; read with direction=tail or use file_grep")
+        }
+        if let totalLines, offset > totalLines {
+            return "（offset \(offset) is past the end: the file has \(totalLines) line(s)）"
+        }
+        if windowFilled, collected.last == 10 { collected.removeLast() }
+        guard !collected.contains(0), let text = ReadOnlyFileSearch.decodeText(collected) else {
+            throw ToolExecutorError.readFailed("File is not valid UTF-8 text: \(path)")
+        }
+        return Self.renderFileRead(text: text, offset: offset, maxLines: maxLines, maxLength: maxLength,
+            direction: "head", windowStartLine: offset, totalLines: totalLines, textIsComplete: false,
+            scanNote: nil)
+    }
+
+    /// 超大文件的 UTF-16 判定：先认 BOM（FF FE / FE FF，纯中文也没有 NUL，所以不能靠 NUL）；
+    /// 无 BOM 时只认“全部 NUL 都落在同一奇偶位上且占比不低”的头部（ASCII 为主的 UTF-16）。
+    struct LargeFileUTF16Layout: Equatable {
+        let bigEndian: Bool
+        let bomLength: Int
+    }
+
+    static func largeFileUTF16Layout(head: Data) -> LargeFileUTF16Layout? {
+        let bytes = [UInt8](head.prefix(8192))
+        if bytes.count >= 2 {
+            if bytes[0] == 0xFF, bytes[1] == 0xFE { return LargeFileUTF16Layout(bigEndian: false, bomLength: 2) }
+            if bytes[0] == 0xFE, bytes[1] == 0xFF { return LargeFileUTF16Layout(bigEndian: true, bomLength: 2) }
+        }
+        let pairs = bytes.count / 2
+        guard pairs >= 16 else { return nil }
+        var evenNULs = 0
+        var oddNULs = 0
+        for index in 0..<(pairs * 2) where bytes[index] == 0 {
+            if index % 2 == 0 { evenNULs += 1 } else { oddNULs += 1 }
+        }
+        if evenNULs == 0, oddNULs * 4 >= pairs { return LargeFileUTF16Layout(bigEndian: false, bomLength: 0) }
+        if oddNULs == 0, evenNULs * 4 >= pairs { return LargeFileUTF16Layout(bigEndian: true, bomLength: 0) }
+        // 无 BOM 的纯中文 UTF-16 几乎没有 NUL：头部不是合法 UTF-8（允许末尾被截断的半个字符）时，
+        // 按小端、大端各试解，可读字符占比 ≥ 0.9 且明显高于另一种字节序才认。否则维持原行为（二进制或非 UTF-8 报错）。
+        let evenBytes = Array(bytes.prefix(pairs * 2))
+        guard !(0...3).contains(where: { String(data: Data(evenBytes.dropLast($0)), encoding: .utf8) != nil }) else {
+            return nil
+        }
+        let little = plausibleUTF16Ratio(evenBytes, bigEndian: false)
+        let big = plausibleUTF16Ratio(evenBytes, bigEndian: true)
+        if little >= 0.9, little - big >= 0.2 { return LargeFileUTF16Layout(bigEndian: false, bomLength: 0) }
+        if big >= 0.9, big - little >= 0.2 { return LargeFileUTF16Layout(bigEndian: true, bomLength: 0) }
+        return nil
+    }
+
+    /// 按给定字节序把字节当 UTF-16 看，返回“常见可读字符”（ASCII 可打印与换行制表、拉丁、希腊西里尔、常用标点、
+    /// 日文假名、汉字、谚文、全角形式、成对代理项）占全部码元的比例。
+    private static func plausibleUTF16Ratio(_ bytes: [UInt8], bigEndian: Bool) -> Double {
+        let count = bytes.count / 2
+        guard count > 0 else { return 0 }
+        func unit(_ index: Int) -> UInt16 {
+            let first = UInt16(bytes[index * 2]), second = UInt16(bytes[index * 2 + 1])
+            return bigEndian ? first << 8 | second : second << 8 | first
+        }
+        var plausible = 0
+        var index = 0
+        while index < count {
+            let value = unit(index)
+            switch value {
+            case 0x20...0x7E, 0x09, 0x0A, 0x0D, 0xA0...0x24F, 0x370...0x52F, 0x2000...0x206F,
+                 0x3000...0x30FF, 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xAC00...0xD7A3, 0xFF00...0xFFEF:
+                plausible += 1
+            case 0xD800...0xDBFF:
+                if index + 1 < count, (0xDC00...0xDFFF).contains(unit(index + 1)) {
+                    plausible += 2
+                    index += 1
+                }
+            default:
+                break
+            }
+            index += 1
+        }
+        return Double(plausible) / Double(count)
+    }
+
+    /// 把一块 UTF-16 字节转成 UTF-8。奇数的尾字节和被切开的高代理项放进 `carry`，下一块开头接上，
+    /// 保证块边界不会切坏字符。解码失败返回 nil。
+    static func utf16BlockToUTF8(_ block: Data, bigEndian: Bool, carry: inout Data) -> Data? {
+        var combined = carry
+        combined.append(block)
+        carry = Data()
+        var usable = combined.count & ~1
+        if usable < combined.count { carry = Data(combined[(combined.startIndex + usable)...]) }
+        if usable >= 2 {
+            let hi = combined[combined.startIndex + usable - 2]
+            let lo = combined[combined.startIndex + usable - 1]
+            let last = bigEndian ? UInt16(hi) << 8 | UInt16(lo) : UInt16(lo) << 8 | UInt16(hi)
+            if (0xD800...0xDBFF).contains(last) {
+                carry = Data(combined[(combined.startIndex + usable - 2)..<(combined.startIndex + usable)]) + carry
+                usable -= 2
+            }
+        }
+        guard usable > 0 else { return Data() }
+        let units = Data(combined[combined.startIndex..<(combined.startIndex + usable)])
+        guard let text = String(data: units, encoding: bigEndian ? .utf16BigEndian : .utf16LittleEndian) else { return nil }
+        return Data(text.utf8)
+    }
+
+    /// Window, bound and annotate file text. `windowStartLine` is set when `text`
+    /// is already the requested window (block-wise reads). Every truncation says
+    /// where to continue.
+    private static func renderFileRead(text: String, offset: Int, maxLines: Int?, maxLength: Int,
+                                       direction: String, windowStartLine: Int?, totalLines: Int?,
+                                       textIsComplete: Bool, scanNote: String?) -> String {
+        // NSString splitting handles "\r\n" (one Character in Swift) as well as "\n".
+        let allLines = text.components(separatedBy: "\n")
+            .map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        var contentLines = allLines
+        if contentLines.count > 1, contentLines.last == "" { contentLines.removeLast() }
+        var total = totalLines
+        if windowStartLine == nil, textIsComplete { total = text.isEmpty ? 0 : contentLines.count }
+
+        let isTail = direction == "tail"
         let selected: ArraySlice<String>
-        let isTail: Bool
-        switch direction {
-        case "tail":
-            selected = lines.suffix(maxLines ?? lines.count)
-            isTail = true
-        default:
-            selected = lines.dropFirst(offset - 1).prefix(maxLines ?? Int.max)
-            isTail = false
+        var startLine = 1
+        if let windowStartLine {
+            selected = contentLines[...]
+            startLine = windowStartLine
+        } else if isTail {
+            selected = contentLines.suffix(maxLines ?? contentLines.count)
+            startLine = contentLines.count - selected.count + 1
+        } else {
+            if let total, !text.isEmpty, offset > total {
+                return "（offset \(offset) is past the end: the file has \(total) line(s)）"
+            }
+            selected = contentLines.dropFirst(offset - 1).prefix(maxLines ?? Int.max)
+            startLine = offset
+        }
+        // 行号按 Claude Code 的 cat -n 格式（右对齐 6 位 + 制表符）加在每行前面；
+        // max_length 只计正文字符，不含行号前缀。尾部只读了一段（行号未知）时不加行号。
+        let numberLines = !text.isEmpty && !(isTail && !textIsComplete)
+        func numbered(_ body: String, firstLine: Int) -> String {
+            guard numberLines else { return body }
+            var number = firstLine - 1
+            return body.components(separatedBy: "\n").map { line -> String in
+                number += 1
+                let digits = String(number)
+                return String(repeating: " ", count: max(0, 6 - digits.count)) + digits + "\t" + line
+            }.joined(separator: "\n")
         }
         var out = selected.joined(separator: "\n")
-        var truncated = false
+        let totalText = total.map { " of \($0)" } ?? ""
         if out.count > maxLength {
-            // Head reads keep the beginning; tail reads keep the END (the
-            // newest lines are the point of a tail read).
-            out = isTail ? String(out.suffix(maxLength)) : String(out.prefix(maxLength))
-            truncated = true
+            if isTail {
+                let kept = String(out.suffix(maxLength))
+                let lastLine = startLine + selected.count - 1
+                let keptCount = kept.components(separatedBy: "\n").count
+                out = numbered(kept, firstLine: lastLine - keptCount + 1)
+                out += "\n…[truncated at \(maxLength) chars; showing the end of the file\(textIsComplete ? " (\(total ?? 0) lines)" : ""); use offset and lines to read earlier text]"
+            } else {
+                let kept = String(out.prefix(maxLength))
+                if let lastNewline = kept.lastIndex(of: "\n") {
+                    let whole = String(kept[..<lastNewline])
+                    let end = startLine + whole.components(separatedBy: "\n").count - 1
+                    out = numbered(whole, firstLine: startLine) + "\n…[truncated at \(maxLength) chars; showing lines \(startLine)-\(end)\(totalText); continue with offset=\(end + 1)]"
+                } else {
+                    out = numbered(kept, firstLine: startLine) + "\n…[truncated at \(maxLength) chars; line \(startLine) is longer than max_length, raise max_length to read more]"
+                }
+            }
+        } else {
+            out = numbered(out, firstLine: startLine)
         }
-        if truncated {
-            out += "\n…[truncated at \(maxLength) chars]"
-        }
+        if let scanNote { out += "\n[\(scanNote)]" }
         return out
+    }
+
+    /// Plain-text explanation for an image file: file_read returns text, so the
+    /// model is told what the file is instead of receiving an error.
+    /// 读图片文件时最多整文件读入内存的字节数；更大的图片只给文字说明。
+    private static let fileReadImageMaxBytes = 25 * 1024 * 1024
+
+    private static func imageKind(head: Data) -> String? {
+        let bytes = [UInt8](head.prefix(16))
+        func starts(_ prefix: [UInt8], at index: Int = 0) -> Bool {
+            bytes.count >= index + prefix.count && Array(bytes[index..<(index + prefix.count)]) == prefix
+        }
+        if starts([0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if starts([0xFF, 0xD8, 0xFF]) { return "jpeg" }
+        if starts(Array("GIF8".utf8)) { return "gif" }
+        if starts(Array("RIFF".utf8)), starts(Array("WEBP".utf8), at: 8) { return "webp" }
+        if starts([0x49, 0x49, 0x2A, 0x00]) || starts([0x4D, 0x4D, 0x00, 0x2A]) { return "tiff" }
+        if starts(Array("ftyp".utf8), at: 4),
+           ["heic", "heix", "mif1", "avif"].contains(String(decoding: bytes[min(8, bytes.count)..<min(12, bytes.count)], as: UTF8.self)) {
+            return "heic/avif"
+        }
+        if starts([0x42, 0x4D]) { return "bmp" }
+        return nil
+    }
+
+    /// 图片文件的文字说明；传入 `data` 时同时把图片经旁路交给模型（由 AgentLoop 按模型能力决定是否真正发送）。
+    private static func describeImage(head: Data, url: URL, byteCount: Int, data: Data? = nil) -> String? {
+        guard let kind = imageKind(head: head) else { return nil }
+        var dimensions = ""
+        if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let width = properties[kCGImagePropertyPixelWidth] as? Int,
+           let height = properties[kCGImagePropertyPixelHeight] as? Int {
+            dimensions = "，\(width)×\(height)"
+        }
+        let description = "这是图片文件（\(kind)\(dimensions)，\(byteCount) 字节）。"
+        let mimeByKind = ["png": "image/png", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+                          "tiff": "image/tiff", "heic/avif": "image/heic", "bmp": "image/bmp"]
+        if let data, let mime = mimeByKind[kind],
+           let marker = ToolResultImageChannel.attach(data: data, mimeType: mime) {
+            return description + "图片本身随本次结果一并提供。\n" + marker
+        }
+        return description + "这张图片无法交给模型（文件过大或无法解码），file_read 只能给出以上信息；需要看图时，请让用户把它作为附件发送。"
     }
 
     private func runFileWrite(_ input: [String: Any]) async throws -> String {
@@ -2777,7 +3335,9 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let url = try resolveAllowedPath(path)
 
         let append = (input["append"] as? Bool) ?? false
-        let createDirs = (input["create_dirs"] as? Bool) ?? false
+        // 默认自动建缺失的父目录（对齐 Claude Code）；父路径存在但不是目录时，
+        // createDirectory 仍会失败并按写入失败报告。
+        let createDirs = (input["create_dirs"] as? Bool) ?? true
 
         // A missing/non-directory parent is a known refusal before any write
         // attempt. Keep the prepared receipt unstarted so the ordinary loop can
@@ -2789,6 +3349,18 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
                   isDirectory.boolValue else {
                 throw ToolExecutorError.writeFailed("Failed to write \(path): parent directory is unavailable")
             }
+        } else {
+            // 自动建目录时，最近的已存在祖先必须是目录；是普通文件就在任何写入前明确失败。
+            var ancestor = url.deletingLastPathComponent()
+            var isDirectory: ObjCBool = false
+            while !FileManager.default.fileExists(atPath: ancestor.path, isDirectory: &isDirectory) {
+                let next = ancestor.deletingLastPathComponent()
+                if next.path == ancestor.path { break }
+                ancestor = next
+            }
+            if FileManager.default.fileExists(atPath: ancestor.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+                throw ToolExecutorError.writeFailed("Failed to write \(path): parent path is not a directory")
+            }
         }
 
         // P3-OUTPUT-01（DEV-286）：写入口捕获写入前内容（尽力而为，仅作
@@ -2796,7 +3368,16 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let preWriteContent: String? = try {
             let data = FileManager.default.fileExists(atPath: url.path) ? try? Data(contentsOf: url) : nil
             try ApprovalFilePreviewContext.current?.validateMutation(data: data)
+            // 带 BOM 的 UTF-16 文件 file_read 能读出正文，模型很容易"读完改好整份写回"；
+            // file_write 一律写 UTF-8，会悄悄改掉编码，所以和 GBK 一样拒绝（含 0 字节，不能放在下一行判断之后）。
+            if let data, ReadOnlyFileSearch.decodeUTF16WithBOM(data) != nil {
+                throw ToolExecutorError.writeFailed("\(path) 现有内容是 UTF-16 编码，file_write 会把它改成 UTF-8，本次未写入。请先告诉用户并确认是否转为 UTF-8，再用 shell 转码后修改。")
+            }
             guard let data, !data.contains(0) else { return nil }
+            if !data.isEmpty, String(data: data, encoding: .utf8) == nil, !FileImporter.isPDF(data: data, pathExtension: url.pathExtension) {
+                // 已有文件不是 UTF-8（例如 GBK）：file_write 一律写 UTF-8，会悄悄改掉编码、造成乱码，所以拒绝。
+                throw ToolExecutorError.writeFailed("\(path) 现有内容不是 UTF-8 编码（可能是 GBK），file_write 会把它改成 UTF-8 并可能造成乱码，本次未写入。请先告诉用户并确认是否转为 UTF-8，再用 shell 转码后修改。")
+            }
             return String(data: data, encoding: .utf8)
         }()
 
@@ -2914,14 +3495,124 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
 
     // MARK: - file_edit
 
+    enum FileEditMatchResult {
+        case notFound
+        case ambiguous(Int)
+        /// `appliedNew` is the replacement text actually written (CRLF-adapted when needed).
+        case replaced(edited: String, occurrences: Int, appliedNew: String)
+    }
+
+    /// file_edit 的唯一匹配/替换实现：执行、检查点预计算、审批预览三处共用，
+    /// 保证预览与检查点摘要和实际写入的字节一致。
+    /// file_read 把 CRLF 文件显示成 "\n" 换行；从中复制的多行 old_string 必须能匹配
+    /// CRLF 文件，替换后保持文件自己的换行风格。
+    static func matchAndReplaceEdit(in text: String, old: String, new: String, replaceAll: Bool) -> FileEditMatchResult {
+        let textScalars = Array(text.unicodeScalars)
+        let hasCRLF = zip(textScalars, textScalars.dropFirst()).contains { $0 == "\r" && $1 == "\n" }
+        if hasCRLF {
+            return matchAndReplaceEditPreservingCRLF(text: textScalars, old: old, new: new, replaceAll: replaceAll)
+        }
+        let oldString = old
+        let newString = new
+        let occurrences = text.components(separatedBy: oldString).count - 1
+        guard occurrences > 0 else { return .notFound }
+        if !replaceAll && occurrences > 1 { return .ambiguous(occurrences) }
+        return .replaced(edited: text.replacingOccurrences(of: oldString, with: newString),
+                         occurrences: occurrences, appliedNew: newString)
+    }
+
+    /// 含 CRLF 的文件：按 unicode 标量匹配，old_string 里的换行同时匹配 "\r\n" 与 "\n"
+    /// （混合换行文件两种都计入次数、replace_all 都替换）；写入的 new_string 换行
+    /// 统一成文件的主导风格（CRLF 不少于孤立 LF 时用 CRLF）。未命中的部分字节不变。
+    private static func matchAndReplaceEditPreservingCRLF(
+        text: [Unicode.Scalar], old: String, new: String, replaceAll: Bool
+    ) -> FileEditMatchResult {
+        func normalized(_ s: String) -> [Unicode.Scalar] {
+            let scalars = Array(s.unicodeScalars)
+            var out: [Unicode.Scalar] = []
+            out.reserveCapacity(scalars.count)
+            var i = 0
+            while i < scalars.count {
+                if scalars[i] == "\r", i + 1 < scalars.count, scalars[i + 1] == "\n" {
+                    i += 1
+                    continue
+                }
+                out.append(scalars[i])
+                i += 1
+            }
+            return out
+        }
+        var crlfCount = 0
+        var lfCount = 0
+        for (i, scalar) in text.enumerated() where scalar == "\n" {
+            if i > 0, text[i - 1] == "\r" { crlfCount += 1 } else { lfCount += 1 }
+        }
+        let useCRLF = crlfCount >= lfCount
+        let pattern = normalized(old)
+        guard !pattern.isEmpty else { return .notFound }
+        var newScalars = normalized(new)
+        if useCRLF {
+            var converted: [Unicode.Scalar] = []
+            converted.reserveCapacity(newScalars.count)
+            for scalar in newScalars {
+                if scalar == "\n" { converted.append("\r") }
+                converted.append(scalar)
+            }
+            newScalars = converted
+        }
+        // 匹配区间（半开）
+        var ranges: [Range<Int>] = []
+        var i = 0
+        while i < text.count {
+            var t = i
+            var p = 0
+            while p < pattern.count, t < text.count {
+                if pattern[p] == "\n" {
+                    if text[t] == "\n" {
+                        t += 1
+                    } else if text[t] == "\r", t + 1 < text.count, text[t + 1] == "\n" {
+                        t += 2
+                    } else {
+                        break
+                    }
+                } else if text[t] == pattern[p] {
+                    t += 1
+                } else {
+                    break
+                }
+                p += 1
+            }
+            if p == pattern.count {
+                ranges.append(i..<t)
+                i = t
+                if !replaceAll, ranges.count > 1 { break }
+            } else {
+                i += 1
+            }
+        }
+        guard !ranges.isEmpty else { return .notFound }
+        if !replaceAll && ranges.count > 1 { return .ambiguous(ranges.count) }
+        var out = String.UnicodeScalarView()
+        var cursor = 0
+        for range in ranges {
+            out.append(contentsOf: text[cursor..<range.lowerBound])
+            out.append(contentsOf: newScalars)
+            cursor = range.upperBound
+        }
+        out.append(contentsOf: text[cursor...])
+        var appliedView = String.UnicodeScalarView()
+        appliedView.append(contentsOf: newScalars)
+        return .replaced(edited: String(out), occurrences: ranges.count, appliedNew: String(appliedView))
+    }
+
     private func runFileEdit(_ input: [String: Any]) async throws -> String {
         guard let path = input["path"] as? String, !path.isEmpty else {
             throw ToolExecutorError.missingParameter("path")
         }
-        guard let oldString = input["old_string"] as? String, !oldString.isEmpty else {
+        guard let requestedOld = input["old_string"] as? String, !requestedOld.isEmpty else {
             throw ToolExecutorError.missingParameter("old_string")
         }
-        guard let newString = input["new_string"] as? String else {
+        guard let requestedNew = input["new_string"] as? String else {
             throw ToolExecutorError.missingParameter("new_string")
         }
         let url = try resolveAllowedPath(path)
@@ -2932,7 +3623,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let data = try readFileDataOrDenial(at: url, path: path)
         try ApprovalFilePreviewContext.current?.validateMutation(data: data)
         if FileImporter.isPDF(data: data, pathExtension: url.pathExtension) {
-            return try FileImporter.readPDF(data: data, input: input)
+            throw ToolExecutorError.editFailed("PDF 无法编辑：\(path)。请另存为文本或 Markdown 后再改，或用 file_write 新建文件。")
         }
         if data.contains(0) {
             throw ToolExecutorError.fileIsBinary(path)
@@ -2945,16 +3636,20 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let preEditContent = text
 
         let replaceAll = (input["replace_all"] as? Bool) ?? false
-        let occurrences = text.components(separatedBy: oldString).count - 1
-        guard occurrences > 0 else {
-            throw ToolExecutorError.editFailed("old_string not found in \(path)")
-        }
-        if !replaceAll && occurrences > 1 {
+        let newString: String
+        let occurrences: Int
+        switch Self.matchAndReplaceEdit(in: text, old: requestedOld, new: requestedNew, replaceAll: replaceAll) {
+        case .notFound:
+            throw ToolExecutorError.editFailed(Self.editNotFoundDetail(path: path, text: text, old: requestedOld))
+        case .ambiguous(let count):
             throw ToolExecutorError.editFailed(
-                "old_string matches \(occurrences) locations in \(path); pass replace_all=true to replace all"
+                "old_string matches \(count) locations in \(path); pass replace_all=true to replace all"
             )
+        case .replaced(let edited, let count, let appliedNew):
+            text = edited
+            occurrences = count
+            newString = appliedNew
         }
-        text = text.replacingOccurrences(of: oldString, with: newString)
         guard !Self.introducesRedactedFileMask(from: preEditContent, to: text) else {
             throw ToolExecutorError.editFailed(Self.redactedFileMutationMessage)
         }
@@ -3064,6 +3759,11 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
               let path = approvalStringValue(input, for: "path") else { throw ToolExecutorError.invalidParameter("path") }
         // Swift 6 generic executor: off-main I/O with the original TaskLocals.
         try await validateChildWorkspace(name: tool, input: input.toolExecutionDictionary)
+        // 先读再改的检查放在审批预检之前：不合格的写入不弹审批卡，直接把原因返回给模型。
+        if tool == "file_write" || tool == "file_edit",
+           let physical = try? resolveAllowedPath(path).path {
+            try verifyReadBeforeMutation(name: tool, physical: physical, input: input.toolExecutionDictionary)
+        }
         let preview = try captureFileApprovalPreview(tool: tool, input: input, path: path)
         try await validateChildWorkspace(name: tool, input: input.toolExecutionDictionary)
         return preview
@@ -3111,7 +3811,10 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
               version.matches(before), (before.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
               before.st_nlink == 1, before.st_size >= 0, (tool != "file_delete" || before.st_size <= 64 * 1024) else {
             throw ToolExecutorError.invalidParameter(tool == "file_delete"
-                ? "无法提供正文预览：仅支持不超过64 KiB的普通文本文件" : "无法提供正文预览：目标不是同一普通文件")
+                ? (before.st_size > 64 * 1024
+                    ? "文件超过 64 KiB，不能用 file_delete 删除。请先把文件名和大小告诉用户并征得确认，确认后改用 shell_execute 执行 rm（需要审批）。"
+                    : "无法提供正文预览：仅支持不超过64 KiB的普通文本文件")
+                : "无法提供正文预览：目标不是同一普通文件")
         }
         let fd = Darwin.openat(parentFD, url.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if fd < 0 {
@@ -3155,8 +3858,12 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
             let chunk = Data(buffer.prefix(count))
             hasher.update(data: chunk)
             byteCount += Int64(count)
-            if tool == "file_write" { lineCounter.consume(chunk) }
-            else { data.append(chunk) }
+            if tool == "file_write" {
+                lineCounter.consume(chunk)
+                // 覆盖写入：旧文件不超过 256KiB 时留存正文，供审批卡给新旧对比。
+                if byteCount <= Int64(ApprovalFilePreview.overwriteDiffMaxBytes) { data.append(chunk) }
+                else if !data.isEmpty { data = Data() }
+            } else { data.append(chunk) }
         }
         var after = stat()
         guard Darwin.fstat(fd, &after) == 0, version.matches(after), after.st_nlink == 1,
@@ -3165,8 +3872,11 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         try version.validateCurrent()
         let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
         if tool == "file_write" {
+            let oldText: String? = byteCount <= Int64(ApprovalFilePreview.overwriteDiffMaxBytes) && !data.contains(0)
+                ? String(data: data, encoding: .utf8) : nil
             return .write(version: version, content: approvalStringValue(input, for: "content") ?? "", exists: true,
-                oldLines: lineCounter.finish(), append: input.toolExecutionDictionary["append"] as? Bool == true, digest: digest)
+                oldLines: lineCounter.finish(), append: input.toolExecutionDictionary["append"] as? Bool == true, digest: digest,
+                oldContent: oldText)
         }
         if tool == "file_edit", FileImporter.isPDF(data: data, pathExtension: url.pathExtension) {
             // Match runFileEdit's existing PDF read branch, without inventing
@@ -3181,14 +3891,16 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         if tool == "file_edit" {
             guard let old = approvalStringValue(input, for: "old_string"), !old.isEmpty,
                   let replacement = approvalStringValue(input, for: "new_string") else { throw ToolExecutorError.invalidParameter("edit strings") }
-            let count = content.components(separatedBy: old).count - 1
-            guard count > 0 else {
-                throw ToolExecutorError.editFailed("old_string not found in \(version.canonicalPath)")
-            }
-            guard count == 1 || input.toolExecutionDictionary["replace_all"] as? Bool == true else {
+            switch Self.matchAndReplaceEdit(in: content, old: old, new: replacement,
+                                            replaceAll: input.toolExecutionDictionary["replace_all"] as? Bool == true) {
+            case .notFound:
+                throw ToolExecutorError.editFailed(
+                    Self.editNotFoundDetail(path: version.canonicalPath, text: content, old: old))
+            case .ambiguous:
                 throw ToolExecutorError.editFailed("old_string must identify one location, or use replace_all=true")
+            case .replaced(let edited, _, _):
+                return .edit(version: version, old: content, new: edited, digest: digest)
             }
-            return .edit(version: version, old: content, new: content.replacingOccurrences(of: old, with: replacement), digest: digest)
         }
         return .deletion(version: version, data: data, content: content)
     }
@@ -3447,6 +4159,19 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
     private static let redactedFileMutationMessage =
         "本次改动包含脱敏占位符，未写入。请用 file_edit 只修改目标行，不要把脱敏占位符写入文件。"
 
+    /// file_edit 未命中的说明。原文带脱敏占位符，或只差空白（缩进、空格、换行）时，
+    /// 补一句可操作的提示；其他未命中保持原样。
+    private static func editNotFoundDetail(path: String, text: String, old: String) -> String {
+        let base = "old_string not found in \(path)"
+        func collapsed(_ value: String) -> String {
+            value.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        guard old.contains(redactedFileMarker) || text.contains(redactedFileMarker)
+                || collapsed(text).contains(collapsed(old)) else { return base }
+        return base + "。原文可能含脱敏占位符，或与文件里的空白（缩进、空格、换行）不一致；"
+            + "请先用 file_read 重新读取这个文件，再按读到的内容原样编辑。"
+    }
+
     private static func introducesRedactedFileMask(from original: String, to proposed: String) -> Bool {
         if proposed.contains(redactedFileMarker),
            proposed.components(separatedBy: redactedFileMarker).count
@@ -3501,12 +4226,23 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         return String(prefix[name])
     }
 
+    private static func strippingLineNumberPrefix(_ line: Substring) -> Substring {
+        var index = line.startIndex
+        while index < line.endIndex, line[index] == " " { index = line.index(after: index) }
+        let digitsStart = index
+        while index < line.endIndex, line[index].isASCII, line[index].isNumber { index = line.index(after: index) }
+        guard index > digitsStart, index < line.endIndex, line[index] == "\t" else { return line }
+        return line[line.index(after: index)...]
+    }
+
     /// Match exact redaction runs by their line prefix (e.g. a dotenv key),
     /// independent of line order. Count pre-existing literal runs separately.
     private static func starMaskOccurrences(in text: String,
                                             withAssignmentComments: Bool = false) -> [FileStarMaskContext: Int] {
         var counts: [FileStarMaskContext: Int] = [:]
-        for line in text.split(whereSeparator: \.isNewline) {
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            // file_read 的显示带 cat -n 行号前缀；模型整段抄回时前缀不能让掩码上下文对不上而放行写回。
+            let line = strippingLineNumberPrefix(rawLine)
             var index = line.startIndex
             while index < line.endIndex {
                 guard line[index] == "*" else {
@@ -3547,8 +4283,16 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         let url = try Self.resolveAllowedPath(raw, allowedRoot: allowedRoot,
             additionalAllowedRoots: additionalAllowedRoots + (readRoot.map { [$0] } ?? []),
             deniedRoots: deniedRoots)
-        if BypassOpenScope.isActive, SensitiveFilePolicy.credentialDenial(for: url.path) != nil {
-            throw ToolExecutorError.permissionDenied(raw)
+        if BypassOpenScope.isActive {
+            // 凭据目录与 home 下的登录文件：绕过下也不读。
+            if SensitiveFilePolicy.credentialDenial(for: url.path, forWrite: true) != nil {
+                throw ToolExecutorError.permissionDenied(raw)
+            }
+            // .env、密钥文件名：绕过下改为弹卡询问，用户批准过这一个文件（ApprovedFileReadScope）才读。
+            if SensitiveFilePolicy.credentialDenial(for: url.path) != nil,
+               !ApprovedFileReadScope.permits(tool: tool, path: url.path) {
+                throw ToolExecutorError.permissionDenied(raw)
+            }
         }
         return url
     }
@@ -3590,7 +4334,7 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         }
         // 绕过模式（已确认）下文件读写改删不再受项目授权根限制；
         // deniedRoots（应用自己的密钥目录等）仍然生效。
-        guard isUnderAnyRoot || BypassOpenScope.isActive else {
+        guard isUnderAnyRoot || BypassOpenScope.isActive || ApprovedFileWriteScope.permits(path: candidate) else {
             if reportRootBoundary { throw ProjectDirectoryAuthorizationError.outsideAccessibleRoots }
             throw ToolExecutorError.pathViolation(raw)
         }
@@ -3731,7 +4475,8 @@ func shellExitCode(_ status: Int32) -> Int32 {
 func readPipeData(
     _ handle: FileHandle,
     maxBytes: Int,
-    lifetime: ShellPipeReaderLifetime
+    lifetime: ShellPipeReaderLifetime,
+    onChunk: (@Sendable (Data) -> Void)? = nil
 ) async -> Data {
     var data = Data()
     let readDescriptor = handle.fileDescriptor
@@ -3771,6 +4516,7 @@ func readPipeData(
             return data
         }
         if count > max(0, maxBytes - data.count) { await lifetime.recordIncomplete() }
+        onChunk?(Data(buffer.prefix(count)))
         if data.count < maxBytes {
             data.append(contentsOf: buffer.prefix(min(count, maxBytes - data.count)))
         }

@@ -26,6 +26,13 @@ public enum ProductRedactionPolicy {
     /// stricter and still masks paths. Never recover anything from the original text.
     public static func redactConversationBody(_ text: String, knownSecrets: [String] = []) -> String {
         let redacted = ContentSecretRedactor.redact(text, knownSecrets: knownSecrets)
+        return maskCredentialLinks(inRedacted: redacted, knownSecrets: knownSecrets)
+    }
+
+    /// `redactConversationBody` 的第二步（原样抽出，逻辑未改）：对已经过 `ContentSecretRedactor`
+    /// 的文本把带凭据的链接遮蔽为 `<remote-url>`。链接匹配不含空白，所以以换行结尾的前缀与其后
+    /// 文本可以分开处理，供转录显示层的流式增量脱敏复用。
+    public static func maskCredentialLinks(inRedacted redacted: String, knownSecrets: [String] = []) -> String {
         guard let urls = conversationURLRegex else {
             return redacted
         }

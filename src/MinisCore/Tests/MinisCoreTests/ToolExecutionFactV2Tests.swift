@@ -185,6 +185,11 @@ private func v2Tool() -> AgentToolDefinition {
     AgentToolDefinition(name: "web_search", description: "", parameters: [:], required: [])
 }
 
+// web_search 默认要问（11/19）；本文件的测试与审批无关，显式设为自动通过。
+private func v2AutoApproveGate() -> ApprovalGate {
+    ApprovalGate(policyByTool: ["web_search": .autoApprove])
+}
+
 private func v2Identity(attempt: Int) -> AgentExecutionIdentity {
     AgentExecutionIdentity(
         turn: AgentTurnIdentity(sessionID: "v2-session", turnID: 1, messageID: "v2-message"),
@@ -336,6 +341,7 @@ struct ToolExecutionFactV2Tests {
         await #expect(throws: AgentLoopError.invalidToolExecutionAttempt) {
             _ = try await AgentLoop(
                 maxIterations: 1,
+                approvalGate: v2AutoApproveGate(),
                 toolExecutionFactLedger: ledger
             ).run(
                 messages: [],
@@ -366,6 +372,7 @@ struct ToolExecutionFactV2Tests {
         await #expect(throws: AgentLoopError.toolExecutionFactsUnavailable) {
             _ = try await AgentLoop(
                 maxIterations: 1,
+                approvalGate: v2AutoApproveGate(),
                 toolExecutionFactLedger: ledger
             ).run(
                 messages: [],
@@ -391,7 +398,7 @@ struct ToolExecutionFactV2Tests {
         let identity = v2Identity(attempt: 1)
         let envelope = v2Envelope(id: "event591-effect")
         do {
-            var loop = AgentLoop(maxIterations: 2, toolExecutionFactLedger: first)
+            var loop = AgentLoop(maxIterations: 2, approvalGate: v2AutoApproveGate(), toolExecutionFactLedger: first)
             loop.onToolNonExecution = { _, _ in nonExecution.record() }
             _ = try await loop.run(
                 messages: [], systemPrompt: nil,
@@ -420,7 +427,7 @@ struct ToolExecutionFactV2Tests {
         #expect(unknown.toolLifecycleEvents.count == 1)
         #expect(unknown.toolLifecycleEvents.first?.status == .needsReview)
         #expect(unknown.toolLifecycleEvents.first?.toolCompositeKey == receipt.compositeKey)
-        _ = try await AgentLoop(maxIterations: 2, toolExecutionFactLedger: recovered).run(
+        _ = try await AgentLoop(maxIterations: 2, approvalGate: v2AutoApproveGate(), toolExecutionFactLedger: recovered).run(
             messages: [], systemPrompt: nil,
             provider: V2FactProvider([LLMResponse(text: envelope, stopReason: nil, usage: nil)]),
             toolExecutor: executor, tools: [v2Tool()], executionIdentity: identity
@@ -453,6 +460,7 @@ struct ToolExecutionFactV2Tests {
         await #expect(throws: AgentLoopError.invalidToolExecutionAttempt) {
             _ = try await AgentLoop(
                 maxIterations: 1,
+                approvalGate: v2AutoApproveGate(),
                 toolExecutionFactLedger: ledger
             ).run(
                 messages: [],
@@ -519,6 +527,7 @@ struct ToolExecutionFactV2Tests {
         await #expect(throws: CancellationError.self) {
             _ = try await AgentLoop(
                 maxIterations: 1,
+                approvalGate: v2AutoApproveGate(),
                 toolExecutionFactLedger: ledger
             ).run(
                 messages: [],
@@ -545,6 +554,7 @@ struct ToolExecutionFactV2Tests {
         await #expect(throws: ToolExecutorError.self) {
             _ = try await AgentLoop(
                 maxIterations: 1,
+                approvalGate: v2AutoApproveGate(),
                 toolExecutionFactLedger: ledger
             ).run(
                 messages: [],
@@ -571,6 +581,7 @@ struct ToolExecutionFactV2Tests {
         await #expect(throws: AgentLoopError.timedOut(0)) {
             _ = try await AgentLoop(
                 maxIterations: 1,
+                approvalGate: v2AutoApproveGate(),
                 toolExecutionFactLedger: ledger
             ).run(
                 messages: [],
@@ -592,6 +603,7 @@ struct ToolExecutionFactV2Tests {
         let ledger = try ToolExecutionFactLedger(persistenceURL: url)
         let outcome = await AgentLoop(
             maxIterations: 1,
+            approvalGate: v2AutoApproveGate(),
             toolExecutionFactLedger: ledger
         ).runOutcome(
             messages: [],
@@ -618,6 +630,7 @@ struct ToolExecutionFactV2Tests {
 
         let outcome = await AgentLoop(
             maxIterations: 1,
+            approvalGate: v2AutoApproveGate(),
             toolExecutionFactLedger: ledger
         ).runOutcome(
             messages: [],
@@ -644,6 +657,7 @@ struct ToolExecutionFactV2Tests {
 
         let outcome = await AgentLoop(
             maxIterations: 2,
+            approvalGate: v2AutoApproveGate(),
             toolExecutionFactLedger: ledger
         ).runOutcome(
             messages: [],
@@ -676,6 +690,7 @@ struct ToolExecutionFactV2Tests {
 
         let result = try await AgentLoop(
             maxIterations: 2,
+            approvalGate: v2AutoApproveGate(),
             toolExecutionFactLedger: ledger
         ).run(
             messages: [],
@@ -700,7 +715,7 @@ struct ToolExecutionFactV2Tests {
             LLMResponse(text: v2Envelope(id: "output-call"), stopReason: nil, usage: nil),
             LLMResponse(text: "done", stopReason: nil, usage: nil),
         ])
-        let result = try await AgentLoop(maxIterations: 2, toolExecutionFactLedger: ledger).run(
+        let result = try await AgentLoop(maxIterations: 2, approvalGate: v2AutoApproveGate(), toolExecutionFactLedger: ledger).run(
             messages: [],
             systemPrompt: nil,
             provider: provider,
@@ -709,7 +724,16 @@ struct ToolExecutionFactV2Tests {
             executionIdentity: v2Identity(attempt: 1)
         )
         let fact = try #require(result.toolExecutionFacts.first)
-        #expect(fact.outputSummary == .text(bytes: output.utf8.count, lines: 2_001))
+        // 对齐 Claude Code：事实里带可展开的输出详情，统计不变，详情有行数上限。
+        guard case .withDetail(let base, let detail)? = fact.outputSummary else {
+            Issue.record("expected output summary with detail")
+            return
+        }
+        #expect(base == .text(bytes: output.utf8.count, lines: 2_001))
+        #expect((detail.output ?? "").split(separator: "\n", omittingEmptySubsequences: false).count
+            <= ToolOutputSummary.maxDetailLines)
+        #expect(detail.omittedLines > 0)
+        #expect(!(detail.output ?? "").contains(canary), "超出行数上限的尾部不进入详情")
         #expect(try ToolExecutionFactLedger(persistenceURL: url).facts.first?.outputSummary == fact.outputSummary)
 
         let eventURL = url.deletingLastPathComponent().appendingPathComponent("events.json")
@@ -1004,6 +1028,7 @@ struct ToolExecutionFactV2Tests {
         let ledger = try ToolExecutionFactLedger(persistenceURL: url)
         let outcome = await AgentLoop(
             maxIterations: 1,
+            approvalGate: v2AutoApproveGate(),
             toolExecutionFactLedger: ledger
         ).runOutcome(
             messages: [],
@@ -1026,6 +1051,7 @@ struct ToolExecutionFactV2Tests {
         let ledger = try ToolExecutionFactLedger(persistenceURL: url)
         let outcome = await AgentLoop(
             maxIterations: 1,
+            approvalGate: v2AutoApproveGate(),
             toolExecutionFactLedger: ledger
         ).runOutcome(
             messages: [],

@@ -162,7 +162,7 @@ struct ExternalSessionFormatMapTests {
         #expect(ExternalSessionReadTool.toolName == "external_session_read")
         #expect(ExternalSessionReadTool.definition().name == ExternalSessionToolNames.read)
         let properties = Set(ExternalSessionReadTool.definition().parameters.keys)
-        #expect(properties == ["source", "session", "name", "cursor", "limit", "max_chars"])
+        #expect(properties == ["source", "session", "name", "cursor", "limit", "max_chars", "include_tools"])
         #expect(ExternalSessionReadTool.definition().required.isEmpty)
     }
 }

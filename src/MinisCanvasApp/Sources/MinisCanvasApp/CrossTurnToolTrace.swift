@@ -11,6 +11,32 @@ struct CrossTurnTraceRule: Sendable {
     let project: @Sendable (_ call: LLMToolCall, _ result: String, _ knownSecrets: [String]) -> (call: LLMToolCall, result: String)?
 }
 
+/// The excerpt pairs one turn has persisted so far, in completion order. Keeps the
+/// newest ones within the pair and byte ceilings (T-08: the latest records of a turn
+/// matter most to the next one) and names the older pairs that must now leave, whole.
+/// Handle-class pairs (`excerptCost` is nil) never enter it.
+struct CrossTurnExcerptWindow {
+    private var pairs: [(messageIDs: [UUID], cost: Int)] = []
+    private var totalCost = 0
+
+    /// Registers a newly persisted pair and returns the message ids to remove
+    /// (oldest pairs first). A pair that alone exceeds the byte ceiling is returned
+    /// itself and older pairs stay.
+    mutating func add(messageIDs: [UUID], cost: Int) -> [UUID] {
+        guard cost <= CrossTurnToolTracePolicy.excerptByteLimitPerTurn else { return messageIDs }
+        pairs.append((messageIDs, cost))
+        totalCost += cost
+        var evicted: [UUID] = []
+        while pairs.count > CrossTurnToolTracePolicy.excerptPairLimitPerTurn
+            || totalCost > CrossTurnToolTracePolicy.excerptByteLimitPerTurn {
+            let oldest = pairs.removeFirst()
+            totalCost -= oldest.cost
+            evicted += oldest.messageIDs
+        }
+        return evicted
+    }
+}
+
 enum CrossTurnToolTracePolicy {
     static let commandPreviewLimit = 120
     static let fileResultByteLimit = 512
@@ -36,16 +62,17 @@ enum CrossTurnToolTracePolicy {
                       envelope["background"] as? Bool == true,
                       let taskID = envelope["task_id"] as? String, isBackgroundTaskID(taskID),
                       envelope["status"] as? String == BackgroundShellState.running.wireName,
-                      let timeout = finitePositive(envelope["timeout_seconds"]),
                       let maximum = finitePositive(envelope["max_timeout_seconds"]),
                       let command = call.arguments["command"] as? String
                 else { return nil }
                 var arguments: [String: Any] = [
                     "command": preview(command, knownSecrets), "run_in_background": true]
                 if let title = call.arguments["tool_title"] as? String { arguments["tool_title"] = preview(title, knownSecrets) }
-                let kept: [String: Any] = [
+                var kept: [String: Any] = [
                     "background": true, "task_id": taskID, "status": BackgroundShellState.running.wireName,
-                    "timeout_seconds": timeout, "max_timeout_seconds": maximum]
+                    "max_timeout_seconds": maximum]
+                // 不设时限时启动结果里该字段为空：为正数才保留，空就不带。
+                if let timeout = finitePositive(envelope["timeout_seconds"]) { kept["timeout_seconds"] = timeout }
                 guard let projectedCall = rebuild(call, arguments: arguments),
                       let text = encode(kept) else { return nil }
                 return (projectedCall, text)
@@ -88,7 +115,8 @@ enum CrossTurnToolTracePolicy {
             return (projectedCall, utf8Prefix(result, bytes: fileResultByteLimit))
         })
 
-    /// Per-turn ceiling for excerpt pairs (D-07): pairs beyond it are dropped whole.
+    /// Per-turn ceiling for excerpt pairs (D-07): the newest pairs stay, older ones
+    /// leave whole (T-08, see `CrossTurnExcerptWindow`).
     static let excerptPairLimitPerTurn = 12
     static let excerptByteLimitPerTurn = 16 * 1_024
 

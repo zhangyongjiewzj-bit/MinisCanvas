@@ -85,7 +85,8 @@ struct ThemeTokenTests {
             #expect(t.background == p.surface0)
             #expect(t.sidebarBackground == p.surface1)
             #expect(t.surfaceRaised == p.surface2)
-            #expect(t.stroke == p.text2)
+            // 第 1 套（产品主题 .pseudo）深色边框是专门的 #3A3935，其余主题仍取弱文本色。
+            #expect(t.stroke == (theme == .pseudo ? ThemeColor(hex: 0x3A3935) : p.text2))
             #expect(t.textPrimary == p.text0)
             #expect(t.textSecondary == p.text1)
             #expect(t.textTertiary == p.text2)
@@ -111,7 +112,10 @@ struct ThemeTokenTests {
     }
 
     @Test func statusColorsInvariantAcrossModes() {
-        // 核心不变量：亮/暗只换背景/文本层，状态色两套模式引用同一 palette 值。
+        // 暗模式状态色恒取 palette 值。其余主题亮/暗只换中性层、状态色同值；
+        // 第 1 套（产品主题 .pseudo）为保证浅底对比度，浅色模式有专门的一组状态色。
+        let pseudoLight = (success: ThemeColor(hex: 0x2A7549), warning: ThemeColor(hex: 0x9A5B0F),
+                           danger: ThemeColor(hex: 0xB3261E), info: ThemeColor(hex: 0x2F6AAE))
         for theme in AccentTheme.allCases {
             let p = theme.palette
             let dark = theme.semanticTokens(for: .dark)
@@ -121,17 +125,14 @@ struct ThemeTokenTests {
             #expect(dark.statusDanger == p.danger)
             #expect(dark.statusInfo == p.info)
             #expect(dark.statusRunning == p.info)
-            #expect(light.statusSuccess == p.success)
-            #expect(light.statusWarning == p.warning)
-            #expect(light.statusDanger == p.danger)
-            #expect(light.statusInfo == p.info)
-            #expect(light.statusRunning == p.info)
-            // 跨模式一致（同一语义色在两套模式下取同值）。
-            #expect(light.statusSuccess == dark.statusSuccess)
-            #expect(light.statusWarning == dark.statusWarning)
-            #expect(light.statusDanger == dark.statusDanger)
-            #expect(light.statusInfo == dark.statusInfo)
-            #expect(light.statusRunning == dark.statusRunning)
+            let expected = theme == .pseudo
+                ? pseudoLight
+                : (success: p.success, warning: p.warning, danger: p.danger, info: p.info)
+            #expect(light.statusSuccess == expected.success)
+            #expect(light.statusWarning == expected.warning)
+            #expect(light.statusDanger == expected.danger)
+            #expect(light.statusInfo == expected.info)
+            #expect(light.statusRunning == expected.info)
         }
     }
 
@@ -144,7 +145,8 @@ struct ThemeTokenTests {
             // 中性层确实不同（否则「亮暗切换」是空操作）。
             #expect(light.background != dark.background)
             #expect(light.textPrimary != dark.textPrimary)
-            // 状态层完全一致。
+            // 状态层完全一致（第 1 套产品主题浅色有专门状态色，见上一条测试）。
+            guard theme != .pseudo else { continue }
             #expect(light.statusSuccess == dark.statusSuccess)
             #expect(light.statusWarning == dark.statusWarning)
             #expect(light.statusDanger == dark.statusDanger)

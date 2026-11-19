@@ -34,6 +34,12 @@ enum ProviderSaveFailureCategory: Equatable, Sendable {
         }
     }
 
+    static let allMessages: [String] = [
+        ProviderSaveFailureCategory.duplicateName, .invalidName, .missingCredential,
+        .keychainReadMissing, .keychainReadDenied, .keychainReadFailed, .keychainWriteFailed,
+        .keychainDeleteFailed, .metadataWriteFailed, .keychainRollbackFailed, .unknown,
+    ].map(\.message)
+
     var message: String {
         switch self {
         case .duplicateName:
@@ -252,6 +258,19 @@ enum ProviderDraftProbeState: Equatable, Sendable {
     case empty
     case failed(String)
     case cancelled
+}
+
+/// 只用于“默认勾选”和“抽测挑选”：名字像向量、重排、语音、图像、审核的模型多半不是聊天模型。
+/// 不拒绝任何模型，用户仍可手动勾选。
+enum ProviderModelNameHeuristics {
+    private static let nonChatKeywords = [
+        "embed", "rerank", "whisper", "tts", "transcribe", "moderation",
+        "dall-e", "dalle", "stable-diffusion", "sdxl", "text-to-image", "image-gen"
+    ]
+    static func likelyNonChat(_ modelID: String) -> Bool {
+        let lower = modelID.lowercased()
+        return nonChatKeywords.contains { lower.contains($0) }
+    }
 }
 
 enum ProviderDraftModelMerger {
@@ -579,7 +598,7 @@ final class SettingsCenter {
         var label: String {
             switch self {
             case .settingsCenter: "记忆设置"
-            case .composerCommand: "Composer 命令"
+            case .composerCommand: "斜杠命令"
             case .presetCommand: "快捷记忆命令"
             case .chatSessionRuntime: "聊天记忆提议"
             case .userRequestedChatFact: "对话中明确请求记住的事实"
@@ -742,6 +761,13 @@ final class SettingsCenter {
     /// The App binds this to restorePersona, which does not write back here.
     @ObservationIgnored
     var onPersonaSettingsChanged: ((Persona, Bool) -> Void)?
+    /// F1-01：供应商改名成功后，把会话里按旧名保存的服务商选择改到新名字。
+    /// App 装配到 ChatStore；这里只传名字，不传任何凭据。
+    @ObservationIgnored
+    var onProviderRenamed: ((_ oldName: String, _ newName: String) -> Void)?
+    /// F1-09：查询仍选用某个供应商的会话标题，供删除确认框如实列出影响。
+    @ObservationIgnored
+    var providerDependentSessionTitles: ((_ providerName: String) -> [String])?
     /// 只转发已提交的 canonical 输出模式，供当前 ChatStore 下回合读取。
     @ObservationIgnored
     var onChatOutputModeSettingsChanged: ((ChatOutputMode) -> Void)?
@@ -753,6 +779,11 @@ final class SettingsCenter {
     /// production composition root; existing turns keep their captured engine.
     @ObservationIgnored
     var onFileAccessSettingsChanged: (() -> Void)?
+    /// The asynchronous re-attach started by the latest committed file-access
+    /// change. Callers that act on the new roots right away (the project folder
+    /// auto-mount retry) await it; otherwise they would still see the old roots.
+    @ObservationIgnored
+    var pendingFileAccessAttachment: Task<Void, Never>?
     /// BL6 resolves opaque credential handles only at the secure composition
     /// boundary; neither ChatStore nor a model receives credential bytes.
     @ObservationIgnored
@@ -870,6 +901,9 @@ final class SettingsCenter {
     /// history) from the same single read, so export messaging matches the
     /// exported file instead of the visible list.
     private(set) var memoryFactTotalCount: Int = 0
+    /// FC-22：最近一次读取记忆失败（文件读不出来）。列表保留上一次读到的内容，
+    /// 页面据此提示，不把"读失败"显示成"暂无记忆"。
+    private(set) var memoryFactsLoadFailed: Bool = false
     /// AJ-47：文件式记忆文档快照（GLOBAL.md / SOUL.md / 每日日志）。
     private(set) var memoryFiles: [MemoryFileInfo] = []
     /// E6: MCP 服务器列表快照（MCPManagerView 数据源）。
@@ -1526,13 +1560,12 @@ final class SettingsCenter {
         }
     }
 
-    /// 旧「外观模式」字段的兼容读投影。写入即映射到对应预设（THEME-05），
-    /// 不再是可与主题色自由组合的独立轴。
+    /// 明暗选择（浅色 / 深色 / 跟随系统），独立于配色预设；产品主题配色不变，
+    /// 只决定用浅色版还是深色版。
     var appearance: Appearance {
         get { settingsMirror.general.appearance }
         set {
-            // 先确定性映射，再让预设成为真值并反向投影旧字段。
-            themePreset = ThemePreset.nearest(for: newValue, accentTheme: accentTheme)
+            persistSettings { settingsStore.update(\.general.appearance, to: newValue) }
         }
     }
 
@@ -1541,7 +1574,10 @@ final class SettingsCenter {
     var accentTheme: AccentTheme {
         get { settingsMirror.general.accentTheme }
         set {
-            themePreset = ThemePreset.nearest(for: appearance, accentTheme: newValue)
+            // 主题色轴不再决定任何东西：保持当前预设（产品主题自第 1 套配色起也投影为 system 外观，
+            // 若再用 appearance 反推预设会把产品主题误改成「跟随系统」）。
+            _ = newValue
+            themePreset = themePreset
         }
     }
 
@@ -1700,6 +1736,22 @@ final class SettingsCenter {
                 onSuccess: { self.configureModelShellEnvironment() })
         }
     }
+
+    /// 审批卡的呈现方式与超时自动拒绝：重启后保持（审批卡上的开关改动经这里落盘）。
+    @discardableResult
+    func setApprovalPresentation(inline: Bool, timeoutSeconds: Double) -> Bool {
+        let seconds = timeoutSeconds.isFinite ? min(3600, max(0, timeoutSeconds)) : 0
+        // 两项设置合成一次写盘，不会出现只落盘一半。
+        return persistSettings({
+            settingsStore.update(\.agent) {
+                $0.approvalInlineEnabled = inline
+                $0.approvalTimeoutSeconds = seconds
+            }
+        })
+    }
+
+    var approvalInlineEnabledSetting: Bool { settingsMirror.agent.approvalInlineEnabled }
+    var approvalTimeoutSecondsSetting: Double { settingsMirror.agent.approvalTimeoutSeconds }
 
     private func configureModelShellEnvironment() {
         ModelShellEnvironment.configure(stripCredentials: settingsMirror.agent.stripModelShellCredentials,
@@ -1889,6 +1941,12 @@ final class SettingsCenter {
         }
     }
 
+    /// 后台任务完成后自动续跑。只给用户界面用，模型设置工具没有对应的修改键；立即对之后的判断生效。
+    var backgroundAutoContinueEnabled: Bool {
+        get { settingsMirror.agent.backgroundAutoContinueEnabled }
+        set { persistSettings { settingsStore.update(\.agent.backgroundAutoContinueEnabled, to: newValue) } }
+    }
+
     /// Native user preference only; not registered with the model settings tool.
     var browserWriteEnabled: Bool {
         get { settingsMirror.agent.browserWriteEnabled }
@@ -2018,11 +2076,29 @@ final class SettingsCenter {
         )
     }
 
+    /// 11/16：停用所有工具前的审批策略，恢复时还原。持久化在 `AgentSettings.approvalPolicyBeforeToolsDisabled`，
+    /// 与策略同一次写入，重启后仍可还原；没有记录（例如策略本来就是 deny）时回落到每次询问。
     var toolsDisabled: Bool {
         get { approvalPolicy == .deny || approvalPolicy == .never }
         set {
             guard newValue != toolsDisabled else { return }
-            approvalPolicy = newValue ? .deny : .alwaysAsk
+            let policy: ApprovalPolicy
+            if newValue {
+                policy = .deny
+            } else {
+                policy = settingsMirror.agent.approvalPolicyBeforeToolsDisabled ?? .alwaysAsk
+            }
+            persistSettings(
+                {
+                    settingsStore.update(\.agent) {
+                        if newValue { $0.approvalPolicyBeforeToolsDisabled = $0.approvalPolicy }
+                        else { $0.approvalPolicyBeforeToolsDisabled = nil }
+                        $0.approvalPolicy = policy
+                        $0.legacyAutomaticApprovalCompatibilityActive = false
+                    }
+                },
+                onSuccess: { self.onApprovalPolicyChanged?(policy) }
+            )
         }
     }
 
@@ -2940,6 +3016,119 @@ final class SettingsCenter {
         }
     }
 
+    enum UserTypedMemoryOutcome: Equatable {
+        case project, personal, credentialLike, personalFull, failed
+    }
+
+    /// 本人在对话输入框里键入的“请记住…”/“# …”：直接写入，不经提案。
+    /// 只允许由输入框的本人提交路径调用（模型提议的记忆仍走提案 + 批准）。
+    /// 项目会话写入项目记忆；普通会话写成记忆库里的个人事实（.personal，每回合常驻注入），
+    /// 不再改写 GLOBAL.md，所以不会把内置默认全局指令冻结成“已自定义”。
+    func addUserTypedMemory(
+        _ text: String, within scope: MemoryScope?, sessionID: String? = nil
+    ) -> UserTypedMemoryOutcome {
+        let fact = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !fact.isEmpty else { return .failed }
+        guard ContentSecretRedactor.redact(fact) == fact else { return .credentialLike }
+        if let scope {
+            guard scope.isValid else { return .failed }
+            do {
+                _ = try memoryProposalConsumer.addManualProjectFact(
+                    text: fact, category: .fact, within: scope)
+                reloadStorage()
+                return .project
+            } catch {
+                return .failed
+            }
+        }
+        guard let principal = memoryTrustedPrincipalProvider?() else { return .failed }
+        migratePersonalMemorySectionFromGlobal()
+        do {
+            let mine = try memoryStore.activeFacts().filter {
+                $0.visibility == .personal && $0.ownerUserID == principal.userID
+            }
+            if mine.contains(where: { $0.text == fact }) { return .personal }
+            guard mine.count < Self.personalMemoryFactLimit else { return .personalFull }
+            _ = try memoryStore.addFact(
+                fact,
+                sourceSessionID: sessionID ?? "",
+                category: .fact,
+                memoryScope: Self.personalMemoryScope,
+                ownerUserID: principal.userID,
+                visibility: .personal,
+                trustedPrincipal: principal
+            )
+            reloadStorage()
+            return .personal
+        } catch {
+            return .failed
+        }
+    }
+
+    /// 个人事实不属于某个会话或项目，用固定范围存放；注入按本人身份取，不看这个范围。
+    static let personalMemoryScope = MemoryScope(sessionID: "personal-memory", projectID: "personal-memory")
+    /// 常驻注入受 maxFacts 与字符预算约束，个人事实太多只会互相挤掉，这里设上限提示精简。
+    static let personalMemoryFactLimit = 200
+    private static let personalMemoryHeader = "【我的记忆】"
+
+    /// 把旧版写进 GLOBAL.md 的“【我的记忆】”段迁成个人事实，并从 GLOBAL.md 移除该段。
+    /// 移除后剩下的内容与内置默认全局指令一致（或为空）时，删除 GLOBAL.md 回到“未自定义”，
+    /// 让以后默认指令的更新继续生效；否则保留用户自己的内容。
+    /// 幂等：段不存在就什么也不做；个人事实写入失败时不动 GLOBAL.md，下次再迁。
+    @discardableResult
+    func migratePersonalMemorySectionFromGlobal() -> Int {
+        let existing = memoryFileStore.readGlobal()
+        guard let headerRange = existing.range(of: Self.personalMemoryHeader),
+              let principal = memoryTrustedPrincipalProvider?() else { return 0 }
+        let before = String(existing[..<headerRange.lowerBound])
+        let section = String(existing[headerRange.upperBound...])
+        var items: [String] = []
+        var restLines: [Substring] = []
+        var inItems = true
+        for line in section.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if inItems, trimmed.hasPrefix("- ") {
+                let item = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                if !item.isEmpty { items.append(item) }
+            } else if inItems, trimmed.isEmpty {
+                continue
+            } else {
+                inItems = false
+                restLines.append(line)
+            }
+        }
+        do {
+            let known = Set(try memoryStore.activeFacts().filter {
+                $0.visibility == .personal && $0.ownerUserID == principal.userID
+            }.map(\.text))
+            for item in items where !known.contains(item) {
+                _ = try memoryStore.addFact(
+                    item, sourceSessionID: "", category: .fact,
+                    memoryScope: Self.personalMemoryScope,
+                    ownerUserID: principal.userID, visibility: .personal,
+                    trustedPrincipal: principal)
+            }
+        } catch {
+            return 0
+        }
+        let remainder = (before + restLines.joined(separator: "\n"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isDefault = remainder.isEmpty
+            || remainder == MemoryInjector.defaultGlobalInstructions
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if isDefault {
+                _ = try deleteMemoryDocument(named: "GLOBAL.md")
+            } else {
+                _ = try writeMemoryDocument(named: "GLOBAL.md", content: remainder)
+            }
+        } catch {
+            // 个人事实已写入；GLOBAL.md 下次再清理，重复事实会按文本去重。
+        }
+        reloadStorage()
+        return items.count
+    }
+
     /// MEMORY-05 编辑半区：把一条仍为 active 的长期记忆追加一个新修订。
     /// 写入只走 `MemoryStore.appendRevision` 规范入口（旧修订被 store 置为
     /// superseded，不新增任何并行持久化通道）；空文本与不存在/非 active 目标
@@ -3714,7 +3903,7 @@ final class SettingsCenter {
                                                settingsRecovery: makeSettingsRecoveryAttachment())
             return ("备份已导出：\(url.lastPathComponent)", false)
         } catch {
-            return ("备份导出失败：\(error)", true)
+            return (SettingsFailureMessage.backup(error, operation: .export).message, true)
         }
     }
 
@@ -3743,7 +3932,7 @@ final class SettingsCenter {
             }
             return ("备份已导出：\(url.lastPathComponent)", false)
         } catch {
-            return ("备份导出失败：\(error)", true)
+            return (SettingsFailureMessage.backup(error, operation: .export).message, true)
         }
     }
 
@@ -4188,8 +4377,12 @@ final class SettingsCenter {
         protocolType: ProviderWireProtocol
     ) async -> ProviderDraftProbeState {
         providerDraftProbeState = .loading
-        let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedBaseURL = rawBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 本机/局域网服务不需要 Key：留空时用占位值，与保存时一致。
+        if trimmedAPIKey.isEmpty, ProviderEndpointPolicy.allowsBlankAPIKey(forBaseURL: trimmedBaseURL) {
+            trimmedAPIKey = ProviderEndpointPolicy.localPlaceholderAPIKey
+        }
 
         guard !trimmedAPIKey.isEmpty else {
             return finishProviderDraftProbe(.failed("获取模型列表失败：API Key 不能为空"))
@@ -4219,8 +4412,18 @@ final class SettingsCenter {
             try Task.checkCancellation()
 
             guard (200..<300).contains(response.statusCode) else {
+                if response.statusCode == 404 || response.statusCode == 405 {
+                    return finishProviderDraftProbe(
+                        .failed("获取模型列表失败：该服务没有 /models 接口，请手动填写模型名称")
+                    )
+                }
                 return finishProviderDraftProbe(
                     .failed("获取模型列表失败（HTTP \(response.statusCode)）")
+                )
+            }
+            if response.errorCategory == .malformedResponse {
+                return finishProviderDraftProbe(
+                    .failed("获取模型列表失败：返回的模型列表格式无法识别，请手动填写模型名称")
                 )
             }
 
@@ -4233,10 +4436,24 @@ final class SettingsCenter {
                 error.localizedDescription,
                 knownSecrets: [trimmedAPIKey]
             )
+            // 界面只能显示固定文字：能归类的原因给出固定说明，其余保持原样（会被投影成类别）。
+            let failure: String
+            switch error {
+            case let urlFailure as CustomProviderURL.Failure:
+                failure = "获取模型列表失败：" + (urlFailure.errorDescription ?? "基础地址不可用")
+            case SettingsProviderReadinessTransportError.unavailable:
+                failure = "获取模型列表失败：当前运行配置不允许联网"
+            case SettingsProviderReadinessTransportError.timeout:
+                failure = "获取模型列表失败：连接超时，请检查 Base URL 或网络"
+            case is URLError:
+                failure = (error as? URLError)?.code == .timedOut
+                    ? "获取模型列表失败：连接超时，请检查 Base URL 或网络"
+                    : "获取模型列表失败：无法连接服务器，请检查 Base URL 或网络"
+            default:
+                failure = "获取模型列表失败：\(message)"
+            }
             return finishProviderDraftProbe(
-                Task.isCancelled
-                    ? .cancelled
-                    : .failed("获取模型列表失败：\(message)")
+                Task.isCancelled ? .cancelled : .failed(failure)
             )
         }
     }
@@ -4344,6 +4561,50 @@ final class SettingsCenter {
         }
         providerModelReadinessTasks[key] = (id: taskID, task: task)
         return task
+    }
+
+    /// 检查某供应商已保存的全部模型，同时最多 3 个；内置官方路线走供应商级检查（本身就逐个检查模型）。
+    @discardableResult
+    func startCheckAllProviderModels(forProviderName name: String) -> Task<Void, Never> {
+        Task { @MainActor [weak self] in
+            guard let self, let record = self.providerRecords.first(where: {
+                $0.name.caseInsensitiveCompare(name) == .orderedSame
+            }) else { return }
+            if ChatStore.chatProviderTypes.contains(where: {
+                $0.rawValue.caseInsensitiveCompare(record.name) == .orderedSame
+                    && ChatStore.BuiltinReadinessBinding.route(for: $0) != nil
+            }) {
+                _ = await self.startProviderReadinessAfterSave(forProviderName: name).value
+                return
+            }
+            let modelIDs = self.normalizedModelIDs(record.modelNames)
+            await Self.runLimited(modelIDs, limit: Self.checkAllConcurrencyLimit) { modelID in
+                await self.startProviderModelReadiness(forProviderName: name, modelID: modelID).value
+            }
+        }
+    }
+
+    nonisolated static let checkAllConcurrencyLimit = 3
+
+    /// 按并发上限依次处理一批条目：同时运行的数量不超过 limit，完成一个再补一个。
+    nonisolated static func runLimited(
+        _ items: [String],
+        limit: Int,
+        operation: @escaping @MainActor @Sendable (String) async -> Void
+    ) async {
+        await withTaskGroup(of: Void.self) { group in
+            var iterator = items.makeIterator()
+            var running = 0
+            while running < max(1, limit), let item = iterator.next() {
+                group.addTask { await operation(item) }
+                running += 1
+            }
+            while await group.next() != nil {
+                if let item = iterator.next() {
+                    group.addTask { await operation(item) }
+                }
+            }
+        }
     }
 
     /// IF-07B：检查一个已保存模型；返回值和状态只属于该模型。
@@ -4667,8 +4928,16 @@ final class SettingsCenter {
         generation: Int,
         persistenceProviderID: String
     ) -> ProviderModelReadiness {
-        let stored = storeProviderModelReadiness(
+        let incomingModelID = state.modelID
+        let guided = Self.readinessStateWithFailureGuidance(
             state,
+            hasPriorPassed: providerReadinessStore.records.contains {
+                $0.providerID.caseInsensitiveCompare(persistenceProviderID) == .orderedSame
+                    && $0.modelID == incomingModelID && $0.status == .passed
+            }
+        )
+        let stored = storeProviderModelReadiness(
+            guided,
             for: providerID,
             modelID: modelID,
             key: key,
@@ -4681,6 +4950,31 @@ final class SettingsCenter {
             key: key
         )
         return stored
+    }
+
+    /// 失败结果的用户提示：最小请求失败时按失败类别写“原因 + 下一步”（接 HTTPStatusMessages.providerReadinessMessage）；
+    /// 瞬时故障且此前已有通过结果时，写明“最近一次检查失败”，此前的通过结果仍保留。
+    nonisolated static func readinessStateWithFailureGuidance(
+        _ state: ProviderModelReadiness,
+        hasPriorPassed: Bool
+    ) -> ProviderModelReadiness {
+        guard state.status == .failed, let category = state.errorCategory else { return state }
+        let message = HTTPStatusMessages.providerReadinessMessage(for: category)
+        let guidance = "\(message.zh)。\(message.suggestionZH)"
+        let isGenericFailure = state.redactedResult.hasPrefix("最小请求失败")
+        let text: String
+        if category.isTransient, hasPriorPassed {
+            text = "最近一次检查失败：\(message.zh)，此前的检查结果仍保留，可稍后重试"
+        } else if isGenericFailure {
+            text = guidance
+        } else {
+            return state
+        }
+        return ProviderModelReadiness(
+            modelID: state.modelID, status: state.status, redactedResult: text,
+            readiness: state.readiness, errorCategory: state.errorCategory,
+            latency: state.latency, lineage: state.lineage
+        )
     }
 
     /// Persist only terminal model facts. The generation guard prevents a
@@ -4697,7 +4991,16 @@ final class SettingsCenter {
         case .passed:
             status = .passed
         case .failed, .cancelled:
-            status = .unavailable
+            // 瞬时故障：此前通过的结果保留不动；没有旧结果的标“未验证”（可重试），不当作配置错误阻断。
+            if state.status == .failed, state.errorCategory?.isTransient == true {
+                if providerReadinessStore.records.contains(where: {
+                    $0.providerID.caseInsensitiveCompare(providerID) == .orderedSame
+                        && $0.modelID == state.modelID && $0.status == .passed
+                }) { return }
+                status = .unverified
+            } else {
+                status = .unavailable
+            }
         case .loading, .notRun:
             return
         }
@@ -4706,7 +5009,7 @@ final class SettingsCenter {
                 providerID: providerID,
                 modelID: state.modelID,
                 status: status,
-                readinessState: state.readiness?.state ?? .blocked,
+                readinessState: status == .unverified ? .unverified : (state.readiness?.state ?? .blocked),
                 checkedAt: state.readiness?.checkedAt ?? Date(),
                 errorCategory: state.errorCategory,
                 latency: state.latency,
@@ -4879,13 +5182,16 @@ final class SettingsCenter {
         )
         guard isCurrentProbe(allowCancelledResult: isCancelledResult(reachabilityResponse)) else { return nil }
         if case .localControl = reachabilityResponse { return previousReport }
+        // 可达只看有没有收到 HTTP 响应：401/403/404/429/5xx 也说明服务端可达，
+        // 具体问题交给后面的鉴权与模型阶段说明（11/16 现场：错 Key 被报成"不可达"）。
         let reachability = stage(
             from: reachabilityResponse,
             success: { (100..<600).contains($0) },
             successDetail: "服务端可达",
             failureDetail: "未收到有效 HTTP 响应",
             apiKey: apiKey,
-            resultLines: &resultLines
+            resultLines: &resultLines,
+            anyHTTPResponsePasses: true
         )
         guard reachability.status == .passed else {
             var report = SettingsProviderReadinessReport(
@@ -4914,7 +5220,9 @@ final class SettingsCenter {
             return report
         }
 
-        let authenticationResponse = await sendReadinessRequest(
+        // 手动填写的模型：服务没有 /models 时，用它们做一次最小对话请求代替鉴权与模型发现。
+        let manualModelIDs = normalizedModelIDs(record.modelNames)
+        var authenticationResponse = await sendReadinessRequest(
             operation: .authentication,
             record: record,
             baseURL: baseURL,
@@ -4922,11 +5230,27 @@ final class SettingsCenter {
         )
         guard isCurrentProbe(allowCancelledResult: isCancelledResult(authenticationResponse)) else { return nil }
         if case .localControl = authenticationResponse { return previousReport }
+        // 很多中转站没有 /models（返回 404/405）：这不是鉴权失败，改用一次最小对话请求判断。
+        var modelListEndpointMissing = false
+        if isModelListEndpointMissing(authenticationResponse), let probeModelID = manualModelIDs.first {
+            modelListEndpointMissing = true
+            authenticationResponse = await sendReadinessRequest(
+                operation: .minimalModelRequest(probeModelID),
+                record: record,
+                baseURL: baseURL,
+                apiKey: apiKey,
+                modelID: probeModelID
+            )
+            guard isCurrentProbe(allowCancelledResult: isCancelledResult(authenticationResponse)) else { return nil }
+            if case .localControl = authenticationResponse { return previousReport }
+        }
         let authentication = stage(
             from: authenticationResponse,
             success: { (200..<300).contains($0) },
-            successDetail: "鉴权通过",
-            failureDetail: "鉴权失败",
+            successDetail: modelListEndpointMissing ? "鉴权通过（该服务没有 /models，已用一次对话请求确认）" : "鉴权通过",
+            failureDetail: !modelListEndpointMissing && isModelListEndpointMissing(authenticationResponse)
+                ? "该服务没有 /models 接口，且还没有填写模型名称，无法判断鉴权；请先填写至少一个模型名称"
+                : "鉴权失败",
             apiKey: apiKey,
             resultLines: &resultLines
         )
@@ -4957,29 +5281,45 @@ final class SettingsCenter {
             return report
         }
 
-        let discoveryResponse = await sendReadinessRequest(
-            operation: .modelDiscovery,
-            record: record,
-            baseURL: baseURL,
-            apiKey: apiKey
-        )
-        guard isCurrentProbe(allowCancelledResult: isCancelledResult(discoveryResponse)) else { return nil }
-        if case .localControl = discoveryResponse { return previousReport }
-        let discoveredModelIDs: [String]
-        if case .response(let response, _) = discoveryResponse {
+        var discoveryResponse: ProviderReadinessRequestResult = .failed(errorCategory: .notFound, latency: 0)
+        if !modelListEndpointMissing {
+            discoveryResponse = await sendReadinessRequest(
+                operation: .modelDiscovery,
+                record: record,
+                baseURL: baseURL,
+                apiKey: apiKey
+            )
+            guard isCurrentProbe(allowCancelledResult: isCancelledResult(discoveryResponse)) else { return nil }
+            if case .localControl = discoveryResponse { return previousReport }
+        }
+        var discoveredModelIDs: [String]
+        if case .response(let response, _) = discoveryResponse, !modelListEndpointMissing {
             let discovered = normalizedModelIDs(response.modelIDs)
             discoveredModelIDs = mm01FieldLane.map { $0.discoverySubset(discovered, record: record) } ?? discovered
         } else {
             discoveredModelIDs = []
         }
-        let modelDiscovery = stage(
-            from: discoveryResponse,
-            success: { (200..<300).contains($0) && !discoveredModelIDs.isEmpty },
-            successDetail: "发现 \(discoveredModelIDs.count) 个模型",
-            failureDetail: discoveredModelIDs.isEmpty ? "模型发现返回空目录" : "模型发现失败",
-            apiKey: apiKey,
-            resultLines: &resultLines
-        )
+        // 没有可用的模型目录（404/405/非 JSON）但用户填了模型：跳过发现，直接检查已填写的模型。
+        let skipDiscovery = !manualModelIDs.isEmpty
+            && (modelListEndpointMissing || isModelListUnusable(discoveryResponse))
+        let modelDiscovery: ProviderReadinessStage
+        if skipDiscovery {
+            modelDiscovery = ProviderReadinessStage(
+                status: .passed,
+                detail: "该服务没有可用的模型列表，使用已填写的模型",
+                statusCode: nil
+            )
+            discoveredModelIDs = []
+        } else {
+            modelDiscovery = stage(
+                from: discoveryResponse,
+                success: { (200..<300).contains($0) && !discoveredModelIDs.isEmpty },
+                successDetail: "发现 \(discoveredModelIDs.count) 个模型",
+                failureDetail: discoveryFailureDetail(discoveryResponse, discoveredIsEmpty: discoveredModelIDs.isEmpty),
+                apiKey: apiKey,
+                resultLines: &resultLines
+            )
+        }
         guard modelDiscovery.status == .passed else {
             var report = SettingsProviderReadinessReport(
                 recordID: record.id,
@@ -5008,7 +5348,7 @@ final class SettingsCenter {
         }
 
         let modelCheckResult = await checkModels(
-            discoveredModelIDs,
+            modelIDsToCheck(manual: manualModelIDs, discovered: discoveredModelIDs),
             record: record,
             baseURL: baseURL,
             apiKey: apiKey,
@@ -5063,19 +5403,51 @@ final class SettingsCenter {
         _ report: SettingsProviderReadinessReport,
         for provider: EnvVarEntry
     ) {
-        invalidateProviderReadiness(for: provider, checkedAt: report.checkedAt)
+        // 某个模型这次只是瞬时失败（限流、超时、5xx）：此前通过的结果保留，不被推翻。
+        let previouslyPassed = Set(providerReadinessStore.records.filter {
+            $0.providerID.caseInsensitiveCompare(provider.name) == .orderedSame && $0.status == .passed
+        }.map(\.modelID))
+        let preservedModelIDs = Set(report.modelChecks.filter {
+            $0.status == .failed && $0.errorCategory?.isTransient == true
+                && previouslyPassed.contains($0.modelID)
+        }.map(\.modelID))
         let appliedModelIDs = Set(normalizedModelIDs(provider.modelNames))
+        // 这次没测的模型（只抽测少数几个）不参与失效标记，保留旧记录；没有旧记录的就是“未检查”。
+        let checkedModelIDs = Set(report.modelChecks.map(\.modelID))
+        let knownModelIDs = Set(providerReadinessStore.records.filter {
+            $0.providerID.caseInsensitiveCompare(provider.name) == .orderedSame
+        }.map(\.modelID)).union(appliedModelIDs)
+        let untestedModelIDs = knownModelIDs.subtracting(checkedModelIDs)
+        invalidateProviderReadiness(
+            for: provider, checkedAt: report.checkedAt,
+            preserving: preservedModelIDs.union(untestedModelIDs))
         let configurationFingerprint = builtinReadinessFingerprint(for: provider)
+        // 目录里发现但没有测、也没有旧记录的模型：标“未检查”，进入选择器的待应用列表。
+        for modelID in normalizedModelIDs(report.discoveredModelIDs)
+        where !checkedModelIDs.contains(modelID) && !knownModelIDs.contains(modelID) {
+            providerReadinessStore.upsert(
+                ProviderReadinessPersistenceRecord(
+                    providerID: provider.name,
+                    modelID: modelID,
+                    status: .discovered,
+                    readinessState: .unverified,
+                    checkedAt: report.checkedAt,
+                    isApplied: false
+                )
+            )
+        }
         for model in report.modelChecks {
+            if preservedModelIDs.contains(model.modelID) { continue }
+            let transientFailure = model.status == .failed && model.errorCategory?.isTransient == true
             let status: ProviderReadinessPersistenceStatus =
-                model.status == .passed ? .passed : .unavailable
+                model.status == .passed ? .passed : (transientFailure ? .unverified : .unavailable)
             providerReadinessStore.upsert(
                 ProviderReadinessPersistenceRecord(
                     providerID: provider.name,
                     modelID: model.modelID,
                     status: status,
-                    readinessState: model.readiness?.state
-                        ?? (status == .passed ? report.state : .blocked),
+                    readinessState: transientFailure ? .unverified : (model.readiness?.state
+                        ?? (status == .passed ? report.state : .blocked)),
                     checkedAt: model.readiness?.checkedAt ?? report.checkedAt,
                     errorCategory: model.errorCategory,
                     latency: model.latency,
@@ -5097,16 +5469,21 @@ final class SettingsCenter {
         for provider: EnvVarEntry,
         checkedAt: Date,
         errorCategory: ProviderReadinessFailureCategory? = nil,
-        latency: Int? = nil
+        latency: Int? = nil,
+        preserving preservedModelIDs: Set<String> = []
     ) {
         let appliedModelIDs = Set(normalizedModelIDs(provider.modelNames))
         let knownRecords = providerReadinessStore.records.filter {
             $0.providerID.caseInsensitiveCompare(provider.name) == .orderedSame
         }
         let modelIDs = appliedModelIDs.union(knownRecords.map(\.modelID))
+        // 瞬时故障（限流、超时、5xx、网络不通）不推翻此前的通过结果；没有旧结果的标“未验证”，可重试。
+        let isTransient = errorCategory?.isTransient == true
 
         for modelID in modelIDs {
+            if preservedModelIDs.contains(modelID) { continue }
             let existing = knownRecords.first { $0.modelID == modelID }
+            if isTransient, existing?.status == .passed { continue }
             let lineage = existing?.lineage ?? providerReadinessLineage(
                 providerID: provider.name,
                 modelID: modelID,
@@ -5116,8 +5493,8 @@ final class SettingsCenter {
                 ProviderReadinessPersistenceRecord(
                     providerID: provider.name,
                     modelID: modelID,
-                    status: .unavailable,
-                    readinessState: .blocked,
+                    status: isTransient ? .unverified : .unavailable,
+                    readinessState: isTransient ? .unverified : .blocked,
                     checkedAt: checkedAt,
                     errorCategory: errorCategory,
                     latency: latency,
@@ -5161,8 +5538,11 @@ final class SettingsCenter {
                 nil
             )
         }
-        guard let rawBaseURL = record.baseURL else {
-            failures.append("Base URL 缺失")
+        // 基础地址留空：有预设就用预设默认地址（与新增表单的“可选”提示一致）。
+        let configuredBaseURL = record.baseURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let rawBaseURL = (configuredBaseURL?.isEmpty == false ? configuredBaseURL : nil)
+            ?? ProviderPreset.defaultBaseURL(forCredentialName: record.name) else {
+            failures.append("未填写基础地址：该服务没有默认地址，请在编辑里填写服务商提供的地址")
             return (
                 ProviderReadinessStage(status: .failed, detail: failures.joined(separator: "；"), statusCode: nil),
                 nil
@@ -5175,7 +5555,7 @@ final class SettingsCenter {
                 baseURL
             )
         } catch {
-            failures.append("Base URL 无效：\(error.localizedDescription)")
+            failures.append("基础地址无效：\(UserFacingErrorText.describe(error))")
             return (
                 ProviderReadinessStage(status: .failed, detail: failures.joined(separator: "；"), statusCode: nil),
                 nil
@@ -5216,7 +5596,8 @@ final class SettingsCenter {
             return .invalidConfiguration
         case 401:
             return .unauthorized
-        case 403:
+        case 402, 403:
+            // 402 = 余额或额度不足，与无权限同属“账户侧问题”，提示里写明检查余额。
             return .permissionDenied
         case 404:
             return .notFound
@@ -5272,6 +5653,57 @@ final class SettingsCenter {
         }
     }
 
+    /// /models 不存在：404 或 405。
+    private func isModelListEndpointMissing(_ result: ProviderReadinessRequestResult) -> Bool {
+        guard case .response(let response, _) = result else { return false }
+        return response.statusCode == 404 || response.statusCode == 405
+    }
+
+    /// 模型目录不可用：404/405，或 2xx 但返回的不是可解析的目录（例如 HTML 页面）。
+    private func isModelListUnusable(_ result: ProviderReadinessRequestResult) -> Bool {
+        guard case .response(let response, _) = result else { return false }
+        if response.statusCode == 404 || response.statusCode == 405 { return true }
+        return (200..<300).contains(response.statusCode) && response.errorCategory == .malformedResponse
+    }
+
+    private func discoveryFailureDetail(
+        _ result: ProviderReadinessRequestResult,
+        discoveredIsEmpty: Bool
+    ) -> String {
+        if case .response(let response, _) = result {
+            if response.errorCategory == .malformedResponse {
+                return "模型列表格式无法识别（不是常见的 OpenAI 或 Anthropic 目录格式），请手动填写模型名称"
+            }
+            if isModelListUnusable(result) {
+                return "该服务没有 /models 接口，请手动填写模型名称"
+            }
+        }
+        return discoveredIsEmpty ? "模型发现返回空目录" : "模型发现失败"
+    }
+
+    /// 只对少量模型发真实请求，不逐个全测：已填写（已应用）的模型里出现在目录中的，
+    /// 最多 3 个；已填写的模型都不在目录里时，直接测已填写的前 3 个（不拿目录里的别的模型顶替）；
+    /// 什么都没填写才取目录里的第一个。
+    func modelIDsToCheck(manual: [String], discovered: [String]) -> [String] {
+        let limit = 3
+        if discovered.isEmpty { return Array(manual.prefix(limit)) }
+        let discoveredSet = Set(discovered)
+        // 抽测优先挑名字像聊天模型的，避免抽到向量/语音模型而把整家误判失败。
+        let saved = manual.filter { discoveredSet.contains($0) }
+        if !saved.isEmpty {
+            let chatLike = saved.filter { !ProviderModelNameHeuristics.likelyNonChat($0) }
+            return Array((chatLike.isEmpty ? saved : chatLike).prefix(limit))
+        }
+        if !manual.isEmpty { return Array(manual.prefix(limit)) }
+        let first = discovered.first { !ProviderModelNameHeuristics.likelyNonChat($0) } ?? discovered[0]
+        return [first]
+    }
+
+    /// 408、429 和 5xx 视为偶发故障，检查内可重试。
+    private static func isTransientReadinessStatus(_ statusCode: Int) -> Bool {
+        statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
+    }
+
     private func sendReadinessRequest(
         operation: ProviderReadinessOperation,
         record: EnvVarEntry,
@@ -5293,7 +5725,31 @@ final class SettingsCenter {
         let startedAt = DispatchTime.now().uptimeNanoseconds
         do {
             try Task.checkCancellation()
-            let response = try await providerReadinessTransport.send(request)
+            // 偶发的 429、超时、5xx 在检查内重试最多 2 次（间隔 0.5 秒、1.5 秒），
+            // 不因一次抖动把模型锁成不可用；401/403/404/400 等确定性失败不重试。
+            var response: ProviderReadinessTransportResponse
+            var transientRetries = 0
+            // 受控现场通道要求请求数精确，不做重试。
+            let maxTransientRetries = mm01FieldLane == nil ? 2 : 0
+            while true {
+                do {
+                    response = try await providerReadinessTransport.send(request)
+                } catch SettingsProviderReadinessTransportError.timeout where transientRetries < maxTransientRetries {
+                    try await Task.sleep(nanoseconds: transientRetries == 0 ? 500_000_000 : 1_500_000_000)
+                    try Task.checkCancellation()
+                    transientRetries += 1
+                    continue
+                }
+                // 余额或额度不足（传输层已归入 permissionDenied）不是偶发故障，不重试。
+                if transientRetries < maxTransientRetries, response.errorCategory != .permissionDenied,
+                   Self.isTransientReadinessStatus(response.statusCode) {
+                    try await Task.sleep(nanoseconds: transientRetries == 0 ? 500_000_000 : 1_500_000_000)
+                    try Task.checkCancellation()
+                    transientRetries += 1
+                    continue
+                }
+                break
+            }
             try Task.checkCancellation()
             let elapsed = Int(
                 (DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
@@ -5325,7 +5781,8 @@ final class SettingsCenter {
         successDetail: String,
         failureDetail: String,
         apiKey: String,
-        resultLines: inout [String]
+        resultLines: inout [String],
+        anyHTTPResponsePasses: Bool = false
     ) -> ProviderReadinessStage {
         switch result {
         case .localControl(let reason):
@@ -5343,7 +5800,8 @@ final class SettingsCenter {
             if !redactedBody.isEmpty {
                 resultLines.append(redactedBody)
             }
-            let passed = success(response.statusCode) && response.errorCategory == nil
+            let passed = success(response.statusCode)
+                && (anyHTTPResponsePasses || response.errorCategory == nil)
             return ProviderReadinessStage(
                 status: passed ? .passed : .failed,
                 detail: passed ? successDetail : "\(failureDetail)（HTTP \(response.statusCode)）",
@@ -5522,11 +5980,31 @@ final class SettingsCenter {
             entry: entry,
             targetType: "provider",
             targetName: entry.name,
-            impactSummary: "删除供应商配置及其 API 密钥链副本",
+            impactSummary: Self.providerDeletionImpactSummary(
+                dependentSessionTitles: providerDependentSessionTitles?(entry.name) ?? [],
+                isDefaultProvider: defaultProviderID?.caseInsensitiveCompare("custom.\(entry.name)") == .orderedSame
+            ),
             scopeID: "provider:\(entry.name)",
             now: now,
             ttl: ttl
         )
+    }
+
+    /// F1-09：删除确认框的影响说明。会话与默认服务商的后果都如实写出。
+    nonisolated static func providerDeletionImpactSummary(
+        dependentSessionTitles: [String],
+        isDefaultProvider: Bool
+    ) -> String {
+        var text = "删除供应商配置及其 API 密钥链副本"
+        if isDefaultProvider {
+            text += "；它是当前默认服务商，删除后默认服务商和默认模型会清空，需要重新选择"
+        }
+        if !dependentSessionTitles.isEmpty {
+            let shown = dependentSessionTitles.prefix(3).map { "「\($0)」" }.joined(separator: "、")
+            let more = dependentSessionTitles.count > 3 ? "等 \(dependentSessionTitles.count) 个" : ""
+            text += "；\(shown)\(more)会话正在选用它，删除后这些会话会改用默认模型"
+        }
+        return text
     }
 
     @discardableResult
@@ -5541,6 +6019,12 @@ final class SettingsCenter {
         if let provider {
             providerReadinessStore.removeProvider(providerID: provider.name)
             usageStore.deleteProvider(recordID: provider.id, at: now)
+            // F1-09：默认服务商指向已删除的供应商时一并清空，不留下指向空记录的默认值。
+            if let current = defaultProviderID,
+               current.caseInsensitiveCompare("custom.\(provider.name)") == .orderedSame {
+                defaultProviderID = nil
+                defaultModelID = nil
+            }
         }
         reloadEnv()
         return receipt
@@ -5724,6 +6208,8 @@ final class SettingsCenter {
                 }
             }
             reloadEnv()
+            // F1-01：会话里按旧名保存的服务商选择跟着改名，不退回默认模型。
+            onProviderRenamed?(oldSnapshot.name, canonicalNew)
             // The old UUID remains the historical usage lineage. EnvVarStore
             // creates a new UUID for the replacement record; do not silently
             // merge subsequent calls into this old identity by display name.
@@ -5892,15 +6378,22 @@ final class SettingsCenter {
     @discardableResult
     func addMCPServer(_ server: MCPServer) -> Bool {
         invalidateMCPDiscovery(for: server.id)
+        lastMCPWriteFailure = nil
         do {
             try mcpManager.addServer(server)
             mcpToolsByServer.removeValue(forKey: server.id)
             reloadMCP()
             return true
         } catch {
+            lastMCPWriteFailure = error
             return false
         }
     }
+
+    /// 11/16：最近一次 addMCPServer 失败的原因，供设置页区分“配置已被修改”与“写入失败”。
+    private(set) var lastMCPWriteFailure: Error?
+
+    func clearMCPWriteFailure() { lastMCPWriteFailure = nil }
 
     /// 删除服务器（无 id 时 no-op）。失败返回 false。
     @discardableResult
@@ -5915,6 +6408,7 @@ final class SettingsCenter {
             reloadMCP()
             return true
         } catch {
+            lastMCPWriteFailure = error
             return false
         }
     }
@@ -5931,6 +6425,7 @@ final class SettingsCenter {
             reloadMCP()
             return true
         } catch {
+            lastMCPWriteFailure = error
             return false
         }
     }
@@ -5955,8 +6450,32 @@ final class SettingsCenter {
             reloadMCP()
             return true
         } catch {
+            lastMCPWriteFailure = error
             return false
         }
+    }
+
+    /// 批量工具授权（“全部授权/全部取消”）：一次持久化。
+    @discardableResult
+    func setMCPToolsAuthorized(serverID: String, toolNames: [String], authorized: Bool) -> Bool {
+        let names = toolNames.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !names.isEmpty else { return false }
+        do {
+            if authorized {
+                _ = try mcpManager.authorizeTools(serverID: serverID, toolNames: names)
+            } else {
+                _ = try mcpManager.revokeTools(serverID: serverID, toolNames: names)
+            }
+            return true
+        } catch {
+            lastMCPWriteFailure = error
+            return false
+        }
+    }
+
+    /// 因工具定义摘要变化而被收窄、需要重新授权的工具数。
+    func mcpNarrowedToolCount(serverID: String) -> Int {
+        mcpManager.schemaNarrowedToolCount(serverID: serverID)
     }
 
     func mcpTools(for serverID: String) -> [MCPTool] {
@@ -5991,6 +6510,7 @@ final class SettingsCenter {
             }
             return true
         } catch {
+            lastMCPWriteFailure = error
             return false
         }
     }
@@ -6161,6 +6681,8 @@ final class SettingsCenter {
         childConcurrencyRiskAcknowledgedValue = false
         safetyControlState = .defaults
         logManager.minimumLevel = LogLevel(settingsMirror.privacy.logLevel)
+        // F3-02：恢复默认后命令环境（去凭据、非交互）也按默认值重新配置。
+        configureModelShellEnvironment()
         onChildConcurrencySelectionChanged?(childConcurrencySelection)
         onApprovalPolicyChanged?(settingsMirror.agent.approvalPolicy)
         onPolicyRuntimeDefaultsChanged?(settingsMirror.agent.policyRuntimeDefaults)
@@ -6308,9 +6830,11 @@ final class SettingsCenter {
             let persistedFacts = try memoryStore.facts()
             memoryFactTotalCount = persistedFacts.count
             memoryFacts = persistedFacts.filter { $0.lifecycleState == .active }
+            memoryFactsLoadFailed = false
         } catch {
             // Retain the last known good snapshot. A corrupt facts file must
             // not turn the settings view into a false empty-state.
+            memoryFactsLoadFailed = true
         }
         memoryFiles = memoryFileStore.listFiles()
     }

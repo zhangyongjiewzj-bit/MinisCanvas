@@ -48,7 +48,8 @@ struct ComposerVideoContext603Tests {
         #expect(parts.contains { ($0["text"] as? String)?.contains("owned cue 一") == true })
     }
 
-    @Test func compoundReadinessRechecksAudioCapabilityAndKeepsBlockedDraft() async throws {
+    // 11/16 起视频随所选模型自动调整：模型能收图片但不能收音频时，去掉音轨只发画面，草稿不再被拦下。
+    @Test func compoundReadinessRechecksAudioCapabilityAndDropsAudioTrackForVisionModel() async throws {
         Video603NoNetworkProtocol.reset()
         let video = try await resolved()
         let chat = ChatStore()
@@ -57,15 +58,16 @@ struct ComposerVideoContext603Tests {
         chat.addComposerDraftAttachment(video); chat.draftText = "owned compound draft"
         let full = chat.composerMediaReadinessSnapshot
         #expect(full.attachment(id: video.id)?.readiness == .supported)
+        #expect(full.attachment(id: video.id)?.requiredInputModalities.contains(.audioInput) == true)
         #expect(chat.canSubmitComposerAttachments)
         chat.streamingProviderOverride = provider(.vision)
         #expect(!chat.isCurrentComposerMediaReadiness(full))
-        #expect(chat.composerMediaReadinessSnapshot.attachment(id: video.id)?.readiness == .unsupported)
-        chat.submitComposer()
-        #expect(chat.pendingAttachments.map(\.id) == [video.id])
+        let vision = chat.composerMediaReadinessSnapshot.attachment(id: video.id)
+        #expect(vision?.readiness == .supported)
+        #expect(vision?.requiredInputModalities.contains(.audioInput) == false)
+        #expect(vision?.reason.contains("未附带音轨") == true)
+        #expect(chat.canSubmitComposerAttachments)
         #expect(chat.draftText == "owned compound draft")
-        #expect(!chat.messages.contains { $0.role == .user })
-        await Task.yield()
         #expect(Video603NoNetworkProtocol.count == 0)
     }
 

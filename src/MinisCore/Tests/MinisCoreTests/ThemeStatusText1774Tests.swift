@@ -13,9 +13,9 @@ struct ThemeStatusText1774Tests {
     // These existing AJ-38 endpoints are pinned by the production-source guard
     // below. The test does not instantiate an App, native view or SettingsCenter.
     private func inspectorSurfaces(_ tokens: ThemeSemanticTokens, dark: Bool) -> [ThemeColor] {
-        let primary = hex(dark ? 0x14181C : 0xFAF9F6)
-        let secondary = hex(dark ? 0x0A0D10 : 0xF1EEE7)
-        let border = hex(dark ? 0x39342F : 0xB4AEA4)
+        let primary = hex(dark ? 0x1F1E1C : 0xFAF9F5)
+        let secondary = hex(dark ? 0x262522 : 0xF3F1EB)
+        let border = hex(dark ? 0x3A3935 : 0xE3E0D7)
         let faces = [tokens.background, tokens.sidebarBackground, tokens.surfaceRaised, primary, secondary]
         return faces + faces.map { background in
             ThemeColor(r: border.r * 0.10 + background.r * 0.90,
@@ -29,10 +29,10 @@ struct ThemeStatusText1774Tests {
         let original = try #require(preset.semanticTokens(systemIsDark: systemIsDark))
         let dark = preset.resolvedMode(systemIsDark: systemIsDark) == .dark
         let surfaces = inspectorSurfaces(original, dark: dark)
-        let overlayPrimary = hex(dark ? 0xFAF9F6 : 0x39342F)
+        let overlayPrimary = hex(dark ? 0xECEAE4 : 0x1F1E1D)
         let overlayDanger = ThemeContrast.foregroundMeetingContrast(
-            hex(0x8C3A2B), role: preset == .highContrast ? .body : .status,
-            backgrounds: [hex(dark ? 0x14181C : 0xFAF9F6), hex(dark ? 0x0A0D10 : 0xF1EEE7)],
+            hex(dark ? 0xF08072 : 0xB3261E), role: preset == .highContrast ? .body : .status,
+            backgrounds: [hex(dark ? 0x1F1E1C : 0xFAF9F5), hex(dark ? 0x262522 : 0xF3F1EB)],
             readableAnchor: overlayPrimary
         )
         for source in [original.statusWarning, overlayDanger] {
@@ -57,10 +57,10 @@ struct ThemeStatusText1774Tests {
         #expect(ThemePreset.dark.semanticTokens(systemIsDark: true) == nil)
         #expect(ThemePreset.highContrast.semanticTokens(systemIsDark: true) == nil)
         let tokens = try #require(ThemePreset.system.semanticTokens(systemIsDark: true))
-        let background = hex(0x14181C)
+        let background = hex(0x1F1E1C)
         let original = ThemeContrast.foregroundMeetingContrast(
             hex(0x8C3A2B), role: .status,
-            backgrounds: [background, hex(0x0A0D10)], readableAnchor: hex(0xFAF9F6)
+            backgrounds: [background, hex(0x262522)], readableAnchor: hex(0xECEAE4)
         )
         #expect(ThemeContrast.evaluate(role: .status, foreground: original, background: background).passes)
         #expect(!ThemeContrast.evaluate(role: .secondary, foreground: original, background: background).passes)
@@ -92,7 +92,7 @@ struct ThemeStatusText1774Tests {
         #expect(provider.contains("return tokens.readableStatusText("))
         #expect(provider.contains("additionalBackgrounds: surfaces + sectionSurfaces"))
         let overlay = try source("src/MinisCanvasApp/Sources/MinisCanvasApp/ThemeTokens.swift")
-        for existing in ["0x14181C", "0x0A0D10", "0xFAF9F6", "0xF1EEE7", "0x39342F", "0xB4AEA4", "0x8C3A2B"] {
+        for existing in ["0x1F1E1C", "0x262522", "0xECEAE4", "0xFAF9F5", "0xF3F1EB", "0x1F1E1D", "0xE3E0D7", "0x3A3935", "0xB3261E", "0xF08072"] {
             #expect(overlay.contains(existing))
         }
         let inspector = try source("src/MinisCanvasApp/Sources/MinisCanvasApp/Inspector/InspectorSection.swift")

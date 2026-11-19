@@ -2,6 +2,7 @@ import Foundation
 import Observation
 import AppKit
 import UserNotifications
+import MinisCore
 
 enum SystemNotificationAuthorizationStatus: Equatable { case unknown, notDetermined, denied, authorized }
 enum SystemNotificationCategory: String, CaseIterable, Identifiable, Hashable, Sendable {
@@ -271,6 +272,8 @@ final class SystemNotificationController {
         seenEventKeys.append(event.key)
         if seenEventKeys.count > 512 { seenEventKeys.removeFirst(seenEventKeys.count - 512) }
         guard !(effects.isApplicationActive() && isTargetViewed(event.target)) else { return nil }
+        MinisCore.HookRuntime.installed?.notifyEvent(
+            .notification, sessionID: event.target.sessionID ?? "", fields: ["message": event.body])
         let id = "miniscanvas-event-" + UUID().uuidString
         records[id] = event
         recordOrder.append(id)

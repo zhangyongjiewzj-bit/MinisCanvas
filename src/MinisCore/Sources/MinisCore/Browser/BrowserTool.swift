@@ -516,10 +516,17 @@ public struct BrowserTool: ToolExecutor, Sendable {
                 }
                 let path = try await session.screenshot(directory: directory)
                 try ensureOriginalResource()
-                return try BrowserToolResponse.succeeded(
+                let response = try BrowserToolResponse.succeeded(
                     action: parsed.action, scopeID: session.scope.id,
                     result: "Screenshot saved to: \(path)"
                 )
+                // 截图同时走图片通道，支持图片输入的模型能直接看到页面；
+                // 通道不可用（读取或缩放失败）时仍只返回路径。
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                   let marker = ToolResultImageChannel.attach(data: data, mimeType: "image/jpeg") {
+                    return response + "\n" + marker
+                }
+                return response
             default:
                 // Unreachable — parse() rejects unknown actions.
                 throw ToolExecutorError.invalidParameter("action=\(parsed.action)")
@@ -562,7 +569,7 @@ public struct BrowserTool: ToolExecutor, Sendable {
                 "selector": AgentToolParam(type: .string, description: "CSS selector for targeting elements (click, type, download, upload, read)"),
                 "path": AgentToolParam(type: .string, description: "Exact absolute upload input file or new download output file. Requires browser approval and existing file permissions; existing output files are refused."),
                 "text": AgentToolParam(type: .string, description: "Text to type into the element (type action only)"),
-                "directory": AgentToolParam(type: .string, description: "Optional directory for the screenshot file (screenshot action only; defaults to the system temp dir)"),
+                "directory": AgentToolParam(type: .string, description: "Optional directory for the screenshot file (screenshot action only; defaults to the system temp dir). The screenshot is a JPEG of the visible viewport and is also shown to you directly when the model accepts images."),
             ],
             required: ["tool_title", "action"],
             propertyOrdering: ["tool_title", "action", "url", "selector", "text", "directory", "path"]

@@ -35,6 +35,18 @@ public enum ProviderReadinessProjectionState: String, Codable, Hashable, Sendabl
     }
 }
 
+extension ProviderReadinessFailureCategory {
+    /// 瞬时故障（限流、超时、服务端 5xx、网络不通）：重试后仍失败时不推翻此前的通过结果，
+    /// 也不当作配置错误阻断；401/403/404/400 等仍按阻断处理。
+    public var isTransient: Bool {
+        switch self {
+        case .timeout, .rateLimited, .server, .unavailable, .transport: return true
+        case .invalidConfiguration, .missingCredential, .unauthorized, .permissionDenied,
+             .notFound, .malformedResponse, .modelNotFound: return false
+        }
+    }
+}
+
 public enum ProviderReadinessProjectionReason: String, Codable, Hashable, Sendable {
     case mockEvidence
     case localEvidence
@@ -132,6 +144,14 @@ public struct ChatModelPickerItem: Identifiable, Codable, Hashable, Sendable {
     /// visible for recovery but is never treated as configured.
     public var isConfigured: Bool {
         isApplied && applyReceiptID != nil && appliedAt != nil
+    }
+
+    /// 已应用（用户保存了该模型）但从未做过连接检查：只有“发现并应用”的记录，没有任何检查结果。
+    /// 选择器里可选并标“未检查”，首次发送前由发送链路做一次就绪预检；
+    /// 它不是就绪证据，回退候选等只认已就绪模型的地方仍然用 `isSelectable`。
+    public var isUncheckedApplied: Bool {
+        isApplied && applyReceiptID != nil && appliedAt != nil
+            && status == .discovered && errorCategory == nil && evidenceID == nil
     }
 
     public var selectionTruth: ProviderReadinessSelectionTruth {

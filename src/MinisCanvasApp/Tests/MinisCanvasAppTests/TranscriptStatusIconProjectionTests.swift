@@ -330,7 +330,8 @@ struct TranscriptStatusIconProjectionTests {
         let text = try #require(scroll.documentView as? NSTextView)
         // Both reads precede any explicit layoutManager getter in this case.
         #expect((text.textLayoutManager != nil) == factoryIsTextKit2)
-        #expect(text.usesFindBar == factoryText.usesFindBar)
+        // 对话正文现在启用原生查找栏（⌘F），与默认工厂视图不同是有意的。
+        #expect(text.usesFindBar)
         #expect(text.accessibilityRole() == factoryText.accessibilityRole())
         let lease = NativeTestHostLifecycle.begin("Goal22StatusCopy", requestActivation: false)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 400),

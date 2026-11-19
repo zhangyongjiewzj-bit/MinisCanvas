@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MinisCore
 
@@ -92,6 +93,8 @@ struct ChatInspectorSnapshot: Sendable, Equatable {
     /// and canonical terminal facts; old or failed calls are absent.
     let fileArtifacts: [ProducedFileArtifactEvidence]
     let artifactPersistenceUnavailable: Bool
+    /// shell 命令文本里出现且命令结束后存在的新文件（命令生成，未经写入验证）；与已证实产物分开显示。
+    let commandGeneratedPaths: [String]
     let persistence: SessionCompactProjection
 
     init(
@@ -118,6 +121,7 @@ struct ChatInspectorSnapshot: Sendable, Equatable {
         turnFileChanges: [TurnFileChange] = [],
         fileArtifacts: [ProducedFileArtifactEvidence] = [],
         artifactPersistenceUnavailable: Bool = false,
+        commandGeneratedPaths: [String] = [],
         persistence: SessionCompactProjection
     ) {
         self.sessionID = sessionID
@@ -143,6 +147,7 @@ struct ChatInspectorSnapshot: Sendable, Equatable {
         self.turnFileChanges = turnFileChanges
         self.fileArtifacts = fileArtifacts
         self.artifactPersistenceUnavailable = artifactPersistenceUnavailable
+        self.commandGeneratedPaths = commandGeneratedPaths
         self.persistence = persistence
     }
 
@@ -187,7 +192,10 @@ struct ChatInspectorView: View {
     let budgetResetTarget: SessionBudgetResetTarget?
     let budgetResetBlockedReason: String?
     let onConfirmBudgetReset: ((SessionBudgetResetTarget) -> Void)?
+    /// 带压缩指引的压缩；没有给出时检查器里不显示指引输入。
+    let onCompactWithHint: ((String) -> Void)?
     @State private var pendingBudgetReset: SessionBudgetResetTarget?
+    @State private var compactionHint = ""
 
     init(
         snapshot: ChatInspectorSnapshot,
@@ -200,8 +208,10 @@ struct ChatInspectorView: View {
         onUndoCompaction: ((SessionCompactProjection.CheckpointIdentity) -> Void)? = nil,
         budgetResetTarget: SessionBudgetResetTarget? = nil,
         budgetResetBlockedReason: String? = nil,
-        onConfirmBudgetReset: ((SessionBudgetResetTarget) -> Void)? = nil
+        onConfirmBudgetReset: ((SessionBudgetResetTarget) -> Void)? = nil,
+        onCompactWithHint: ((String) -> Void)? = nil
     ) {
+        self.onCompactWithHint = onCompactWithHint
         self.snapshot = snapshot
         self.onCompact = onCompact
         self.onOpenChildSession = onOpenChildSession
@@ -220,14 +230,16 @@ struct ChatInspectorView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 10) {
-                overviewSection
+            // MC4-047：各区块列表都有上限（最多 40 行），用普通 VStack。外层懒加载列表套
+            // 折叠区块、区块里再套懒加载列表时，两次卡死采样都停在懒加载列表反复重排上。
+            VStack(alignment: .leading, spacing: 10) {
                 InspectorSection(
                     identifier: "chat-inspector.current-task",
                     title: "当前任务",
                     icon: "checklist",
                     catalogIcon: .task,
-                    summary: snapshot.currentTaskID == nil ? "暂无" : "已绑定"
+                    summary: snapshot.currentTaskID == nil ? "暂无" : "已绑定",
+                    hasContent: snapshot.currentTaskID != nil
                 ) {
                     TaskSummaryView(
                         currentTaskID: snapshot.currentTaskID,
@@ -237,11 +249,12 @@ struct ChatInspectorView: View {
                         onOpenChildSession: onOpenChildSession
                     )
                 }
-                sourceSection
-                toolSection
                 fileChangesSection
+                toolSection
+                sourceSection
                 activitySection
                 persistenceSection
+                overviewSection
             }
             .padding(10)
         }
@@ -258,10 +271,10 @@ struct ChatInspectorView: View {
             title: "会话",
             icon: "bubble.left.and.bubble.right",
             catalogIcon: .messages,
-            summary: snapshot.sessionID == nil ? "未选择" : "活动"
+            summary: snapshot.sessionID == nil ? "未选择" : "活动",
+            // 预算告警时默认展开，重置入口才能直接看到；平时收起。
+            hasContent: snapshot.budgetIsOverLimit || snapshot.budgetIsWarning
         ) {
-            InspectorValueRow("服务商", snapshot.providerLabel)
-            InspectorValueRow("模型", snapshot.modelLabel)
             InspectorValueRow("智能体", snapshot.engineLabel)
             InspectorValueRow("消息", "\(snapshot.messageCount)")
             InspectorValueRow("会话", "\(snapshot.activeSessionCount) 活动 · \(snapshot.archivedSessionCount) 归档")
@@ -293,7 +306,8 @@ struct ChatInspectorView: View {
             title: "来源文件",
             icon: "doc.text",
             catalogIcon: .document,
-            summary: "\(snapshot.sourceItems.count) 项"
+            summary: "\(snapshot.sourceItems.count) 项",
+            hasContent: !snapshot.sourceItems.isEmpty
         ) {
             InspectorValueRow("最近回报占用", contextOccupancy?.display ?? "—")
             if let context = snapshot.contextSummary {
@@ -315,7 +329,7 @@ struct ChatInspectorView: View {
             if snapshot.sourceItems.isEmpty {
                 InspectorEmptyState(text: "当前回合没有可显示的结构化来源")
             } else {
-                LazyVStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(snapshot.sourceItems.enumerated()), id: \.offset) { item in
                         let source = item.element
                         VStack(alignment: .leading, spacing: 3) {
@@ -345,7 +359,8 @@ struct ChatInspectorView: View {
             identifier: "chat-inspector.tools",
             title: "工具",
             icon: "wrench.and.screwdriver",
-            summary: ChatInspectorListPresentation.summary(count: snapshot.toolEvents.count, limit: ChatInspectorSnapshot.maxToolRows, unit: "条")
+            summary: ChatInspectorListPresentation.summary(count: snapshot.toolEvents.count, limit: ChatInspectorSnapshot.maxToolRows, unit: "条"),
+            hasContent: !snapshot.toolEvents.isEmpty
         ) {
             if snapshot.toolEvents.isEmpty {
                 InspectorEmptyState(text: "暂无工具生命周期事实")
@@ -353,7 +368,7 @@ struct ChatInspectorView: View {
                 // D-OUTPUT-01：每条工具/子智能体生命周期事实呈现为可折叠摘要卡
                 // （ToolEventCard：标题行=类型+终态；展开=脱敏摘要+耗时/Provider/
                 // Model/错误类别等详情）。
-                LazyVStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(snapshot.toolEvents) { event in
                         ToolEventCard(event: event, concurrentEvents: snapshot.toolEvents)
                     }
@@ -377,7 +392,9 @@ struct ChatInspectorView: View {
             identifier: "chat-inspector.file-changes",
             title: "变更文件",
             icon: "doc.on.doc",
-            summary: snapshot.artifactPersistenceUnavailable ? "引用记录不可用" : ChatInspectorListPresentation.summary(count: snapshot.fileChanges.count, limit: ChatInspectorSnapshot.maxFileChangeRows, unit: "项")
+            summary: snapshot.artifactPersistenceUnavailable ? "引用记录不可用" : ChatInspectorListPresentation.summary(count: snapshot.fileChanges.count, limit: ChatInspectorSnapshot.maxFileChangeRows, unit: "项"),
+            hasContent: snapshot.artifactPersistenceUnavailable || !snapshot.fileChanges.isEmpty
+                || !snapshot.fileArtifacts.isEmpty || !snapshot.commandGeneratedPaths.isEmpty
         ) {
             if snapshot.artifactPersistenceUnavailable {
                 InspectorEmptyState(text: "产物引用记录读取或保存失败；文件可能已写入，引用暂不可用。原记录未被清空。")
@@ -385,7 +402,7 @@ struct ChatInspectorView: View {
             if !snapshot.fileChanges.isEmpty {
                 // D-OUTPUT-02：可展开变更列表（每文件一行），展开查看逐文件
                 // 有界脱敏 Diff。列表本身是纯值投影，不做任何目录扫描。
-                LazyVStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(snapshot.fileChanges.enumerated()), id: \.element.id) { _, change in
                         FileChangeRow(change: change)
                     }
@@ -395,9 +412,19 @@ struct ChatInspectorView: View {
                 Text("已证实产物 · \(snapshot.fileArtifacts.count) 项")
                     .font(typography?.caption ?? .system(size: 10))
                     .foregroundStyle(.secondary)
-                LazyVStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(snapshot.fileArtifacts.enumerated()), id: \.offset) { _, artifact in
                         FileArtifactEvidenceRow(artifact: artifact)
+                    }
+                }
+            }
+            if !snapshot.commandGeneratedPaths.isEmpty {
+                Text("命令生成 · \(snapshot.commandGeneratedPaths.count) 项（未经写入验证）")
+                    .font(typography?.caption ?? .system(size: 10))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(snapshot.commandGeneratedPaths, id: \.self) { path in
+                        CommandGeneratedArtifactRow(path: path)
                     }
                 }
             }
@@ -409,12 +436,13 @@ struct ChatInspectorView: View {
             identifier: "chat-inspector.activity",
             title: "活动日志",
             icon: "clock.arrow.circlepath",
-            summary: ChatInspectorListPresentation.summary(count: snapshot.activityEvents.count, limit: ChatInspectorSnapshot.maxActivityRows, unit: "条")
+            summary: ChatInspectorListPresentation.summary(count: snapshot.activityEvents.count, limit: ChatInspectorSnapshot.maxActivityRows, unit: "条"),
+            hasContent: !snapshot.activityEvents.isEmpty
         ) {
             if snapshot.activityEvents.isEmpty {
                 InspectorEmptyState(text: "暂无活动日志")
             } else {
-                LazyVStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(snapshot.activityEvents.enumerated()), id: \.offset) { item in
                         let event = item.element.display
                         HStack(spacing: 6) {
@@ -454,7 +482,11 @@ struct ChatInspectorView: View {
             identifier: "chat-inspector.persistence",
             title: "压缩与恢复",
             icon: "arrow.clockwise.circle",
-            summary: snapshot.persistence.stateLabel
+            summary: snapshot.persistence.stateLabel,
+            // 有检查点、父会话或分叉信息时才默认展开；压缩按钮在展开后可用。
+            hasContent: snapshot.persistence.checkpointID != nil
+                || snapshot.persistence.parentSessionID != nil
+                || snapshot.persistence.forkedThroughRevision != nil
         ) {
             if let checkpointID = snapshot.persistence.checkpointID {
                 InspectorValueRow("Checkpoint", String(checkpointID.prefix(12)))
@@ -484,7 +516,17 @@ struct ChatInspectorView: View {
             }
             if let onCompact {
                 Divider()
-                Button(action: onCompact) {
+                if onCompactWithHint != nil {
+                    TextField("压缩指引（可选），例如：保留数据库迁移的决定", text: $compactionHint)
+                        .textFieldStyle(.roundedBorder)
+                        .font(typography?.caption ?? .system(size: 10))
+                        .accessibilityIdentifier("chat-inspector.compaction-hint")
+                }
+                Button(action: {
+                    let hint = compactionHint.trimmingCharacters(in: .whitespacesAndNewlines)
+                    compactionHint = ""
+                    if hint.isEmpty { onCompact() } else if let onCompactWithHint { onCompactWithHint(hint) } else { onCompact() }
+                }) {
                     Label { Text("压缩上下文（保留最近 3 条）") } icon: {
                         MinisIconView(.activity, size: 14)
                     }
@@ -499,7 +541,7 @@ struct ChatInspectorView: View {
                             ? (theme?.statusWarning ?? .orange)
                             : (theme?.aj38.accent.swiftUIColor ?? Color.accentColor))
                 )
-                .help("把早前对话折叠成摘要，保留最近 3 条消息（MinisCore Compactor）")
+                .help("把早前对话折叠成摘要，保留最近 3 条消息；上方可以先写压缩指引，告诉模型摘要里要保留什么")
             }
         }
     }
@@ -533,10 +575,23 @@ private struct CompactionSummaryDisclosure: View {
 struct FileArtifactEvidenceRow: View {
     let artifact: ProducedFileArtifactEvidence
     @State private var isExpanded = false
+    @State private var actionFeedback: String?
+    @Environment(\.agentArtifactOutputAction) private var onArtifactAction
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {
             VStack(alignment: .leading, spacing: 3) {
+                if let onArtifactAction {
+                    HStack(spacing: 8) {
+                        Button("在访达中显示") { actionFeedback = onArtifactAction(artifact, .finderReveal).message }
+                        Button("复制路径") { actionFeedback = onArtifactAction(artifact, .copySafePath).message }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Text(actionFeedback ?? "操作前将按台账记录和文件摘要重新核验。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Text("生成时 SHA-256（写入字节）：\(artifact.outputSHA256)")
                 Text("工具：\(artifact.producerToolName)")
                 Text("Attempt：\(artifact.producerAttemptID)")
@@ -552,11 +607,76 @@ struct FileArtifactEvidenceRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text("已验证产物引用 · 展开查看验证信息")
-                    .foregroundStyle(.secondary)
+                if let onArtifactAction {
+                    // 常用操作直接放在标题行，不必先展开；折叠时结果也显示在这里。
+                    if !isExpanded, let actionFeedback {
+                        Text(actionFeedback)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Button("预览") { actionFeedback = feedback(onArtifactAction(artifact, .preview)) }
+                    Button("系统打开") { actionFeedback = onArtifactAction(artifact, .systemOpen).message }
+                } else {
+                    Text("已验证产物引用 · 展开查看验证信息")
+                        .foregroundStyle(.secondary)
+                }
             }
             .font(.system(size: 10))
         }
+    }
+
+    private func feedback(_ outcome: AgentFileOutputOutcome) -> String {
+        outcome == .completed ? "已送至右侧预览。" : outcome.message
+    }
+}
+
+/// shell 命令生成的文件：只表示命令文本里提到了它、且它在命令结束后存在并比命令开始更新，
+/// 不是写入证明。操作前仍按文件类型拦截可执行内容。
+struct CommandGeneratedArtifactRow: View {
+    let path: String
+    @State private var feedback: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(path).lineLimit(1).truncationMode(.middle).help(path)
+                Spacer(minLength: 4)
+                Text(CommandGeneratedArtifacts.statusLabel).foregroundStyle(.secondary)
+            }
+            .font(.system(size: 10))
+            HStack(spacing: 8) {
+                Button("系统打开") { openFile() }
+                Button("在访达中显示") {
+                    feedback = NSWorkspace.shared.selectFile(
+                        path, inFileViewerRootedAtPath: (path as NSString).deletingLastPathComponent)
+                        ? nil : "文件已不存在或无法显示。"
+                }
+                Button("复制路径") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(path, forType: .string)
+                    feedback = "路径已复制。"
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            if let feedback {
+                Text(feedback).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func openFile() {
+        let url = URL(fileURLWithPath: path)
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+            feedback = "文件已不存在，无法打开。"
+            return
+        }
+        let ok = AgentFileOutputActionConsumer.guardedSystemOpen(
+            url, open: { NSWorkspace.shared.open($0) },
+            reveal: { NSWorkspace.shared.selectFile($0.path, inFileViewerRootedAtPath: $0.deletingLastPathComponent().path) },
+            openText: nil)
+        feedback = ok ? nil : "系统未能完成文件操作。"
     }
 }
 

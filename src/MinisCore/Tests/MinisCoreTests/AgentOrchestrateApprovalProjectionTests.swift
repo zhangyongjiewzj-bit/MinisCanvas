@@ -95,6 +95,30 @@ struct AgentOrchestrateApprovalProjectionTests {
         ]
     }
 
+    // MARK: 审批卡显示子任务标题（只展示，不进身份）
+
+    @Test func requestCarriesRedactedTruncatedTaskTitlesButNoInstructionsAndKeepsSummary() throws {
+        var first = Self.explicitTask("t1")
+        first["title"] = String(repeating: "长", count: 60) + "\n第二行"
+        var second = Self.explicitTask("t2")
+        second["title"] = "整理报告"
+        let input: [String: Any] = ["input_version": 1, "tasks": [first, second]]
+        let gate = ApprovalGate()
+        let request = gate.makeRequest(id: "d219r-titles", tool: Self.tool, input: input)
+        #expect(request.displayTaskTitles.count == 2)
+        #expect(request.displayTaskTitles[0].count <= 41)
+        #expect(!request.displayTaskTitles[0].contains("\n"))
+        #expect(request.displayTaskTitles[1] == "整理报告")
+        #expect(!request.displayTaskTitles.joined().contains("指令-"))
+        // tasks 以 JSON 字符串传入时同样能取到标题。
+        let data = try JSONSerialization.data(withJSONObject: [first, second])
+        let encoded: [String: Any] = ["input_version": 1, "tasks": String(decoding: data, as: UTF8.self)]
+        #expect(gate.makeRequest(id: "d219r-titles-2", tool: Self.tool, input: encoded).displayTaskTitles.count == 2)
+        // 不改请求身份：非 orchestrate 工具没有标题；无法解码时为空。
+        #expect(gate.makeRequest(id: "x", tool: "file_read", input: ["path": "/a"]).displayTaskTitles.isEmpty)
+        #expect(gate.makeRequest(id: "y", tool: Self.tool, input: ["tasks": "not json"]).displayTaskTitles.isEmpty)
+    }
+
     // MARK: 默认策略投影
 
     @Test func defaultGateProjectsOrchestrateAsKnownAlwaysAsk() {
@@ -127,9 +151,10 @@ struct AgentOrchestrateApprovalProjectionTests {
         #expect(decision.approved)
         #expect(delegate.requests.count == 1)
         #expect(delegate.requests.first?.toolName == Self.tool)
-        // 0845：含 external: 子任务的编排按高风险处理，需要二次确认，不提供持久放行。
+        // 0845：含 external: 子任务的编排按高风险处理，不提供持久放行；
+        // 2026-11-16 起只有不可逆操作才需要第二次确认，编排一次点击即可。
         #expect(delegate.requests.first?.riskLevel == .high)
-        #expect(delegate.requests.first?.requiresSecondConfirmation == true)
+        #expect(delegate.requests.first?.requiresSecondConfirmation == false)
         #expect(delegate.requests.first?.persistentAllowOffer == nil)
     }
 

@@ -110,8 +110,8 @@ struct ToolExecutorWritePermissionTests {
         #expect(String(data: unchanged, encoding: .utf8) == "original")
     }
 
-    /// 反弱化守卫（无行为塌缩）：非权限类写失败（父目录不存在，ENOENT 族）
-    /// 仍必须精确返回既有 `writeFailed`，不得被新的 permissionDenied 分型吞掉。
+    /// 反弱化守卫（无行为塌缩）：非权限类写失败（父目录不存在，ENOENT 族；缺失的父目录现在默认自动创建，
+    /// 所以这里显式传 create_dirs=false）仍必须精确返回既有 `writeFailed`，不得被新的 permissionDenied 分型吞掉。
     @Test func nonPermissionWriteFailureStillReturnsWriteFailed() async throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.base) }
@@ -143,7 +143,7 @@ struct ToolExecutorWritePermissionTests {
         do {
             _ = try await subject.execute(
                 name: "file_write",
-                input: ["path": missingDirTarget, "content": "x"]
+                input: ["path": missingDirTarget, "content": "x", "create_dirs": false]
             )
             Issue.record("expected ToolExecutorError.writeFailed for a non-permission I/O failure")
         } catch let error as ToolExecutorError {

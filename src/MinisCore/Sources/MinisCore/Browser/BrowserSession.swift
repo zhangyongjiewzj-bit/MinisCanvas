@@ -1826,6 +1826,17 @@ public final class BrowserSession: NSObject, @unchecked Sendable {
             throw BrowserError.screenshotFailed("Could not encode snapshot as JPEG")
         }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        // 清理超过 1 小时的旧截图临时文件（只动本功能命名的 browser_*.jpg）。
+        if let stale = try? FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: [.contentModificationDateKey]) {
+            let cutoff = Date().addingTimeInterval(-3600)
+            for file in stale where file.lastPathComponent.hasPrefix("browser_") && file.pathExtension == "jpg" {
+                if let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                   modified < cutoff {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
+        }
         let filename = "browser_\(Int(Date().timeIntervalSince1970 * 1000)).jpg"
         let fileURL = directory.appendingPathComponent(filename)
         do {

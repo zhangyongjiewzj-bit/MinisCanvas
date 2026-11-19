@@ -55,7 +55,7 @@ struct P3AcceptanceM05CommandReadinessTests {
                 continue
             }
             #expect(reason == (id == "boundary.set"
-                ? "暂不可用，请在设置→智能体调整自主权上限。" : "当前没有已接线的生产执行入口"))
+                ? "暂不可用，请在设置→智能体调整最高模式。" : "当前没有已接线的生产执行入口"))
         }
         #expect(ComposerCommandAdjudicationCenter.missingExecutorReason(for: "workflow") == nil)
         // The runner is bound by the App root; a concrete template/provider

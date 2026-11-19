@@ -67,8 +67,11 @@ struct ChatMessageContentAlignmentTests {
             #expect(style?.textBlocks.count == 1)
             let codeBlock = style?.textBlocks.first
             #expect(codeBlock?.backgroundColor != nil)
-            #expect(codeBlock?.width(for: .padding, edge: .minX) == 8)
-            #expect(codeBlock?.width(for: .padding, edge: .maxX) == 8)
+            // 代码卡片：文字与卡片边缘的距离走段落缩进，不用块内边距（AppKit 只给块内首段加内边距会让首行错位）。
+            #expect(codeBlock is CodeSurfaceTextBlock)
+            #expect(codeBlock?.width(for: .padding, edge: .minX) == 0)
+            #expect(style?.headIndent == CodeSurfaceTextBlock.textInset)
+            #expect(style?.firstLineHeadIndent == CodeSurfaceTextBlock.textInset)
 
             let listRange = (state.attributedString.string as NSString).range(of: "第一项 list body")
             if listRange.location != NSNotFound {
@@ -240,5 +243,38 @@ private final class NativeMessageHost {
         window.orderOut(nil)
         window.contentViewController = nil
         window.close()
+    }
+}
+
+/// 思考过程块：默认折叠、不进入正文；展开后才出现全文。
+@Suite("思考过程显示")
+@MainActor
+struct ChatThinkingDisplayTests {
+    private func assistant(thinking: String?, seconds: Double? = nil, content: String = "答案") -> ChatMessageUI {
+        var message = ChatMessageUI(role: .assistant, content: content)
+        message.thinkingText = thinking
+        message.thinkingSeconds = seconds
+        return message
+    }
+
+    @Test func titleShowsStreamingSecondsOrCharacterCount() {
+        #expect(ChatTranscriptFormatter.thinkingTitle(thinking: "abc", seconds: nil, isThinkingNow: true) == "正在思考…")
+        #expect(ChatTranscriptFormatter.thinkingTitle(thinking: "abc", seconds: 4.4, isThinkingNow: false) == "思考了 4 秒")
+        #expect(ChatTranscriptFormatter.thinkingTitle(thinking: "想想看", seconds: nil, isThinkingNow: false) == "思考过程 · 3 字")
+    }
+
+    @Test func thinkingIsCollapsedByDefaultAndExpandsOnDemand() {
+        let message = assistant(thinking: "内部推理文本")
+        let collapsed = ChatTranscriptFormatter.formattedMessage(message, baseSize: 13, redactor: nil).string
+        #expect(collapsed.contains("▸ 思考过程"))
+        #expect(!collapsed.contains("内部推理文本"))
+        let expandedMessage = ChatTranscriptFormatter.thinkingDisplayMessage(message, expanded: true)
+        let expanded = ChatTranscriptFormatter.formattedMessage(expandedMessage, baseSize: 13, redactor: nil).string
+        #expect(expanded.contains("内部推理文本"))
+    }
+
+    @Test func thinkingNeverEntersCopiedOrExportedText() {
+        let message = assistant(thinking: "内部推理文本")
+        #expect(!ChatTranscriptFormatter.plainText([message]).contains("内部推理文本"))
     }
 }

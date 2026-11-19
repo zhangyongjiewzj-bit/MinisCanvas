@@ -65,6 +65,22 @@ struct F22CommandArgTests {
         #expect(submission?.args["value"] == "hello world")
     }
 
+    /// 现场旅程 11/18：在“日志”分类里输入“设置日志”回车，解析器把它认成“设置环境变量 + 参数”，
+    /// 执行了列表里看不到的命令。选了分类时只采用该分类里的命令，否则执行列表第一项。
+    @Test func selectedCategoryRejectsParsedCommandFromAnotherCategory() throws {
+        let (registry, _) = try makeRegistry("category")
+        let unfiltered = CommandPaletteView.resolveSubmission(
+            query: "设置日志", registry: registry, fallbackID: "visible.first")
+        let filtered = CommandPaletteView.resolveSubmission(
+            query: "设置日志", registry: registry, fallbackID: "visible.first", category: .logging)
+        #expect(unfiltered?.id == "env.set")
+        #expect(filtered?.id == "visible.first")
+        #expect(filtered?.args.isEmpty == true)
+        let sameCategory = CommandPaletteView.resolveSubmission(
+            query: "env set F22_KEY=42", registry: registry, fallbackID: "visible.first", category: .environment)
+        #expect(sameCategory?.id == "env.set")
+    }
+
     @Test func twoTokenFormCarriesArgs() throws {
         let (registry, _) = try makeRegistry("twotoken")
         let submission = CommandPaletteView.resolveSubmission(

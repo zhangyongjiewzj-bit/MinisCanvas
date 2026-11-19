@@ -120,14 +120,16 @@ struct Line2PolicyRejectionMatrixTests {
         let gate = ApprovalGate()
         #expect(gate.shouldAsk(tool: "file_read", input: ["path": "/tmp/line2-work/.env"]))
         #expect(gate.makeRequest(tool: "file_read", input: ["path": "/tmp/line2-work/.env"]).inputRiskLevel == .high)
-        #expect(gate.makeRequest(tool: "file_write", input: ["path": "/tmp/line2-work/a.txt"]).requiresSecondConfirmation)
+        // 普通写文件只需一次确认；不可逆的 file_delete 才需要第二次确认。
+        #expect(!gate.makeRequest(tool: "file_write", input: ["path": "/tmp/line2-work/a.txt"]).requiresSecondConfirmation)
+        #expect(gate.makeRequest(tool: "file_delete", input: ["path": "/tmp/line2-work/a.txt"]).requiresSecondConfirmation)
 
         await #expect(throws: ApprovalError.denied(reason: "Input requires approval for tool 'file_read'")) {
             try await gate.gate(tool: "file_read", input: ["path": "/tmp/line2-work/.env"])
         }
         await #expect(throws: ApprovalError.denied(reason: "L3 requires second confirmation")) {
             try await ApprovalGate(delegate: ApprovalDecisionDelegate(decision: ApprovalDecision(approved: true)))
-                .gate(tool: "file_write", input: ["path": "/tmp/line2-work/a.txt"])
+                .gate(tool: "file_delete", input: ["path": "/tmp/line2-work/a.txt"])
         }
         await #expect(throws: ApprovalError.denied(reason: "Unknown capability 'mcp_unregistered' is blocked")) {
             try await gate.gate(tool: "mcp_unregistered", input: [:])

@@ -12,6 +12,15 @@ public struct BrowserNavigationPolicy: Codable, Equatable, Sendable {
         "若信任目标域名，可在\(allowedWebsitesSettingsPath)的“\(allowedWebsitesSettingLabel)”中添加，点击“保存运行上限”后在新回合重试。"
     }
 
+    /// 给模型原样转述的一句话（被拒时用）。只描述设置入口，不含网址。
+    public static let modelFacingSettingsHint =
+        "设置 → 智能体运行 → 运行安全上限 → 允许访问的网站，保存后新回合生效"
+
+    public static func modelFacingGuidance(forBrowserRefusalReason reason: String?) -> String? {
+        settingsGuidance(forBrowserRefusalReason: reason) == nil ? nil
+            : "该网站未被允许访问。请告诉用户：到" + modelFacingSettingsHint + "。"
+    }
+
     /// An existing refusal code selects fixed guidance without changing the
     /// structured response or carrying a destination from the page.
     public static func settingsGuidance(forBrowserRefusalReason reason: String?) -> String? {

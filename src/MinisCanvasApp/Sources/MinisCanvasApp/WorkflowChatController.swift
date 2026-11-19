@@ -259,7 +259,7 @@ final class WorkflowChatController {
                 providerPreparation = nil
             }
         } catch {
-            chat.appendAssistant("❌ 无法创建 LLM Provider：\(error.localizedDescription)")
+            chat.appendAssistant("❌ 无法创建 LLM Provider：\(UserFacingErrorText.describe(error))")
             return
         }
 
@@ -290,7 +290,7 @@ final class WorkflowChatController {
                 guard self.isCurrentRun(runID) else { return }
                 chat.replaceMessageContent(
                     sessionID: sessionID, at: progressIndex,
-                    with: "❌ 无法创建 LLM Provider：\(error.localizedDescription)"
+                    with: "❌ 无法创建 LLM Provider：\(UserFacingErrorText.describe(error))"
                 )
                 self.finishRun(runID)
                 return
@@ -379,7 +379,7 @@ final class WorkflowChatController {
             let title = template.steps.indices.contains(stepIndex) ? template.steps[stepIndex].title : stepID
             detail = "第 \(stepIndex + 1)/\(total) 步「\(title)」失败（\(underlying)）"
         } else {
-            detail = error.localizedDescription
+            detail = UserFacingErrorText.describe(error)
         }
 
         let text = """

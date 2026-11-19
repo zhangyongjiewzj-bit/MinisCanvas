@@ -67,7 +67,7 @@ struct ChatProviderSettingsConsumerTests {
         #expect(throws: ChatProviderSettingsValidationError.invalidBaseURL) {
             try ChatProviderSettingsPreview(
                 providerID: "PROVIDER",
-                baseURL: "http://remote.example/v1",
+                baseURL: "ftp://remote.example/v1",  // http 已按对齐 Claude Code 放开，这里改用不受支持的协议
                 modelIDs: ["model"],
                 protocolType: .openaiCompatible,
                 expectedRevision: "revision"

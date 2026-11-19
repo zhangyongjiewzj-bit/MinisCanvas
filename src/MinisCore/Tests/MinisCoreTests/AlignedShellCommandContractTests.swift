@@ -98,7 +98,7 @@ struct AlignedShellCommandContractTests {
     @Test func hardAndUserDenialsRemainEffective() throws {
         let policy = TerminalPolicySnapshot(settings: TerminalPolicySettings(
             automaticAllowCommands: [], confirmationCommands: [], userDeniedCommands: ["blocked-tool"]))
-        for command in ["sudo whoami", "blocked-tool --version"] {
+        for command in ["halt whoami", "blocked-tool --version"] {
             #expect(throws: ToolExecutorError.self) {
                 try BuiltinToolExecutor.validateShellPolicy(command: command, snapshot: policy)
             }
@@ -115,6 +115,21 @@ struct AlignedShellCommandContractTests {
         #expect(try executor.shellWorkingDirectory(["command": "pwd"]).path == root.path)
         #expect(throws: ToolExecutorError.self) {
             try executor.shellWorkingDirectory(["command": "pwd", "cwd": "/"])
+        }
+    }
+
+    /// 有的模型把可选参数全部填上，没有目录时给 cwd:""；按没给处理，沿用会话默认目录。
+    @Test func emptyWorkingDirectoryMeansDefaultDirectory() throws {
+        let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executor = BuiltinToolExecutor(allowedRoot: root)
+        #expect(try executor.shellWorkingDirectory(["command": "pwd", "cwd": ""]).path == root.path)
+        #expect(try executor.shellWorkingDirectory(["command": "pwd", "cwd": "  "]).path == root.path)
+        #expect(PersistentApprovalRuleMatcher.evaluateShell(
+            input: ["command": "swift test", "cwd": ""], defaultWorkingDirectory: root.path) == .pattern("swift test"))
+        #expect(throws: ToolExecutorError.self) {
+            try executor.shellWorkingDirectory(["command": "pwd", "cwd": "relative/dir"])
         }
     }
 
@@ -145,11 +160,17 @@ struct AlignedShellCommandContractTests {
             #expect(TerminalPolicySnapshot.default.classify(command: command) == .confirmation)
             #expect(ApprovalGate(policy: .autoApprove).shouldAsk(tool: "shell_execute", input: ["command": command]))
             try BuiltinToolExecutor.validateShellPolicy(command: command, snapshot: .default)
+            // 只读 git 自动放行所用的判定仍然不接受复合语法。
             guard case .unavailable = PersistentApprovalRuleMatcher.evaluateShell(command: command) else {
-                Issue.record("compound syntax must not create a persistent grant")
+                Issue.record("compound syntax must not be treated as one read-only command")
                 continue
             }
         }
+        // 对齐 Claude Code：以后都允许按子命令各自生成前缀；含重定向的写法不提供。
+        #expect(PersistentApprovalRuleMatcher.evaluateShellRules(command: "npm test && npm run build")
+            == .patterns(["npm test", "npm run build"]))
+        #expect(PersistentApprovalRuleMatcher.evaluateShellRules(command: "npm test > out.log")
+            != .patterns(["npm test"]))
     }
 
     @Test func standaloneCDExplainsTheExplicitDirectoryContract() throws {
@@ -179,7 +200,7 @@ struct AlignedShellCommandContractTests {
     @Test func deniedApprovalCardsWarnOnlyForCommandsTheSnapshotRejects() {
         var gate = ApprovalGate()
         gate.terminalPolicySnapshot = TerminalPolicySnapshot(settings: TerminalPolicySettings(userDeniedCommands: ["blocked-tool"]))
-        for command in ["sudo whoami", "blocked-tool"] {
+        for command in ["halt whoami", "blocked-tool"] {
             #expect(gate.makeRequest(tool: "shell_execute", input: ["command": command]).inputSummary.contains("即使批准也会拒绝"))
         }
         #expect(gate.makeRequest(tool: "shell_execute", input: ["command": "unregistered-tool"]).inputSummary.contains("批准后执行"))
@@ -368,7 +389,7 @@ struct AlignedShellCommandContractTests {
             let artifact = try #require(object["stdout_artifact"] as? [String: Any])
             let path = try #require(artifact["path"] as? String)
             let page = try await executor.execute(name: "file_read", input: ["path": path, "offset": 2, "lines": 2, "max_length": 200])
-            #expect(page == "line 2\nline 3")
+            #expect(page == "     2\tline 2\n     3\tline 3")
             await #expect(throws: ToolExecutorError.pathViolation(path)) {
                 try await explicitlyDenied.execute(name: "file_read", input: ["path": path])
             }

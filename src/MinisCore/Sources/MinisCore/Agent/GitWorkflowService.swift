@@ -42,22 +42,20 @@ public enum GitWorkflowService {
         let commit = words.starts(with: ["git", "commit"])
         guard commit || words.starts(with: ["gh", "pr", "create"]) else { throw WorkflowError.unsupportedWriteCommand }
         // Message must already be explicit so no editor/interactive body opens.
-        let messageFlags = commit ? ["-m", "--message"] : ["--title"]
-        guard let messageIndex = words.indices.first(where: { messageFlags.contains(words[$0]) }),
-              words.indices.contains(messageIndex + 1), !words[messageIndex + 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WorkflowError.missingMessage }
+        var stageAll = false
         if commit {
+            // 与审批卡共用同一套旗标解析（-am、-ma、--message=、--no-verify 等）。
             // Path-limited/--only/--include commits have different index semantics.
             // Do not present a staged stat as if it described those commands.
-            var index = 2
-            while index < words.count {
-                if messageFlags.contains(words[index]) {
-                    guard words.indices.contains(index + 1) else { throw WorkflowError.missingMessage }
-                    index += 2
-                } else if ["-a", "--all", "--signoff", "-s"].contains(words[index]) {
-                    index += 1
-                } else { throw WorkflowError.unsupportedWriteCommand }
-            }
+            guard let invocation = GitWorkflowPolicy.parseCommit(words: words) else { throw WorkflowError.unsupportedWriteCommand }
+            // 先判形式是否受支持：--amend、带路径等形式解析会提前中止，此时 messages 为空不是“缺消息”。
+            guard invocation.supported else { throw WorkflowError.unsupportedWriteCommand }
+            guard !invocation.messages.isEmpty,
+                  invocation.messages.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else { throw WorkflowError.missingMessage }
+            stageAll = invocation.stageAll
         } else {
+            guard let messageIndex = words.indices.first(where: { words[$0] == "--title" }),
+                  words.indices.contains(messageIndex + 1), !words[messageIndex + 1].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw WorkflowError.missingMessage }
             // Explicit body avoids gh opening an editor after approval. An empty
             // body is valid when deliberately supplied as a quoted empty token.
             guard let bodyIndex = words.firstIndex(of: "--body"), words.indices.contains(bodyIndex + 1) else { throw WorkflowError.missingMessage }
@@ -67,7 +65,7 @@ public enum GitWorkflowService {
         if commit {
             // -a stages tracked modifications as part of commit; a staged-only
             // stat would omit those actual proposed changes.
-            diffCommand = words.contains("-a") || words.contains("--all") ? "git diff HEAD --stat" : "git diff --cached --stat"
+            diffCommand = stageAll ? "git diff HEAD --stat" : "git diff --cached --stat"
         } else {
             guard let baseIndex = words.firstIndex(of: "--base"), words.indices.contains(baseIndex + 1) else { throw WorkflowError.missingPullRequestBase }
             let base = words[baseIndex + 1]

@@ -180,6 +180,8 @@ struct ChildDeletionReviewerTests {
         let verdict = try await classifier.classify(ChildDeletionClassifierInput(relativePath: "notes.txt", byteCount: 12))
         #expect(verdict == .requireHuman)
         let sent = await recorder.messages
+        // 不带温度（OpenAI 推理模型拒收任何温度值），各模型用自己的默认值。
+        #expect(await recorder.temperatures == [nil])
         let data = try #require(sent.first?.content.data(using: .utf8))
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(Set(object.keys) == ["action", "metadata"])
@@ -221,7 +223,8 @@ private actor DeletionClassifierProbe: IndependentDeletionClassifying {
 
 private actor DeletionProviderRecorder {
     private(set) var messages: [LLMMessage] = []
-    func record(_ value: [LLMMessage]) { messages = value }
+    private(set) var temperatures: [Double?] = []
+    func record(_ value: [LLMMessage], temperature: Double?) { messages = value; temperatures.append(temperature) }
 }
 
 private final class DeletionScriptedProvider: LLMProvider {
@@ -232,7 +235,7 @@ private final class DeletionScriptedProvider: LLMProvider {
     init(recorder: DeletionProviderRecorder, text: String) { self.recorder = recorder; self.text = text }
     nonisolated(nonsending) func sendMessage(messages: [LLMMessage], systemPrompt: String?,
         maxTokens: Int, temperature: Double?) async throws -> LLMResponse {
-        await recorder.record(messages)
+        await recorder.record(messages, temperature: temperature)
         return LLMResponse(text: text, stopReason: nil, usage: nil)
     }
     nonisolated(nonsending) func streamMessage(messages: [LLMMessage], systemPrompt: String?,

@@ -129,7 +129,9 @@ final class Perf03N40PopulationTrace {
                 }
                 #expect(!tailRequests.isEmpty && rangesAreTail)
             } else if phase == "historical-edit-control" {
-                #expect(observed["assessment-inline", default: 0] > 2)
+                // 消息级与块级缓存之后，历史编辑只重新评估被改动的那一条，不再比追加两条新消息更多；
+                // 仍须观察到真实的评估解析，且下面的整段重排保持。
+                #expect(observed["assessment-inline", default: 0] >= 1)
                 let explicitFull = primary.contains { $0["operation"] == "layout" && $0["startUTF16"] == "0" }
                 #expect(explicitFull, "the same producer must detect a real full-history edit")
             }

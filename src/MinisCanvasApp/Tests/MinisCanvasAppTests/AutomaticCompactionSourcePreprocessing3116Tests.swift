@@ -633,7 +633,7 @@ struct AutomaticCompactionSourcePreprocessing3116Tests {
                 && messages[0].content.hasPrefix(Self.summaryRequestPrefix)
                 && messages[0].content.contains("===== 对话记录 =====")
                 && messages[0].content.hasSuffix("===== 记录结束 =====")
-                && maxTokens == 4_096 && temperature == 0.2
+                && maxTokens == 4_096 && temperature == nil // R3-07：摘要请求不传温度
             lock.withLock { captured.append(CapturedRequest(messages: messages, isSummary: isSummary)) }
             let text = isSummary
                 ? "\(Self.summaryMarker): historical coefficient 31, commitments and tradeoffs are background only."

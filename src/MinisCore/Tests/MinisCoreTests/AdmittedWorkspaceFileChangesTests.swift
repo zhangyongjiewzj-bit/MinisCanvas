@@ -78,7 +78,7 @@ struct AdmittedWorkspaceFileChangesTests {
             let target = mount.appendingPathComponent("note.txt")
             let output = try await owner.execute(name: "file_write", input: ["path": target.path, "content": "mounted"])
             #expect(output.contains("diffID:"))
-            #expect(try await owner.execute(name: "file_read", input: ["path": target.path]) == "mounted")
+            #expect(try await owner.execute(name: "file_read", input: ["path": target.path]) == "     1\tmounted")
         }
         #expect(ledger.records(sessionID: "synthetic-session").first?.workspaceRoot == mount.path)
     }

@@ -77,6 +77,46 @@ struct ComposerAudioHistoryWire1760Tests {
             == [wav.base64EncodedString(), Self.mp3.base64EncodedString()])
     }
 
+    private func image(_ name: String, fill: UInt8) -> ChatAttachment {
+        let bytes = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+            + Data(repeating: fill, count: 3 * 1024 * 1024)
+        return ChatAttachment(kind: .image, fileName: name, fileType: .image,
+            mimeType: "image/png", size: Int64(bytes.count), data: bytes)
+    }
+
+    @Test("many large images and audio reopen with names and bytes; sidecar stays small")
+    func multiImageSessionReopensWithoutSidecarBytes() throws {
+        let images = [image("a.png", fill: 1), image("b.png", fill: 2), image("c.png", fill: 3)]
+        let attachments = images + [audio("voice.wav", "audio/wav", ComposerMediaFixtures589.wav)]
+        let content = ChatStore.composeUserContent(text: "看图", attachments: attachments)
+        let thread = ChatThread(messages: [ChatMessageUI(role: .user,
+            content: content, attachments: attachments)])
+        let (reopened, _, root) = try reopenedHistory(canonical: thread, sidecar: thread)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sidecarURL = ChatAttachmentPersistence.url(in: root)
+        let size = (try FileManager.default.attributesOfItem(atPath: sidecarURL.path)[.size] as? Int) ?? .max
+        #expect(size < 100_000)
+        let restored = try #require(reopened.messages.first)
+        #expect(restored.attachments.map(\.fileName) == ["a.png", "b.png", "c.png", "voice.wav"])
+        #expect(restored.attachments.map(\.status) == [.ready, .ready, .ready, .ready])
+        #expect(restored.attachments.map(\.data) == attachments.map(\.data))
+    }
+
+    @Test("an old-format sidecar that still carries image bytes stays readable")
+    func legacySidecarWithBytesRestores() throws {
+        let attachments = [image("old.png", fill: 9)]
+        let content = ChatStore.composeUserContent(text: "旧", attachments: attachments)
+        let thread = ChatThread(messages: [ChatMessageUI(role: .user,
+            content: content, attachments: attachments)])
+        let record = ChatAttachmentPersistence.MessageRecord(
+            messageIndex: 0, contentDigest: ChatVideoFrame.digest(Data(content.utf8)),
+            attachments: attachments)
+        let restored = ChatAttachmentPersistence.restoreAttachments(
+            from: thread.asPersisted(), records: [record])
+        #expect(restored.messages.first?.attachments.first?.data == attachments[0].data)
+        #expect(restored.messages.first?.attachments.first?.status == .ready)
+    }
+
     @Test("a replaced valid WAV sidecar cannot overwrite Core or borrow MP3 slot")
     func changedSidecarAudioFailsClosedThroughProviderRequest() async throws {
         let wav = ComposerMediaFixtures589.wav

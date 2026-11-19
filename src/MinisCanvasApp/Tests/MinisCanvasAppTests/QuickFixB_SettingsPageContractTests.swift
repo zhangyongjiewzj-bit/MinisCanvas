@@ -1,4 +1,5 @@
 import Foundation
+import MinisCore
 import Testing
 
 @testable import MinisCanvasApp
@@ -143,10 +144,41 @@ struct QuickFixB_SettingsPageContractTests {
         let expectations: [(String, SettingsPage)] = [
             ("循环上限", .agent), ("允许访问的网站", .agent),
             ("任务完成通知", .general), ("已允许", .permissions), ("已允许", .agent),
+            ("自动继续", .general), ("审批等待超时", .agent), ("联网搜索", .browser),
         ]
         for (query, page) in expectations {
             #expect(SettingsSearchResult.matches(query).contains { $0.page == page })
         }
+    }
+
+    /// 11/19 旅途：编辑服务商只改了最大输出，保存后名字从"DeepSeek"变成"自定义 OpenAI 兼容"。
+    @Test("服务商编辑框预填的名字与列表标题同一规则，保存不会换名")
+    func providerEditPrefillUsesListLabel() throws {
+        let record = EnvVarEntry(
+            name: "MINISCANVAS_JOURNEY_DEEPSEEK_API_KEY",
+            value: "",
+            isSecret: true,
+            valueInKeychain: true,
+            baseURL: "https://api.deepseek.com",
+            modelNames: ["deepseek-flash"]
+        )
+        #expect(ProviderDisplayLabel.resolve(record: record) == "DeepSeek")
+        #expect(record.providerDisplayName != "DeepSeek")
+        let text = try Self.source("SettingsView.swift")
+        #expect(text.contains("displayName = ProviderDisplayLabel.resolve(record: existing)"))
+        #expect(!text.contains("displayName = existing.providerDisplayName"))
+    }
+
+    /// 11/19 旅途：审批超时默认 300 秒后，每张行内审批卡都多出一个可编辑的超时输入框。
+    @Test("行内审批卡只显示剩余时间，不放超时时长输入框")
+    func inlineApprovalCardHasNoTimeoutEditor() throws {
+        let text = try Self.source("ApprovalPromptCenter.swift")
+        let start = try #require(text.range(of: "struct InlineApprovalPromptView"))
+        let end = try #require(text.range(of: "private struct ApprovalDurationField"))
+        let inline = text[start.upperBound..<end.lowerBound]
+        #expect(!inline.contains("ApprovalDurationField("))
+        #expect(inline.contains("在弹窗中审批"))
+        #expect(text.contains("分钟后自动拒绝"))
     }
 
 }

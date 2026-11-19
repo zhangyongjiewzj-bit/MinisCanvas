@@ -920,6 +920,10 @@ struct SkillInjectorTests {
         #expect(injector.matchingSkills(for: "写一个图片提示词", within: scope).count == 1)
         #expect(injector.matchingSkills(for: "写一个图片提示词", within: otherScope).isEmpty)
         #expect(injector.matchingSkills(for: "写一个图片提示词").isEmpty)
+        // 匹配上但在别的作用域未批准：不注入，但要能给用户一条轻提示。
+        #expect(injector.unapprovedMatchingSkillIDs(for: "写一个图片提示词", within: otherScope) == [result.skill.id])
+        #expect(injector.unapprovedMatchingSkillIDs(for: "写一个图片提示词", within: scope).isEmpty)
+        #expect(injector.unapprovedMatchingSkillIDs(for: "完全无关的内容 zzz", within: otherScope).isEmpty)
     }
 
     @Test func scopedRollbackNeedsFreshApprovalAndExplicitMatchingEnablementScope() throws {

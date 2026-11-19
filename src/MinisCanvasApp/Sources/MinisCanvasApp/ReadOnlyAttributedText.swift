@@ -72,6 +72,246 @@ enum TranscriptExternalLink {
     }
 }
 
+/// 代码块标题行上的"复制代码"入口：payload 是该代码块的（已脱敏的）可见正文。
+/// 点击由 Coordinator 处理（写入剪贴板），不走任何外部导航。
+enum TranscriptCodeCopy {
+    static let payload = NSAttributedString.Key("MinisCanvas.codeCopyPayload")
+    static let linkURL = URL(string: "minis-copy://code")!
+    static let label = "复制代码"
+    static let copiedLabel = "✓已复制"
+}
+
+/// 代码块表面。卡片（底色 + 细边框 + 圆角）由 `ChatTranscriptNativeTextView.draw(_:)`
+/// 按可见行绘制；AppKit 若自行调用块背景绘制，在转录视图里跳过，避免叠出直角方框。
+final class CodeSurfaceTextBlock: NSTextBlock {
+    static let cornerRadius: CGFloat = 8
+    /// 代码文字距卡片左右边缘的距离。
+    static let textInset: CGFloat = 12
+    /// 卡片内上下留白（首行文字之上、末行文字之下）。
+    static let verticalPadding: CGFloat = 8
+    /// 卡片与前后正文之间的空隙。
+    static let outerGap: CGFloat = 6
+    /// 顶行（语言名 · 复制代码）与代码之间的空隙。
+    static let headerGap: CGFloat = 4
+    static let fillAlpha: CGFloat = 0.05
+    static let borderAlpha: CGFloat = 0.14
+
+    override func drawBackground(withFrame frameRect: NSRect, in controlView: NSView,
+                                 characterRange charRange: NSRange, layoutManager: NSLayoutManager) {
+        if controlView is ChatTranscriptNativeTextView { return }
+        super.drawBackground(withFrame: frameRect, in: controlView,
+                             characterRange: charRange, layoutManager: layoutManager)
+    }
+}
+
+/// 用户消息气泡：靠右、圆角、最大宽度约为转录列的 80%。
+/// 宽度靠块左外边距（百分比）实现，文字换行由 AppKit 在窄后的内容区内完成；
+/// 圆角底色由 `ChatTranscriptNativeTextView.draw(_:)` 按可见行绘制（同代码卡片的做法），
+/// AppKit 若自行调用块背景绘制，在转录视图里跳过，避免叠出直角方框。
+final class UserBubbleTextBlock: NSTextBlock {
+    static let cornerRadius: CGFloat = 12
+    /// 气泡占转录列宽度的比例上限（按文字实际宽度贴合，长消息最多到这个比例）。
+    static let maxWidthFraction: CGFloat = 0.8
+    /// 气泡最小宽度，避免一两个字的消息气泡过窄。
+    static let minimumWidth: CGFloat = 120
+    /// 气泡边缘与文字之间的水平内边距（文字缩进为阅读列 gutter，气泡向外伸出 gutter 减此值）。
+    static let textInset: CGFloat = 12
+    /// 气泡上下各向内收的距离，避免相邻消息的气泡首尾相接。
+    static let verticalTrim: CGFloat = 3
+
+    /// 文字换行的左侧额外缩进（由段落缩进实现，见 ChatTranscriptFormatter.applyReadingParagraphStyle；
+    /// 文本块外边距在这套排版里不生效，包上实测为整栏）。气泡可见宽度由绘制层按文字实际宽度贴合。
+    static let wrapInset: CGFloat = 96
+
+    /// 几何全部由段落缩进与绘制层负责，块本身不设外边距（保留此入口，调用方不变）。
+    func applyBubbleGeometry() {}
+
+    override func drawBackground(withFrame frameRect: NSRect, in controlView: NSView,
+                                 characterRange charRange: NSRange, layoutManager: NSLayoutManager) {
+        if controlView is ChatTranscriptNativeTextView { return }
+        super.drawBackground(withFrame: frameRect, in: controlView,
+                             characterRange: charRange, layoutManager: layoutManager)
+    }
+}
+
+/// 当前对话的项目根目录：用于把回复里的相对路径（如 `src/a.swift:42`）识别为可点链接。
+/// 由对话界面在会话切换时写入；只读、线程安全，不写入偏好或对话。
+final class TranscriptPathLinkContext: @unchecked Sendable {
+    static let shared = TranscriptPathLinkContext()
+    private let lock = NSLock()
+    private var root: URL?
+    var projectRoot: URL? {
+        get { lock.lock(); defer { lock.unlock() }; return root }
+        set { lock.lock(); defer { lock.unlock() }; root = newValue }
+    }
+}
+
+/// 路径识别时“文件是否存在”的短时缓存：渲染在主线程上反复重算，
+/// 每次都对磁盘（含网络盘）做存在性检查会卡顿；缓存几十秒、有数量上限。
+enum TranscriptPathExistenceCache {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [String: (exists: Bool, at: Date)] = [:]
+    static let lifetime: TimeInterval = 30
+    static let capacity = 2000
+
+    static func exists(_ path: String, now: Date = Date(),
+                       check: (String) -> Bool = { FileManager.default.fileExists(atPath: $0) }) -> Bool {
+        lock.lock()
+        if let hit = entries[path], now.timeIntervalSince(hit.at) < lifetime {
+            lock.unlock()
+            return hit.exists
+        }
+        lock.unlock()
+        let result = check(path)
+        lock.lock()
+        if entries.count >= capacity { entries.removeAll() }
+        entries[path] = (result, now)
+        lock.unlock()
+        return result
+    }
+
+    static func resetForTesting() { lock.lock(); entries.removeAll(); lock.unlock() }
+}
+
+/// 对话正文里的本地文件链接：`file://`、以 `/` 开头的绝对路径、`~/` 路径。
+/// 解析与风险判定都是纯函数（不依赖点击），点击处理只负责弹确认并执行结果。
+enum TranscriptLocalFileLink {
+    enum Action: Equatable {
+        /// 已存在的普通文件，且不是可执行/自动运行类型：用系统默认程序打开。
+        case open(URL)
+        /// 已存在的文件夹：在 Finder 中显示。
+        case revealFolder(URL)
+        /// 可执行、脚本、安装包等类型或带执行位：只在 Finder 中显示，不运行。
+        case revealBlocked(URL, reason: String)
+        /// 路径不存在。
+        case missing(URL)
+    }
+
+    static let blockedExtensions: Set<String> = [
+        "app", "command", "sh", "zsh", "bash", "tool", "pkg", "mpkg", "dmg",
+        "terminal", "workflow", "scpt", "applescript", "jar", "py", "rb", "pl",
+        "js", "exe", "webloc", "inetloc", "fileloc", "bat", "cmd", "ps1", "vbs",
+        "jnlp", "action", "osax", "service", "wflow", "lnk"
+    ]
+
+    /// 脚本类：不直接运行，也不交给默认程序，显式用文本编辑器打开查看。
+    /// app、command、pkg 等其余被拦截类型仍只在 Finder 中显示。
+    static let textEditorExtensions: Set<String> = [
+        "sh", "zsh", "bash", "command", "tool", "py", "rb", "pl", "js",
+        "scpt", "applescript", "bat", "cmd", "ps1", "vbs"
+    ]
+
+    /// 用户点“打开”时的处置：普通文件交给系统，脚本用文本编辑器，其余可执行类型只在 Finder 显示。
+    enum OpenDisposition: Equatable {
+        case systemOpen
+        case textEditor
+        case revealOnly
+    }
+
+    static func openDisposition(for url: URL, fileManager: FileManager = .default) -> OpenDisposition {
+        let resolved = url.resolvingSymlinksInPath()
+        let extensions = [url.pathExtension, resolved.pathExtension].map { $0.lowercased() }
+        if extensions.contains(where: { blockedExtensions.contains($0) }) {
+            // 链接与真实目标都必须是脚本类，才允许文本编辑器打开。
+            if extensions.allSatisfy({ textEditorExtensions.contains($0) }) { return .textEditor }
+            return .revealOnly
+        }
+        let permissions = (try? fileManager.attributesOfItem(atPath: resolved.path))?[.posixPermissions] as? NSNumber
+        if let mode = permissions?.intValue, mode & 0o111 != 0 { return .revealOnly }
+        return .systemOpen
+    }
+
+    /// 用 TextEdit 显式打开（不运行）。
+    @MainActor static func openInTextEditor(_ url: URL) -> Bool {
+        let editor = URL(fileURLWithPath: "/System/Applications/TextEdit.app")
+        guard FileManager.default.fileExists(atPath: editor.path) else { return false }
+        NSWorkspace.shared.open([url], withApplicationAt: editor,
+                                configuration: NSWorkspace.OpenConfiguration(), completionHandler: nil)
+        return true
+    }
+
+    // Session-scoped, like web host confirmation: never persisted.
+    @MainActor private static var confirmedPathsBySession: [UUID: Set<String>] = [:]
+
+    @MainActor static func isConfirmed(path: String, sessionID: UUID?) -> Bool {
+        guard let sessionID else { return false }
+        return confirmedPathsBySession[sessionID]?.contains(path) == true
+    }
+
+    @MainActor static func confirm(path: String, sessionID: UUID?) {
+        guard let sessionID else { return }
+        confirmedPathsBySession[sessionID, default: []].insert(path)
+    }
+
+    /// 把链接目标解析成标准化的本地文件 URL；非本地目标（含 http/https 与其它 scheme）返回 nil。
+    static func resolve(
+        _ value: Any?,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL? {
+        guard let url = (value as? URL) ?? (value as? String).flatMap(URL.init(string:)) else { return nil }
+        let path: String
+        if let scheme = url.scheme?.lowercased() {
+            guard scheme == "file" else { return nil }
+            path = url.path
+        } else {
+            // 排除 //host/path 这类网络路径引用。
+            guard (url.host ?? "").isEmpty else { return nil }
+            let raw = url.path
+            if raw.hasPrefix("/") {
+                path = raw
+            } else if raw == "~" {
+                path = homeDirectory.path
+            } else if raw.hasPrefix("~/") {
+                path = homeDirectory.appendingPathComponent(String(raw.dropFirst(2))).path
+            } else {
+                return nil
+            }
+        }
+        if let host = url.host, !host.isEmpty, host.lowercased() != "localhost" { return nil }
+        guard path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path).standardizedFileURL
+    }
+
+    static func action(for url: URL, fileManager: FileManager = .default) -> Action {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return .missing(url)
+        }
+        // 链接本身与其指向的真实目标，任何一个命中拦截扩展名都拦截。
+        let resolved = url.resolvingSymlinksInPath()
+        let extensions = [url.pathExtension, resolved.pathExtension].map { $0.lowercased() }
+        if let hit = extensions.first(where: { blockedExtensions.contains($0) }) {
+            return .revealBlocked(url, reason: "“.\(hit)”属于可执行或会自动运行的类型")
+        }
+        if isDirectory.boolValue { return .revealFolder(url) }
+        let values = try? resolved.resourceValues(forKeys: [.isRegularFileKey])
+        guard values?.isRegularFile == true else {
+            return .revealBlocked(url, reason: "目标不是普通文件")
+        }
+        let permissions = (try? fileManager.attributesOfItem(atPath: resolved.path))?[.posixPermissions] as? NSNumber
+        if let mode = permissions?.intValue, mode & 0o111 != 0 {
+            return .revealBlocked(url, reason: "文件带有执行权限")
+        }
+        return .open(url)
+    }
+
+    static func confirmationText(for action: Action) -> String {
+        switch action {
+        case .open(let url):
+            return "将使用系统默认程序打开：\n\(url.path)"
+        case .revealFolder(let url):
+            return "将在 Finder 中显示文件夹：\n\(url.path)"
+        case .revealBlocked(let url, let reason):
+            if openDisposition(for: url) == .textEditor {
+                return "\(reason)，不会运行，将用文本编辑器打开查看：\n\(url.path)"
+            }
+            return "\(reason)，不会直接运行，将改为在 Finder 中显示：\n\(url.path)"
+        case .missing(let url):
+            return "路径不存在：\n\(url.path)"
+        }
+    }
+}
+
 // MARK: - 消息正文的语义起始对齐（UF04）
 
 /// 消息气泡的 role 容器由上层负责（用户靠右、assistant/tool 靠左）。
@@ -112,6 +352,25 @@ enum MessageContentAlignment {
 
 /// 只读 NSTextView 包装：isEditable=false, isSelectable=true。
 /// 原生 ⌘A 全选整篇 + 跨段拖选；不适合可编辑内容。
+/// ⌘F 查找：转录正文的 NSTextView 在创建时登记，对话区的快捷键据此打开查找栏。
+@MainActor
+enum TranscriptFindRouter {
+    private static weak var transcriptTextView: NSTextView?
+
+    static func register(_ textView: NSTextView) { transcriptTextView = textView }
+
+    /// 打开（或聚焦）当前对话正文的查找栏。没有可用的正文视图时返回 false。
+    @discardableResult
+    static func showFindInterface() -> Bool {
+        guard let textView = transcriptTextView, let window = textView.window else { return false }
+        window.makeFirstResponder(textView)
+        let item = NSMenuItem()
+        item.tag = NSTextFinder.Action.showFindInterface.rawValue
+        textView.performTextFinderAction(item)
+        return true
+    }
+}
+
 /// Bounded, opt-in diagnostics for the formal synthetic native transcript host.
 /// This observes only the mounted text view's clip ancestors; no text, selection,
 /// session contents or configuration is logged, and scrolling is never changed.
@@ -345,33 +604,46 @@ struct ReadOnlyAttributedTextView: NSViewRepresentable {
     /// 这样即便上游误传带 attachment/link 的 NSAttributedString，也不会触发
     /// NSWorkspace、文件路径或网络 URL 行为。
     nonisolated static func sanitized(_ source: NSAttributedString) -> NSAttributedString {
-        let result = NSMutableAttributedString()
+        // 在副本上原地改：只有属性被过滤、或需要换成占位文本的 run 才动，
+        // 其余 run 不再逐个重建（长回复流式时这是每个片段的热点）。
+        let result = NSMutableAttributedString(attributedString: source)
         let allowed: Set<NSAttributedString.Key> = [
             .font, .foregroundColor, .backgroundColor, .paragraphStyle,
             .kern, .underlineStyle, .strikethroughStyle, .baselineOffset
         ]
         let fullRange = NSRange(location: 0, length: source.length)
+        let nsText = source.string as NSString
+        let hasObjectMarker = nsText.range(of: "\u{FFFC}", options: .literal).location != NSNotFound
+        var placeholders: [(range: NSRange, attributes: [NSAttributedString.Key: Any])] = []
         source.enumerateAttributes(in: fullRange) { attributes, range, _ in
             var safeAttributes = attributes.filter { allowed.contains($0.key) }
             if let marker = attributes[ChatInlineToolGap.marker] as? String,
                ChatInlineToolGap.isMarkerID(marker) {
                 safeAttributes[ChatInlineToolGap.marker] = marker
             }
-            if let url = TranscriptExternalLink.allowedURL(attributes[TranscriptExternalLink.destination]) {
+            if let code = attributes[TranscriptCodeCopy.payload] as? String {
+                safeAttributes[TranscriptCodeCopy.payload] = code
+                safeAttributes[.link] = TranscriptCodeCopy.linkURL
+            } else if let url = TranscriptExternalLink.allowedURL(attributes[TranscriptExternalLink.destination]) {
                 safeAttributes[TranscriptExternalLink.destination] = url
                 safeAttributes[.link] = url
+            } else if let file = TranscriptLocalFileLink.resolve(attributes[TranscriptExternalLink.destination]) {
+                safeAttributes[TranscriptExternalLink.destination] = file
+                safeAttributes[.link] = file
             }
-            let hasAttachment = attributes[.attachment] != nil
-            let text: String
-            if hasAttachment {
-                text = "[附件内容已隐藏]"
-            } else {
-                let candidate = (source.string as NSString).substring(with: range)
-                // U+FFFC is AppKit's object-replacement marker and can arrive
-                // without a well-formed .attachment attribute after persistence.
-                text = candidate.contains("\u{FFFC}") ? "[附件内容已隐藏]" : candidate
+            // U+FFFC is AppKit's object-replacement marker and can arrive
+            // without a well-formed .attachment attribute after persistence.
+            let hidden = attributes[.attachment] != nil
+                || (hasObjectMarker
+                    && nsText.range(of: "\u{FFFC}", options: .literal, range: range).location != NSNotFound)
+            if !NSDictionary(dictionary: attributes).isEqual(to: safeAttributes) {
+                result.setAttributes(safeAttributes, range: range)
             }
-            result.append(NSAttributedString(string: text, attributes: safeAttributes))
+            if hidden { placeholders.append((range, safeAttributes)) }
+        }
+        for item in placeholders.reversed() {
+            result.replaceCharacters(in: item.range, with: NSAttributedString(
+                string: "[附件内容已隐藏]", attributes: item.attributes))
         }
         return NSAttributedString(attributedString: result)
     }
@@ -409,7 +681,14 @@ struct ReadOnlyAttributedTextView: NSViewRepresentable {
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.isAutomaticLinkDetectionEnabled = false
         textView.linkTextAttributes = [.underlineStyle: NSUnderlineStyle.single.rawValue]
+        ThemeNativeTextColors.apply(to: textView)
         textView.delegate = coordinator
+        if transcriptUpdate != nil {
+            // 对话正文支持原生查找栏（⌘F，输入即搜）。
+            textView.usesFindBar = true
+            textView.isIncrementalSearchingEnabled = true
+            TranscriptFindRouter.register(textView)
+        }
         // The transcript already supplies resolved foreground/background colors
         // from the selected theme. AppKit's adaptive mapping would invert those
         // component colors a second time in dark appearance, making light text
@@ -647,7 +926,8 @@ struct ReadOnlyAttributedTextView: NSViewRepresentable {
             container.containerSize = NSSize(width: width, height: CGFloat.greatestFiniteMagnitude)
             container.widthTracksTextView = false
         }
-        let contentLength = textView.attributedString().length
+        // textStorage.length 是 O(1)；attributedString() 会把全文拷贝一份。
+        let contentLength = textView.textStorage?.length ?? 0
         if sameWidth, let start = coord.pendingTailStart, start < contentLength {
             TranscriptOperationDiagnostics.layoutRequest(
                 scope: transcriptUpdate?.diagnosticScope, host: "native", mode: "tail",
@@ -687,15 +967,57 @@ struct ReadOnlyAttributedTextView: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
-            guard charIndex >= 0, charIndex < textView.attributedString().length,
-                  let url = TranscriptExternalLink.allowedURL(
-                    textView.attributedString().attribute(TranscriptExternalLink.destination, at: charIndex, effectiveRange: nil)
-                  ), let host = url.host else { return true }
-            if hasConfirmedLink(to: host) {
-                NSWorkspace.shared.open(url)
+            guard charIndex >= 0, charIndex < textView.attributedString().length else { return true }
+            if let code = textView.attributedString()
+                .attribute(TranscriptCodeCopy.payload, at: charIndex, effectiveRange: nil) as? String {
+                copyCode(code, at: charIndex, in: textView)
                 return true
             }
-            guard !confirmingLink, let window = textView.window else { return true }
+            let destination = textView.attributedString()
+                .attribute(TranscriptExternalLink.destination, at: charIndex, effectiveRange: nil)
+            if let url = TranscriptExternalLink.allowedURL(destination), let host = url.host {
+                openWebLink(url, host: host, in: textView)
+            } else if let file = TranscriptLocalFileLink.resolve(destination) {
+                openLocalFile(file, in: textView)
+            }
+            // Always consume AppKit's default navigation, including cancellation.
+            return true
+        }
+
+        /// 复制代码块并把入口文字短暂改成"已复制"（等长替换，不影响转录的增量更新位置）。
+        @MainActor private func copyCode(_ code: String, at charIndex: Int, in textView: NSTextView) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(code, forType: .string)
+            guard let storage = textView.textStorage else { return }
+            var effective = NSRange()
+            _ = storage.attribute(TranscriptCodeCopy.payload, at: charIndex, effectiveRange: &effective)
+            let label = TranscriptCodeCopy.label as NSString
+            let copied = TranscriptCodeCopy.copiedLabel as NSString
+            guard effective.length == label.length,
+                  (storage.string as NSString).substring(with: effective) == TranscriptCodeCopy.label,
+                  copied.length == label.length else { return }
+            let range = effective
+            let attributes = storage.attributes(at: range.location, effectiveRange: nil)
+            storage.replaceCharacters(in: range,
+                with: NSAttributedString(string: TranscriptCodeCopy.copiedLabel, attributes: attributes))
+            Task { @MainActor [weak textView] in
+                try? await Task.sleep(for: .seconds(1.5))
+                guard let storage = textView?.textStorage,
+                      NSMaxRange(range) <= storage.length,
+                      (storage.string as NSString).substring(with: range) == TranscriptCodeCopy.copiedLabel
+                else { return }
+                let attributes = storage.attributes(at: range.location, effectiveRange: nil)
+                storage.replaceCharacters(in: range,
+                    with: NSAttributedString(string: TranscriptCodeCopy.label, attributes: attributes))
+            }
+        }
+
+        @MainActor private func openWebLink(_ url: URL, host: String, in textView: NSTextView) {
+            if hasConfirmedLink(to: host) {
+                NSWorkspace.shared.open(url)
+                return
+            }
+            guard !confirmingLink, let window = textView.window else { return }
             confirmingLink = true
             let alert = NSAlert()
             alert.messageText = "打开外部链接？"
@@ -709,8 +1031,65 @@ struct ReadOnlyAttributedTextView: NSViewRepresentable {
                 TranscriptExternalLink.confirm(host: host, sessionID: confirmedSessionID)
                 NSWorkspace.shared.open(url)
             }
-            // Always consume AppKit's default navigation, including cancellation.
-            return true
+        }
+
+        @MainActor private func openLocalFile(_ url: URL, in textView: NSTextView) {
+            let action = TranscriptLocalFileLink.action(for: url)
+            let sessionID = linkSessionID
+            let alreadyConfirmed = TranscriptLocalFileLink.isConfirmed(path: url.path, sessionID: sessionID)
+            if case .missing = action {
+                presentNotice(TranscriptLocalFileLink.confirmationText(for: action), title: "无法打开", in: textView)
+                return
+            }
+            if alreadyConfirmed {
+                perform(action)
+                if case .revealBlocked(let blockedURL, _) = action,
+                   TranscriptLocalFileLink.openDisposition(for: blockedURL) != .textEditor {
+                    presentNotice(TranscriptLocalFileLink.confirmationText(for: action), title: "已改为在 Finder 中显示", in: textView)
+                }
+                return
+            }
+            guard !confirmingLink, let window = textView.window else { return }
+            confirmingLink = true
+            let alert = NSAlert()
+            alert.messageText = "打开本地文件？"
+            alert.informativeText = TranscriptLocalFileLink.confirmationText(for: action)
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "继续")
+            alert.beginSheetModal(for: window) { [weak self] response in
+                self?.confirmingLink = false
+                guard response == .alertSecondButtonReturn else { return }
+                TranscriptLocalFileLink.confirm(path: url.path, sessionID: sessionID)
+                self?.perform(action)
+            }
+        }
+
+        @MainActor private func perform(_ action: TranscriptLocalFileLink.Action) {
+            switch action {
+            case .open(let url):
+                NSWorkspace.shared.open(url)
+            case .revealBlocked(let url, _):
+                // 脚本类用文本编辑器打开查看（不运行），其余可执行类型只在访达显示。
+                if TranscriptLocalFileLink.openDisposition(for: url) == .textEditor,
+                   TranscriptLocalFileLink.openInTextEditor(url) {
+                    return
+                }
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            case .revealFolder(let url):
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            case .missing:
+                break
+            }
+        }
+
+        @MainActor private func presentNotice(_ text: String, title: String, in textView: NSTextView) {
+            guard !confirmingLink, let window = textView.window else { return }
+            confirmingLink = true
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = text
+            alert.addButton(withTitle: "好")
+            alert.beginSheetModal(for: window) { [weak self] _ in self?.confirmingLink = false }
         }
 
         /// 测量缓存：同宽度命中直接返回（避免测量副作用触发布局循环）。
@@ -730,14 +1109,149 @@ struct ReadOnlyAttributedTextView: NSViewRepresentable {
 
 /// 把文档内容（Markdown 或纯文本）构建为 NSAttributedString，供只读 NSTextView 渲染。
 /// 纯函数，文档内容可完整测试。
+///
+/// 块级缓存：解析仍整篇做（行扫描，便宜），但每个已解析块的富文本结果按
+/// （块值 + 字号 + 基色 + 流式标记 + 项目根）缓存。块输出只取决于这些输入，
+/// 所以命中与重建逐字节一致；流式时只有内容变化的最后一块会重建。
+/// 含 NSTextBlock/NSTextTable 的块（代码块、表格）和分隔线不缓存，避免同一
+/// 对象在一篇文档里出现两次。
+final class MarkdownBlockRenderCache: @unchecked Sendable {
+    struct Key: Hashable {
+        let block: MinisCore.MarkdownBlock
+        let baseSize: CGFloat
+        let baseColor: NSColor
+        let isStreaming: Bool
+        let projectRoot: String?
+    }
+    struct Value {
+        let attributed: NSAttributedString
+        let sawLink: Bool
+        let malformed: Bool
+        let createdAt: Date
+    }
+
+    static let capacity = 2048
+    /// 与路径存在性缓存同寿命，避免已关闭块里的文件链接状态长期过期。
+    static let lifetime: TimeInterval = TranscriptPathExistenceCache.lifetime
+
+    private let lock = NSLock()
+    private var current: [Key: Value] = [:]
+    private var previous: [Key: Value] = [:]
+    private var hits = 0
+    private var misses = 0
+
+    var hitCount: Int { lock.lock(); defer { lock.unlock() }; return hits }
+    var missCount: Int { lock.lock(); defer { lock.unlock() }; return misses }
+
+    func value(for key: Key, now: Date = Date()) -> Value? {
+        lock.lock(); defer { lock.unlock() }
+        if let value = current[key] ?? previous[key],
+           now.timeIntervalSince(value.createdAt) < Self.lifetime {
+            hits += 1
+            return value
+        }
+        misses += 1
+        return nil
+    }
+
+    func store(_ value: Value, for key: Key) {
+        lock.lock(); defer { lock.unlock() }
+        if current.count >= Self.capacity {
+            previous = current
+            current = [:]
+        }
+        current[key] = value
+    }
+}
+
 enum MarkdownAttributedTextBuilder {
+
+    private static func inlineTexts(of block: MinisCore.MarkdownBlock) -> [String] {
+        switch block {
+        case .heading(_, let text), .paragraph(let text), .blockquote(let text):
+            return [text]
+        case .list(let items, _):
+            return items
+        case .nestedList(let items):
+            return items.map(\.text)
+        case .table(let header, let rows):
+            return header + rows.flatMap { $0 }
+        case .codeBlock(_, _), .divider:
+            return []
+        }
+    }
+
+    private static func isCacheable(_ block: MinisCore.MarkdownBlock) -> Bool {
+        switch block {
+        case .heading, .paragraph, .blockquote, .list, .nestedList: return true
+        case .codeBlock, .table, .divider: return false
+        }
+    }
+
+    /// 带块缓存的渲染：与无缓存路径逐字节一致（块输出彼此独立，
+    /// normalizedLeading 只按 run 处理，逐块应用等于整体应用）。
+    private static func renderStateCached(
+        blocks: [MinisCore.MarkdownBlock], baseSize: CGFloat, baseColor: NSColor,
+        isStreaming: Bool, cache: MarkdownBlockRenderCache
+    ) -> ReadOnlyAttributedTextRenderState {
+        var inlineAssessments: [Data: ReadOnlyAttributedTextStatus] = [:]
+        let projectRoot = TranscriptPathLinkContext.shared.projectRoot?.path
+        let combined = NSMutableAttributedString()
+        var sawLink = false
+        var malformed = false
+        for block in blocks {
+            let cacheable = isCacheable(block)
+            let key = MarkdownBlockRenderCache.Key(
+                block: block, baseSize: baseSize, baseColor: baseColor,
+                isStreaming: isStreaming, projectRoot: projectRoot)
+            if cacheable, let hit = cache.value(for: key) {
+                combined.append(hit.attributed)
+                sawLink = sawLink || hit.sawLink
+                malformed = malformed || hit.malformed
+                continue
+            }
+            var blockLink = false
+            var blockMalformed = false
+            for text in inlineTexts(of: block) {
+                let textKey = Data(text.utf8)
+                let status: ReadOnlyAttributedTextStatus
+                if let existing = inlineAssessments[textKey] {
+                    status = existing
+                } else {
+                    status = assessInline(text, isStreaming: isStreaming)
+                    inlineAssessments[textKey] = status
+                }
+                blockLink = blockLink || status == .sanitized
+                blockMalformed = blockMalformed || status == .fallback
+            }
+            let rendered = attributed(from: [block], baseSize: baseSize, baseColor: baseColor,
+                                      inlineAssessments: inlineAssessments)
+            if cacheable {
+                cache.store(.init(attributed: rendered, sawLink: blockLink,
+                                  malformed: blockMalformed, createdAt: Date()), for: key)
+            }
+            combined.append(rendered)
+            sawLink = sawLink || blockLink
+            malformed = malformed || blockMalformed
+        }
+        let assessment: ReadOnlyAttributedTextStatus = malformed ? .fallback : (sawLink ? .sanitized : .rendered)
+        if assessment == .fallback {
+            combined.append(NSAttributedString(string: "\n" + (assessment.userMessage ?? ""), attributes: [
+                .font: NSFont.systemFont(ofSize: max(10, baseSize - 1)),
+                .foregroundColor: secondaryColor(baseColor, alpha: 0.68)
+            ]))
+        }
+        return ReadOnlyAttributedTextRenderState(attributedString: combined, status: assessment)
+    }
 
     /// 生产渲染入口：解析结果和状态一起返回，避免 malformed 输入被静默吞掉。
     static func renderState(
         content: String,
         isMarkdown: Bool,
         baseSize: CGFloat = 13,
-        baseColor: NSColor = .textColor
+        baseColor: NSColor = .textColor,
+        isStreaming: Bool = false,
+        blockCache: MarkdownBlockRenderCache? = nil
     ) -> ReadOnlyAttributedTextRenderState {
         guard isMarkdown else {
             return ReadOnlyAttributedTextRenderState(
@@ -746,18 +1260,23 @@ enum MarkdownAttributedTextBuilder {
             )
         }
 
+        let perf = PerformanceSignposts.begin(.transcriptMarkdownBuild); defer { perf.end() }
         TranscriptOperationDiagnostics.parserCall(kind: "block")
         let blocks = MinisCore.MarkdownParser.parse(content)
+        if let blockCache {
+            return renderStateCached(blocks: blocks, baseSize: baseSize, baseColor: baseColor,
+                                     isStreaming: isStreaming, cache: blockCache)
+        }
         // Reuse only byte-identical inline safety results within this render.
         var inlineAssessments: [Data: ReadOnlyAttributedTextStatus] = [:]
-        let assessment = assess(blocks, inlineAssessments: &inlineAssessments)
+        let assessment = assess(blocks, inlineAssessments: &inlineAssessments, isStreaming: isStreaming)
         let rendered = NSMutableAttributedString(attributedString:
             attributed(from: blocks, baseSize: baseSize, baseColor: baseColor,
                 inlineAssessments: inlineAssessments))
         if assessment == .fallback {
             rendered.append(NSAttributedString(string: "\n" + (assessment.userMessage ?? ""), attributes: [
                 .font: NSFont.systemFont(ofSize: max(10, baseSize - 1)),
-                .foregroundColor: baseColor.withAlphaComponent(0.68)
+                .foregroundColor: secondaryColor(baseColor, alpha: 0.68)
             ]))
         }
         return ReadOnlyAttributedTextRenderState(
@@ -769,8 +1288,10 @@ enum MarkdownAttributedTextBuilder {
     /// 入口：isMarkdown=true 走块级 Markdown 渲染；false 走等宽纯文本。
     /// baseColor：正文基色（默认 .textColor；AJ-71 聊天用户白字气泡传 .white），
     /// 次级元素（列表标记/引用/代码语言/分隔线）由基色按透明度派生。
-    static func build(content: String, isMarkdown: Bool, baseSize: CGFloat = 13, baseColor: NSColor = .textColor) -> NSAttributedString {
-        renderState(content: content, isMarkdown: isMarkdown, baseSize: baseSize, baseColor: baseColor).attributedString
+    static func build(content: String, isMarkdown: Bool, baseSize: CGFloat = 13, baseColor: NSColor = .textColor,
+                      isStreaming: Bool = false, blockCache: MarkdownBlockRenderCache? = nil) -> NSAttributedString {
+        renderState(content: content, isMarkdown: isMarkdown, baseSize: baseSize, baseColor: baseColor,
+                    isStreaming: isStreaming, blockCache: blockCache).attributedString
     }
 
     private static func buildPlain(content: String, baseSize: CGFloat, baseColor: NSColor) -> NSAttributedString {
@@ -801,7 +1322,8 @@ enum MarkdownAttributedTextBuilder {
 
     private static func assess(
         _ blocks: [MinisCore.MarkdownBlock],
-        inlineAssessments: inout [Data: ReadOnlyAttributedTextStatus]
+        inlineAssessments: inout [Data: ReadOnlyAttributedTextStatus],
+        isStreaming: Bool = false
     ) -> ReadOnlyAttributedTextStatus {
         var sawLink = false
         var malformed = false
@@ -812,6 +1334,8 @@ enum MarkdownAttributedTextBuilder {
                 inlineTexts = [text]
             case .list(let items, _):
                 inlineTexts = items
+            case .nestedList(let items):
+                inlineTexts = items.map(\.text)
             case .table(let header, let rows):
                 inlineTexts = header + rows.flatMap { $0 }
             case .codeBlock(_, _), .divider:
@@ -824,7 +1348,7 @@ enum MarkdownAttributedTextBuilder {
                 if let existing = inlineAssessments[key] {
                     status = existing
                 } else {
-                    status = assessInline(text)
+                    status = assessInline(text, isStreaming: isStreaming)
                     inlineAssessments[key] = status
                 }
                 sawLink = sawLink || status == .sanitized
@@ -835,7 +1359,7 @@ enum MarkdownAttributedTextBuilder {
         return sawLink ? .sanitized : .rendered
     }
 
-    private static func assessInline(_ text: String) -> ReadOnlyAttributedTextStatus {
+    private static func assessInline(_ text: String, isStreaming: Bool = false) -> ReadOnlyAttributedTextStatus {
         var sawLink = false
         var malformed = false
         TranscriptOperationDiagnostics.parserCall(kind: "assessment-inline", observerOnly: true)
@@ -844,7 +1368,8 @@ enum MarkdownAttributedTextBuilder {
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) {
             for run in parsed.runs {
-                if let url = run.link, TranscriptExternalLink.allowedURL(url) == nil {
+                if let url = run.link, TranscriptExternalLink.allowedURL(url) == nil,
+                   TranscriptLocalFileLink.resolve(url) == nil {
                     sawLink = true
                 }
             }
@@ -853,23 +1378,25 @@ enum MarkdownAttributedTextBuilder {
         }
         // An odd inline delimiter is a common streaming/malformed state.
         // Treating it as plain text is deterministic and keeps the source visible.
-        let backticks = text.filter { $0 == "`" }.count
+        // 行内代码里的 * 与反引号是字面内容，不参与配对；流式输出中未闭合的反引号
+        // 只是"还没写完"，完成后才判断。
+        let (outside, hasUnclosedBacktick) = Self.removingInlineCodeSpans(text)
         // A symbol-only value between a value separator and a value terminator
         // has no strong content. Do not split its run into many empty pairs.
         // Ambiguous Markdown openers keep the original unmatched-strong guard.
         var strongPairs = 0
         var originalStrongPairs = 0
-        var cursor = text.startIndex
-        while cursor < text.endIndex {
-            guard text[cursor] == "*" else { cursor = text.index(after: cursor); continue }
+        var cursor = outside.startIndex
+        while cursor < outside.endIndex {
+            guard outside[cursor] == "*" else { cursor = outside.index(after: cursor); continue }
             let start = cursor
             var length = 0
-            while cursor < text.endIndex, text[cursor] == "*" {
+            while cursor < outside.endIndex, outside[cursor] == "*" {
                 length += 1
-                cursor = text.index(after: cursor)
+                cursor = outside.index(after: cursor)
             }
-            let before = start == text.startIndex ? nil : text[text.index(before: start)]
-            let after = cursor == text.endIndex ? nil : text[cursor]
+            let before = start == outside.startIndex ? nil : outside[outside.index(before: start)]
+            let after = cursor == outside.endIndex ? nil : outside[cursor]
             let valuePrefix = before.map { "=:：".contains($0) } ?? false
             let valueEnd = after.map { $0.isWhitespace || ";；".contains($0) } ?? true
             let literalRun = length > 2 && valuePrefix && valueEnd && strongPairs % 2 == 0
@@ -879,11 +1406,46 @@ enum MarkdownAttributedTextBuilder {
         // Discounting a literal run must never turn an originally balanced
         // paragraph into a new imbalance (including a run closing emphasis).
         let unbalancedStrong = originalStrongPairs % 2 != 0 && strongPairs % 2 != 0
-        if backticks % 2 != 0 || unbalancedStrong || hasMalformedLinkSyntax(text) {
+        if (hasUnclosedBacktick && !isStreaming) || unbalancedStrong || hasMalformedLinkSyntax(text) {
             malformed = true
         }
         if malformed { return .fallback }
         return sawLink ? .sanitized : .rendered
+    }
+
+    /// 去掉成对闭合的行内代码（按反引号个数配对），返回剩余文本与"是否有未闭合的反引号"。
+    /// 被去掉的位置留一个占位字符，避免两侧的 `*` 被误并成一串。
+    static func removingInlineCodeSpans(_ text: String) -> (outside: String, hasUnclosedBacktick: Bool) {
+        guard text.contains("`") else { return (text, false) }
+        let chars = Array(text)
+        var result = ""
+        var i = 0
+        var unclosed = false
+        while i < chars.count {
+            guard chars[i] == "`" else { result.append(chars[i]); i += 1; continue }
+            var run = 0
+            while i + run < chars.count, chars[i + run] == "`" { run += 1 }
+            var j = i + run
+            var closeAt: Int?
+            while j < chars.count {
+                if chars[j] == "`" {
+                    var n = 0
+                    while j + n < chars.count, chars[j + n] == "`" { n += 1 }
+                    if n == run { closeAt = j; break }
+                    j += n
+                } else {
+                    j += 1
+                }
+            }
+            if let closeAt {
+                result.append("\u{FFFC}")
+                i = closeAt + run
+            } else {
+                unclosed = true
+                i += run
+            }
+        }
+        return (result, unclosed)
     }
 
     private static func hasMalformedLinkSyntax(_ text: String) -> Bool {
@@ -920,6 +1482,8 @@ enum MarkdownAttributedTextBuilder {
                 appendBlockquote(t, to: result, baseSize: baseSize, baseColor: baseColor, inlineAssessments: inlineAssessments)
             case .list(let items, let ordered):
                 appendList(items, ordered: ordered, to: result, baseSize: baseSize, baseColor: baseColor, inlineAssessments: inlineAssessments)
+            case .nestedList(let items):
+                appendNestedList(items, to: result, baseSize: baseSize, baseColor: baseColor, inlineAssessments: inlineAssessments)
             case .table(let header, let rows):
                 appendTable(header, rows: rows, to: result, baseSize: baseSize, baseColor: baseColor, inlineAssessments: inlineAssessments)
             case .divider:
@@ -939,34 +1503,82 @@ enum MarkdownAttributedTextBuilder {
         result.append(NSAttributedString(string: "\n\n"))
     }
 
+    /// 次级文字色：基色按透明度派生；白字气泡底色本身只刚好满足 4.5:1（深色 4.5），
+    /// 任何透明度都会掉到门槛以下，所以白色基色保持不透明，层级靠字号/字重区分。
+    static func secondaryColor(_ baseColor: NSColor, alpha: CGFloat) -> NSColor {
+        if let rgb = baseColor.usingColorSpace(.sRGB),
+           rgb.redComponent > 0.98, rgb.greenComponent > 0.98, rgb.blueComponent > 0.98 {
+            return baseColor
+        }
+        return baseColor.withAlphaComponent(alpha)
+    }
+
+    /// 行内代码文字色：第 1 套陶土橙（浅底 #A84E2A、深底 #E08B68，对比度均 ≥4.5）。
+    /// 白字气泡（底色本身是强调色）沿用基色，避免同色看不见。
+    private static func inlineCodeColor(for baseColor: NSColor) -> NSColor {
+        guard let rgb = baseColor.usingColorSpace(.sRGB) else { return baseColor }
+        if rgb.redComponent > 0.98, rgb.greenComponent > 0.98, rgb.blueComponent > 0.98 { return baseColor }
+        let luminance = 0.2126 * rgb.redComponent + 0.7152 * rgb.greenComponent + 0.0722 * rgb.blueComponent
+        return luminance < 0.5
+            ? NSColor(srgbRed: 168 / 255, green: 78 / 255, blue: 42 / 255, alpha: rgb.alphaComponent)
+            : NSColor(srgbRed: 224 / 255, green: 139 / 255, blue: 104 / 255, alpha: rgb.alphaComponent)
+    }
+
     private static func appendCode(language: String?, code: String, to result: NSMutableAttributedString, baseSize: CGFloat, baseColor: NSColor) {
         let codeFont = NSFont.monospacedSystemFont(ofSize: baseSize - 1, weight: .regular)
-        if let language, !language.isEmpty {
-            result.append(NSAttributedString(
-                string: language + "\n",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: baseSize - 2, weight: .medium),
-                    .foregroundColor: baseColor.withAlphaComponent(0.75)
-                ]
-            ))
+        // 圆角卡片：外观（底色、细边框、圆角）由 ChatTranscriptNativeTextView 按行绘制，
+        // 不用 NSTextBlock 的内边距排版（AppKit 只给块内第一段加内边距，首行会错位）。
+        // 文字与卡片边缘的距离靠段落缩进，卡片上下留白靠首段段前、末段段后间距。
+        let surface = CodeSurfaceTextBlock()
+        surface.backgroundColor = baseColor.withAlphaComponent(CodeSurfaceTextBlock.fillAlpha)
+        surface.setBorderColor(baseColor.withAlphaComponent(CodeSurfaceTextBlock.borderAlpha))
+        func paragraphStyle(before: CGFloat, after: CGFloat) -> NSMutableParagraphStyle {
+            let style = NSMutableParagraphStyle()
+            style.textBlocks = [surface]
+            style.firstLineHeadIndent = CodeSurfaceTextBlock.textInset
+            style.headIndent = CodeSurfaceTextBlock.textInset
+            style.tailIndent = -CodeSurfaceTextBlock.textInset
+            style.paragraphSpacingBefore = before
+            style.paragraphSpacing = after
+            return style
         }
-        let surface = NSTextBlock()
-        surface.backgroundColor = baseColor.withAlphaComponent(0.12)
-        surface.setWidth(8, type: .absoluteValueType, for: .padding, edge: .minX)
-        surface.setWidth(8, type: .absoluteValueType, for: .padding, edge: .maxX)
-        let style = NSMutableParagraphStyle()
-        style.textBlocks = [surface]
-        result.append(NSAttributedString(
-            string: code + "\n",
-            attributes: [.font: codeFont, .foregroundColor: baseColor, .paragraphStyle: style]
-        ))
+        let headerAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: baseSize - 2, weight: .medium),
+            // 0.72：卡片底色上仍满足次要文字 4.5:1（0.6 在浅色主题只有约 3.8）。
+            .foregroundColor: secondaryColor(baseColor, alpha: 0.72),
+            .paragraphStyle: paragraphStyle(before: CodeSurfaceTextBlock.outerGap + CodeSurfaceTextBlock.verticalPadding,
+                                            after: CodeSurfaceTextBlock.headerGap)
+        ]
+        if let language, !language.isEmpty {
+            result.append(NSAttributedString(string: language + "  ·  ", attributes: headerAttributes))
+        }
+        // 就地复制入口：随代码块出现在卡片顶行，点击即复制该代码块正文。
+        var copyAttributes = headerAttributes
+        copyAttributes[TranscriptCodeCopy.payload] = code
+        result.append(NSAttributedString(string: TranscriptCodeCopy.label, attributes: copyAttributes))
+        result.append(NSAttributedString(string: "\n", attributes: headerAttributes))
+        let codeAttributes: [NSAttributedString.Key: Any] = [
+            .font: codeFont, .foregroundColor: baseColor,
+            .paragraphStyle: paragraphStyle(before: 0, after: 0)
+        ]
+        var lastAttributes = codeAttributes
+        lastAttributes[.paragraphStyle] = paragraphStyle(
+            before: 0, after: CodeSurfaceTextBlock.verticalPadding + CodeSurfaceTextBlock.outerGap)
+        let body = code as NSString
+        let lastBreak = body.range(of: "\n", options: .backwards)
+        if lastBreak.location == NSNotFound {
+            result.append(NSAttributedString(string: code + "\n", attributes: lastAttributes))
+        } else {
+            result.append(NSAttributedString(string: body.substring(to: NSMaxRange(lastBreak)), attributes: codeAttributes))
+            result.append(NSAttributedString(string: body.substring(from: NSMaxRange(lastBreak)) + "\n", attributes: lastAttributes))
+        }
     }
 
     private static func appendBlockquote(_ text: String, to result: NSMutableAttributedString, baseSize: CGFloat, baseColor: NSColor,
         inlineAssessments: [Data: ReadOnlyAttributedTextStatus]) {
         let para = NSMutableParagraphStyle()
         para.headIndent = 12
-        let m = NSMutableAttributedString(attributedString: inlineAttributed(text, baseSize: baseSize, baseColor: baseColor.withAlphaComponent(0.75), inlineAssessments: inlineAssessments))
+        let m = NSMutableAttributedString(attributedString: inlineAttributed(text, baseSize: baseSize, baseColor: secondaryColor(baseColor, alpha: 0.75), inlineAssessments: inlineAssessments))
         m.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: m.length))
         result.append(m)
         result.append(NSAttributedString(string: "\n"))
@@ -978,7 +1590,7 @@ enum MarkdownAttributedTextBuilder {
             let marker = ordered ? "\(i + 1). " : "• "
             result.append(NSAttributedString(
                 string: marker,
-                attributes: [.font: NSFont.systemFont(ofSize: baseSize, weight: .semibold), .foregroundColor: baseColor.withAlphaComponent(0.75)]
+                attributes: [.font: NSFont.systemFont(ofSize: baseSize, weight: .semibold), .foregroundColor: secondaryColor(baseColor, alpha: 0.75)]
             ))
             result.append(inlineAttributed(item, baseSize: baseSize, baseColor: baseColor, inlineAssessments: inlineAssessments))
             result.append(NSAttributedString(string: "\n"))
@@ -986,19 +1598,48 @@ enum MarkdownAttributedTextBuilder {
         result.append(NSAttributedString(string: "\n"))
     }
 
+    /// 嵌套列表：按层级缩进；有序项使用解析出的序号（保留起始序号，空行不重新编号）。
+    private static func appendNestedList(_ items: [MarkdownListItem], to result: NSMutableAttributedString, baseSize: CGFloat, baseColor: NSColor,
+        inlineAssessments: [Data: ReadOnlyAttributedTextStatus]) {
+        let bullets = ["•", "◦", "▪"]
+        for item in items {
+            let marker = item.ordered ? "\(item.number). " : bullets[min(item.level, bullets.count - 1)] + " "
+            let line = NSMutableAttributedString(
+                string: marker,
+                attributes: [.font: NSFont.systemFont(ofSize: baseSize, weight: .semibold), .foregroundColor: secondaryColor(baseColor, alpha: 0.75)]
+            )
+            line.append(inlineAttributed(item.text, baseSize: baseSize, baseColor: baseColor, inlineAssessments: inlineAssessments))
+            line.append(NSAttributedString(string: "\n"))
+            if item.level > 0 {
+                let style = NSMutableParagraphStyle()
+                style.firstLineHeadIndent = CGFloat(item.level) * 20
+                style.headIndent = CGFloat(item.level) * 20 + 14
+                line.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: line.length))
+            }
+            result.append(line)
+        }
+        result.append(NSAttributedString(string: "\n"))
+    }
+
+    static func tableColumnCount(_ rows: [[String]]) -> Int {
+        rows.map(\.count).max() ?? 0
+    }
+
     private static func appendTable(_ header: [String], rows: [[String]], to result: NSMutableAttributedString, baseSize: CGFloat, baseColor: NSColor,
         inlineAssessments: [Data: ReadOnlyAttributedTextStatus]) {
         guard !header.isEmpty else { return }
         let table = NSTextTable()
-        table.numberOfColumns = header.count
+        let visibleRows = [header] + Array(rows.prefix(200))
+        // 数据行比表头多出的单元格也要显示（与流式阶段一致）：列数取表头和可见数据行的最大值，表头缺的列留空。
+        let columnCount = tableColumnCount(visibleRows)
+        table.numberOfColumns = columnCount
         table.layoutAlgorithm = .fixedLayoutAlgorithm
         table.setValue(100, type: .percentageValueType, for: .width)
-        let visibleRows = [header] + Array(rows.prefix(200))
         for (rowIndex, row) in visibleRows.enumerated() {
-            for column in header.indices {
+            for column in 0..<columnCount {
                 let cell = NSTextTableBlock(table: table, startingRow: rowIndex, rowSpan: 1,
                                             startingColumn: column, columnSpan: 1)
-                cell.setValue(100 / CGFloat(header.count), type: .percentageValueType, for: .width)
+                cell.setValue(100 / CGFloat(columnCount), type: .percentageValueType, for: .width)
                 cell.setWidth(ChatReadingLayout.tablePadding, type: .absoluteValueType, for: .padding)
                 let style = NSMutableParagraphStyle()
                 style.textBlocks = [cell]
@@ -1015,7 +1656,7 @@ enum MarkdownAttributedTextBuilder {
         if rows.count > 200 {
             result.append(NSAttributedString(string: "…还有 \(rows.count - 200) 行，复制可得全部\n", attributes: [
                 .font: NSFont.systemFont(ofSize: max(10, baseSize - 1)),
-                .foregroundColor: baseColor.withAlphaComponent(0.68)
+                .foregroundColor: secondaryColor(baseColor, alpha: 0.68)
             ]))
         }
         result.append(NSAttributedString(string: "\n"))
@@ -1083,10 +1724,11 @@ enum MarkdownAttributedTextBuilder {
             ns.enumerateAttributes(in: semantic.range) { attrs, range, _ in
                 let substring = (ns.string as NSString).substring(with: range)
                 var font = forceFont ?? baseFont
-                var bg: NSColor? = nil
+                var foreground = baseColor
                 if semantic.code {
+                    // 行内代码：不铺灰底（灰底按整行高画，折行时会断成两块），只用等宽字 + 强调色区分。
                     font = forceFont ?? NSFont.monospacedSystemFont(ofSize: baseSize - 1, weight: .regular)
-                    bg = baseColor.withAlphaComponent(0.15)
+                    foreground = inlineCodeColor(for: baseColor)
                 }
                 if semantic.strong || semantic.emphasis {
                     var traits = NSFontManager.shared.traits(of: font)
@@ -1094,15 +1736,151 @@ enum MarkdownAttributedTextBuilder {
                     if semantic.emphasis { traits.insert(.italicFontMask) }
                     font = NSFontManager.shared.convert(font, toHaveTrait: traits)
                 }
-                var attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: baseColor]
-                if let bg { attributes[.backgroundColor] = bg }
+                var attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: foreground]
                 if let url = TranscriptExternalLink.allowedURL(attrs[.link]) {
                     attributes[TranscriptExternalLink.destination] = url
+                    attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                } else if let file = TranscriptLocalFileLink.resolve(attrs[.link]) {
+                    attributes[TranscriptExternalLink.destination] = file
                     attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
                 }
                 result.append(NSAttributedString(string: substring, attributes: attributes))
             }
         }
+        linkifyBareTargets(result)
         return result
+    }
+
+    // MARK: 裸网址与文件路径
+
+    private static let bareURLExpression = try? NSRegularExpression(
+        pattern: #"https?://[^\s<>"'`\]\)）】，。；！？、]+"#)
+
+    private static let barePathExpression: NSRegularExpression? = {
+        let forbidden = #"\s<>"'`|*?:;,，。；！？、（）()\[\]{}“”‘’"#
+        let absolute = "~?/[^\(forbidden)]+"
+        // 路径字符集放宽到 Unicode（中文文件名、带重音字符等）。
+        let relativeWithSlash = #"(?:\.{1,2}/)?[\p{L}\p{N}_@+\-][\p{L}\p{N}_.@+\-]*(?:/[\p{L}\p{N}_.@+\-]+)+"#
+        let bareFile = #"[\p{L}\p{N}_@+\-]+(?:\.[\p{L}\p{N}_@+\-]+)*\.[A-Za-z][A-Za-z0-9]{0,7}"#
+        let pattern = #"(?<![\p{L}\p{N}_./~@:\-])(?:"# + absolute + "|" + relativeWithSlash + "|" + bareFile
+            + #")(?::[0-9]+(?::[0-9]+)?)?"#
+        return try? NSRegularExpression(pattern: pattern)
+    }()
+
+    /// 引号、反引号或中文引号包住的路径（可含空格），捕获组 1 为路径本身。
+    private static let quotedPathExpression = try? NSRegularExpression(
+        pattern: #"["'`“‘「]((?:~/|/|[\p{L}\p{N}_.][^"'`”’」\n]*/)[^"'`”’」\n]*[^"'`”’」\n/])["'`”’」]"#)
+
+    private static let lineSuffixExpression = try? NSRegularExpression(pattern: #":[0-9]+(?::[0-9]+)?$"#)
+
+    /// 把回复里的裸 http(s) 网址和 `path/file.swift:42` 这类文件路径变成可点链接。
+    /// 路径只在文件真实存在时才可点（相对路径相对当前项目根）；点击沿用已有的确认与
+    /// 可执行文件拦截规则。已经是链接的文字不动。
+    private static func linkifyBareTargets(_ result: NSMutableAttributedString) {
+        let text = result.string
+        guard text.contains("/") || text.contains(".") else { return }
+        let ns = text as NSString
+        let full = NSRange(location: 0, length: ns.length)
+
+        func overlapsLink(_ range: NSRange) -> Bool {
+            var found = false
+            result.enumerateAttribute(TranscriptExternalLink.destination, in: range) { value, _, stop in
+                if value != nil { found = true; stop.pointee = true }
+            }
+            return found
+        }
+        func apply(_ url: URL, to range: NSRange) {
+            result.addAttributes([
+                TranscriptExternalLink.destination: url,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ], range: range)
+        }
+
+        var claimed: [NSRange] = []
+        if let expression = bareURLExpression {
+            for match in expression.matches(in: text, range: full) {
+                var range = match.range
+                while range.length > 0, ".,;:!?".contains(ns.substring(with: NSRange(location: NSMaxRange(range) - 1, length: 1))) {
+                    range.length -= 1
+                }
+                guard range.length > 0,
+                      let url = TranscriptExternalLink.allowedURL(ns.substring(with: range)) else { continue }
+                if overlapsLink(range) {
+                    // 上游解析把裸网址连同后面的中文标点和文字一起吞成了更长的链接：
+                    // 显示文字就是网址原文加后缀时，截回网址本身重设。其他已有链接不动。
+                    var effective = NSRange(location: 0, length: 0)
+                    guard result.attribute(TranscriptExternalLink.destination, at: range.location,
+                                           effectiveRange: &effective) != nil,
+                          effective.location == range.location, effective.length > range.length,
+                          NSMaxRange(effective) <= ns.length,
+                          ns.substring(with: effective).hasPrefix(ns.substring(with: range)) else { continue }
+                    result.removeAttribute(TranscriptExternalLink.destination, range: effective)
+                    result.removeAttribute(.underlineStyle, range: effective)
+                }
+                apply(url, to: range)
+                claimed.append(range)
+            }
+        }
+
+        let projectRoot = TranscriptPathLinkContext.shared.projectRoot
+        let home = FileManager.default.homeDirectoryForCurrentUser
+
+        // 含空格的路径只认引号/反引号包住且文件真实存在的。
+        if let quoted = quotedPathExpression {
+            var quotedChecked = 0
+            for match in quoted.matches(in: text, range: full) where match.numberOfRanges > 1 {
+                let range = match.range(at: 1)
+                guard range.location != NSNotFound, range.length > 0,
+                      !overlapsLink(range),
+                      !claimed.contains(where: { NSIntersectionRange($0, range).length > 0 }) else { continue }
+                quotedChecked += 1
+                if quotedChecked > 8 { break }
+                let token = ns.substring(with: range)
+                let path: String
+                if token.hasPrefix("/") {
+                    path = token
+                } else if token.hasPrefix("~/") {
+                    path = home.appendingPathComponent(String(token.dropFirst(2))).path
+                } else if let projectRoot {
+                    path = projectRoot.appendingPathComponent(token).path
+                } else {
+                    continue
+                }
+                guard TranscriptPathExistenceCache.exists(path),
+                      let url = TranscriptLocalFileLink.resolve(URL(fileURLWithPath: path)) else { continue }
+                apply(url, to: range)
+                claimed.append(range)
+            }
+        }
+
+        guard let expression = barePathExpression else { return }
+        var checked = 0
+        for match in expression.matches(in: text, range: full) {
+            var range = match.range
+            if claimed.contains(where: { NSIntersectionRange($0, range).length > 0 }) { continue }
+            while range.length > 1, ns.substring(with: NSRange(location: NSMaxRange(range) - 1, length: 1)) == "." {
+                range.length -= 1
+            }
+            var token = ns.substring(with: range)
+            if let suffix = lineSuffixExpression?.firstMatch(in: token, range: NSRange(location: 0, length: (token as NSString).length)) {
+                token = (token as NSString).substring(to: suffix.range.location)
+            }
+            guard !token.isEmpty, !overlapsLink(range) else { continue }
+            checked += 1
+            if checked > 24 { break }
+            let path: String
+            if token.hasPrefix("/") {
+                path = token
+            } else if token.hasPrefix("~/") {
+                path = home.appendingPathComponent(String(token.dropFirst(2))).path
+            } else if let projectRoot {
+                path = projectRoot.appendingPathComponent(token).path
+            } else {
+                continue
+            }
+            guard TranscriptPathExistenceCache.exists(path),
+                  let url = TranscriptLocalFileLink.resolve(URL(fileURLWithPath: path)) else { continue }
+            apply(url, to: range)
+        }
     }
 }

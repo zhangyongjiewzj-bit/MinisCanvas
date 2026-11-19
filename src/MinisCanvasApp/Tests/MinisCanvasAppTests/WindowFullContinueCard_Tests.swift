@@ -21,6 +21,25 @@ struct WindowFullContinueCard_Tests {
         return predicate()
     }
 
+    /// 后台、项目这类无人值守回合没有“压缩后重试”按钮，窗口已满的失败文案不能再指向它；前台文案不变。
+    @Test func unattendedTurnsGetADelegatedWindowFullMessageWhileForegroundKeepsTheButtons() {
+        let error = AgentLoopError.contextWindowFull(fraction: 0.97)
+        let foreground = ChatStore.userErrorMessage(error)
+        #expect(foreground.contains("压缩后重试") || foreground.contains("Compact and retry"))
+        let unattended = ChatStore.unattendedUserErrorMessage(error)
+        #expect(unattended == AgentLoopError.contextWindowFullDelegatedDescription(subagent: false))
+        #expect(!unattended.contains("压缩后重试") && !unattended.contains("Compact and retry"))
+        // 被包装成只带文案的失败信封时也一样。
+        let wrapped = MinisCore.ChatSessionRuntimeError.turnFailed(ChatRetryEnvelope(
+            envelopeID: "windowFull", inputText: "synthetic", sessionID: "windowFull-session",
+            conversationID: "windowFull-session", turnID: "windowFull-turn", taskID: "windowFull-task",
+            attempt: 1, providerID: "syntheticWindowFull", modelID: "modelWindowFull",
+            configurationFingerprint: "configWindowFull", policySnapshotID: "policyWindowFull",
+            grantSnapshotID: "grantWindowFull", failureMessage: foreground))
+        #expect(ChatStore.unattendedUserErrorMessage(wrapped)
+            == AgentLoopError.contextWindowFullDelegatedDescription(subagent: false))
+    }
+
     private func shortHistory() -> [LLMMessage] {
         (0..<8).map { index in
             LLMMessage(role: index.isMultiple(of: 2) ? .user : .assistant, content: "short-\(index)")

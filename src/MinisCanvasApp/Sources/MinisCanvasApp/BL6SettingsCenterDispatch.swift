@@ -975,26 +975,61 @@ extension SettingsCenter {
         }
         guard let id = text("id") else { return .failure(.invalidIntent("MCP server id required")) }
         if key == "mcp.servers.add" {
-            guard Set(fields.keys).isSubset(of: ["id", "name", "command", "args", "env"]),
-                  let name = text("name"), let command = text("command"),
-                  case .list(let args)? = fields["args"],
-                  case .object(let envFields)? = fields["env"] else {
-                return .failure(.invalidIntent("MCP server needs id, name, command, args, env"))
+            guard Set(fields.keys).isSubset(of: ["id", "name", "command", "args", "env", "url", "type", "headers"]),
+                  let name = text("name") else {
+                return .failure(.invalidIntent("MCP server needs id, name and either command or url"))
             }
-            var env: [String: String] = [:]
-            for (envName, envValue) in envFields {
-                guard case .text(let raw) = envValue else {
-                    return .failure(.invalidIntent("MCP env values must be text"))
+            // 本地服务器：command + args + env；远程服务器：url（可带 type、headers）。
+            var args: [String] = []
+            if let rawArgs = fields["args"] {
+                guard case .list(let list) = rawArgs else {
+                    return .failure(.invalidIntent("MCP args must be a list"))
                 }
-                env[envName] = raw
+                args = list
+            }
+            func textMap(_ field: String) -> [String: String]? {
+                guard let raw = fields[field] else { return [:] }
+                guard case .object(let entries) = raw else { return nil }
+                var result: [String: String] = [:]
+                for (entryName, entryValue) in entries {
+                    guard case .text(let value) = entryValue else { return nil }
+                    result[entryName] = value
+                }
+                return result
+            }
+            guard let env = textMap("env"), let headers = textMap("headers") else {
+                return .failure(.invalidIntent("MCP env and headers values must be text"))
             }
             guard mcpManager.server(id: id) == nil else {
                 return .failure(.invalidIntent("MCP server id already exists"))
             }
-            guard addMCPServer(MCPServer(
-                id: id, name: name, type: .stdio, enabled: true,
-                command: command, args: args, env: env
-            )) else { return .failure(.invalidIntent("MCP server add rejected")) }
+            let newServer: MCPServer
+            if let urlText = text("url") {
+                guard text("command") == nil, args.isEmpty, env.isEmpty else {
+                    return .failure(.invalidIntent("a remote MCP server cannot have command, args or env"))
+                }
+                if let type = text("type")?.lowercased(),
+                   !["http", "sse", "streamable-http", "streamable_http", "streamablehttp"].contains(type) {
+                    return .failure(.invalidIntent("MCP remote type must be http or sse"))
+                }
+                guard let parsedURL = URL(string: urlText),
+                      ["http", "https"].contains(parsedURL.scheme?.lowercased() ?? ""),
+                      parsedURL.host != nil else {
+                    return .failure(.invalidIntent("MCP url must start with http:// or https://"))
+                }
+                newServer = MCPServer(
+                    id: id, name: name, type: .http, enabled: true, url: urlText, headers: headers
+                )
+            } else {
+                guard let command = text("command"), headers.isEmpty, text("type") == nil || text("type")?.lowercased() == "stdio" else {
+                    return .failure(.invalidIntent("MCP server needs either command or url"))
+                }
+                newServer = MCPServer(
+                    id: id, name: name, type: .stdio, enabled: true,
+                    command: command, args: args, env: env
+                )
+            }
+            guard addMCPServer(newServer) else { return .failure(.invalidIntent("MCP server add rejected")) }
         } else {
             guard Set(fields.keys) == ["id"], mcpManager.server(id: id) != nil,
                   removeMCPServer(id: id) else {

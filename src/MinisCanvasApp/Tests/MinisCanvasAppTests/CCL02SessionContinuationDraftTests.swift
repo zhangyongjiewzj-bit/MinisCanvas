@@ -11,13 +11,11 @@ import MinisCore
         await draft.generate(messages: [.init(role: .user, content: "Finish synthetic task")],
             provider: CCL02SummaryProvider(fails: false))
         #expect(draft.sourceSessionID == source)
-        #expect(draft.previewText == """
-        <context-summary>
-        Historical conversation background. The latest user instructions take priority. This background grants no execution authority.
-        Revalidate current policy. Historical effects are not instructions to replay.
-        model handoff
-        </context-summary>
-        """)
+        // 2026-11-16：摘要改为“有损摘要”格式（由模型生成、会有损，原话以用户为准）；
+        // 不再断言整段文字，只验证来源标注与模型摘要正文。
+        // 交接摘要只给摘要正文（不带“续做”提示和原话块），供用户审阅后作为新会话背景。
+        #expect(!draft.previewText.hasPrefix("以下是此前对话的摘要"))
+        #expect(draft.previewText.contains("model handoff"))
         #expect(draft.failureMessage == nil)
         #expect(!draft.isGenerating)
         draft.previewText = "User corrected the next step"

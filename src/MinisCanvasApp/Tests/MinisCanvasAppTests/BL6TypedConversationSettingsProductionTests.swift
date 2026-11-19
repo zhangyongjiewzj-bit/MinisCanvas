@@ -208,7 +208,7 @@ struct BL6TypedConversationSettingsProductionTests {
         ))
         #expect(observedBoundary?.classify(command: "printf ok") == .allowed)
         #expect(observedBoundary?.classify(command: "rm -rf fixture") == .denied)
-        #expect(observedBoundary?.classify(command: "sudo echo fixture") == .denied)
+        #expect(observedBoundary?.classify(command: "halt echo fixture") == .denied)
 
         let reloaded = makeCenter(at: root, using: InMemoryKeychainBacking())
         #expect(reloaded.bl6EffectiveSettingsSnapshot?.value(for: "agent.terminal-policy") == canonicalValue)
@@ -258,8 +258,8 @@ struct BL6TypedConversationSettingsProductionTests {
                 "userDeniedCommands": .list([]),
                 "productHardDeniedCommands": .list([])
             ]),
-            terminalValue(allowed: ["sudo"], confirmation: [], denied: []),
-            terminalValue(allowed: [], confirmation: [], denied: ["sudo"]),
+            terminalValue(allowed: ["halt"], confirmation: [], denied: []),
+            terminalValue(allowed: [], confirmation: [], denied: ["halt"]),
             terminalValue(allowed: ["echo -n"], confirmation: [], denied: []),
             terminalValue(allowed: ["echo", "echo"], confirmation: [], denied: []),
             terminalValue(allowed: ["echo"], confirmation: ["echo"], denied: [])
@@ -344,7 +344,8 @@ struct BL6TypedConversationSettingsProductionTests {
         let before = try #require(center.bl6EffectiveSettingsSnapshot)
         let intent = approved(
             requestID: "chat-cas",
-            changes: ["agent.fallback-enabled": .toggle(false)],
+            // 跨供应商自动回退默认已改为关闭（2026-11-16）：改成开启才是一次真实变更，会推进目录修订号。
+            changes: ["agent.fallback-enabled": .toggle(true)],
             revision: before.catalogRevision
         )
         let applied = try requireSuccess(chat.dispatchBL6Settings(intent))

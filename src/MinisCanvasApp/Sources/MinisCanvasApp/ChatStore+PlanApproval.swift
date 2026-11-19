@@ -37,7 +37,7 @@ extension ChatStore {
                 || (allowsCeilingConfirmation && composerPolicyFacts.autonomyCeiling != nil) else {
             return ComposerModeAvailability.explanation(mode, ceiling: composerPolicyFacts.autonomyCeiling)
         }
-        guard draftText.isEmpty, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty,
+        guard !hasDraft, pendingAttachments.isEmpty, activePastedTextDrafts.isEmpty,
               editingMessageID == nil else { return "请先发送或清空当前草稿" }
         return nil
     }
@@ -105,7 +105,7 @@ extension ChatStore {
               ComposerModeAvailability.isEnabled(.plan, ceiling: composerPolicyFacts.autonomyCeiling) else { return false }
         let task = description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !task.isEmpty {
-            guard draftText.isEmpty, pendingAttachments.isEmpty,
+            guard !hasDraft, pendingAttachments.isEmpty,
                   activePastedTextDrafts.isEmpty, editingMessageID == nil else { return false }
         }
         var selection = composerPolicySelection

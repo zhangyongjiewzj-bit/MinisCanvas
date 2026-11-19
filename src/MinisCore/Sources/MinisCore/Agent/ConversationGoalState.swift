@@ -412,6 +412,16 @@ public struct ConversationGoalState: Codable, Hashable, Sendable {
         return true
     }
 
+    /// 用户确认已处理待办：清空待办与提醒，不改目标状态。
+    @discardableResult
+    public mutating func clearBlockers() -> Bool {
+        guard !blockers.isEmpty, status != .stopped, status != .completed else { return false }
+        blockers = []
+        reminder = nil
+        allRemainingWorkBlocked = false
+        return true
+    }
+
     @discardableResult
     public mutating func resetBlockerReminder(now: Date) -> Bool {
         guard !blockers.isEmpty, status != .stopped, status != .completed else { return false }

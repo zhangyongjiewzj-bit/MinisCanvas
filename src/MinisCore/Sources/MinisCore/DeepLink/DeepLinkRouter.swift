@@ -108,9 +108,11 @@ public final class DeepLinkRouter: @unchecked Sendable {
 
     /// URL and component bounds keep a pasted document or malformed external
     /// event from becoming an unbounded command/deep-link payload.
-    public static let maxURLLength = 2_048
+    public static let maxURLLength = 16_384
     private static let maxSegmentCount = 32
     private static let maxComponentLength = 256
+    /// 提示词文本（prompt 路径或 ?text=）可以比一般组件更长。
+    private static let maxPromptComponentLength = 4_096
     private static let maxPayloadLength = 4_096
 
     private let lock = NSLock()
@@ -184,8 +186,11 @@ public final class DeepLinkRouter: @unchecked Sendable {
         let segments = url.path
             .split(separator: "/", omittingEmptySubsequences: true)
             .map { String($0) }
+        let firstRoute = (url.host?.isEmpty == false ? url.host : segments.first)?.lowercased()
+        let segmentLimit = firstRoute.map(Self.promptRoutes.contains) == true
+            ? Self.maxPromptComponentLength : Self.maxComponentLength
         guard segments.count <= Self.maxSegmentCount,
-              segments.allSatisfy(Self.isUsableComponent) else {
+              segments.allSatisfy({ Self.isUsableBoundedComponent($0, limit: segmentLimit) }) else {
             return DeepLinkParseResult(disposition: .unsupported, reason: "invalid path components")
         }
         let host = url.host?.lowercased()
@@ -269,7 +274,7 @@ public final class DeepLinkRouter: @unchecked Sendable {
             let text = segments.joined(separator: "/")
             let promptText = text.isEmpty ? (query["text"] ?? "") : text
             guard !promptText.isEmpty, promptText.utf8.count <= Self.maxPayloadLength,
-                  Self.isUsableComponent(promptText),
+                  Self.isUsableBoundedComponent(promptText, limit: Self.maxPromptComponentLength),
                   query["session"].map(Self.isUsableComponent) ?? true else { return nil }
             return .sendPrompt(text: promptText, session: query["session"])
 
@@ -289,9 +294,15 @@ public final class DeepLinkRouter: @unchecked Sendable {
 
     /// Reject blank/control components while preserving URL-decoded Unicode
     /// IDs used by existing session and workflow links.
+    private static let promptRoutes: Set<String> = ["prompt", "send-prompt", "sendprompt"]
+
     private static func isUsableComponent(_ value: String) -> Bool {
+        isUsableBoundedComponent(value, limit: maxComponentLength)
+    }
+
+    private static func isUsableBoundedComponent(_ value: String, limit: Int) -> Bool {
         !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && value.utf8.count <= maxComponentLength
+            && value.utf8.count <= limit
             && !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
     }
 }

@@ -32,6 +32,15 @@ struct P03CleanupAppRow: Identifiable, Sendable {
     }
 }
 
+/// 落盘的隔离目录登记：只记路径和分支，不含任何授权。
+struct P03CleanupLeftoverRecord: Codable, Identifiable, Equatable, Sendable {
+    let id: UUID
+    let taskID: String
+    let workingDirectory: String
+    let branch: String
+    let recordedAt: Date
+}
+
 struct P03CleanupConfirmationGate: Sendable {
     private var pending: UUID?
     mutating func issue() -> UUID {
@@ -73,6 +82,60 @@ final class P03CleanupAppController {
     private var reviewGeneration: UInt64 = 0
     private var resources: [UUID: P03CleanupAppResource] = [:]
 
+    // MARK: 重启后可见的残留登记（只读展示，不是清理授权）
+
+    private var persistedRecords: [P03CleanupLeftoverRecord] = []
+    private var recordsURL: URL?
+    private(set) var recordsError: String?
+
+    /// 上次运行登记、本次运行没有对应授权来源的隔离目录。清理授权不落盘，
+    /// 所以这里只能展示路径和分支，由用户自行核对处理。
+    var leftovers: [P03CleanupLeftoverRecord] {
+        persistedRecords.filter { resources[$0.id] == nil }
+    }
+
+    /// 由 App 组合根在启动时调用一次。登记文件读不出来时不覆盖它，只提示。
+    func enablePersistence(at url: URL) {
+        if FileManager.default.fileExists(atPath: url.path) {
+            do {
+                persistedRecords = try JSONDecoder().decode([P03CleanupLeftoverRecord].self,
+                                                            from: Data(contentsOf: url))
+            } catch {
+                recordsError = "残留隔离目录的登记文件读取失败，已保留原文件：\(UserFacingErrorText.describe(error))"
+                return
+            }
+        }
+        recordsURL = url
+        for row in rows { addRecord(for: row.snapshot) }
+    }
+
+    func dismissLeftover(_ id: UUID) {
+        persistedRecords.removeAll { $0.id == id }
+        saveRecords()
+    }
+
+    private func addRecord(for snapshot: GitChildWorktreeCleanupSnapshot) {
+        let id = snapshot.allocation.identity.executionID
+        guard recordsURL != nil, !persistedRecords.contains(where: { $0.id == id }) else { return }
+        persistedRecords.append(P03CleanupLeftoverRecord(
+            id: id, taskID: snapshot.allocation.identity.taskID,
+            workingDirectory: snapshot.allocation.workingDirectory,
+            branch: snapshot.allocation.branch, recordedAt: Date()))
+        saveRecords()
+    }
+
+    private func saveRecords() {
+        guard let recordsURL else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: recordsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(persistedRecords).write(to: recordsURL, options: .atomic)
+            recordsError = nil
+        } catch {
+            recordsError = "残留隔离目录的登记写入失败：\(UserFacingErrorText.describe(error))"
+        }
+    }
+
     /// Called once at actual allocation capture, never from a model URL/list scan.
     func register(_ resource: P03CleanupAppResource) async throws {
         let snapshot = try await resource.source.currentSnapshot()
@@ -82,6 +145,7 @@ final class P03CleanupAppController {
         }
         resources[id] = resource
         rows.append(P03CleanupAppRow(id: id, snapshot: snapshot))
+        addRecord(for: snapshot)
     }
 
     func refresh(_ id: UUID) async {
@@ -94,7 +158,7 @@ final class P03CleanupAppController {
             }
             rows[index].snapshot = snapshot
             rows[index].failure = nil
-        } catch { rows[index].failure = error.localizedDescription }
+        } catch { rows[index].failure = UserFacingErrorText.describe(error) }
     }
 
     /// The child finishes (scope.revoke) long after register() captured its
@@ -119,7 +183,7 @@ final class P03CleanupAppController {
             rows[index].failure = nil
             guard generation == reviewGeneration else { return }
             confirmation = P03CleanupAppConfirmation(id: confirmationGate.issue(), resourceID: id, request: request)
-        } catch { rows[index].failure = error.localizedDescription }
+        } catch { rows[index].failure = UserFacingErrorText.describe(error) }
     }
 
     func cancelConfirmation() {
@@ -159,7 +223,8 @@ final class P03CleanupAppController {
                 })
             rows[index].result = result
             rows[index].failure = nil
-        } catch { rows[index].failure = error.localizedDescription }
+            dismissLeftover(approved.resourceID)
+        } catch { rows[index].failure = UserFacingErrorText.describe(error) }
     }
 
     private func index(_ id: UUID) -> Int? { rows.firstIndex { $0.id == id } }

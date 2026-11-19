@@ -137,7 +137,8 @@ struct IF02SettingsUIContractTests {
         let source = try settingsSource()
         let centerSource = try settingsCenterSource()
 
-        #expect(source.contains("return hasExistingProviderReference ? .keepExisting : .missing"))
+        // 本机/局域网服务可以不填 Key：此时存占位值；已有 Keychain 引用时仍保留。
+        #expect(source.contains("if hasExistingProviderReference { return .keepExisting }"))
         #expect(source.contains("return .replace(trimmed)"))
         #expect(source.contains("ProviderCredentialUpdate"))
         #expect(!source.contains("readCredential(canonicalName)"))
@@ -210,6 +211,15 @@ struct IF02SettingsUIContractTests {
         #expect(submitBody.contains("let draft = ProviderEditDraft("))
     }
 
+    @Test("R3-08: the custom model form has an optional max-output field saved on every provider save path")
+    func providerFormHasOptionalMaxOutputField() throws {
+        let source = try settingsSource()
+        #expect(source.contains("TextField(\"最大输出（tokens，可选）\", text: $row.maxOutputText)"))
+        #expect(source.contains("&& !hasInvalidMaxOutputRow"))
+        // 新增、编辑、转换三处保存，加编辑、转换两处改名。
+        #expect(source.components(separatedBy: "setModelMaxOutputTokens(name:").count - 1 == 5)
+    }
+
     @Test("Provider credential sheet remains readable under narrow and dynamic layouts")
     func providerCredentialSheetLayoutAndErrorContract() throws {
         let source = try settingsSource()
@@ -217,7 +227,7 @@ struct IF02SettingsUIContractTests {
         #expect(source.contains(".frame(minWidth: 320, idealWidth: 480, maxWidth: .infinity)"))
         #expect(source.contains(".fixedSize(horizontal: false, vertical: true)"))
         #expect(source.contains(".accessibilityIdentifier(\"settings.provider.save.error\")"))
-        #expect(source.contains(".foregroundStyle(Color.red)"))
+        #expect(source.contains(".foregroundStyle(theme?.statusDangerText ?? AppStatusColor.danger)"))
     }
 
     @Test("Provider save keeps the sheet open on typed persistence failure")
@@ -312,7 +322,7 @@ struct IF02SettingsUIContractTests {
         #expect(source.contains("center.policyRuntimeDefaults.deadlineHorizon"))
         #expect(source.contains("center.policyRuntimeDefaults.autonomyLevel"))
         #expect(source.contains("center.policyRuntimeDefaults.networkDomains"))
-        #expect(source.contains("Composer 只能选择请求策略，不能放宽"))
+        #expect(source.contains("输入框里只能选择请求策略，不能放宽"))
     }
 
     @Test("设置持久化失败有安全可访问投影")

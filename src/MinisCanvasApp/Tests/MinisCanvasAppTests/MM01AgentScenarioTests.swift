@@ -47,7 +47,7 @@ private final class MM01ScenarioFakeWire: URLProtocol, @unchecked Sendable {
         } else {
             content = #"{"choices":[{"index":0,"message":{"role":"assistant","content":"MM01 controlled visual answer"},"finish_reason":"stop"}]}"#
         }
-        Self.lock.lock(); let status = Self.rejectVisual && request.httpMethod == "POST" && payload?["max_tokens"] as? Int != 1 ? 503 : 200; Self.lock.unlock()
+        Self.lock.lock(); let status = Self.rejectVisual && request.httpMethod == "POST" && payload?["max_tokens"] as? Int != 16 ? 503 : 200; Self.lock.unlock()
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": streaming ? "text/event-stream" : "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -231,7 +231,7 @@ struct MM01AgentScenarioTests {
         #expect(MM01ScenarioFakeWire.requests.prefix(3).allSatisfy { $0.0.absoluteString == "https://api.deepseek.com:443/models" && $0.1.isEmpty })
         let probe = try #require(try JSONSerialization.jsonObject(with: MM01ScenarioFakeWire.requests[3].1) as? [String: Any])
         #expect(probe["model"] as? String == "deepseek-flash")
-        #expect(probe["max_tokens"] as? Int == 1)
+        #expect(probe["max_tokens"] as? Int == 16)
         f.chat.newSession()
         let installed = try #require(f.center.providerRecords.first {
             $0.name == DeepSeekProviderContract.apiKeyEnvironmentVariable
@@ -432,7 +432,7 @@ struct MM01AgentScenarioTests {
         #expect(SHA256.hash(data: Data(actualPrompt.utf8)).map { String(format: "%02x", $0) }.joined() == MM01AgentScenarioContract.approvedPromptSHA256)
         #expect(body["tools"] == nil)
         #expect(body["max_tokens"] as? Int == 256)
-        #expect(body["temperature"] as? Double == 0.7)
+        #expect(body["temperature"] == nil) // R3-07：主对话不传温度
         #expect(messages.filter { $0["role"] as? String == "user" }.count == 1)
         let raw = String(decoding: requests[4].1, as: UTF8.self)
         // Preserve the historical raw-literal result only as a diagnostic.
@@ -664,7 +664,7 @@ struct MM01AgentScenarioTests {
                 try #require(prompt.utf8.count == MM01AgentScenarioContract.approvedPromptUTF8Length)
                 try #require(SHA256.hash(data: Data(prompt.utf8)).map { String(format: "%02x", $0) }.joined() == MM01AgentScenarioContract.approvedPromptSHA256)
                 try #require(wire["tools"] == nil && wire["max_tokens"] as? Int == 256)
-                try #require(wire["temperature"] as? Double == 0.7)
+                try #require(wire["temperature"] == nil) // R3-07：主对话不传温度
                 try #require(wire["model"] as? String == DeepSeekMM01FieldLane.modelID)
                 let png = try ownedPNGFromVisualJSON(wire)
                 let bytesMatchOwnedPNG = png.data == image

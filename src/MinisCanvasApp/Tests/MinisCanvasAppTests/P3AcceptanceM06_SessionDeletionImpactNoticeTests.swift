@@ -30,6 +30,9 @@ struct P3AcceptanceM06_SessionDeletionImpactNoticeTests {
         #expect(activeNotice.contains("未发送草稿"))
         #expect(activeNotice.contains("待发附件"))
         #expect(activeNotice.contains("不随该回执恢复"))
+        // FC-09 / C-05：如实披露后台命令会终止、工具输出文件保留到永久删除。
+        #expect(activeNotice.contains("后台命令"))
+        #expect(activeNotice.contains("工具输出文件保留"))
 
         chat.newSession()
         chat.archiveSession(id: targetID)

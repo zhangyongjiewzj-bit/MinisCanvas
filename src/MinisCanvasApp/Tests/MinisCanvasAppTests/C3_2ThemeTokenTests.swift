@@ -50,19 +50,25 @@ final class C3_2ThemeTokenTests: XCTestCase {
         let provider = ThemeTokenProvider(center: center)
         provider.updateSystemAppearance(NSAppearance(named: .darkAqua))
         center.appearance = .light
+        // F-1：固定浅色不跟随系统；系统是深色时产品主题仍用浅色那套。
         XCTAssertEqual(provider.mode, .light)
         XCTAssertEqual(center.themePreset, .light)
         XCTAssertEqual(provider.tokens, ThemePreset.light.semanticTokens(systemIsDark: false)!)
 
-        center.appearance = .dark // legacy compatibility input converges to nativeSystem.
-        XCTAssertEqual(center.themePreset, .system)
-        XCTAssertEqual(center.appearance, .system)
+        center.appearance = .dark   // 固定深色：配色预设不变
+        XCTAssertEqual(center.themePreset, .light)
+        XCTAssertEqual(center.appearance, .dark)
         XCTAssertEqual(provider.mode, .dark)
+        XCTAssertEqual(provider.tokens, ThemePreset.light.semanticTokens(systemIsDark: true)!)
+
+        center.appearance = .system
+        XCTAssertEqual(provider.mode, .dark)   // 系统是深色，产品主题跟随
+        center.themePreset = .system
         XCTAssertEqual(provider.tokens, ThemeTokenProvider.nativeSystemTokens(for: .dark))
 
         center.themePreset = .light
-        XCTAssertEqual(provider.mode, .light)
-        XCTAssertEqual(center.appearance, .light)
+        XCTAssertEqual(provider.mode, .dark)   // 系统仍是深色，产品主题跟随
+        XCTAssertEqual(center.appearance, .system)
         XCTAssertEqual(center.accentTheme, ThemePreset.canonicalAccentTheme)
         center.themePreset = .dark // no retained selectable dark preset.
         XCTAssertEqual(center.themePreset, .system)
@@ -82,7 +88,7 @@ final class C3_2ThemeTokenTests: XCTestCase {
         let (center, _) = try makeCenter()
         let provider = ThemeTokenProvider(center: center)
         provider.updateSystemAppearance(NSAppearance(named: .aqua))
-        center.appearance = .system
+        center.themePreset = .system
         for theme in AccentTheme.allCases {
             center.accentTheme = theme
             XCTAssertEqual(provider.mode, .light)
@@ -100,7 +106,7 @@ final class C3_2ThemeTokenTests: XCTestCase {
         let (center, _) = try makeCenter()
         let provider = ThemeTokenProvider(center: center)
         provider.updateSystemAppearance(NSAppearance(named: .darkAqua))
-        center.appearance = .dark
+        center.themePreset = .system
         center.accentTheme = .codex
         let darkTokens = provider.tokens
         let darkPalette = provider.palette
@@ -125,10 +131,10 @@ final class C3_2ThemeTokenTests: XCTestCase {
         let (center, _) = try makeCenter()
         let provider = ThemeTokenProvider(center: center)
         center.accentTheme = .codex
-        XCTAssertEqual(center.themePreset, .system)
+        XCTAssertEqual(center.themePreset, .light)   // 主题色轴不改预设；默认是产品主题
         provider.updateSystemAppearance(NSAppearance(named: .darkAqua))
         center.appearance = .dark
-        XCTAssertEqual(center.themePreset, .system)
+        XCTAssertEqual(center.themePreset, .light)   // 明暗不改配色预设
         let darkTokens = provider.tokens
         let darkPalette = provider.palette
         center.appearance = .light
@@ -154,6 +160,7 @@ final class C3_2ThemeTokenTests: XCTestCase {
 
     func testNodeStatusColorMapping() throws {
         let (center, _) = try makeCenter()
+        center.themePreset = .system   // 原生色里 running(青)/info(蓝) 是两个角色；产品主题里两者同色
         let provider = ThemeTokenProvider(center: center)
         for mode in [ThemeMode.light, .dark] {
             provider.updateSystemAppearance(NSAppearance(named: mode == .dark ? .darkAqua : .aqua))
@@ -189,5 +196,32 @@ final class C3_2ThemeTokenTests: XCTestCase {
                 XCTAssertTrue((0.0...1.0).contains(component))
             }
         }
+    }
+
+    /// 流畅度第四轮：跟随系统的 token 按明暗缓存，重复读取不重算；失效后重算且结果一致。
+    func testNativeSystemTokensAreCachedUntilInvalidated() {
+        ThemeTokenProvider.invalidateNativeTokenCache()
+        let dark = ThemeTokenProvider.nativeSystemTokens(for: .dark)
+        let afterFirst = ThemeTokenProvider.nativeTokenComputeCount
+        for _ in 0..<50 { XCTAssertEqual(ThemeTokenProvider.nativeSystemTokens(for: .dark), dark) }
+        XCTAssertEqual(ThemeTokenProvider.nativeTokenComputeCount, afterFirst, "命中缓存不得重算")
+        let light = ThemeTokenProvider.nativeSystemTokens(for: .light)
+        XCTAssertNotEqual(light, dark)
+        XCTAssertEqual(ThemeTokenProvider.nativeTokenComputeCount, afterFirst + 1, "另一明暗各算一次")
+        ThemeTokenProvider.invalidateNativeTokenCache()
+        XCTAssertEqual(ThemeTokenProvider.nativeSystemTokens(for: .dark), dark)
+        XCTAssertEqual(ThemeTokenProvider.nativeTokenComputeCount, afterFirst + 2, "失效后重算一次且结果一致")
+    }
+
+    func testAppearanceSwitchRefreshesCachedSystemTokens() throws {
+        let (center, _) = try makeCenter()
+        let provider = ThemeTokenProvider(center: center)
+        provider.updateSystemAppearance(NSAppearance(named: .aqua))
+        let light = provider.tokens
+        provider.updateSystemAppearance(NSAppearance(named: .darkAqua))
+        let dark = provider.tokens
+        XCTAssertNotEqual(light, dark)
+        provider.updateSystemAppearance(NSAppearance(named: .aqua))
+        XCTAssertEqual(provider.tokens, light)
     }
 }

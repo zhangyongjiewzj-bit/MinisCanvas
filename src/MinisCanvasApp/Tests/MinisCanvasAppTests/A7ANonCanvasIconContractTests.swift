@@ -34,6 +34,9 @@ struct A7ANonCanvasIconContractTests {
         "Label(context.statusLabel, systemImage: \"circle.fill\")",
         // ROOT #79: skipped-row status hint, not an action icon.
         "Image(systemName: \"circle.slash\")",
+        // 错误行的"重试"与"压缩后重试"按钮：普通文字按钮的前置图标，不是语义动作图标。
+        "Label(\"重试\", systemImage: \"arrow.clockwise\")",
+        "systemImage: \"arrow.down.right.and.arrow.up.left\")",
     ]
 
     @Test("settings and chat sidebar migrate non-canvas actions to semantic icons")

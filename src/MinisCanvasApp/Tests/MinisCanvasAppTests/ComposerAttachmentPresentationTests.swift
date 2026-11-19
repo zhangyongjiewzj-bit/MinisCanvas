@@ -110,6 +110,36 @@ struct ComposerAttachmentPresentationTests {
         #expect(ComposerAttachmentPresentation.status(for: undecodable) == .resolvingOrDegraded)
     }
 
+    @Test("E-9: oversized text attachment metadata degrades the largest to a reference and still saves")
+    func oversizedTextAttachmentSidecarDegradesLargestToReference() throws {
+        let sizes = [2_500_000, 4_000_000, 1_000_000]  // base64 后合计超过 8MB
+        let attachments = sizes.enumerated().map { index, size in
+            ChatAttachment(
+                kind: .text, fileName: "big-\(index).txt", fileType: .text,
+                mimeType: "text/plain", size: Int64(size),
+                data: Data(repeating: 0x61, count: size), fileURL: "/tmp/big-\(index).txt")
+        }
+        let thread = ChatThread(messages: [ChatMessageUI(
+            role: .user, content: "附件测试", attachments: attachments)])
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("e9-sidecar-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 回退降级逻辑时这里会抛“附件归属 sidecar 超出大小上限”。
+        try ChatAttachmentPersistence.save(session: thread, to: root)
+
+        let loaded = try #require(
+            try ChatAttachmentPersistence.load(forSessionID: thread.id.uuidString, from: root))
+        let restored = try #require(loaded.first).attachments
+        #expect(restored.count == 3)
+        #expect(restored[1].data == nil)  // 最大的被降级
+        #expect(restored[1].fileURL == "/tmp/big-1.txt")
+        #expect(restored[1].size == 4_000_000)
+        #expect(ComposerAttachmentPresentation.truncationNotice(for: restored[1], sent: true)
+                == "内容过大，只保存了引用")
+        #expect(restored[2].data != nil)  // 降到上限以内就停，不多降级
+    }
+
     @Test("type labels come from the classification source, not the coarse kind")
     func typeLabels() {
         let cases: [(FileType, String)] = [
@@ -120,6 +150,13 @@ struct ComposerAttachmentPresentationTests {
             let att = attachment(kind: .file, fileType: fileType, data: nil)
             #expect(ComposerAttachmentPresentation.typeLabel(for: att) == label)
         }
+    }
+
+    @Test("directory reference shows 文件夹 and never 未知类型 / 未知大小")
+    func directorySubtitle() {
+        let dir = ChatStore.directoryReference(id: UUID(), url: URL(fileURLWithPath: "/tmp/demo"), size: nil)
+        #expect(ComposerAttachmentPresentation.typeLabel(for: dir) == "文件夹")
+        #expect(ComposerAttachmentPresentation.subtitle(for: dir) == "文件夹")
     }
 
     @Test("accessibility value carries name, type and status together")

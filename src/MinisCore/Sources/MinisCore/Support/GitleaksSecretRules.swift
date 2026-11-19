@@ -3,9 +3,12 @@ import Foundation
 // Derived rule data from gitleaks v8.24.3 (MIT, Zachary Rice).
 // See docs/third-party/gitleaks-v8.24.3 for pinned source records and license.
 enum GitleaksSecretRules {
+    /// private-key 规则单独暴露：流式增量脱敏需要知道哪些区间属于同一个跨行匹配。
+    static let privateKeyExpression = try! NSRegularExpression(pattern: #"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----"#)
+
     static let expressions: [NSRegularExpression] = [
         // aws-access-token
-        try! NSRegularExpression(pattern: #"\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16})\b"#),
+        try! NSRegularExpression(pattern: #"(?<![A-Za-z0-9_])((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16})(?![A-Za-z0-9_])"#),
         // github-app-token
         try! NSRegularExpression(pattern: #"(?:ghu|ghs)_[0-9a-zA-Z]{36}"#),
         // github-fine-grained-pat
@@ -17,11 +20,11 @@ enum GitleaksSecretRules {
         // gitlab-pat
         try! NSRegularExpression(pattern: #"glpat-[\w-]{20}"#),
         // npm-access-token
-        try! NSRegularExpression(pattern: #"(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)"#),
+        try! NSRegularExpression(pattern: #"(?i)(?<![A-Za-z0-9_])(npm_[a-z0-9]{36})(?![A-Za-z0-9_\-])"#),
         // openai-api-key
-        try! NSRegularExpression(pattern: #"\b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)"#),
+        try! NSRegularExpression(pattern: #"(?<![A-Za-z0-9_])(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?![A-Za-z0-9_\-])"#),
         // private-key
-        try! NSRegularExpression(pattern: #"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----"#),
+        privateKeyExpression,
         // pypi-upload-token
         try! NSRegularExpression(pattern: #"pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}"#),
         // slack-bot-token
@@ -29,7 +32,7 @@ enum GitleaksSecretRules {
         // slack-user-token
         try! NSRegularExpression(pattern: #"xox[pe](?:-[0-9]{10,13}){3}-[a-zA-Z0-9-]{28,34}"#),
         // stripe-access-token
-        try! NSRegularExpression(pattern: #"\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)"#),
+        try! NSRegularExpression(pattern: #"(?<![A-Za-z0-9_])((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?![A-Za-z0-9_\-])"#),
     ]
 
     static func containsMatch(_ text: String) -> Bool {

@@ -244,7 +244,8 @@ struct ProductionUsageForwarding397Tests {
                 // no OS effects. No auto-grant or permission-policy change.
                 #expect(pending.toolName == "shell_execute" && pending.requiresApproval)
                 #expect(pending.callID == "usage397-call" && pending.identityDigest?.count == 64)
-                #expect(pending.requiresSecondConfirmation)
+                // 非不可逆命令只需一次点击（2026-11-16）。
+                #expect(!pending.requiresSecondConfirmation)
                 #expect(f.executor.calls == 0)
                 let lifecycleID = try #require(f.approvalCenter.pendingRequestLifecycleID)
                 let confirming = f.approvalCenter.awaitingConfirmation
@@ -256,12 +257,8 @@ struct ProductionUsageForwarding397Tests {
                       f.approvalCenter.isPromptPresented else { continue }
                 #expect(f.executor.calls == 0)
                 f.approvalCenter.actionsForPresentedRequest().approve()
-                if confirming {
-                    if f.approvalCenter.pendingRequestLifecycleID != lifecycleID {
-                        approvedRequests.append(pending)
-                    }
-                } else {
-                    #expect(f.approvalCenter.awaitingConfirmation && f.executor.calls == 0)
+                if f.approvalCenter.pendingRequestLifecycleID != lifecycleID {
+                    approvedRequests.append(pending)
                 }
             }
             try await Task.sleep(for: .milliseconds(10))

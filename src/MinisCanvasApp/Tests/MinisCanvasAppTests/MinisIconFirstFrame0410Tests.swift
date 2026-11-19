@@ -182,12 +182,12 @@ private final class IconFirstFrameHost0410<Content: View> {
         for x in 0..<bitmap.pixelsWide {
             for y in 0..<bitmap.pixelsHigh {
                 let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
-                // Original approved A7A orange D97707; test the rendered
-                // consumer, rather than comparing a token to itself.
+                // 第 1 套陶土橙 A84E2A（浅色强调，取代原 A7A 橙 D97707）；测试的是渲染出来的
+                // 像素，而不是拿 token 跟自己比较。
                 let matches = color.map {
-                    abs($0.redComponent - 217.0 / 255) < 0.10 &&
-                    abs($0.greenComponent - 119.0 / 255) < 0.10 &&
-                    abs($0.blueComponent - 7.0 / 255) < 0.10 && $0.alphaComponent > 0.9
+                    abs($0.redComponent - 168.0 / 255) < 0.10 &&
+                    abs($0.greenComponent - 78.0 / 255) < 0.10 &&
+                    abs($0.blueComponent - 42.0 / 255) < 0.10 && $0.alphaComponent > 0.9
                 } ?? false
                 if matches { orange += 1 }
                 if x >= left && x < right && y >= bottom && y < top {

@@ -144,7 +144,19 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         let extraHeaders: [String: String]
         let apiKey: String
         let probe: (@Sendable () -> Void)?
+        /// ChatGPT account sign-in: `apiKey` is a placeholder swapped for the live access token.
+        let usesChatGPTAccount: Bool
+
+        func replacingAPIKey(_ value: String) -> RequestAssemblyConfiguration {
+            RequestAssemblyConfiguration(
+                model: model, customBaseURL: customBaseURL, appendV1Suffix: appendV1Suffix,
+                extraHeaders: extraHeaders, apiKey: value, probe: probe,
+                usesChatGPTAccount: usesChatGPTAccount)
+        }
     }
+
+    /// True when the provider record signs in with a ChatGPT account instead of an API key.
+    private var usesChatGPTAccount: Bool { apiKey == ChatGPTAccountSession.credentialPlaceholder }
     /// Monotonic local generation fencing requests against a later model rebind.
     private var modelGeneration: UInt64 = 0
     /// The latest request nonce prevents a late result from an older request
@@ -723,6 +735,11 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         mediaCapabilities: ModelCapabilities? = nil
     ) -> ResponsesAPIRequestBody.InputMessage {
         typealias Part = ResponsesAPIRequestBody.InputMessage.ContentPart
+        // 历史里的助手消息：只回放文本，部件类型必须是 output_text（input_text 会让第二轮起整轮 400）。
+        if msg.role == .assistant {
+            return .init(role: msg.role.rawValue,
+                         content: msg.content.isEmpty ? [] : [.outputTextPart(msg.content)])
+        }
         var parts: [Part] = []
         for img in msg.images {
             if let capabilities = mediaCapabilities {
@@ -796,13 +813,29 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         }
         var specialItems: [ResponsesAPIRequestBody.InputItem] = []
         var containsSpecialItems = false
+        // 工具返回的图片：function_call_output 只能放文字，图片在这一批连续工具输出之后追加成 user 消息。
+        var toolNames: [String: String] = [:]
+        var pendingImageMessages: [LLMMessage] = []
+        func flushToolImages() {
+            for imageMessage in pendingImageMessages {
+                specialItems.append(.message(responsesInputItem(imageMessage, mediaCapabilities: model.capabilities)))
+            }
+            pendingImageMessages.removeAll()
+        }
         for message in messages {
+            if message.role != .tool { flushToolImages() }
+            for call in message.toolCalls { toolNames[call.id] = call.name }
             if message.role == .tool {
                 containsSpecialItems = true
                 specialItems.append(.functionCallOutput(
                     callID: message.toolCallID ?? "unknown_tool_call",
                     output: message.content
                 ))
+                if !message.images.isEmpty {
+                    let name = message.toolCallID.flatMap { toolNames[$0] } ?? "未知工具"
+                    pendingImageMessages.append(LLMMessage(role: .user, content: "[工具 \(name) 返回的图片]",
+                                                           images: message.images))
+                }
             } else if !message.toolCalls.isEmpty {
                 containsSpecialItems = true
                 if !message.content.isEmpty {
@@ -816,12 +849,17 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
                     ))
                 }
             } else {
+                // 空的助手消息（例如被中断、没有文字也没有工具调用）不回放：空 content 会被拒。
+                if message.role == .assistant && message.content.isEmpty { continue }
                 specialItems.append(.message(responsesInputItem(message, mediaCapabilities: model.capabilities)))
             }
         }
+        flushToolImages()
         let input: AnyCodableInput = containsSpecialItems
             ? .items(specialItems)
-            : .messages(messages.map { responsesInputItem($0, mediaCapabilities: model.capabilities) })
+            : .messages(messages
+                .filter { !($0.role == .assistant && $0.content.isEmpty) }
+                .map { responsesInputItem($0, mediaCapabilities: model.capabilities) })
         return ResponsesAPIRequestBody(
             model: model.id,
             input: input,
@@ -845,7 +883,14 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
     ) async throws -> URLRequest {
         // Freeze every mutable wire input before leaving the caller's actor.
         // A later model/endpoint rebind cannot change the in-flight bytes.
-        let configuration = try requestConfiguration(for: identity)
+        let frozenConfiguration = try requestConfiguration(for: identity)
+        let configuration: RequestAssemblyConfiguration
+        if frozenConfiguration.usesChatGPTAccount {
+            // The access token rotates hourly: resolve it per request, never at construction.
+            configuration = frozenConfiguration.replacingAPIKey(try await Self.chatGPTAccessToken())
+        } else {
+            configuration = frozenConfiguration
+        }
         let applicationObserver = AssistantThinkingParameters.reportApplication
         let worker = Task.detached(priority: .userInitiated) {
             try Self.buildRequest(
@@ -878,7 +923,8 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         return RequestAssemblyConfiguration(
             model: storedModel, customBaseURL: storedCustomBaseURL,
             appendV1Suffix: storedAppendV1Suffix, extraHeaders: storedExtraHeaders,
-            apiKey: apiKey, probe: requestAssemblyProbe
+            apiKey: apiKey, probe: requestAssemblyProbe,
+            usesChatGPTAccount: usesChatGPTAccount
         )
     }
 
@@ -906,6 +952,10 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         ) else {
             throw LLMError.providerError(message: "Invalid Responses API base URL")
         }
+        // The ChatGPT access token may only ever go to the official API host.
+        if configuration.usesChatGPTAccount, !ChatGPTAccountEndpoints.isOfficialAPIURL(url) {
+            throw LLMError.providerError(message: "ChatGPT 账号只能连接官方接口地址。")
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -932,7 +982,62 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         } else {
             request.httpBody = encodedBody
         }
+        if configuration.usesChatGPTAccount,
+           let finalBody = request.httpBody,
+           var wireBody = try JSONSerialization.jsonObject(with: finalBody) as? [String: Any] {
+            ChatGPTAccountRequestPolicy.rewrite(&wireBody)
+            request.httpBody = try JSONSerialization.data(withJSONObject: wireBody, options: [.sortedKeys])
+        }
         return request
+    }
+
+    /// Live ChatGPT access token (refreshes ahead of expiry). Failures carry fixed Chinese guidance.
+    private static func chatGPTAccessToken() async throws -> String {
+        guard let session = ChatGPTAccountSessions.shared else {
+            throw LLMError.providerError(message: ChatGPTAccountError.notSignedIn.localizedDescription)
+        }
+        do {
+            return try await session.accessToken()
+        } catch is CancellationError {
+            throw LLMError.cancelled
+        } catch let failure as ChatGPTAccountError {
+            if failure == .cancelled { throw LLMError.cancelled }
+            if failure == .requestFailed { throw LLMError.transientError(message: failure.localizedDescription) }
+            throw LLMError.providerError(message: failure.localizedDescription)
+        }
+    }
+
+    /// Non-2xx before a stream opens. The error body is read (bounded) for every account
+    /// type, only to pick fixed local guidance (ChatGPT plan usage, context overflow,
+    /// insufficient balance); the body text itself never reaches the UI or the logs.
+    private func httpFailure(
+        statusCode: Int,
+        headers: [String: String],
+        bytes: URLSession.AsyncBytes,
+        identity: RequestIdentity
+    ) async -> LLMError {
+        var body = Data()
+        do {
+            for try await byte in bytes {
+                body.append(byte)
+                if body.count >= 16 * 1024 { break }
+            }
+        } catch {}
+        if usesChatGPTAccount {
+            if statusCode == 401 { await ChatGPTAccountSessions.shared?.noteRejectedAccessToken() }
+            // 诊断：只把状态码和服务端错误的类型/代码/字段名（标识符形态）写进本机系统日志，
+            // 不写 message 与正文；界面仍只显示本地固定文案。
+            logger.error("ChatGPT 账号请求被拒 " + ChatGPTAccountErrors.diagnosticSummary(statusCode: statusCode, body: body))
+            if isCurrent(identity), let mapped = ChatGPTAccountErrors.llmError(statusCode: statusCode, body: body) {
+                return mapped
+            }
+        }
+        return mapHTTPError(
+            statusCode: statusCode,
+            headers: headers,
+            body: String(decoding: body, as: UTF8.self),
+            identity: identity
+        )
     }
 
     // MARK: - LLMProvider
@@ -962,6 +1067,20 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         // A cancelled caller must never start an attempt that can later
         // project a buffered response into ChatAgentEngine.
         guard !Task.isCancelled else { throw LLMError.cancelled }
+        if usesChatGPTAccount {
+            // ChatGPT plan usage only accepts streamed requests: collect the stream.
+            var terminal: LLMResponse?
+            let events = try await streamAssistantMessage(
+                messages: messages, systemPrompt: systemPrompt, tools: tools,
+                maxTokens: maxTokens, temperature: temperature, thinkingLevel: nil)
+            for try await event in events {
+                if case .completed(let response) = event { terminal = response }
+            }
+            guard let terminal else {
+                throw LLMError.decodingError(underlying: ResponsesAPIError.prematureStreamEnd)
+            }
+            return terminal
+        }
         let identity = try beginRequestIdentity(stream: false)
         let request = try await buildRequestOffMain(
             messages: messages,
@@ -1101,10 +1220,10 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         let statusCode = httpResponse?.statusCode ?? -1
 
         if !(200..<300).contains(statusCode) {
-            throw mapHTTPError(
+            throw await httpFailure(
                 statusCode: statusCode,
                 headers: Self.stringHeaders(from: httpResponse),
-                body: "",
+                bytes: byteStream,
                 identity: identity
             )
         }
@@ -1350,7 +1469,8 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
                         return true
                     case .failed(let message):
                         receivedTerminator = true
-                        throw streamFailure(identity: identity, message: message)
+                        let failedCode = ((json["response"] as? [String: Any])?["error"] as? [String: Any])?["code"] as? String
+                        throw streamFailure(identity: identity, code: failedCode, message: message, serverReported: true)
                     case .incomplete(let reason):
                         guard isCurrent(identity) else { throw LLMError.cancelled }
                         try Task.checkCancellation()
@@ -1363,7 +1483,7 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
                         return true
                     case .error(let code, let message):
                         receivedTerminator = true
-                        throw streamFailure(identity: identity, code: code, message: message)
+                        throw streamFailure(identity: identity, code: code, message: message, serverReported: true)
                     case .ignored:
                         try commitTransaction(responseBody: canonicalPayload)
                     }
@@ -1898,6 +2018,9 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
     ) -> LLMError {
         guard isCurrent(identity) else { return .cancelled }
         if ProviderContextOverflowClassifier.isOpenAIStyleOverflow(statusCode: statusCode, body: body) { return .contextLengthExceeded }
+        if ProviderHTTPErrorAdapter.indicatesQuotaExhausted(statusCode: statusCode, body: body) {
+            return .httpStatus(code: statusCode, detail: ProviderHTTPErrorAdapter.quotaDetail(statusCode: statusCode, headers: headers))
+        }
         return ProviderHTTPErrorAdapter.classify(statusCode: statusCode, headers: headers).llmError
     }
 
@@ -3182,14 +3305,36 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
         return normalized
     }
 
+    /// 本机日志里的失败原因（V-11）。`message` 是本地写死的原因短语时原样记录；
+    /// 来自服务端的事件（`serverReported`）只记“服务端返回失败事件”和已识别的固定错误码，
+    /// 不写服务端原文、令牌或请求体。
+    static func streamFailureDiagnostic(code: String?, message: String, serverReported: Bool) -> String {
+        guard serverReported else { return "Responses 流失败：" + message }
+        switch code {
+        case "context_length_exceeded", "insufficient_quota":
+            return "Responses 流失败：服务端返回失败事件（\(code ?? "")）"
+        default:
+            return "Responses 流失败：服务端返回失败事件"
+        }
+    }
+
     private func streamFailure(
         identity: RequestIdentity,
         code: String? = nil,
-        message _: String
+        message: String,
+        serverReported: Bool = false
     ) -> LLMError {
         guard isCurrent(identity) else { return .cancelled }
-        _ = code
-        return .providerError(message: "Responses API stream error")
+        logger.error(Self.streamFailureDiagnostic(code: code, message: message, serverReported: serverReported))
+        // 只按固定错误码映射成类型化错误；服务端的 message 不进入任何错误表面。
+        switch code {
+        case "context_length_exceeded":
+            return .contextLengthExceeded
+        case "insufficient_quota":
+            return .httpStatus(code: 429, detail: ProviderHTTPErrorAdapter.quotaDetail(statusCode: 429))
+        default:
+            return .providerError(message: "Responses API stream error")
+        }
     }
 }
 
@@ -3290,10 +3435,10 @@ extension OpenAIResponsesProvider: AssistantStreamingLLMProvider {
         let statusCode = httpResponse?.statusCode ?? -1
 
         if !(200..<300).contains(statusCode) {
-            throw mapHTTPError(
+            throw await httpFailure(
                 statusCode: statusCode,
                 headers: Self.stringHeaders(from: httpResponse),
-                body: "",
+                bytes: byteStream,
                 identity: identity
             )
         }
@@ -3317,6 +3462,11 @@ extension OpenAIResponsesProvider: AssistantStreamingLLMProvider {
                 // Append-only mirror of the forwarded text deltas. The
                 // terminal must equal it (seam contract 1) before admission.
                 var streamedText = ""
+                // Finished output items, in stream order. The ChatGPT account
+                // backend (store: false) may send `response.completed` with an
+                // empty `output`; like Codex, the terminal is then rebuilt from
+                // these validated `response.output_item.done` items.
+                var doneOutputItems: [[String: Any]] = []
 
                 func discardTransaction() {
                     eventData.removeAll(keepingCapacity: false)
@@ -3519,6 +3669,7 @@ extension OpenAIResponsesProvider: AssistantStreamingLLMProvider {
                                 throw streamFailure(identity: identity, message: "invalid output item identity")
                             }
                         }
+                        if eventName == "response.output_item.done" { doneOutputItems.append(item) }
                     default:
                         break
                     }
@@ -3548,8 +3699,14 @@ extension OpenAIResponsesProvider: AssistantStreamingLLMProvider {
                             // Response object.
                             throw streamFailure(identity: identity, message: "invalid terminal response")
                         }
+                        var terminalObject = terminalResponse
+                        if usesChatGPTAccount,
+                           (terminalResponse["output"] as? [Any])?.isEmpty ?? true,
+                           !doneOutputItems.isEmpty {
+                            terminalObject["output"] = doneOutputItems
+                        }
                         let terminal = try assistantStreamTerminal(
-                            from: terminalResponse,
+                            from: terminalObject,
                             streamedText: streamedText,
                             identity: identity
                         )
@@ -3560,15 +3717,21 @@ extension OpenAIResponsesProvider: AssistantStreamingLLMProvider {
                         return true
                     case "response.failed":
                         receivedTerminator = true
-                        let message = ((json["response"] as? [String: Any])?["error"] as? [String: Any])?["message"] as? String
-                            ?? "response failed"
-                        throw streamFailure(identity: identity, message: message)
+                        let failedError = (json["response"] as? [String: Any])?["error"] as? [String: Any]
+                        if usesChatGPTAccount, isCurrent(identity),
+                           let mapped = ChatGPTAccountErrors.llmError(code: failedError?["code"] as? String) {
+                            throw mapped
+                        }
+                        let message = failedError?["message"] as? String ?? "response failed"
+                        throw streamFailure(identity: identity, code: failedError?["code"] as? String, message: message,
+                                            serverReported: true)
                     case "error":
                         receivedTerminator = true
                         throw streamFailure(
                             identity: identity,
                             code: json["code"] as? String,
-                            message: json["message"] as? String ?? "unknown stream error"
+                            message: json["message"] as? String ?? "unknown stream error",
+                            serverReported: true
                         )
                     default:
                         // response.created / response.in_progress /

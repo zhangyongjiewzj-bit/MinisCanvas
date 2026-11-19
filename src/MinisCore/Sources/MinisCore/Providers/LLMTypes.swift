@@ -147,8 +147,9 @@ extension LLMModel {
     public static let gpt52 = LLMModel(id: "gpt-5.2", displayName: "GPT-5.2", provider: "OpenAI")
     public static let gpt5 = LLMModel(id: "gpt-5", displayName: "GPT-5", provider: "OpenAI")
     public static let gpt41 = LLMModel(id: "gpt-4.1", displayName: "GPT-4.1", provider: "OpenAI")
-    public static let gpt4o = LLMModel(id: "gpt-4o", displayName: "GPT-4o", provider: "OpenAI")
-    public static let gpt4oMini = LLMModel(id: "gpt-4o-mini", displayName: "GPT-4o Mini", provider: "OpenAI")
+    // R3-08：只给官方输出上限低于聊天默认值（32000）的模型补上限；其余模型的官方上限都不低于 32000，默认值已在范围内。
+    public static let gpt4o = LLMModel(id: "gpt-4o", displayName: "GPT-4o", provider: "OpenAI", maxOutputTokens: 16384)
+    public static let gpt4oMini = LLMModel(id: "gpt-4o-mini", displayName: "GPT-4o Mini", provider: "OpenAI", maxOutputTokens: 16384)
     public static let o3 = LLMModel(id: "o3", displayName: "o3", provider: "OpenAI")
     public static let o3Mini = LLMModel(id: "o3-mini", displayName: "o3 Mini", provider: "OpenAI")
     public static let o4Mini = LLMModel(id: "o4-mini", displayName: "o4 Mini", provider: "OpenAI")
@@ -157,7 +158,7 @@ extension LLMModel {
 
     public static let orClaudeSonnet4 = LLMModel(id: "anthropic/claude-sonnet-4", displayName: "Claude Sonnet 4", provider: "OpenRouter")
     public static let orGemini25Flash = LLMModel(id: "google/gemini-2.5-flash", displayName: "Gemini 2.5 Flash", provider: "OpenRouter")
-    public static let orGPT4o = LLMModel(id: "openai/gpt-4o", displayName: "GPT-4o", provider: "OpenRouter")
+    public static let orGPT4o = LLMModel(id: "openai/gpt-4o", displayName: "GPT-4o", provider: "OpenRouter", maxOutputTokens: 16384)
     public static let orLlama4Maverick = LLMModel(id: "meta-llama/llama-4-maverick", displayName: "Llama 4 Maverick", provider: "OpenRouter")
     public static let allOpenRouter: [LLMModel] = [.orClaudeSonnet4, .orGemini25Flash, .orGPT4o, .orLlama4Maverick]
 
@@ -281,6 +282,17 @@ public struct LLMToolCall: @unchecked Sendable {
     public let name: String
     public let rawArguments: String
     public let arguments: [String: Any]
+    /// Anthropic 开启思考后，带工具调用的多轮请求必须原样回传本轮的 thinking /
+    /// redacted_thinking 块（含 signature）。只挂在该轮第一个工具调用上，
+    /// 仅用于 Anthropic 请求序列化；不进入正文、不展示、不跨会话持久化。
+    public var thinkingBlocks: [[String: Any]] = []
+    /// DeepSeek 思考模式 + 工具调用：同一轮内的后续请求必须把本轮助手消息的
+    /// reasoning_content 原样回传（否则 400）。同样只挂在该轮第一个工具调用上；
+    /// 仅在目标模型声明了 `interleavedReasoningField` 时才写进请求，不展示、不持久化，跨轮丢弃。
+    public var reasoningContent: String?
+    /// 参数超过边界上限（64KB、数组或对象元素过多等）：这个调用不会被执行，
+    /// 参数已被换成空对象，AgentLoop 给模型回一条固定的工具错误让它分段（V-6）。
+    public var argumentsExceedLimit = false
     public init(id: String, name: String, rawArguments: String, arguments: [String: Any]) {
         self.id = id
         self.name = name

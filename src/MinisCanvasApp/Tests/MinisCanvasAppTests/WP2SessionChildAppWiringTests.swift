@@ -165,9 +165,9 @@ struct WP2SessionChildAppWiringTests {
         var stoppedBTurn: Task<Void, Never>?
         var originalError: (any Error)?
         do {
-            bridge.chat.draftText = "会话 A"
-            bridge.chat.sendDraft()
-            try await Task.sleep(for: .milliseconds(50))
+            // A is idle history: forking a session that is still generating is refused (D-3),
+            // so the fork source here has a settled message, while B keeps streaming.
+            bridge.chat.appendUser("会话 A")
             let sessionA = try #require(bridge.chat.activeSessionID)
 
             _ = try bridge.performSessionAction(.new(title: "会话 B"))

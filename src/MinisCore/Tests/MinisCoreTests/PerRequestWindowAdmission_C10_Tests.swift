@@ -80,6 +80,35 @@ struct PerRequestWindowAdmissionC10Tests {
         #expect(provider.requests[5].filter { $0.role == .tool }.allSatisfy { $0.content.count == 20_000 })
     }
 
+    // R3-05: the same 20-round turn in a sub-agent run, with no App projection in
+    // front of the provider: the loop must shrink the request itself.
+    @Test func loopAppliedReductionShrinksOlderResultsWithoutAnAppProjection() async throws {
+        let root = try minisCoreToolContractRoot("c10-standalone")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let admission = try #require(ContextAdmissionConfig(
+            windowTokens: 100_000, triggerFraction: 0.8,
+            allowsCompaction: false, appliesReductionInLoop: true))
+        var outcomes: [ScriptedWindowProvider.Outcome] = (1...20).map { .response(windowTestToolCallResponse("c\($0)")) }
+        outcomes.append(.response(LLMResponse(text: "读完了", stopReason: nil, usage: nil)))
+        let provider = ScriptedWindowProvider(outcomes: outcomes)
+
+        let result = try await makeLoop(admission: admission, root: root).run(
+            messages: [LLMMessage(role: .user, content: "把这 20 个文件都读一遍")],
+            systemPrompt: nil, provider: provider,
+            toolExecutor: LargeResultToolExecutor(characters: 20_000),
+            tools: minisCoreToolContractCatalog(["file_read"]),
+            executionIdentity: minisCoreToolContractIdentity("c10-standalone"))
+
+        #expect(result.messages.last?.content == "读完了")
+        #expect(provider.callCount == 21)
+        #expect(result.messages.filter { $0.role == .tool }.allSatisfy { $0.content.count == 20_000 })
+        let last = provider.requests[20].filter { $0.role == .tool }
+        #expect(last.count == 20)
+        #expect(last.prefix(14).allSatisfy { $0.content.count < 1_700 })
+        #expect(last.suffix(6).allSatisfy { $0.content.count == 20_000 })
+        #expect(provider.requests[5].filter { $0.role == .tool }.allSatisfy { $0.content.count == 20_000 })
+    }
+
     @Test func belowTheTriggerNothingIsReducedAndAdmissionIsInvisible() async throws {
         let root = try minisCoreToolContractRoot("c10-below")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -115,6 +144,29 @@ struct PerRequestWindowAdmissionC10Tests {
         #expect(provider.callCount == 1)
         #expect(provider.requests[0].count < history.count)
         #expect(windowTestCharacterCount(provider.requests[0]) * 2 < windowTestCharacterCount(history))
+    }
+
+    // R3-05: background, project and scheduled turns must not rewrite their history.
+    @Test func aRunThatDisallowsCompactionSendsTheFullHistoryInTheTriggerBand() async throws {
+        let root = try minisCoreToolContractRoot("c10-nocompact")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let reduction = ContextReductionState()
+        // About 86% of the 7k window (15 messages of ~400 estimated tokens): inside the 80%-95% band.
+        let admission = try #require(ContextAdmissionConfig(
+            windowTokens: 7_000, triggerFraction: 0.8, reduction: reduction, allowsCompaction: false))
+        let history = windowTestRepeatedHistory(messages: 15, characters: 400)
+            + [LLMMessage(role: .user, content: "继续")]
+        let provider = ScriptedWindowProvider(
+            outcomes: [.response(LLMResponse(text: "好", stopReason: nil, usage: nil))],
+            deliver: { reduction.apply($0) })
+        let result = try await makeLoop(admission: admission, root: root).run(
+            messages: history, systemPrompt: nil, provider: provider,
+            toolExecutor: LargeResultToolExecutor(characters: 1), tools: [],
+            executionIdentity: minisCoreToolContractIdentity("c10-nocompact"))
+        #expect(result.messages.last?.content == "好")
+        #expect(provider.callCount == 1)
+        #expect(provider.requests[0].count == history.count)
+        #expect(windowTestCharacterCount(provider.requests[0]) == windowTestCharacterCount(history))
     }
 
     @Test func firstRequestWithoutAnchorUsesTheLocalEstimate() async throws {
@@ -170,6 +222,69 @@ struct PerRequestWindowAdmissionC10Tests {
         #expect(provider.requests[0] == history)
     }
 
+    // C3-05: a failed summary request (rate limit, timeout, offline) is handled like a refusal.
+    @Test func aFailedSummaryRequestBelowNinetyFivePercentStillSends() async throws {
+        let root = try minisCoreToolContractRoot("c10-summary-failed")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let admission = try #require(ContextAdmissionConfig(windowTokens: 10_000, triggerFraction: 0.8))
+        let history = (0..<9).map {
+            LLMMessage(role: $0 % 2 == 0 ? .user : .assistant,
+                       content: String((0..<1_000).map { "v\($0 * 11 + 3)" }.joined(separator: " ").prefix(3_780 + $0)) + "#\($0)")
+        }
+        let provider = ScriptedWindowProvider(outcomes: [])
+        var loop = try makeLoop(admission: admission, root: root)
+        loop.automaticCompaction = { _, _, _ in throw LLMError.rateLimited }
+        _ = try await loop.run(
+            messages: history, systemPrompt: nil, provider: provider,
+            toolExecutor: LargeResultToolExecutor(characters: 1), tools: [],
+            currentConversationID: "c10-summary-failed",
+            executionIdentity: minisCoreToolContractIdentity("c10-summary-failed", sessionID: "c10-summary-failed"))
+        #expect(provider.callCount == 1)
+        #expect(provider.requests[0] == history)
+    }
+
+    @Test func aFailedSummaryRequestAtNinetyFivePercentStillBlocksWithTheTypedError() async throws {
+        let root = try minisCoreToolContractRoot("c10-summary-failed-blocked")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let admission = try #require(ContextAdmissionConfig(windowTokens: 10_000, triggerFraction: 0.8))
+        let history = (0..<10).map {
+            LLMMessage(role: $0 % 2 == 0 ? .user : .assistant,
+                       content: String((0..<1_000).map { "w\($0 * 7 + 1)" }.joined(separator: " ").prefix(4_700 + $0)) + "#\($0)")
+        }
+        let provider = ScriptedWindowProvider(outcomes: [])
+        var loop = try makeLoop(admission: admission, root: root)
+        loop.automaticCompaction = { _, _, _ in throw LLMError.rateLimited }
+        await #expect(throws: AgentLoopError.self) {
+            _ = try await loop.run(
+                messages: history, systemPrompt: nil, provider: provider,
+                toolExecutor: LargeResultToolExecutor(characters: 1), tools: [],
+                currentConversationID: "c10-summary-failed-blocked",
+                executionIdentity: minisCoreToolContractIdentity("c10-summary-failed-blocked", sessionID: "c10-summary-failed-blocked"))
+        }
+        #expect(provider.callCount == 0)
+    }
+
+    @Test func aCancelledSummaryRequestStillPropagates() async throws {
+        let root = try minisCoreToolContractRoot("c10-summary-cancelled")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let admission = try #require(ContextAdmissionConfig(windowTokens: 10_000, triggerFraction: 0.8))
+        let history = (0..<9).map {
+            LLMMessage(role: $0 % 2 == 0 ? .user : .assistant,
+                       content: String((0..<1_000).map { "v\($0 * 11 + 3)" }.joined(separator: " ").prefix(3_780 + $0)) + "#\($0)")
+        }
+        let provider = ScriptedWindowProvider(outcomes: [])
+        var loop = try makeLoop(admission: admission, root: root)
+        loop.automaticCompaction = { _, _, _ in throw LLMError.cancelled }
+        await #expect(throws: LLMError.self) {
+            _ = try await loop.run(
+                messages: history, systemPrompt: nil, provider: provider,
+                toolExecutor: LargeResultToolExecutor(characters: 1), tools: [],
+                currentConversationID: "c10-summary-cancelled",
+                executionIdentity: minisCoreToolContractIdentity("c10-summary-cancelled", sessionID: "c10-summary-cancelled"))
+        }
+        #expect(provider.callCount == 0)
+    }
+
     // Judged transcript, 85%: no compaction, reduction still activates, request goes out.
     @Test func anAlreadyJudgedTranscriptSkipsCompactionButStillReducesOldImages() async throws {
         let root = try minisCoreToolContractRoot("c10-judged")
@@ -178,10 +293,11 @@ struct PerRequestWindowAdmissionC10Tests {
         let admission = try #require(ContextAdmissionConfig(
             windowTokens: 7_000, triggerFraction: 0.8, reduction: reduction, compactionAlreadyJudged: true))
         let secretImageBytes = Data(repeating: 0xAB, count: 3_000)
-        var history = windowTestRepeatedHistory(messages: 59, characters: 400)
+        // 中日韩字符按约 1 个 token 一个字估算：每条 100 字 ≈ 100 token，整体约 85%。
+        var history = windowTestRepeatedHistory(messages: 59, characters: 100)
             + [LLMMessage(role: .user, content: "继续")]
         history[0] = LLMMessage(
-            role: .user, content: String(repeating: "重复内容", count: 100),
+            role: .user, content: String(repeating: "重复内容", count: 25),
             images: [LLMMessage.ImageAttachment(mimeType: "image/png", data: secretImageBytes)])
         let provider = ScriptedWindowProvider(outcomes: [], deliver: { reduction.apply($0) })
         _ = try await makeLoop(admission: admission, root: root).run(
@@ -201,9 +317,10 @@ struct PerRequestWindowAdmissionC10Tests {
         defer { try? FileManager.default.removeItem(at: root) }
         let projection: @Sendable ([LLMMessage]) throws -> [LLMMessage] = { Array($0.suffix(20)) }
         // Raw: 200 x 100 = 20,000 tokens (333% of the window). Projected: 2,000 (33%).
+        // 每条 100 个汉字，按中日韩约 1 token 一字估算即 100 token。
         let admission = try #require(ContextAdmissionConfig(
             windowTokens: 6_000, triggerFraction: 0.8, deliveryProjection: projection))
-        let history = windowTestRepeatedHistory(messages: 199, characters: 400)
+        let history = windowTestRepeatedHistory(messages: 199, characters: 100)
             + [LLMMessage(role: .user, content: "继续")]
         let provider = ScriptedWindowProvider(outcomes: [], deliver: { Array($0.suffix(20)) })
         _ = try await makeLoop(admission: admission, root: root).run(
@@ -214,5 +331,34 @@ struct PerRequestWindowAdmissionC10Tests {
         #expect(provider.requests[0].count == 20, "neither compacted nor refused")
         var run = ContextAdmissionRun(config: admission)
         #expect(try run.decide(messages: history, systemPrompt: "") == .proceed)
+    }
+}
+
+/// C-3：准入给本轮输出留空间（输入 + max_tokens 不能超过窗口的接口）。
+struct OutputReserveAdmissionTests {
+    // 约 7.6k 估算 token：低于 10k×0.8=8k（无预留时放行），高于 10k-2.5k=7.5k（预留封顶，压缩）。
+    private let history = windowTestRepeatedHistory(messages: 19, characters: 400)
+        + [LLMMessage(role: .user, content: "继续")]
+
+    @Test func withoutAReserveTheSameInputStillProceeds() throws {
+        let admission = try #require(ContextAdmissionConfig(windowTokens: 10_000, triggerFraction: 0.8))
+        var run = ContextAdmissionRun(config: admission)
+        #expect(try run.decide(messages: history, systemPrompt: "") == .proceed)
+    }
+
+    @Test func aReserveShrinksTheInputWindowSoCompactionStartsEarlier() throws {
+        let admission = try #require(ContextAdmissionConfig(
+            windowTokens: 10_000, triggerFraction: 0.8, outputReserveTokens: 2_500))
+        #expect(admission.inputWindowTokens == 7_500)
+        var run = ContextAdmissionRun(config: admission)
+        guard case .compact = try run.decide(messages: history, systemPrompt: "") else {
+            Issue.record("expected compact"); return
+        }
+    }
+
+    @Test func theReserveIsCappedAtAQuarterOfTheWindow() throws {
+        let admission = try #require(ContextAdmissionConfig(
+            windowTokens: 10_000, triggerFraction: 0.8, outputReserveTokens: 32_000))
+        #expect(admission.inputWindowTokens == 7_500)
     }
 }

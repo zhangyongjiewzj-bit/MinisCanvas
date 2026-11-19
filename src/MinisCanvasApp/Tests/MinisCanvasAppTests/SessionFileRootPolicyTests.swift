@@ -25,6 +25,19 @@ struct SessionFileRootPolicyTests {
             sessionDirectory: storage, sessionID: id).path == storage.path + "/workspaces/" + id.uuidString)
     }
 
+    @Test func projectlessWorkspaceLeavesApplicationSupportButIsolatedProfilesStayPut() throws {
+        let id = UUID()
+        let support = try #require(FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+        let production = SessionFileRootPolicy.root(explicit: nil, workingDirectory: nil,
+            sessionDirectory: support.appendingPathComponent("MinisCanvas", isDirectory: true),
+            sessionID: id, home: "/synthetic/home")
+        #expect(production.path == "/synthetic/home/MinisCanvas工作区/" + id.uuidString)
+        let isolated = SessionFileRootPolicy.root(explicit: nil, workingDirectory: nil,
+            sessionDirectory: URL(fileURLWithPath: "/synthetic/profile/sessions"), sessionID: id,
+            home: "/synthetic/home")
+        #expect(isolated.path == "/synthetic/profile/sessions/workspaces/" + id.uuidString)
+    }
+
     @Test func legacySchemaRetainsExplicitSettingsAndRecordsVersion() throws {
         let decoder = JSONDecoder()
         let implicit = try decoder.decode(PrivacySettings.self, from: Data("{}".utf8))

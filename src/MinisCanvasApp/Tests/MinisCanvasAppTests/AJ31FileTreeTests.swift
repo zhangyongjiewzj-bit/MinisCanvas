@@ -129,3 +129,68 @@ struct FileKindAndPreviewTests {
         #expect(missing.error != nil)
     }
 }
+
+@Suite("文件树：隐藏文件 / 按需加载 / 稳定 id / 预览")
+struct FileTreeBehaviorTests {
+    private func realPath(_ url: URL) -> URL {
+        guard let resolved = realpath(url.path, nil) else { return url }
+        defer { free(resolved) }
+        return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+    }
+
+    @Test func dotFilesShownButVersionControlHiddenAndIDsAreStablePaths() throws {
+        let root = realPath(try makeTreeDir())  // 节点 id 用真实路径（/var → /private/var）
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data("KEY=1".utf8).write(to: root.appendingPathComponent(".env"))
+        let first = FileTreeLogic.scanDirectory(at: root)
+        #expect(first.contains { $0.name == ".env" })
+        #expect(!first.contains { $0.name == ".git" })
+        let second = FileTreeLogic.scanDirectory(at: root)
+        #expect(first.map(\.id) == second.map(\.id))
+        #expect(first.first { $0.name == "src" }?.id == root.appendingPathComponent("src").path)
+    }
+
+    @Test func buildDirectoryIsListedCollapsedAndLoadsOnDemand() throws {
+        let root = realPath(try makeTreeDir())  // 节点 id 用真实路径（/var → /private/var）
+        defer { try? FileManager.default.removeItem(at: root) }
+        let build = root.appendingPathComponent("build", isDirectory: true)
+        try FileManager.default.createDirectory(at: build, withIntermediateDirectories: true)
+        try Data("o".utf8).write(to: build.appendingPathComponent("out.bin"))
+        let nodes = FileTreeLogic.scanDirectory(at: root)
+        let node = try #require(nodes.first { $0.name == "build" })
+        #expect(node.isDirectory && !node.isLoaded && node.children.isEmpty)
+        let children = FileTreeLogic.scanDirectory(at: build, maxDepth: 0)
+        let updated = FileTreeLogic.replacingChildren(in: nodes, path: build.path, with: children)
+        let loaded = try #require(updated.first { $0.name == "build" })
+        #expect(loaded.isLoaded && loaded.children.map(\.name) == ["out.bin"])
+        // 用户已展开的大目录在刷新时直接读入。
+        let refreshed = FileTreeLogic.scanDirectory(at: root, expanded: [build.path])
+        #expect(refreshed.first { $0.name == "build" }?.isLoaded == true)
+    }
+
+    @Test func typeScriptAndUnknownTextFilesPreviewAsText() throws {
+        let root = try makeTreeDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        #expect(FileKind(url: URL(fileURLWithPath: "/x/app.ts")) == .text)
+        #expect(FileKind(url: URL(fileURLWithPath: "/x/app.tsx")) == .text)
+        try Data("export const a = 1".utf8).write(to: root.appendingPathComponent("app.ts"))
+        try Data("all: build\n".utf8).write(to: root.appendingPathComponent("Makefile"))
+        try Data([0x47, 0x00, 0x01, 0x02, 0x00, 0xFF]).write(to: root.appendingPathComponent("clip.ts"))
+        #expect(FilePreview.load(url: root.appendingPathComponent("app.ts")).text == "export const a = 1")
+        let makefile = FilePreview.load(url: root.appendingPathComponent("Makefile"))
+        #expect(makefile.kind == .text && makefile.text == "all: build\n")
+        #expect(FilePreview.load(url: root.appendingPathComponent("clip.ts")).kind == .video)
+    }
+
+    @Test func largeTextFilePreviewReadsOnlyTheHead() throws {
+        let root = try makeTreeDir()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let big = root.appendingPathComponent("big.log")
+        try Data(String(repeating: "x", count: FilePreview.readByteLimit + 5_000).utf8).write(to: big)
+        let preview = FilePreview.load(url: big)
+        #expect(preview.error == nil)
+        // 正文先截断到上限，再追加“仅显示前 N MB”提示，提示不会被截掉。
+        #expect(preview.text?.count ?? Int.max <= FilePreview.textLimit + 100)
+        #expect(preview.text?.contains("仅显示前") == true)
+    }
+}

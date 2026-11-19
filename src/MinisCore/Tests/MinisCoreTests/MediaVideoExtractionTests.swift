@@ -144,15 +144,26 @@ struct MediaVideoExtractionTests {
         ), .encodingFailed)
     }
 
-    @Test func duplicateActualTimeAndLaterFailureNeverReturnPartialFrames() async {
-        let sameActualTime = SyntheticVideoFrameSource(samples: [
+    /// M-08：画面不动的视频（系统录屏）相邻取样时刻取到同一帧时跳过重复帧，不再整段失败。
+    @Test func sampleLandingOnTheSameFrameIsSkippedNotFatal() async {
+        let source = SyntheticVideoFrameSource(samples: [
             0.2: syntheticSample(time: 0.2),
-            0.4: syntheticSample(time: 0.2)
+            0.4: syntheticSample(time: 0.2),
+            0.8: syntheticSample(time: 0.8)
         ])
-        expectFailure(await MediaVideoExtraction.extractFrames(
-            from: sameActualTime, requestedTimes: [0.2, 0.4], limits: limits
-        ), .duplicateTime)
+        let result = await MediaVideoExtraction.extractFrames(
+            from: source, requestedTimes: [0.2, 0.4, 0.8],
+            limits: MediaVideoExtractionLimits(maxFrameCount: 3, maxPixelSize: 64, maxOutputBytes: 24)
+        )
+        guard case .success(let frames) = result else {
+            Issue.record("A repeated actual frame should be skipped, not fail the whole video")
+            return
+        }
+        #expect(frames.map(\.requestedSeconds) == [0.2, 0.8])
+        #expect(frames.map(\.timecodeSeconds) == [0.2, 0.8])
+    }
 
+    @Test func laterFailureAndInvalidActualTimesNeverReturnPartialFrames() async {
         let nonFiniteActual = SyntheticVideoFrameSource(samples: [
             0.2: syntheticSample(time: .nan)
         ])
@@ -206,5 +217,32 @@ struct MediaVideoExtractionTests {
         } catch {
             Issue.record("Adapter must return a typed, path-free error")
         }
+    }
+}
+
+/// A source whose PNG size follows the requested pixel bound, like a real decoder.
+private struct SizeFollowsPixelBoundSource: MediaVideoFrameSource {
+    func durationSeconds() async throws -> Double { 10 }
+    func pngFrame(at seconds: Double, maxPixelSize: Int) async throws -> MediaVideoFrameSample {
+        var png = Data([0x89, 0x50, 0x4E, 0x47])
+        png.append(contentsOf: repeatElement(UInt8(0), count: maxPixelSize * 10))
+        return MediaVideoFrameSample(
+            pngData: png, actualSeconds: seconds, pixelWidth: min(maxPixelSize, 100), pixelHeight: 10)
+    }
+}
+
+@Suite("Video frames shrink to the byte budget instead of failing")
+struct MediaVideoFrameShrinkTests {
+    @Test func overBudgetFramesAreRetakenSmallerAndKeepTheirTimes() async {
+        // 768 px frames are ~7.7 KB each; the budget only fits ~3 KB per frame.
+        let limits = MediaVideoExtractionLimits(maxFrameCount: 3, maxPixelSize: 768, maxOutputBytes: 9_000)
+        let result = await MediaVideoExtraction.extractFrames(
+            from: SizeFollowsPixelBoundSource(), requestedTimes: [1, 5, 9], limits: limits)
+        guard case .success(let frames) = result else {
+            Issue.record("Over-budget frames should be retaken at a smaller size, not fail the batch")
+            return
+        }
+        #expect(frames.map(\.requestedSeconds) == [1, 5, 9])
+        #expect(frames.reduce(0) { $0 + $1.pngData.count } <= limits.maxOutputBytes)
     }
 }

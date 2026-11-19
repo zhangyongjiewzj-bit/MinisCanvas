@@ -96,6 +96,29 @@ struct MarkdownParserTests {
         #expect(blocks == [.list(items: ["甲"], ordered: false), .paragraph("普通段落")])
     }
 
+    @Test func nestedBulletsUnderOrderedKeepStructure() {
+        let blocks = MarkdownParser.parse("1. 第一\n   - 子项甲\n   - 子项乙\n2. 第二")
+        #expect(blocks == [.nestedList(items: [
+            MarkdownListItem(level: 0, ordered: true, number: 1, text: "第一"),
+            MarkdownListItem(level: 1, ordered: false, number: 0, text: "子项甲"),
+            MarkdownListItem(level: 1, ordered: false, number: 0, text: "子项乙"),
+            MarkdownListItem(level: 0, ordered: true, number: 2, text: "第二"),
+        ])])
+    }
+
+    @Test func orderedListKeepsStartAndSurvivesBlankLines() {
+        let blocks = MarkdownParser.parse("3. 三\n\n4. 四\n\n5. 五")
+        #expect(blocks == [.nestedList(items: [
+            MarkdownListItem(level: 0, ordered: true, number: 3, text: "三"),
+            MarkdownListItem(level: 0, ordered: true, number: 4, text: "四"),
+            MarkdownListItem(level: 0, ordered: true, number: 5, text: "五"),
+        ])])
+    }
+
+    @Test func headingWithHashInsideTextStaysHeading() {
+        #expect(MarkdownParser.parse("## C# 与 F# 入门") == [.heading(level: 2, text: "C# 与 F# 入门")])
+    }
+
     // MARK: - 表格
 
     @Test func tableParsing() {

@@ -110,7 +110,8 @@ struct PastedTextComposerSliceTests {
         #expect(global.contains("chat.activePastedTextDraft"))
         #expect(sidebar.contains("chat.activePastedTextDraft"))
         #expect(global.contains("chat.submitComposer()"))
-        #expect(sidebar.contains("chat.submitComposer()"))
+        // 侧栏起始提示按钮改为只预填（2026-11-16），侧栏只剩键盘提交入口。
+        #expect(sidebar.contains("chat.submitComposerFromKeyboard()"))
         #expect(global.contains("PastedTextComposerConsumer.accept"))
         #expect(sidebar.contains("PastedTextComposerConsumer.accept"))
     }

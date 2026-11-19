@@ -232,6 +232,8 @@ struct ChatCredentialBrokerTests {
         }
         #expect(!broker.replaceStream(messageID: id, with: "reply " + secret).contains(secret))
         broker.finishStream(messageID: id)
-        #expect(broker.projectStream(messageID: UUID(), current: "normal", append: " reply") == "normal reply")
+        let plain = UUID()
+        let shown = broker.projectStream(messageID: plain, current: "normal", append: " reply")
+        #expect(broker.finalizeStream(messageID: plain, current: shown)?.text == "normal reply")
     }
 }

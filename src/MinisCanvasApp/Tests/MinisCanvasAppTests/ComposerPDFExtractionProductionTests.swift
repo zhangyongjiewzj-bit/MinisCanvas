@@ -300,7 +300,32 @@ struct ComposerPDFExtractionProductionTests {
         }
     }
 
-    @Test("textless, corrupt and oversize PDFs remain visible failed drafts and never send")
+    @Test("PDF limits are 32 MB, 100 pages, 100000 characters and a 5 MB PDF is no longer oversize")
+    func pdfBetween4And32MBIsAccepted() async throws {
+        #expect(MediaConversion.defaultMaxPDFInputBytes == 32 * 1024 * 1024)
+        #expect(MediaConversion.defaultMaxPDFPages == 100)
+        #expect(MediaConversion.defaultMaxPDFCharacters == 100_000)
+        var padded = pdfFixture(pages: ["ALPHA large file"])
+        padded.append(Data(repeating: 0x20, count: 5 * 1024 * 1024))
+        #expect(padded.count > 4 * 1024 * 1024)
+        let paddedBytes = padded
+        let direct = await Task.detached(priority: .userInitiated) {
+            MediaConversion.extractPDFPages(paddedBytes)
+        }.value
+        if case .failure(.sourceTooLarge) = direct {
+            Issue.record("a 5 MB PDF must not exceed the 32 MB limit")
+        }
+        let chat = ChatStore()
+        let url = try writeFixture(padded, name: "five-mb.pdf")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        chat.addAttachments(urls: [url])
+        try await awaitSettled(chat)
+        let attachment = try #require(chat.pendingAttachments.first)
+        #expect(attachment.status == .ready)
+        #expect(String(data: try #require(attachment.data), encoding: .utf8)?.contains("ALPHA large file") == true)
+    }
+
+    @Test("corrupt PDFs remain visible failed drafts and never send; oversize PDFs become path references")
     func failedPDFsRequireExplicitRemoval() async throws {
         let chat = ChatStore()
         let textless = try writeFixture(pdfFixture(pages: [nil]), name: "scanned.pdf")
@@ -317,10 +342,15 @@ struct ComposerPDFExtractionProductionTests {
         chat.addAttachments(urls: [textless, corrupt, oversize])
         try await awaitSettled(chat)
         #expect(chat.pendingAttachments.count == 3)
-        #expect(chat.pendingAttachments.allSatisfy { $0.status == .failed && $0.data == nil })
-        #expect(chat.pendingAttachments[0].statusText?.contains("没有可提取文本") == true)
+        // 2026-11-16：没有文字层的扫描件不再直接失败——草稿里先渲染成页面图片，
+        // 发送时模型不支持看图才改为路径引用；所以草稿是带图片字节、可发送的非失败态。
+        // 损坏和超大的 PDF 仍是可见的失败草稿。
+        #expect(chat.pendingAttachments[0].status != .failed)
+        #expect(chat.pendingAttachments[0].kind == .image && chat.pendingAttachments[0].data != nil)
+        #expect(chat.pendingAttachments[1].status == .failed && chat.pendingAttachments[1].data == nil)
         #expect(chat.pendingAttachments[1].statusText?.contains("无法解析") == true)
-        #expect(chat.pendingAttachments[2].statusText?.contains("超过") == true)
+        #expect(chat.pendingAttachments[2].status == .ready && chat.pendingAttachments[2].kind == .file)
+        #expect(chat.pendingAttachments[2].data == nil && chat.pendingAttachments[2].fileURL == oversize.path)
         #expect(!chat.canSubmitComposerAttachments)
         chat.submitComposer()
         #expect(chat.draftText == "请读 PDF")

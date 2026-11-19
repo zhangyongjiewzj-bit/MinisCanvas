@@ -412,6 +412,36 @@ struct V7SkillReadAndQuestionApprovalTests {
         #expect(payload["sha256"] == SkillManifest.hash(raw))
     }
 
+    /// S-10：用户在设置里停用的技能，模型不能再用 skill_read 读出全文；重新启用后恢复可读。
+    @Test func readRefusesADisabledSkillAndWorksAgainOnceEnabled() throws {
+        let (root, store) = try store()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try store.importSkill(content: document("V7-DISABLED-BODY"))
+        let tool = SkillMaintenanceTool(store: store)
+        #expect(try tool.read(input: ["skillID": "v7-read"]).contains("V7-DISABLED-BODY"))
+        try #require(store.setEnabled("v7-read", enabled: false))
+        #expect(throws: SkillError.self) { _ = try tool.read(input: ["skillID": "v7-read"]) }
+        try #require(store.setEnabled("v7-read", enabled: true))
+        #expect(try tool.read(input: ["skillID": "v7-read"]).contains("V7-DISABLED-BODY"))
+    }
+
+    /// P3：磁盘上有 SKILL.md、但技能库还没收录（技能列表里查不到）的技能，skill_read 同样不返回全文。
+    @Test func readRefusesASkillThatIsNotInTheSkillList() throws {
+        let (root, store) = try store()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = try store.importSkill(content: document("V7-LISTED-BODY"))
+        let tool = SkillMaintenanceTool(store: store)
+        #expect(try tool.read(input: ["skillID": "v7-read"]).contains("V7-LISTED-BODY"))
+        // 技能库收录之后才放进磁盘的目录：rawContent 能读到，allSkills 里没有。
+        let late = root.appendingPathComponent("skills/late-skill", isDirectory: true)
+        try FileManager.default.createDirectory(at: late, withIntermediateDirectories: true)
+        try "---\nname: late-skill\ndescription: late\nversion: 1.0.0\n---\nLATE-BODY"
+            .write(to: late.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+        try #require(store.rawContent("late-skill") != nil)
+        try #require(!store.allSkills().contains { $0.id == "late-skill" })
+        #expect(throws: SkillError.self) { _ = try tool.read(input: ["skillID": "late-skill"]) }
+    }
+
     @Test func readRejectsPathsExtraKeysAndUnknownSkills() throws {
         let (root, store) = try store()
         defer { try? FileManager.default.removeItem(at: root) }

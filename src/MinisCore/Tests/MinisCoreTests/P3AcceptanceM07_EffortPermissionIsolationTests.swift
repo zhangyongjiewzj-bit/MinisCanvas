@@ -99,7 +99,8 @@ struct P3AcceptanceM07EffortPermissionIsolationTests {
                     snapshot: snapshot, facts: facts(granted: ["file_write"]), now: { now }
                 )
             )
-            await #expect(throws: ComposerAuthorizationError.pathOutsideAllowedRoots(outsidePath)) {
+            // 2026-11-16 起：授权根外写入改为审批；无审批通道时仍不会执行。
+            await #expect(throws: ComposerAuthorizationError.approvalRequired("file_write")) {
                 _ = try await outside.execute(
                     callID: "outside-\(effort.rawValue)",
                     name: "file_write",

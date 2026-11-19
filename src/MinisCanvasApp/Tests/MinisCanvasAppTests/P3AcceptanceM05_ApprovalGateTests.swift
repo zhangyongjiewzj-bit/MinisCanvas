@@ -50,7 +50,7 @@ struct P3AcceptanceM05ApprovalGateTests {
             #expect(center.evaluate(request: request, snapshot: snapshot, facts: facts) == .reject)
             #expect(center.lastResolution?.id == request.id)
             if id == "boundary.set" {
-                let reason = "暂不可用，请在设置→智能体调整自主权上限。"
+                let reason = "暂不可用，请在设置→智能体调整最高模式。"
                 #expect(center.lastResolution?.outcome == .unavailableExecutor(reason))
                 #expect(center.projection?.text == reason)
             } else {

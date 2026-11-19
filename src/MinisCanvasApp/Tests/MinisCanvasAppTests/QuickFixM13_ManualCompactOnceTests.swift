@@ -133,7 +133,7 @@ struct QuickFixM13_ManualCompactOnceTests {
         let finished = await waitUntil { compactNoticeCount(chat) >= 1 }
         #expect(finished)
         let text = center.projection?.text
-        #expect(text?.contains("正通过规范 Composer 路径执行") != true,
+        #expect(text?.contains("正通过规范路径执行") != true,
                 "projection must be cleared or show a completed state after /compact finished")
     }
 }

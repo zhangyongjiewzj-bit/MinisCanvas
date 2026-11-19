@@ -28,6 +28,7 @@ final class ApprovalQueue {
     @ObservationIgnored private var waiters: [Waiter] = []
     private var activeOrigin: ApprovalExecutionOrigin?
     private var activeChildKey: ChildKey?
+    private var activeSessionID: String?
     private var isShuttingDown = false
     private(set) var queuedRequests: [ApprovalRequest] = []
 
@@ -44,8 +45,11 @@ final class ApprovalQueue {
         let duplicateChild = childKey.map { key in
             activeChildKey == key || waiters.contains(where: { $0.childKey == key })
         } ?? false
+        // 直接拒绝只留给"同一会话的重复请求"；不同会话的请求走下面的排队，等前一个裁决后轮到。
+        let sessionID = request.sessionID
         if duplicateChild || (!origin.isUnattended && childKey == nil
-            && (activeOrigin == .interactive || waiters.contains(where: { $0.origin == .interactive }))) {
+            && ((activeOrigin == .interactive && activeSessionID == sessionID)
+                || waiters.contains(where: { $0.origin == .interactive && $0.request.sessionID == sessionID }))) {
             return ApprovalDecision(approved: false, reason: "已有审批请求在处理中",
                 requestID: request.requestID, bindingDigest: request.identityDigest)
         }
@@ -56,12 +60,17 @@ final class ApprovalQueue {
                 if activeOrigin == nil {
                     activeOrigin = origin
                     activeChildKey = childKey
+                    activeSessionID = sessionID
                     continuation.resume(returning: true)
                 } else {
                     let waiter = Waiter(id: waiterID, request: request, origin: origin,
                         childKey: childKey, continuation: continuation)
                     if origin.isUnattended { waiters.append(waiter) }
-                    else { waiters.insert(waiter, at: 0) }
+                    else {
+                        // 交互请求排在无人值守请求之前；交互请求之间先到先得。
+                        let index = waiters.firstIndex(where: { $0.origin.isUnattended }) ?? waiters.count
+                        waiters.insert(waiter, at: index)
+                    }
                     queuedRequests = waiters.map(\.request)
                 }
             }
@@ -152,10 +161,11 @@ final class ApprovalQueue {
     }
 
     private func release() {
-        guard !waiters.isEmpty else { activeOrigin = nil; activeChildKey = nil; return }
+        guard !waiters.isEmpty else { activeOrigin = nil; activeChildKey = nil; activeSessionID = nil; return }
         let waiter = waiters.removeFirst()
         activeOrigin = waiter.origin
         activeChildKey = waiter.childKey
+        activeSessionID = waiter.request.sessionID
         queuedRequests = waiters.map(\.request)
         waiter.continuation.resume(returning: true)
     }

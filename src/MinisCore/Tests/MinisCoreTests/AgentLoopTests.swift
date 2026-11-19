@@ -481,9 +481,13 @@ struct AgentLoopTests {
         await #expect(throws: ToolExecutorError.pathViolation("/etc/passwd")) {
             _ = try await fixture.executor.execute(name: "file_read", input: ["path": "/etc/passwd"])
         }
-        // Relative paths are rejected outright.
-        await #expect(throws: ToolExecutorError.pathViolation("etc/passwd")) {
+        // Relative paths resolve against the project root, so they can never leave it;
+        // a relative path that tries to climb out is refused with an explanation.
+        await #expect(throws: ToolExecutorError.fileNotFound(fixture.root.appendingPathComponent("etc/passwd").path)) {
             _ = try await fixture.executor.execute(name: "file_read", input: ["path": "etc/passwd"])
+        }
+        await #expect(throws: ToolExecutorError.invalidParameter("path 需要绝对路径（不能含 ..）：../etc/passwd")) {
+            _ = try await fixture.executor.execute(name: "file_read", input: ["path": "../etc/passwd"])
         }
         // Traversal that escapes the root is rejected after standardization.
         await #expect(throws: ToolExecutorError.pathViolation("/tmp/../../etc/passwd")) {
@@ -947,7 +951,8 @@ struct AgentLoopTests {
             }
         }
         let gate = ApprovalGate(
-            policyByTool: ["file_write": .alwaysAsk],
+            // web_search 默认要问（11/19）；这里测的是逐条顺序，c3 显式设为自动通过。
+            policyByTool: ["file_write": .alwaysAsk, "web_search": .autoApprove],
             delegate: DenyAllDelegate()
         )
         let root = try minisCoreToolContractRoot("agent-loop-mixed-order")

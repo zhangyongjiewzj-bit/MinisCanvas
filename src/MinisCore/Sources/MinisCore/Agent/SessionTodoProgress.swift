@@ -120,3 +120,50 @@ public struct SessionTodoProgress: Codable, Equatable, Sendable {
         return latest
     }
 }
+
+/// One run's nudge to keep the todo checklist current. It lives only in the
+/// local variables of a single `AgentLoop` run and rides on the next request's
+/// system prompt, so it never enters the transcript or the visible reply.
+struct SessionTodoReminder: Sendable {
+    static let roundsBeforeReminder = 3
+    private static let maxListedItems = 8
+    private static let maxItemLength = 80
+
+    private var progress: SessionTodoProgress?
+    private var roundsSinceUpdate = 0
+
+    init(history: [LLMMessage]) {
+        progress = SessionTodoProgress.latest(in: history)
+    }
+
+    /// Call once after each round of executed tool calls. A round that includes
+    /// `todo_write` re-reads the checklist from the transcript and restarts the
+    /// count; any other round with tool calls advances it.
+    mutating func recordRound(toolNames: [String], messages: [LLMMessage]) {
+        if toolNames.contains(SessionTodoProgress.toolName) {
+            progress = SessionTodoProgress.latest(in: messages)
+            roundsSinceUpdate = 0
+        } else if !toolNames.isEmpty {
+            roundsSinceUpdate += 1
+        }
+    }
+
+    /// Text to append to the next request's system prompt, or nil. Emitting it
+    /// restarts the count so the reminder repeats at most once per window.
+    mutating func requestReminder() -> String? {
+        guard roundsSinceUpdate >= Self.roundsBeforeReminder, let progress else { return nil }
+        let open = progress.todos.filter { $0.status != .completed }
+        guard !open.isEmpty else { return nil }
+        roundsSinceUpdate = 0
+        let listed = open.prefix(Self.maxListedItems).map { item -> String in
+            let flat = item.content.replacingOccurrences(of: "\n", with: " ")
+            return "- [\(item.status.rawValue)] " + String(flat.prefix(Self.maxItemLength))
+        }
+        let more = open.count > Self.maxListedItems ? ["- ... and \(open.count - Self.maxListedItems) more"] : []
+        return ([
+            "[Todo reminder] You created a checklist with todo_write but have not updated it for the last \(Self.roundsBeforeReminder) rounds of tool calls. Unfinished items:"
+        ] + listed + more + [
+            "If your progress changed, call todo_write now (resend the full list): mark finished items completed and keep exactly one item in_progress. Work through the items one at a time. This reminder is internal; do not mention it to the user."
+        ]).joined(separator: "\n")
+    }
+}

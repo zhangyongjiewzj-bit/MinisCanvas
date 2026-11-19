@@ -9,6 +9,7 @@ import Foundation
 /// - Claude 1M 模型与 Haiku 4.5 = 200k：platform.claude.com/docs/en/build-with-claude/context-windows
 ///   “Context window sizes by model”（2026-11-09 读取）。该页未列出的 Claude ID 属 200k 家族。
 /// - 其余数值沿用 LLMTypes 原启发式，官方出处未核实。
+/// - qwen-long / glm / kimi / deepseek 为常见长上下文模型的近似值，目录无命中时界面会标注“估计值”。
 public enum ModelContextWindowCatalog {
     private static let exact: [String: Int] = [
         "claude-fable-5": 1_000_000,
@@ -34,6 +35,14 @@ public enum ModelContextWindowCatalog {
         ("o3", 200_000, false),
         ("o4", 200_000, false),
         ("codex", 200_000, false),
+        // 常见国产长上下文模型（数值为各家公开资料的近似值，出处未逐项核实；
+        // 不准时用户可在“编辑模型”里手动填写窗口）。更具体的前缀放在前面。
+        ("qwen-long", 10_000_000, false),
+        ("glm-4-long", 1_000_000, false),
+        ("glm-4.6", 200_000, false),
+        ("glm", 128_000, false),
+        ("kimi", 256_000, false),
+        ("deepseek", 128_000, false),
     ]
 
     /// 精确项或家族规则命中时返回窗口；没有任何命中返回 nil（调用方用 128,000 兜底）。

@@ -261,7 +261,8 @@ struct ContextCacheChatStore663Tests {
             let old = try JSONSerialization.data(withJSONObject: ["maxTokensPerSession": oldValue])
             let decoded = try JSONDecoder().decode(AgentSettings.self, from: old)
             #expect(!decoded.tokenBudgetUnlimited)
-            #expect(decoded.maxTokensPerSession == max(1, oldValue))
+            // 已保存值恰好等于旧默认 10 万的，迁移到新默认 100 万（2026-11-16 用户决定）。
+            #expect(decoded.maxTokensPerSession == (oldValue == 100000 ? 1_000_000 : max(1, oldValue)))
         }
         let selected = AgentSettings(maxTokensPerSession: 250, tokenBudgetUnlimited: true)
         let restored = try JSONDecoder().decode(AgentSettings.self, from: JSONEncoder().encode(selected))

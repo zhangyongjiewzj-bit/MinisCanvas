@@ -36,6 +36,8 @@ enum ChatTranscriptStatusIconProjection {
                 return containsStatus(value)
             case .list(let items, _):
                 return items.contains(where: containsStatus)
+            case .nestedList(let items):
+                return items.contains { containsStatus($0.text) }
             case .codeBlock, .table, .divider:
                 return false
             }
@@ -97,26 +99,50 @@ enum ChatTranscriptStatusIconProjection {
 
     private static func matches(_ source: NSAttributedString)
         -> [(range: NSRange, icon: MinisIcon, label: String, original: String)] {
-        let text = source.string as NSString
+        let string = source.string
+        // 目录里每个状态符号的首个 Unicode 标量；与 `entries` 保持一致。
+        // 先按标量快速扫描：没有候选就不做逐字符（字素簇）切分，这是流式长回复里
+        // 每个片段都要走的路径；有候选时只对候选所在的行逐字符匹配（字素簇不会跨行）。
+        func isCandidate(_ value: UInt32) -> Bool {
+            guard value >= 0x23F3 else { return false }
+            switch value {
+            case 0x23F3, 0x23F9, 0x26A0, 0x274C, 0x2705, 0x1FA84: return true
+            default: return false
+            }
+        }
+        var candidateLines: [NSRange] = []
+        let text = string as NSString
+        var scanned = 0
+        var scalarPosition = 0
+        for scalar in string.unicodeScalars {
+            if scalarPosition >= scanned, isCandidate(scalar.value) {
+                let line = text.lineRange(for: NSRange(location: scalarPosition, length: 0))
+                candidateLines.append(line)
+                scanned = NSMaxRange(line)
+            }
+            scalarPosition += scalar.value > 0xFFFF ? 2 : 1
+        }
         var found: [(range: NSRange, icon: MinisIcon, label: String, original: String)] = []
-        var position = 0
-        for character in source.string {
-            let original = String(character)
-            let length = original.utf16.count
-            defer { position += length }
-            guard let entry = catalogEntry(for: character), position < source.length else { continue }
-            // A joiner at the next boundary is also protected even if a future
-            // Unicode segmentation implementation treats it separately.
-            if position + length < text.length, text.character(at: position + length) == 0x200D { continue }
-            let attributes = source.attributes(at: position, effectiveRange: nil)
-            let font = attributes[.font] as? NSFont
-            let style = attributes[.paragraphStyle] as? NSParagraphStyle
-            let isCode = font?.fontDescriptor.symbolicTraits.contains(.monoSpace) == true
-                || font?.isFixedPitch == true
-                || attributes[.backgroundColor] != nil
-            let isTable = style?.textBlocks.contains(where: { $0 is NSTextTableBlock }) == true
-            guard !isCode && !isTable else { continue }
-            found.append((NSRange(location: position, length: length), entry.icon, entry.label, original))
+        for line in candidateLines {
+            var position = line.location
+            for character in text.substring(with: line) {
+                let original = String(character)
+                let length = original.utf16.count
+                defer { position += length }
+                guard let entry = catalogEntry(for: character), position < source.length else { continue }
+                // A joiner at the next boundary is also protected even if a future
+                // Unicode segmentation implementation treats it separately.
+                if position + length < text.length, text.character(at: position + length) == 0x200D { continue }
+                let attributes = source.attributes(at: position, effectiveRange: nil)
+                let font = attributes[.font] as? NSFont
+                let style = attributes[.paragraphStyle] as? NSParagraphStyle
+                let isCode = font?.fontDescriptor.symbolicTraits.contains(.monoSpace) == true
+                    || font?.isFixedPitch == true
+                    || attributes[.backgroundColor] != nil
+                let isTable = style?.textBlocks.contains(where: { $0 is NSTextTableBlock }) == true
+                guard !isCode && !isTable else { continue }
+                found.append((NSRange(location: position, length: length), entry.icon, entry.label, original))
+            }
         }
         return found
     }
@@ -263,6 +289,61 @@ final class ChatTranscriptNativeTextView: NSTextView {
         return result
     }
 
+    private struct CodeCardSpan {
+        let block: CodeSurfaceTextBlock
+        let minX: CGFloat
+        let maxX: CGFloat
+        var minY: CGFloat
+        var maxY: CGFloat
+        let firstCharacter: Int
+        var lastCharacter: Int
+    }
+
+    private struct BubbleSpan {
+        let block: UserBubbleTextBlock
+        var minX: CGFloat
+        var maxX: CGFloat
+        var minY: CGFloat
+        var maxY: CGFloat
+        var firstCharacter: Int
+        var lastCharacter: Int
+        /// 可见行里文字实际占到的最左位置（文字靠右排，气泡按它收窄贴合文字）。
+        var textMinX: CGFloat
+    }
+
+    private static func sameBubble(_ block: UserBubbleTextBlock, at index: Int,
+                                   in storage: NSTextStorage) -> Bool {
+        guard index >= 0, index < storage.length,
+              let style = storage.attribute(.paragraphStyle, at: index, effectiveRange: nil) as? NSParagraphStyle
+        else { return false }
+        return style.textBlocks.first === block
+    }
+
+    /// 整个用户气泡（不论哪几行在本次脏区里）各行文字的最左边（容器坐标）。
+    /// 只量这一块的行，O(气泡行数)。
+    static func bubbleTextMinX(_ block: UserBubbleTextBlock, at index: Int, storage: NSTextStorage,
+                               manager: NSLayoutManager, container: NSTextContainer) -> CGFloat? {
+        guard index >= 0, index < storage.length else { return nil }
+        let blockRange = storage.range(of: block, at: index)
+        guard blockRange.length > 0 else { return nil }
+        let glyphs = manager.glyphRange(forCharacterRange: blockRange, actualCharacterRange: nil)
+        var minX: CGFloat?
+        manager.enumerateLineFragments(forGlyphRange: glyphs) { _, _, _, lineGlyphs, _ in
+            guard lineGlyphs.length > 0 else { return }
+            let x = manager.boundingRect(forGlyphRange: lineGlyphs, in: container).minX
+            minX = min(minX ?? x, x)
+        }
+        return minX
+    }
+
+    private static func sameCodeSurface(_ block: CodeSurfaceTextBlock, at index: Int,
+                                        in storage: NSTextStorage) -> Bool {
+        guard index >= 0, index < storage.length,
+              let style = storage.attribute(.paragraphStyle, at: index, effectiveRange: nil) as? NSParagraphStyle
+        else { return false }
+        return style.textBlocks.last === block
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         // Paint the existing role block surfaces before AppKit paints Markdown
         // run backgrounds, selection and glyphs. Query only the dirty viewport;
@@ -273,24 +354,140 @@ final class ChatTranscriptNativeTextView: NSTextView {
             let origin = textContainerOrigin
             let containerRect = visibleDirty.offsetBy(dx: -origin.x, dy: -origin.y)
             let glyphs = manager.glyphRange(forBoundingRect: containerRect, in: container)
+            // 代码卡片按块收集可见行，枚举完再一次画圆角卡片（只看脏区内的行，O(可见行)）。
+            var cards: [ObjectIdentifier: CodeCardSpan] = [:]
+            var cardOrder: [ObjectIdentifier] = []
+            var bubbles: [ObjectIdentifier: BubbleSpan] = [:]
+            var bubbleOrder: [ObjectIdentifier] = []
             manager.enumerateLineFragments(forGlyphRange: glyphs) { line, _, _, lineGlyphs, _ in
                 guard lineGlyphs.length > 0 else { return }
                 let character = manager.characterIndexForGlyph(at: lineGlyphs.location)
                 guard character < storage.length,
                       let style = storage.attribute(.paragraphStyle, at: character,
                           effectiveRange: nil) as? NSParagraphStyle,
-                      !style.textBlocks.contains(where: { $0 is NSTextTableBlock }),
-                      let fill = style.textBlocks.first?.backgroundColor else { return }
+                      !style.textBlocks.contains(where: { $0 is NSTextTableBlock }) else { return }
+                let blocks = style.textBlocks
+                let codeSurface = blocks.last as? CodeSurfaceTextBlock
                 let surface = line.offsetBy(dx: origin.x, dy: origin.y).intersection(visibleDirty)
-                guard !surface.isEmpty else { return }
-                fill.setFill()
-                surface.fill()
-                // Ordinary nested blocks are the fenced-code surface. AppKit
-                // does not paint that inner fill here, so composite it over the
-                // role surface before the native selection and glyph pass.
-                if style.textBlocks.count == 2, let codeFill = style.textBlocks.last?.backgroundColor {
+                if let bubble = blocks.first as? UserBubbleTextBlock {
+                    // 用户气泡：按块收集可见行，枚举完再画圆角底色（O(可见行)）。
+                    let id = ObjectIdentifier(bubble)
+                    let lineRect = line.offsetBy(dx: origin.x, dy: origin.y)
+                    let lineEnd = NSMaxRange(manager.characterRange(forGlyphRange: lineGlyphs, actualGlyphRange: nil))
+                    // 只量本行字形的包围盒（O(本行)），不触发全文排版。
+                    let textMinX = manager.boundingRect(forGlyphRange: lineGlyphs, in: container).minX + origin.x
+                    if var span = bubbles[id] {
+                        span.minX = min(span.minX, lineRect.minX)
+                        span.maxX = max(span.maxX, lineRect.maxX)
+                        span.minY = min(span.minY, lineRect.minY)
+                        span.maxY = max(span.maxY, lineRect.maxY)
+                        span.firstCharacter = min(span.firstCharacter, character)
+                        span.lastCharacter = max(span.lastCharacter, lineEnd)
+                        span.textMinX = min(span.textMinX, textMinX)
+                        bubbles[id] = span
+                    } else {
+                        bubbles[id] = BubbleSpan(block: bubble, minX: lineRect.minX, maxX: lineRect.maxX,
+                                                 minY: lineRect.minY, maxY: lineRect.maxY,
+                                                 firstCharacter: character, lastCharacter: lineEnd,
+                                                 textMinX: textMinX)
+                        bubbleOrder.append(id)
+                    }
+                } else if let role = blocks.first, role !== codeSurface, let fill = role.backgroundColor, !surface.isEmpty {
+                    fill.setFill()
+                    surface.fill()
+                }
+                if let codeSurface {
+                    let id = ObjectIdentifier(codeSurface)
+                    let paragraph = storage.mutableString.paragraphRange(
+                        for: NSRange(location: character, length: 0))
+                    let lineRect = line.offsetBy(dx: origin.x, dy: origin.y)
+                    // 卡片上沿 = 首段段前间距之下再留出内边距；下沿同理。
+                    let isParagraphStart = character == paragraph.location
+                    let isParagraphEnd = NSMaxRange(manager.characterRange(
+                        forGlyphRange: lineGlyphs, actualGlyphRange: nil)) >= NSMaxRange(paragraph)
+                    let top = lineRect.minY + (isParagraphStart
+                        ? max(0, style.paragraphSpacingBefore - CodeSurfaceTextBlock.verticalPadding) : 0)
+                    let bottom = lineRect.maxY - (isParagraphEnd
+                        ? max(0, style.paragraphSpacing - CodeSurfaceTextBlock.verticalPadding) : 0)
+                    let minX = origin.x + max(0, style.headIndent - CodeSurfaceTextBlock.textInset)
+                    let maxX = origin.x + container.size.width
+                        + min(0, style.tailIndent + CodeSurfaceTextBlock.textInset)
+                    if var span = cards[id] {
+                        span.minY = min(span.minY, top)
+                        span.maxY = max(span.maxY, bottom)
+                        span.lastCharacter = max(span.lastCharacter, NSMaxRange(paragraph))
+                        cards[id] = span
+                    } else {
+                        cards[id] = CodeCardSpan(block: codeSurface, minX: minX, maxX: maxX,
+                                                 minY: top, maxY: bottom,
+                                                 firstCharacter: paragraph.location,
+                                                 lastCharacter: NSMaxRange(paragraph))
+                        cardOrder.append(id)
+                    }
+                } else if blocks.count == 2, let codeFill = blocks.last?.backgroundColor, !surface.isEmpty {
+                    // Ordinary nested blocks without the card class keep the flat fill.
                     codeFill.setFill()
                     surface.fill()
+                }
+            }
+            for id in bubbleOrder {
+                guard var span = bubbles[id], let fill = span.block.backgroundColor else { continue }
+                // 局部重画只枚举脏区里的行；气泡左边缘必须按整块所有行量，否则只重画到
+                // 较短的一行时，长行露在底色外（11/19 旅途"色块"）。只量本气泡的行。
+                if let blockMinX = Self.bubbleTextMinX(span.block, at: span.firstCharacter,
+                                                       storage: storage, manager: manager, container: container) {
+                    span.textMinX = min(span.textMinX, blockMinX + origin.x)
+                }
+                // 行矩形 = 气泡内容区；文字已缩进一个阅读列 gutter，底色向外只伸出 textInset。
+                let overhang = max(0, ChatReadingLayout.horizontalInset - UserBubbleTextBlock.textInset)
+                let trim = UserBubbleTextBlock.verticalTrim
+                // 气泡靠右：左边缘贴着文字（再留 textInset），一定盖住文字，且不窄于最小宽度。
+                // 最大宽度由文字换行内缩（UserBubbleTextBlock.wrapInset）决定，这里不再截断。
+                let right = span.maxX - overhang
+                let columnLeft = span.minX + overhang
+                let fittedLeft = span.textMinX - UserBubbleTextBlock.textInset
+                let narrowestLeft = right - UserBubbleTextBlock.minimumWidth
+                let left = max(columnLeft, min(fittedLeft, narrowestLeft))
+                var rect = NSRect(x: left, y: span.minY + trim,
+                                  width: max(0, right - left),
+                                  height: max(0, span.maxY - span.minY - trim * 2))
+                // 气泡延续到脏区外时，把那一侧推出可见区，不在中途画出圆角。
+                if span.firstCharacter > 0, Self.sameBubble(span.block, at: span.firstCharacter - 1, in: storage) {
+                    rect.origin.y -= 2000
+                    rect.size.height += 2000
+                }
+                if span.lastCharacter < storage.length, Self.sameBubble(span.block, at: span.lastCharacter, in: storage) {
+                    rect.size.height += 2000
+                }
+                guard rect.width > 0, rect.height > 0 else { continue }
+                fill.setFill()
+                NSBezierPath(roundedRect: rect, xRadius: UserBubbleTextBlock.cornerRadius,
+                             yRadius: UserBubbleTextBlock.cornerRadius).fill()
+            }
+            for id in cardOrder {
+                guard let span = cards[id] else { continue }
+                var rect = NSRect(x: span.minX, y: span.minY,
+                                  width: max(0, span.maxX - span.minX), height: max(0, span.maxY - span.minY))
+                // 卡片延续到脏区外时，把那一侧推出可见区，不在中途画出圆角。
+                if span.firstCharacter > 0, Self.sameCodeSurface(span.block, at: span.firstCharacter - 1, in: storage) {
+                    rect.origin.y -= 2000
+                    rect.size.height += 2000
+                }
+                if span.lastCharacter < storage.length, Self.sameCodeSurface(span.block, at: span.lastCharacter, in: storage) {
+                    rect.size.height += 2000
+                }
+                guard rect.width > 0, rect.height > 0 else { continue }
+                let path = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5),
+                                        xRadius: CodeSurfaceTextBlock.cornerRadius,
+                                        yRadius: CodeSurfaceTextBlock.cornerRadius)
+                if let fill = span.block.backgroundColor {
+                    fill.setFill()
+                    path.fill()
+                }
+                if let border = span.block.borderColor(for: .minX) {
+                    border.setStroke()
+                    path.lineWidth = 1
+                    path.stroke()
                 }
             }
         }

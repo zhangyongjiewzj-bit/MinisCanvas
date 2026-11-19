@@ -163,8 +163,8 @@ struct ThemeContrastTests {
             let violations = roles(ThemeContrast.violations(tokens: theme.semanticTokens(for: .light)))
             switch theme {
             case .pseudo:
-                // 选中 3.660 ≥ 3.0 过；状态最弱支（警告黄 1.672）不过。
-                #expect(violations == [.status])
+                // 第 1 套浅色（暖中性 + 陶土橙）：选中 5.26、状态最弱支（弱字灰 4.92）均过，无违例。
+                #expect(violations.isEmpty)
             case .codex, .graphite, .ocean, .crimson, .emerald:
                 #expect(violations == [.selected, .status])
             }
@@ -176,7 +176,7 @@ struct ThemeContrastTests {
             let violations = roles(ThemeContrast.violations(tokens: theme.semanticTokens(for: .dark)))
             switch theme {
             case .pseudo:
-                #expect(violations == [.status])   // 失败红 2.576 < 3.0
+                #expect(violations.isEmpty)   // 第 1 套深色：状态最弱支 5.7，无违例
             case .codex, .graphite, .ocean, .crimson, .emerald:
                 #expect(violations.isEmpty)
             }
@@ -191,8 +191,9 @@ struct ThemeContrastTests {
             Issue.record("evaluateAll 未返回 status 角色判定")
             return
         }
-        #expect(abs(status.ratio - 1.672305) < 1e-6)
-        #expect(status.foreground == ThemeColor(r: 0.93, g: 0.74, b: 0.22))  // 警告黄
+        // 第 1 套浅色最弱支是「执行/待执行」的弱字灰 #6F6D66（对底 #FAF9F5 约 4.92）。
+        #expect(abs(status.ratio - 4.9155) < 1e-3)
+        #expect(status.foreground == ThemeColor(hex: 0x6F6D66))
         // 该支确实是 6 支状态色里最低的一支。
         let every = status.foreground
         for candidate in ThemeContrastRole.status.colors(in: tokens) {
@@ -321,4 +322,26 @@ struct ThemeContrastTests {
         #expect(preset.semanticTokens(systemIsDark: systemIsDark) == tokens)
     }
 
+}
+
+/// F-2：用户气泡是「强调色底 + 白字」，深色强调色（#E08B68）原来只有约 2.6:1。
+struct UserBubbleWhiteTextContrastTests {
+    private let white = ThemeColor(r: 1, g: 1, b: 1)
+
+    @Test func darkAccentBubbleMeetsFourPointFive() {
+        let darkAccent = ThemeColor(
+            r: AccentTheme.pseudo.darkAccentRGB.r, g: AccentTheme.pseudo.darkAccentRGB.g,
+            b: AccentTheme.pseudo.darkAccentRGB.b)
+        #expect(ThemeContrast.contrastRatio(white, darkAccent) < 4.5)   // 复现问题
+        let fill = ThemeContrast.fillMeetingWhiteText(darkAccent)
+        #expect(ThemeContrast.contrastRatio(white, fill) >= 4.5)
+    }
+
+    @Test func lightAccentBubbleIsUnchanged() {
+        let lightAccent = ThemeColor(
+            r: AccentTheme.pseudo.accentRGB.r, g: AccentTheme.pseudo.accentRGB.g,
+            b: AccentTheme.pseudo.accentRGB.b)
+        #expect(ThemeContrast.contrastRatio(white, lightAccent) >= 4.5)
+        #expect(ThemeContrast.fillMeetingWhiteText(lightAccent) == lightAccent)
+    }
 }

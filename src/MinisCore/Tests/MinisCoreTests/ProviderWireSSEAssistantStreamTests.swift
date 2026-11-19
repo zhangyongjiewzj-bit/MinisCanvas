@@ -280,6 +280,7 @@ struct W5044AnthropicAssistantStreamTests {
         for event in events {
             switch event {
             case .textDelta(let text): deltas.append(text)
+            case .thinkingDelta: break
             case .completed(let response): terminal = response
             }
         }
@@ -340,14 +341,245 @@ struct W5044AnthropicAssistantStreamTests {
             _ = try await Self.collect(try await Self.stream(Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())))
             Issue.record("expected mid-stream provider error")
         } catch let error as LLMError {
-            guard case .providerError(let message) = error else {
-                Issue.record("expected LLMError.providerError, got \(error)")
+            // V-9：流内 overloaded_error 与 HTTP 529 同一类，可重试；固定类别标签，不带服务端文字。
+            guard case .httpStatus(let code, let detail) = error else {
+                Issue.record("expected LLMError.httpStatus(529), got \(error)")
                 return
             }
-            #expect(message.contains("category=server_overloaded"))
-            #expect(!message.contains("fixture-upstream-secret"))
-            #expect(message.contains("fixture-anthropic-secret") == false)
+            #expect(code == 529)
+            #expect(error.isRetryable)
+            #expect(detail.contains("category=server"))
+            #expect(!detail.contains("fixture-upstream-secret"))
+            #expect(detail.contains("fixture-anthropic-secret") == false)
         }
+    }
+
+    @Test("V-9 in-stream error types map to the retryable status codes")
+    func inStreamErrorTypesMapToRetryableErrors() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        let cases: [(type: String, check: (LLMError) -> Bool)] = [
+            ("overloaded_error", { if case .httpStatus(529, _) = $0 { return $0.isRetryable } else { return false } }),
+            ("rate_limit_error", { if case .httpStatus(429, _) = $0 { return $0.isRetryable } else { return false } }),
+            ("api_error", { if case .transientError = $0 { return $0.isRetryable } else { return false } }),
+            ("invalid_request_error", { if case .providerError = $0 { return !$0.isRetryable } else { return false } }),
+        ]
+        for item in cases {
+            W5044AnthropicMockURLProtocol.handler = {
+                (200, sseBody([
+                    #"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+                    #"{"type":"error","error":{"type":"\#(item.type)","message":"fixture-upstream-secret"}}"#,
+                ]), ["Content-Type": "text/event-stream"])
+            }
+            do {
+                _ = try await Self.collect(try await Self.stream(Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())))
+                Issue.record("expected an error for \(item.type)")
+            } catch let error as LLMError {
+                #expect(item.check(error), "\(item.type) mapped to \(error)")
+            }
+        }
+    }
+
+    @Test("V-10 a stream that ends before message_stop is a retryable transient error, not a completion")
+    func streamEndingBeforeMessageStopIsTransient() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([
+                #"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+                #"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半截回答"}}"#,
+            ]), ["Content-Type": "text/event-stream"])
+        }
+        var events: [LLMAssistantStreamEvent] = []
+        do {
+            let stream = try await Self.stream(Self.provider(session: W5044AnthropicMockURLProtocol.makeSession()))
+            for try await event in stream { events.append(event) }
+            Issue.record("a truncated stream must not complete")
+        } catch let error as LLMError {
+            guard case .transientError = error else {
+                Issue.record("expected transientError, got \(error)")
+                return
+            }
+            #expect(error.isRetryable)
+        }
+        #expect(!events.contains { if case .completed = $0 { return true } else { return false } })
+    }
+
+    @Test("V-10 the plain text stream also reports a missing message_stop")
+    func plainStreamEndingBeforeMessageStopIsTransient() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#,
+            ]), ["Content-Type": "text/event-stream"])
+        }
+        let provider = Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())
+        do {
+            let stream = try await provider.streamMessage(messages: [LLMMessage(role: .user, content: "hi")],
+                systemPrompt: nil, maxTokens: 16, temperature: nil)
+            for try await _ in stream {}
+            Issue.record("a truncated plain stream must not finish normally")
+        } catch let error as LLMError {
+            guard case .transientError = error else {
+                Issue.record("expected transientError, got \(error)")
+                return
+            }
+        }
+    }
+
+    @Test("F-11 a gateway that sends the stop reason but never message_stop still completes normally")
+    func stopReasonWithoutMessageStopCompletes() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([
+                #"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}"#,
+                #"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"完整回答"}}"#,
+                #"{"type":"content_block_stop","index":0}"#,
+                #"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+            ]), ["Content-Type": "text/event-stream"])
+        }
+        let events = try await Self.collect(try await Self.stream(Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())))
+        let completed = events.compactMap { event -> LLMResponse? in
+            if case .completed(let response) = event { return response } else { return nil }
+        }
+        #expect(completed.count == 1)
+        #expect(completed.first?.text == "完整回答")
+        #expect(completed.first?.stopReason == "end_turn")
+    }
+
+    @Test("F-11 the plain text stream also finishes when the stop reason arrived without message_stop")
+    func plainStreamStopReasonWithoutMessageStopFinishes() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}"#,
+                #"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
+            ]), ["Content-Type": "text/event-stream"])
+        }
+        let provider = Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())
+        let stream = try await provider.streamMessage(messages: [LLMMessage(role: .user, content: "hi")],
+            systemPrompt: nil, maxTokens: 16, temperature: nil)
+        var finishedReasons: [String?] = []
+        for try await chunk in stream {
+            if case .finished(let reason) = chunk { finishedReasons.append(reason) }
+        }
+        #expect(finishedReasons == ["end_turn"])
+    }
+
+    private static func requestBody(_ request: URLRequest) throws -> [String: Any] {
+        var data = request.httpBody ?? Data()
+        if data.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var bytes = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&bytes, maxLength: bytes.count)
+                if count <= 0 { break }
+                data.append(bytes, count: count)
+            }
+        }
+        return try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    @Test("V-5 request marks tools, system and the last message with ephemeral cache breakpoints (at most 4)")
+    func requestCarriesPromptCacheBreakpoints() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([#"{"type":"message_stop"}"#]), ["Content-Type": "text/event-stream"])
+        }
+        let tools = ["a_tool", "z_tool"].map {
+            AgentToolDefinition(name: $0, description: "fixture",
+                parameters: ["q": AgentToolParam(type: .string, description: "q")], required: ["q"])
+        }
+        let events = try await Self.collect(try await Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())
+            .streamAssistantMessage(messages: [LLMMessage(role: .user, content: "第一问"),
+                LLMMessage(role: .assistant, content: "答"), LLMMessage(role: .user, content: "第二问")],
+                systemPrompt: "系统提示", tools: tools, maxTokens: 64, temperature: nil))
+        #expect(!events.isEmpty)
+        let body = try Self.requestBody(try #require(W5044AnthropicMockURLProtocol.lastRequest))
+        let ephemeral: ([String: Any]) -> Bool = { ($0["cache_control"] as? [String: Any])?["type"] as? String == "ephemeral" }
+        let toolList = try #require(body["tools"] as? [[String: Any]])
+        #expect(toolList.map(ephemeral) == [false, true])
+        let system = try #require(body["system"] as? [[String: Any]])
+        #expect(system.count == 1 && system[0]["text"] as? String == "系统提示" && ephemeral(system[0]))
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        let firstContent = messages[0]["content"]
+        #expect(firstContent is String, "earlier messages stay plain")
+        let lastBlocks = try #require(messages[2]["content"] as? [[String: Any]])
+        #expect(lastBlocks.count == 1 && lastBlocks[0]["text"] as? String == "第二问" && ephemeral(lastBlocks[0]))
+        // Anthropic 允许的断点上限是 4 个。
+        let marked = toolList.filter(ephemeral).count + system.filter(ephemeral).count
+            + messages.compactMap { $0["content"] as? [[String: Any]] }.flatMap { $0 }.filter(ephemeral).count
+        #expect(marked == 3 && marked <= 4)
+    }
+
+    @Test("P3 a request the caller marks as one-shot (the compaction summary) carries no cache breakpoints")
+    func oneShotRequestCarriesNoCacheBreakpoints() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([#"{"type":"message_stop"}"#]), ["Content-Type": "text/event-stream"])
+        }
+        let provider = Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())
+        _ = try await LLMRequestHints.$promptCaching.withValue(false) {
+            try await Self.collect(try await provider.streamAssistantMessage(
+                messages: [LLMMessage(role: .user, content: "摘要请求")],
+                systemPrompt: "系统提示", tools: [], maxTokens: 64, temperature: nil))
+        }
+        let body = try Self.requestBody(try #require(W5044AnthropicMockURLProtocol.lastRequest))
+        #expect(!String(decoding: try JSONSerialization.data(withJSONObject: body), as: UTF8.self)
+            .contains("cache_control"))
+        // 默认（不关）仍然打断点：同一个 Provider、同一类请求。
+        _ = try await Self.collect(try await provider.streamAssistantMessage(
+            messages: [LLMMessage(role: .user, content: "普通请求")],
+            systemPrompt: "系统提示", tools: [], maxTokens: 64, temperature: nil))
+        let normal = try Self.requestBody(try #require(W5044AnthropicMockURLProtocol.lastRequest))
+        #expect(String(decoding: try JSONSerialization.data(withJSONObject: normal), as: UTF8.self)
+            .contains("cache_control"))
+    }
+
+    @Test("V-5 a tool_result last message is marked on the block and thinking blocks are never marked")
+    func cacheBreakpointPlacementOnBlocks() {
+        let toolResult: [String: Any] = ["type": "tool_result", "tool_use_id": "t1", "content": "ok"]
+        let plainUser: [String: Any] = ["role": "user", "content": "hi"]
+        let resultUser: [String: Any] = ["role": "user", "content": [toolResult]]
+        var body: [String: Any] = ["messages": [plainUser, resultUser]]
+        AnthropicProvider.addPromptCacheBreakpoints(to: &body)
+        var messages = body["messages"] as? [[String: Any]] ?? []
+        var blocks = messages.last?["content"] as? [[String: Any]] ?? []
+        #expect(blocks.last?["cache_control"] != nil)
+        #expect(messages[0]["content"] is String)
+
+        let text: [String: Any] = ["type": "text", "text": "x"]
+        let thinking: [String: Any] = ["type": "thinking", "thinking": "t", "signature": "s"]
+        let assistant: [String: Any] = ["role": "assistant", "content": [text, thinking]]
+        body = ["messages": [assistant]]
+        AnthropicProvider.addPromptCacheBreakpoints(to: &body)
+        messages = body["messages"] as? [[String: Any]] ?? []
+        blocks = messages.last?["content"] as? [[String: Any]] ?? []
+        #expect(blocks[0]["cache_control"] != nil && blocks[1]["cache_control"] == nil)
+
+        let emptyUser: [String: Any] = ["role": "user", "content": ""]
+        body = ["messages": [emptyUser]]
+        AnthropicProvider.addPromptCacheBreakpoints(to: &body)
+        messages = body["messages"] as? [[String: Any]] ?? []
+        #expect(messages[0]["content"] is String, "empty text cannot carry cache_control")
+    }
+
+    @Test("V-5 non-Claude model ids on the Anthropic wire get no cache fields")
+    func nonClaudeModelGetsNoCacheFields() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([#"{"type":"message_stop"}"#]), ["Content-Type": "text/event-stream"])
+        }
+        let provider = AnthropicProvider(apiKey: "fixture-anthropic-secret",
+            model: LLMModel(id: "deepseek-chat", displayName: "DeepSeek Chat", provider: "Anthropic"),
+            session: W5044AnthropicMockURLProtocol.makeSession())
+        _ = try await Self.collect(try await provider.streamAssistantMessage(
+            messages: [LLMMessage(role: .user, content: "hi")], systemPrompt: "sys", tools: [],
+            maxTokens: 16, temperature: nil))
+        let body = try Self.requestBody(try #require(W5044AnthropicMockURLProtocol.lastRequest))
+        #expect(body["system"] as? String == "sys")
+        #expect(!String(decoding: try JSONSerialization.data(withJSONObject: body), as: UTF8.self).contains("cache_control"))
     }
 
     @Test("acquisition HTTP status keeps the typed payload-free projection")
@@ -369,6 +601,54 @@ struct W5044AnthropicAssistantStreamTests {
             // 037 typed-kind consumption unchanged on the migrated path.
             #expect(ProviderRequestFailureKind.classify(error) == .rateLimited)
         }
+    }
+
+    @Test("thinking_delta forwards as thinking events, stays out of text, and thinking blocks ride the tool call for replay")
+    func thinkingDeltasForwardAndReplay() async throws {
+        defer { W5044AnthropicMockURLProtocol.reset() }
+        W5044AnthropicMockURLProtocol.handler = {
+            (200, sseBody([
+                #"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先看"}}"#,
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"目录"}}"#,
+                #"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}"#,
+                #"{"type":"content_block_stop","index":0}"#,
+                #"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc-data"}}"#,
+                #"{"type":"content_block_stop","index":1}"#,
+                #"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+                #"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"好"}}"#,
+                #"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_t1","name":"run_command"}}"#,
+                #"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"ls\"}"}}"#,
+                #"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+                #"{"type":"message_stop"}"#,
+            ]), ["Content-Type": "text/event-stream"])
+        }
+        let events = try await Self.collect(try await Self.stream(Self.provider(session: W5044AnthropicMockURLProtocol.makeSession())))
+        var thoughts: [String] = [], deltas: [String] = []
+        var terminal: LLMResponse?
+        for event in events {
+            switch event {
+            case .thinkingDelta(let t): thoughts.append(t)
+            case .textDelta(let t): deltas.append(t)
+            case .completed(let r): terminal = r
+            }
+        }
+        #expect(thoughts == ["先看", "目录", "（思考内容已加密）"])
+        #expect(deltas == ["好"])
+        let response = try #require(terminal)
+        #expect(response.text == "好")
+        let blocks = try #require(response.toolCalls.first?.thinkingBlocks)
+        #expect(blocks.count == 2)
+        #expect(blocks[0]["thinking"] as? String == "先看目录")
+        #expect(blocks[0]["signature"] as? String == "sig-abc")
+        #expect(blocks[1]["type"] as? String == "redacted_thinking")
+        // 回传：assistant 消息的 content 以思考块开头，且正文不含思考文字。
+        let message = LLMMessage(role: .assistant, content: response.text, toolCalls: response.toolCalls)
+        let wire = AnthropicProvider.anthropicMessageDict(message)
+        let content = try #require(wire["content"] as? [[String: Any]])
+        #expect(content.first?["type"] as? String == "thinking")
+        #expect(content.last?["type"] as? String == "tool_use")
+        #expect(content.compactMap { $0["text"] as? String } == ["好"])
     }
 
     private static func collect(
@@ -724,6 +1004,7 @@ struct W5044OpenAICompatibleAssistantStreamTests {
         for e in events {
             switch e {
             case .textDelta(let text): deltas.append(text)
+            case .thinkingDelta: break
             case .completed(let response): terminal = response
             }
         }
@@ -799,6 +1080,32 @@ struct W5044OpenAICompatibleAssistantStreamTests {
             #expect(!detail.contains("fixture-chat-secret"))
             #expect(ProviderRequestFailureKind.classify(error) == .unauthorized)
         }
+    }
+
+    @Test("reasoning_content forwards as thinking events and never enters text or the terminal")
+    func reasoningContentForwardsAsThinking() async throws {
+        defer { W5044ChatMockURLProtocol.reset() }
+        W5044ChatMockURLProtocol.handler = {
+            (200, sseBody([
+                #"{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"想一下"}}]}"#,
+                #"{"choices":[{"index":0,"delta":{"reasoning_content":"再想"}}]}"#,
+                #"{"choices":[{"index":0,"delta":{"content":"答案"},"finish_reason":"stop"}]}"#,
+                #"[DONE]"#,
+            ]), ["Content-Type": "text/event-stream"])
+        }
+        let events = try await Self.collect(try await Self.stream(Self.provider(session: W5044ChatMockURLProtocol.makeSession())))
+        var thoughts: [String] = [], deltas: [String] = []
+        var terminal: LLMResponse?
+        for event in events {
+            switch event {
+            case .thinkingDelta(let t): thoughts.append(t)
+            case .textDelta(let t): deltas.append(t)
+            case .completed(let r): terminal = r
+            }
+        }
+        #expect(thoughts == ["想一下", "再想"])
+        #expect(deltas == ["答案"])
+        #expect(terminal?.text == "答案")
     }
 
     private static func collect(

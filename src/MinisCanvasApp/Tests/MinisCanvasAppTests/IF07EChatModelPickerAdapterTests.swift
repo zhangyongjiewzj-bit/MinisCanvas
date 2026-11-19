@@ -73,6 +73,76 @@ struct IF07EChatModelPickerAdapterTests {
         ])
     }
 
+    @Test("applied but never-checked models are selectable in the picker but never fallback candidates")
+    func uncheckedAppliedModelIsSelectableButNotReady() throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = ProviderReadinessStore(directory: directory)
+        let luna = providerRecord(name: "LUNA", models: ["luna-model", "luna-failed"])
+        store.upsert(record(
+            providerID: luna.name, modelID: "luna-model",
+            status: .discovered, readinessState: .unverified, evidenceID: nil, isApplied: true))
+        store.upsert(record(
+            providerID: luna.name, modelID: "luna-failed",
+            status: .unavailable, readinessState: .blocked, evidenceID: nil, isApplied: true))
+        let chat = ChatStore(providerReadinessStore: store)
+        chat.providerRecordsSource = { [luna] }
+
+        #expect(chat.isUncheckedChatModel(providerID: "LUNA", modelID: "luna-model"))
+        #expect(!chat.isUncheckedChatModel(providerID: "LUNA", modelID: "luna-failed"))
+        let models = chat.chatModelPickerModels(forProviderID: "LUNA")
+        #expect(models.map(\.id) == ["luna-model"])
+        #expect(models.first?.displayName.hasSuffix("未检查") == true)
+        // 未检查不是就绪证据：运行时门与回退候选仍然拒绝。
+        #expect(!chat.canSelectChatModel(providerID: "LUNA", modelID: "luna-model"))
+        #expect(chat.providerRuntimeFallbackCandidates(excludingProviderID: "Anthropic").isEmpty)
+        #expect(chat.applyChatModel(providerID: "LUNA", modelID: "luna-model"))
+        #expect(chat.selectedModelID == "luna-model")
+        #expect(!chat.applyChatModel(providerID: "LUNA", modelID: "luna-failed"))
+    }
+
+    @Test("repair card points at the provider whose check failed, not the first one")
+    func repairTargetIsTheFailedProvider() throws {
+        let healthy = providerRecord(name: "ALPHA", models: ["a"])
+        let broken = providerRecord(name: "BETA", models: ["b"])
+        let records = [
+            record(providerID: "ALPHA", modelID: "a", status: .passed, readinessState: .mock,
+                   evidenceID: "ok", isApplied: true),
+            ProviderReadinessPersistenceRecord(
+                providerID: "BETA", modelID: "b", status: .unavailable, readinessState: .blocked,
+                checkedAt: Date(timeIntervalSince1970: 1_787_200_000), errorCategory: .unauthorized,
+                isApplied: true)
+        ]
+        let target = ChatStore.providerRecordNeedingRepair(records: [healthy, broken], readiness: records)
+        #expect(target?.name == broken.name)
+        #expect(ChatStore.providerRecordNeedingRepair(records: [healthy, broken], readiness: [])?.name == healthy.name)
+    }
+
+    @Test("transient check failure keeps earlier result and says so; send-time feedback uses typed message")
+    func transientFailureGuidance() {
+        let failed = ProviderModelReadiness(
+            modelID: "m", status: .failed, redactedResult: "最小请求失败（HTTP 429）",
+            readiness: nil, errorCategory: .rateLimited)
+        let kept = SettingsCenter.readinessStateWithFailureGuidance(failed, hasPriorPassed: true)
+        #expect(kept.redactedResult.hasPrefix("最近一次检查失败："))
+        let noEvidence = SettingsCenter.readinessStateWithFailureGuidance(failed, hasPriorPassed: false)
+        #expect(!noEvidence.redactedResult.contains("HTTP"))
+        #expect(!noEvidence.redactedResult.isEmpty)
+        let feedback = ChatStore.readinessFailureFeedback(category: .unauthorized)
+        #expect(feedback.contains("API Key"))
+        #expect(feedback.contains("草稿已保留"))
+    }
+
+    @Test("ChatGPT 账号的检查失败提示指向重新登录与套餐，不提 API Key")
+    func chatGPTAccountFailureGuidance() {
+        for category in [ProviderReadinessFailureCategory.unauthorized, .permissionDenied, .rateLimited, .missingCredential] {
+            let feedback = ChatStore.readinessFailureFeedback(category: category, isChatGPTAccount: true)
+            #expect(!feedback.contains("API Key"))
+            #expect(feedback.contains("ChatGPT"))
+            #expect(feedback.contains("草稿已保留"))
+        }
+    }
+
     @Test("restarted readiness store feeds only applied selectable models")
     func restartedStoreFeedsAppliedSelectableModels() throws {
         let directory = try temporaryDirectory()

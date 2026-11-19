@@ -96,6 +96,14 @@ struct AudioEncodingBoundary2910Tests {
         }
     }
 
+    @Test("E-4: sniffed MIME comes from container bytes, not the declared name")
+    func sniffedMIMEFollowsBytes() {
+        #expect(MediaPayloadValidation.sniffedAudioMIME(MediaPayloadFixtures589.wav) == "audio/wav")
+        #expect(MediaPayloadValidation.sniffedAudioMIME(Data("not audio".utf8)) == nil)
+        #expect(MediaPayloadValidation.sniffedImageMIME(Data([0xFF, 0xD8, 0xFF, 0xE0])) == "image/jpeg")
+        #expect(MediaPayloadValidation.sniffedImageMIME(Data("plain".utf8)) == nil)
+    }
+
     @Test("undecodable IEEE float16 cannot be emitted on the first send or after reopen")
     func invalidFloatingEncodingIsRefusedOnActualSendAndHistory() async throws {
         let root = try ownedRoot()

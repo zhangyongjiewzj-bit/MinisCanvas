@@ -116,10 +116,11 @@ struct QuotedCurrentCommand2919Tests {
             "copy", "permissions", "mcp", "context", "clear", "rewind", "doctor", "usage",
             "export", "rename", "resume", "plan"
         ]
-        let approvedDirectoryExtension = ["add-dir"]
+        // /undo 与 /diff 是后续批准的对齐 Claude Code 命令。
+        let approvedDirectoryExtension = ["add-dir", "undo", "diff"]
         let expectedIDs = Set(original22 + approved12 + approvedDirectoryExtension)
-        #expect(expectedIDs.count == 35)
-        #expect(registered.count == 35)
+        #expect(expectedIDs.count == 37)
+        #expect(registered.count == 37)
         #expect(Set(registered.map(\.id)) == expectedIDs)
         chat.draftText = "/commands"
         chat.submitComposer()

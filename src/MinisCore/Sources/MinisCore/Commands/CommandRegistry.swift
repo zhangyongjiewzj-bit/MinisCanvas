@@ -309,6 +309,18 @@ public final class CommandRegistry: @unchecked Sendable {
             zhSummary: "选择检查点并确认恢复", enSummary: "Select and confirm a checkpoint restore",
             aliases: ["rewind"], category: .session, risk: .low
         ),
+        // /undo 是 /rewind 的别名入口：打开同一个恢复面板并预选最新检查点（对齐 Claude Code）。
+        ComposerCommandMetadata(
+            id: "undo", zhTitle: "撤销上一步改动", enTitle: "Undo",
+            zhSummary: "打开恢复面板并预选最新检查点", enSummary: "Open the rewind panel with the latest checkpoint selected",
+            aliases: ["撤销", "undo"], category: .session, risk: .low
+        ),
+        // /diff：只读查看工作区改动（git status + git diff HEAD），含命令行造成的改动。
+        ComposerCommandMetadata(
+            id: "diff", zhTitle: "工作区改动", enTitle: "Diff",
+            zhSummary: "只读查看工作区的未提交改动（含命令行造成的改动）", enSummary: "Show uncommitted workspace changes (read-only)",
+            aliases: ["diff", "改动"], category: .session, risk: .low
+        ),
         ComposerCommandMetadata(
             id: "doctor", zhTitle: "环境诊断", enTitle: "Doctor",
             zhSummary: "打开环境诊断与配置检查", enSummary: "Open environment diagnostics",
@@ -367,7 +379,7 @@ public final class CommandRegistry: @unchecked Sendable {
     public static func runsDuringGeneration(_ commandID: String) -> Bool {
         // stop/reject act on the in-flight turn or its pending approval card;
         // queueing them behind that turn would make them unusable (N2).
-        ["status", "tasks", "usage", "permissions", "stop", "reject"]
+        ["status", "tasks", "usage", "permissions", "stop", "reject", "resume"]
             .contains(CommandDefinition.canonicalID(commandID))
     }
 

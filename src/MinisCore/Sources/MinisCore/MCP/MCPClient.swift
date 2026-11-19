@@ -157,6 +157,8 @@ public final class MCPClient: @unchecked Sendable {
     private var runtimeChangedHandler: (@Sendable () -> Void)?
     private var toolsChangedHandler: (@Sendable () -> Void)?
     private var serverSupportsListChanged = false
+    private var serverSupportsResources = false
+    private var serverSupportsPrompts = false
     private var negotiatedElicitation = false
     private var diagnosticFailureObserver: (@Sendable (MCPClientLifecycleSnapshot) -> Void)?
 
@@ -187,14 +189,14 @@ public final class MCPClient: @unchecked Sendable {
         case .http:
             guard let urlString = server.url, let url = URL(string: urlString) else {
                 // Invalid http server — return a transport that always throws.
-                return MCPHTTPTransport(url: URL(string: "http://127.0.0.1:1")!, headers: server.headers, timeoutSeconds: server.timeoutSeconds, invalid: true)
+                return MCPHTTPTransport(url: URL(string: "http://127.0.0.1:1")!, headers: server.headers, timeoutSeconds: server.effectiveCallTimeoutSeconds, invalid: true)
             }
-            return MCPHTTPTransport(url: url, headers: server.headers, timeoutSeconds: server.timeoutSeconds)
+            return MCPHTTPTransport(url: url, headers: server.headers, timeoutSeconds: server.effectiveCallTimeoutSeconds)
         case .stdio:
             guard let command = server.command, !command.isEmpty else {
-                return MCPStdioTransport(command: "/bin/false", args: [], env: [:], timeoutSeconds: server.timeoutSeconds, invalid: true)
+                return MCPStdioTransport(command: "/bin/false", args: [], env: [:], timeoutSeconds: server.effectiveCallTimeoutSeconds, invalid: true)
             }
-            return MCPStdioTransport(command: command, args: server.args, env: server.env, timeoutSeconds: server.timeoutSeconds)
+            return MCPStdioTransport(command: command, args: server.args, env: server.env, timeoutSeconds: server.effectiveCallTimeoutSeconds, workingDirectory: server.workingDirectory)
         }
     }
 
@@ -247,7 +249,7 @@ public final class MCPClient: @unchecked Sendable {
                 id: nextID(),
                 method: "initialize",
                 params: .object([
-                    "protocolVersion": .string(transport is MCPStdioTransport ? "2025-11-25" : "2024-11-05"),
+                    "protocolVersion": .string("2025-11-25"),
                     "capabilities": capabilities,
                     "clientInfo": .object([
                         "name": .string("MinisCanvas"),
@@ -255,7 +257,7 @@ public final class MCPClient: @unchecked Sendable {
                     ]),
                 ])
             )
-            let response = try await transport.send(request)
+            let response = try await sendWithinHandshakeTimeout(request)
             try validate(response, for: request, generation: generation)
             if let rpcError = response.error {
                 throw MCPClientError.rpcError(code: rpcError.code, message: rpcError.message)
@@ -278,9 +280,35 @@ public final class MCPClient: @unchecked Sendable {
             setConnected(true, generation: generation)
         } catch {
             guard lifecycleGenerationMatches(generation) else { throw error }
+            if transport is MCPStdioTransport, !(error is CancellationError) {
+                // 给进程最后几行输出一点到达时间，便于把原因带给用户。
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+            let stderrTail = (transport as? MCPStdioTransport)?.recentStderrTail()
             transport.stop()
-            setState(.failed(Self.userFacing(error)), generation: generation)
+            var message = Self.userFacing(error)
+            if let stderrTail, !stderrTail.isEmpty {
+                message += "\n服务器输出（末尾）：\n" + stderrTail
+            }
+            setState(.failed(message), generation: generation)
             throw error
+        }
+    }
+
+    /// 启动握手与列工具使用较短的 `server.timeoutSeconds`；工具调用使用传输层的（更长的）调用超时。
+    private func sendWithinHandshakeTimeout(_ request: MCPJSONRPCRequest) async throws -> MCPJSONRPCResponse {
+        let seconds = server.timeoutSeconds
+        let transport = self.transport
+        guard seconds < server.effectiveCallTimeoutSeconds else { return try await transport.send(request) }
+        return try await withThrowingTaskGroup(of: MCPJSONRPCResponse.self) { group in
+            group.addTask { try await transport.send(request) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                throw MCPClientError.timeout("\(request.method) after \(seconds)s")
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else { throw MCPClientError.transportNotStarted }
+            return first
         }
     }
 
@@ -375,7 +403,7 @@ public final class MCPClient: @unchecked Sendable {
             method: "tools/list",
             params: cursor.map { .object(["cursor": .string($0)]) }
         )
-        let response = try await transport.send(request)
+        let response = try await sendWithinHandshakeTimeout(request)
         try validate(response, for: request, generation: generation)
         if let rpcError = response.error {
             throw MCPClientError.rpcError(code: rpcError.code, message: rpcError.message)
@@ -432,7 +460,7 @@ public final class MCPClient: @unchecked Sendable {
                     throw MCPClientError.badResponse("tools/list page exceeded schema byte limit")
                 }
             }
-            tools.append(MCPTool(name: name, description: description, inputSchema: obj["inputSchema"], _meta: obj["_meta"]))
+            tools.append(MCPTool(name: name, description: description, inputSchema: obj["inputSchema"], _meta: obj["_meta"], annotations: obj["annotations"]))
         }
         let nextCursor: String?
         switch result["nextCursor"] {
@@ -462,8 +490,186 @@ public final class MCPClient: @unchecked Sendable {
         )
     }
 
-    /// Call one tool (`tools/call`) and return its textual content — the
-    /// `text` parts of the `content` array joined with newlines.
+    // MARK: - resources / prompts（只读；服务器须在握手里声明对应能力）
+
+    private static let maxResourceListPages = 5
+    private static let maxResourcePromptEntries = 200
+
+    /// 服务器是否在握手里声明了 `resources` 能力（连接成功后才有意义）。
+    public var supportsResources: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return serverSupportsResources
+    }
+
+    /// 服务器是否在握手里声明了 `prompts` 能力（连接成功后才有意义）。
+    public var supportsPrompts: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return serverSupportsPrompts
+    }
+
+    private func requestResultObject(method: String, params: MCPJSONValue?) async throws -> [String: MCPJSONValue] {
+        let generation = try await ensureConnected()
+        let request = MCPJSONRPCRequest(id: nextID(), method: method, params: params)
+        let response = try await sendWithinHandshakeTimeout(request)
+        try validate(response, for: request, generation: generation)
+        if let rpcError = response.error {
+            throw MCPClientError.rpcError(code: rpcError.code, message: rpcError.message)
+        }
+        guard case .object(let result)? = response.result else {
+            throw MCPClientError.badResponse("\(method) result is not an object")
+        }
+        return result
+    }
+
+    /// `resources/list`：最多 5 页、200 条；服务器没有声明 resources 能力时返回空。
+    public func listResources() async throws -> [MCPResourceInfo] {
+        _ = try await ensureConnected()
+        guard supportsResources else { return [] }
+        var items: [MCPResourceInfo] = []
+        var cursor: String?
+        var seen = Set<String>()
+        for _ in 0..<Self.maxResourceListPages {
+            let result = try await requestResultObject(
+                method: "resources/list",
+                params: cursor.map { .object(["cursor": .string($0)]) }
+            )
+            guard case .array(let raw)? = result["resources"] else {
+                throw MCPClientError.badResponse("resources/list result missing 'resources' array")
+            }
+            for entry in raw {
+                guard case .object(let obj) = entry, case .string(let uri)? = obj["uri"], !uri.isEmpty else { continue }
+                let name: String
+                if case .string(let value)? = obj["name"], !value.isEmpty { name = value } else { name = uri }
+                var description: String?
+                if case .string(let value)? = obj["description"] { description = value }
+                var mimeType: String?
+                if case .string(let value)? = obj["mimeType"] { mimeType = value }
+                items.append(MCPResourceInfo(uri: uri, name: name, description: description, mimeType: mimeType))
+                if items.count >= Self.maxResourcePromptEntries { return items }
+            }
+            guard case .string(let next)? = result["nextCursor"], !next.isEmpty,
+                  seen.insert(next).inserted else { break }
+            cursor = next
+        }
+        return items
+    }
+
+    /// `resources/read`：只取文本内容；二进制内容用一行说明代替。返回内容未脱敏，调用方负责脱敏与限长。
+    public func readResource(uri: String) async throws -> String {
+        guard !uri.isEmpty, uri.utf8.count <= 8 * 1024 else {
+            throw MCPClientError.badResponse("resources/read uri is invalid")
+        }
+        _ = try await ensureConnected()
+        guard supportsResources else {
+            throw MCPClientError.badResponse("server does not support resources")
+        }
+        let result = try await requestResultObject(
+            method: "resources/read", params: .object(["uri": .string(uri)])
+        )
+        guard case .array(let contents)? = result["contents"] else {
+            throw MCPClientError.badResponse("resources/read result missing 'contents' array")
+        }
+        var parts: [String] = []
+        for entry in contents {
+            guard case .object(let obj) = entry else { continue }
+            if case .string(let text)? = obj["text"] {
+                parts.append(text)
+            } else if obj["blob"] != nil {
+                var mime = "未知类型"
+                if case .string(let value)? = obj["mimeType"], !value.isEmpty { mime = value }
+                parts.append("[二进制内容（\(mime)）已省略]")
+            }
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    /// `prompts/list`：最多 5 页、200 条；服务器没有声明 prompts 能力时返回空。
+    public func listPrompts() async throws -> [MCPPromptInfo] {
+        _ = try await ensureConnected()
+        guard supportsPrompts else { return [] }
+        var items: [MCPPromptInfo] = []
+        var cursor: String?
+        var seen = Set<String>()
+        for _ in 0..<Self.maxResourceListPages {
+            let result = try await requestResultObject(
+                method: "prompts/list",
+                params: cursor.map { .object(["cursor": .string($0)]) }
+            )
+            guard case .array(let raw)? = result["prompts"] else {
+                throw MCPClientError.badResponse("prompts/list result missing 'prompts' array")
+            }
+            for entry in raw {
+                guard case .object(let obj) = entry, case .string(let name)? = obj["name"], !name.isEmpty else { continue }
+                var description: String?
+                if case .string(let value)? = obj["description"] { description = value }
+                var arguments: [MCPPromptArgument] = []
+                if case .array(let rawArguments)? = obj["arguments"] {
+                    for item in rawArguments {
+                        guard case .object(let argument) = item, case .string(let argumentName)? = argument["name"],
+                              !argumentName.isEmpty else { continue }
+                        var argumentDescription: String?
+                        if case .string(let value)? = argument["description"] { argumentDescription = value }
+                        arguments.append(MCPPromptArgument(
+                            name: argumentName, description: argumentDescription,
+                            required: argument["required"] == .bool(true)
+                        ))
+                    }
+                }
+                items.append(MCPPromptInfo(name: name, description: description, arguments: arguments))
+                if items.count >= Self.maxResourcePromptEntries { return items }
+            }
+            guard case .string(let next)? = result["nextCursor"], !next.isEmpty,
+                  seen.insert(next).inserted else { break }
+            cursor = next
+        }
+        return items
+    }
+
+    /// `prompts/get`：把返回的消息展开成一段文字（助手角色的消息加“助手：”前缀）。未脱敏，调用方负责脱敏与限长。
+    public func getPrompt(name: String, arguments: [String: String]) async throws -> String {
+        guard !name.isEmpty, name.utf8.count <= Self.maxToolNameBytes else {
+            throw MCPClientError.badResponse("prompts/get name is invalid")
+        }
+        _ = try await ensureConnected()
+        guard supportsPrompts else {
+            throw MCPClientError.badResponse("server does not support prompts")
+        }
+        var params: [String: MCPJSONValue] = ["name": .string(name)]
+        if !arguments.isEmpty { params["arguments"] = .object(arguments.mapValues { .string($0) }) }
+        let result = try await requestResultObject(method: "prompts/get", params: .object(params))
+        guard case .array(let messages)? = result["messages"] else {
+            throw MCPClientError.badResponse("prompts/get result missing 'messages' array")
+        }
+        func text(of content: MCPJSONValue?) -> [String] {
+            switch content {
+            case .object(let obj)?:
+                if case .string(let value)? = obj["text"] { return [value] }
+                if case .object(let resource)? = obj["resource"], case .string(let value)? = resource["text"] {
+                    return [value]
+                }
+                return []
+            case .array(let items)?:
+                return items.flatMap { text(of: $0) }
+            default:
+                return []
+            }
+        }
+        var lines: [String] = []
+        for message in messages {
+            guard case .object(let obj) = message else { continue }
+            let body = text(of: obj["content"]).joined(separator: "\n")
+            guard !body.isEmpty else { continue }
+            if obj["role"] == .string("assistant") {
+                lines.append("助手：" + body)
+            } else {
+                lines.append(body)
+            }
+        }
+        return lines.joined(separator: "\n\n")
+    }
+
+    /// Call one tool (`tools/call`) and return its content as text. `isError`
+    /// results are thrown as `MCPToolReportedError` so the model and UI see an error.
     public func callTool(name: String, arguments: [String: Any]?, invocation: MCPToolInvocationIdentity? = nil) async throws -> String {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw MCPClientError.toolNotFound(name)
@@ -495,27 +701,141 @@ public final class MCPClient: @unchecked Sendable {
         if let rpcError = response.error {
             throw MCPClientError.rpcError(code: rpcError.code, message: rpcError.message)
         }
-        guard case .object(let result)? = response.result,
-              case .array(let content)? = result["content"] else {
+        guard case .object(let result)? = response.result else {
             throw MCPClientError.badResponse("tools/call result missing 'content' array")
         }
         var texts: [String] = []
-        for raw in content {
-            guard case .object(let obj) = raw,
-                  case .string(let type)? = obj["type"] else {
-                throw MCPClientError.badResponse(
-                    "tools/call content item missing string 'type'"
-                )
+        // 图片通过旁路交给模型：标记放在文字限长之后，避免被截断吃掉。
+        var imageMarkers: [String] = []
+        // 报错、被取消或解析失败时，已附上的图片不会交给模型，必须从暂存区清掉。
+        var imagesDelivered = false
+        defer { if !imagesDelivered { ToolResultImageChannel.discard(markers: imageMarkers) } }
+        if case .array(let content)? = result["content"] {
+            for raw in content {
+                guard case .object(let obj) = raw,
+                      case .string(let type)? = obj["type"] else {
+                    throw MCPClientError.badResponse(
+                        "tools/call content item missing string 'type'"
+                    )
+                }
+                if type == "image", imageMarkers.count < ToolResultImageChannel.maxImagesPerResult,
+                   case .string(let base64)? = obj["data"],
+                   let bytes = Data(base64Encoded: base64, options: .ignoreUnknownCharacters),
+                   let marker = ToolResultImageChannel.attach(
+                       data: bytes, mimeType: { if case .string(let m)? = obj["mimeType"] { return m }; return "image/png" }()) {
+                    imageMarkers.append(marker)
+                    var savedNote = ""
+                    if let savedPath = Self.persistImageForDisplay(bytes, mimeType: Self.imageDescription(obj)) {
+                        savedNote = "，已保存：\(savedPath)"
+                    }
+                    texts.append("[工具返回了 1 张图片（\(Self.imageDescription(obj))\(savedNote)）]")
+                    continue
+                }
+                texts.append(contentsOf: try Self.describeContentItem(type: type, object: obj))
             }
-            guard type == "text" else { continue }
+        } else {
+            guard let structured = result["structuredContent"] else {
+                throw MCPClientError.badResponse("tools/call result missing 'content' array")
+            }
+            texts.append(Self.jsonText(structured))
+        }
+        if texts.isEmpty, let structured = result["structuredContent"] {
+            texts.append(Self.jsonText(structured))
+        }
+        if case .bool(true)? = result["isError"] {
+            let message = MCPOutputLimiter.limit(texts, to: maxOutputCharacters)
+            throw MCPToolReportedError(message: message.isEmpty ? "工具报告了错误，但没有返回说明。" : message)
+        }
+        // 超限输出：先脱敏、再在截断之前把完整内容落盘，返回路径（模型可用 file_read 分段读）。
+        var overflowNote = ""
+        if maxOutputCharacters > 1_000,
+           texts.reduce(0, { $0 + $1.count }) > maxOutputCharacters,
+           let scope = ToolOutputArtifactSessionScope.current, scope.sessionStorageRoot.isFileURL {
+            let redactedFull = MCPOutputLimiter.limit(texts, to: Self.maxPersistedOutputCharacters)
+            let store = ToolOutputArtifactStore(sessionStorageRoot: scope.sessionStorageRoot, sessionID: scope.sessionID)
+            if let artifact = try? store.persistIfLarge(
+                redactedOutput: redactedFull, thresholdCharacters: maxOutputCharacters) {
+                overflowNote = "\n[完整输出（已脱敏）共 \(artifact.characterCount) 字符，已保存到 \(artifact.fileURL.path)；用 file_read 的 offset 和 lines 分段读取]\nfull_output_path: \(artifact.fileURL.path)"
+            }
+        }
+        let limitBudget = overflowNote.isEmpty ? maxOutputCharacters : max(1, maxOutputCharacters - overflowNote.count)
+        let limited = MCPOutputLimiter.limit(texts, to: limitBudget) + overflowNote
+        try Task.checkCancellation()
+        imagesDelivered = true
+        return imageMarkers.isEmpty ? limited : limited + "\n" + imageMarkers.joined(separator: "\n")
+    }
+
+    /// 落盘保存的完整输出上限（字符）；超过的部分不保存。
+    private static let maxPersistedOutputCharacters = 20_000_000
+
+    /// 把 MCP 返回的图片存进会话输出目录（供工具卡片显示缩略图）；没有会话存储或写入失败时返回 nil。
+    private static func persistImageForDisplay(_ bytes: Data, mimeType: String) -> String? {
+        guard bytes.count <= 20 * 1024 * 1024,
+              let scope = ToolOutputArtifactSessionScope.current, scope.sessionStorageRoot.isFileURL else { return nil }
+        let ext: String
+        switch mimeType.lowercased() {
+        case "image/png": ext = "png"
+        case "image/jpeg", "image/jpg": ext = "jpg"
+        case "image/gif": ext = "gif"
+        case "image/webp": ext = "webp"
+        default: return nil
+        }
+        let store = ToolOutputArtifactStore(sessionStorageRoot: scope.sessionStorageRoot, sessionID: scope.sessionID)
+        return (try? store.persistImage(bytes, fileExtension: ext))?.path
+    }
+
+    private static func imageDescription(_ obj: [String: MCPJSONValue]) -> String {
+        var mime = "未知类型"
+        if case .string(let value)? = obj["mimeType"] { mime = value }
+        return mime
+    }
+
+    /// 把一个 MCP 内容项转成给模型看的文字。图片、音频目前只给出说明（类型与大小），
+    /// 资源给出 uri 与文本内容。
+    private static func describeContentItem(type: String, object obj: [String: MCPJSONValue]) throws -> [String] {
+        func string(_ key: String, in dict: [String: MCPJSONValue]) -> String? {
+            if case .string(let value)? = dict[key] { return value }
+            return nil
+        }
+        func size(ofBase64 base64: String?) -> String {
+            guard let base64 else { return "大小未知" }
+            let padding = base64.hasSuffix("==") ? 2 : (base64.hasSuffix("=") ? 1 : 0)
+            let bytes = max(0, base64.utf8.count * 3 / 4 - padding)
+            return bytes >= 1024 ? "\(bytes / 1024) KB" : "\(bytes) 字节"
+        }
+        switch type {
+        case "text":
             guard case .string(let text)? = obj["text"] else {
                 throw MCPClientError.badResponse(
                     "tools/call text content item missing string 'text'"
                 )
             }
-            texts.append(text)
+            return [text]
+        case "image":
+            let mime = string("mimeType", in: obj) ?? "未知类型"
+            return ["[工具返回了 1 张图片（\(mime)，\(size(ofBase64: string("data", in: obj)))），图片内容未提供给模型]"]  // 图片无法解码、超过张数上限等没走旁路的情况
+        case "audio":
+            let mime = string("mimeType", in: obj) ?? "未知类型"
+            return ["[工具返回了 1 段音频（\(mime)，\(size(ofBase64: string("data", in: obj)))），音频内容未提供给模型]"]
+        case "resource":
+            guard case .object(let resource)? = obj["resource"] else { return ["[工具返回了 1 个资源]"] }
+            let uri = string("uri", in: resource) ?? "未知地址"
+            if let text = string("text", in: resource) { return ["[资源 \(uri)]\n" + text] }
+            let mime = string("mimeType", in: resource) ?? "未知类型"
+            return ["[资源 \(uri)（\(mime)，\(size(ofBase64: string("blob", in: resource)))，二进制内容未提供给模型）]"]
+        case "resource_link":
+            let uri = string("uri", in: obj) ?? "未知地址"
+            let name = string("name", in: obj).map { "\($0)：" } ?? ""
+            let detail = string("description", in: obj).map { "\n" + $0 } ?? ""
+            return ["[资源链接 \(name)\(uri)]" + detail]
+        default:
+            return ["[工具返回了无法识别的内容（\(type)）]"]
         }
-        return MCPOutputLimiter.limit(texts, to: maxOutputCharacters)
+    }
+
+    private static func jsonText(_ value: MCPJSONValue) -> String {
+        guard let data = try? JSONEncoder().encode(value) else { return "" }
+        return String(decoding: data, as: UTF8.self)
     }
 
     public func setRuntimeChangedHandler(_ handler: (@Sendable () -> Void)?) {
@@ -541,12 +861,18 @@ public final class MCPClient: @unchecked Sendable {
         stateLock.lock(); defer { stateLock.unlock() }
         serverSupportsListChanged = false
         negotiatedElicitation = false
+        serverSupportsResources = false
+        serverSupportsPrompts = false
         guard case .object(let result)? = result else { return }
         if case .string(let version)? = result["protocolVersion"] {
             negotiatedElicitation = ["2025-06-18", "2025-11-25"].contains(version)
         }
         if case .object(let caps)? = result["capabilities"], case .object(let tools)? = caps["tools"] {
             serverSupportsListChanged = tools["listChanged"] == .bool(true)
+        }
+        if case .object(let caps)? = result["capabilities"] {
+            if case .object? = caps["resources"] { serverSupportsResources = true }
+            if case .object? = caps["prompts"] { serverSupportsPrompts = true }
         }
     }
     private func receiveServerNotification(_ notification: MCPJSONRPCNotification, runtimeID: UUID) {
@@ -856,8 +1182,8 @@ public final class MCPClient: @unchecked Sendable {
 // MARK: - STDIO Transport
 
 /// Spawns `command args…` and speaks newline-delimited JSON-RPC over its
-/// stdin/stdout (the MCP stdio transport spec). Server stderr is drained to
-/// /dev/null (TODO: surface for debugging).
+/// stdin/stdout (the MCP stdio transport spec). Server stderr is drained into a
+/// small bounded tail so a failed launch/handshake can show the last lines.
 public final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
 
     public let command: String
@@ -894,17 +1220,50 @@ public final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
     /// 即使句柄尚未完全清理完也直接短路抛 transportNotStarted，不再写 stdin。
     private var stopped = false
     private let invalid: Bool
+    private let stderrLock = NSLock()
+    private var stderrTail = Data()
+    private static let stderrTailLimit = 16 * 1024
 
     private static let naturalExitGracePeriod: TimeInterval = 0.25
     private static let terminateGracePeriod: TimeInterval = 0.25
     private static let forceKillGracePeriod: TimeInterval = 0.25
 
-    public init(command: String, args: [String], env: [String: String], timeoutSeconds: Int = 60, invalid: Bool = false) {
+    /// 项目级 .mcp.json 导入的服务器在项目根目录里启动；nil 表示沿用默认目录。
+    private let workingDirectory: String?
+
+    public init(command: String, args: [String], env: [String: String], timeoutSeconds: Int = 60, invalid: Bool = false, workingDirectory: String? = nil) {
         self.command = command
         self.args = args
         self.env = env
+        self.workingDirectory = workingDirectory
         self.timeoutSeconds = timeoutSeconds
         self.invalid = invalid
+    }
+
+    private func appendStderr(_ chunk: Data) {
+        stderrLock.withLock {
+            stderrTail.append(chunk)
+            if stderrTail.count > Self.stderrTailLimit {
+                stderrTail.removeFirst(stderrTail.count - Self.stderrTailLimit)
+            }
+        }
+    }
+
+    /// 服务器 stderr 最近几行（已遮蔽密钥值），用于启动或握手失败时的提示。没有输出返回 nil。
+    public func recentStderrTail(maxLines: Int = 8, maxLineLength: Int = 300) -> String? {
+        let data = stderrLock.withLock { stderrTail }
+        guard !data.isEmpty else { return nil }
+        let lines = String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .suffix(maxLines)
+            .map { $0.count > maxLineLength ? String($0.prefix(maxLineLength)) + "…" : $0 }
+        guard !lines.isEmpty else { return nil }
+        let secrets = env.compactMap { key, value in
+            !value.isEmpty && MCPServerSecretPolicy.isSecretKey(key) ? value : nil
+        }
+        return MCPServerSecretPolicy.redactText(lines.joined(separator: "\n"), knownSecrets: secrets)
     }
 
     public var isReady: Bool {
@@ -965,6 +1324,12 @@ public final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
         if command.contains("/") {
             process.arguments = args
         }
+        if let workingDirectory, !workingDirectory.isEmpty {
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: workingDirectory, isDirectory: &isDirectory), isDirectory.boolValue {
+                process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            }
+        }
         // Only this server's explicit configuration augments the shared safe
         // baseline. Never import provider credentials from the App environment.
         do {
@@ -985,7 +1350,14 @@ public final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
         }
         process.standardOutput = outPipe
         process.standardInput = inPipe
-        process.standardError = FileHandle.nullDevice
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        stderrLock.withLock { stderrTail.removeAll() }
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { handle.readabilityHandler = nil; return }
+            self?.appendStderr(chunk)
+        }
         // Reuse the frozen stdio exit contract: a descendant can keep stdout
         // open after the root exits, so EOF is not the root's terminal signal.
         process.terminationHandler = { [weak self] terminatedProcess in

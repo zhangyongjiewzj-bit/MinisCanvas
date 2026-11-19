@@ -80,7 +80,7 @@ struct SettingsTests {
         #expect(s.agent.toolTimeoutSeconds == 300)
         #expect(s.agent.concurrentToolLimit == 4)
         #expect(s.agent.autoCompactThreshold == 0.8)
-        #expect(s.agent.fallbackEnabled == true)
+        #expect(s.agent.fallbackEnabled == false)
         #expect(s.agent.composerPolicy == .default)
 
         // privacy
@@ -190,7 +190,7 @@ struct SettingsTests {
         #expect(reloaded.settings.agent.maxLoopIterations == 25)
         #expect(reloaded.settings.privacy.logLevel == .warn)
         #expect(reloaded.settings.general.themePreset == .light)
-        #expect(reloaded.settings.general.appearance == .light)
+        #expect(reloaded.settings.general.appearance == .system)   // 产品主题跟随系统明暗
         #expect(reloaded.settings.general.accentTheme == .pseudo)
         #expect(reloaded.settings.general == store.settings.general)
         #expect(reloaded.settings.providerSettings["kling"] == ["resolution": "720p", "duration": "5"])
@@ -405,13 +405,13 @@ struct SettingsTests {
         // v2 新增字段补默认值。
         #expect(s.agent.concurrentToolLimit == 4)
         #expect(s.agent.autoCompactThreshold == 0.8)
-        #expect(s.agent.fallbackEnabled == true)
+        #expect(s.agent.fallbackEnabled == false)
         #expect(s.storage.memoryLimitMB == nil)
         #expect(s.storage.autoDeleteOldSessions == false)
         #expect(s.typography.uiBaseFontSize == 14)
 
         // 旧主题值按1115决定迁移，原值仍可从 provenance 恢复；其余配置不变。
-        #expect(s.general.themePreset == .system)
+        #expect(s.general.themePreset == .light)   // 旧深色 → 跟随系统 → 一次性迁到产品主题
         #expect(s.general.appearance == .system)
         #expect(s.general.legacyThemePresetRawValue == "dark|pseudo")
         #expect(s.general.language == "en")
@@ -740,6 +740,9 @@ struct SettingsTests {
         let backupURL = URL(fileURLWithPath: dir.path).appendingPathComponent(backups[0])
         let backupText = String(data: try Data(contentsOf: backupURL), encoding: .utf8)
         #expect(backupText == "not-json{{{")
+        // F-15：备份位置对外可读，界面据此告诉用户原文件在哪。
+        #expect(store.corruptBackupURL?.lastPathComponent == backups[0])
+        #expect(SettingsStore(directory: try makeTempDir("no-corrupt-backup")).corruptBackupURL == nil)
 
         // 主文件已被覆写为合法默认设置。
         #expect(fm.fileExists(atPath: fileURL.path))

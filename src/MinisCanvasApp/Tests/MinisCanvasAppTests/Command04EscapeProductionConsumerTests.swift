@@ -26,11 +26,22 @@ struct Command04EscapeProductionConsumerTests {
         center.onPendingTerminalResolution = { resolution in
             chat.resolvePendingComposerCommand(requestID: resolution.id, disposition: .reject)
         }
-        chat.draftText = "/compact"
+        // 11/16 起用户自己提交的 /compact 免卡直接执行，改用仍需审批的 /add-dir（合成执行器，不真实授权目录）。
+        center.prepareAdditionalDirectory = { request, snapshot, facts in
+            .init(request: request, snapshot: snapshot, facts: facts,
+                physicalDirectory: URL(fileURLWithPath: request.args["path"]!),
+                directoryIdentity: "synthetic-device:inode", projectID: "synthetic-project",
+                workingDirectory: "/synthetic/project", attachmentGeneration: 1)
+        }
+        center.applyApprovedAdditionalDirectory = { context in
+            .init(requestID: context.request.id, sessionID: context.snapshot.sessionID,
+                path: context.physicalDirectory.path)
+        }
+        chat.draftText = "/add-dir /synthetic/escape"
         chat.submitComposer()
         _ = try #require(center.pendingAdjudication)
         let request = try #require(chat.pendingComposerCommand)
-        #expect(request.commandID == "compact")
+        #expect(request.commandID == "add-dir")
         return (chat, center)
     }
 
@@ -117,9 +128,14 @@ struct Command04EscapeProductionConsumerTests {
         var executed = 0
         center.openCanonicalSettings = { executed += 1 }
         center.replaySubmittedCommand = { _ in executed += 1 }
+        center.applyApprovedAdditionalDirectory = { context in
+            executed += 1
+            return .init(requestID: context.request.id, sessionID: context.snapshot.sessionID,
+                path: context.physicalDirectory.path)
+        }
         let original = try #require(center.pendingAdjudication)
         let stale = center.escapeDenialAction(requestID: original.id, sessionID: original.sessionID, chat: chat)
-        chat.draftText = "/compact"
+        chat.draftText = "/add-dir /synthetic/escape"
         chat.submitComposer()
         let replacement = try #require(center.pendingAdjudication)
         #expect(replacement.id != original.id)

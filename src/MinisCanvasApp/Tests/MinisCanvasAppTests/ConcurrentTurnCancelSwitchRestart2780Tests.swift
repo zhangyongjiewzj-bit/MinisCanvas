@@ -20,7 +20,7 @@ private actor Turn2780Transport {
         pair.continuation.onTermination = { _ in
             Task { await self.didTerminate(number) }
         }
-        if number == 1 { pair.continuation.yield(.textDelta("A partial 2780")) }
+        if number == 1 { pair.continuation.yield(.textDelta("A partial 2780 ")) }
         return pair.stream
     }
 

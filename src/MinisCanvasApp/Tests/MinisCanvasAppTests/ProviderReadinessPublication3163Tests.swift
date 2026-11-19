@@ -33,7 +33,10 @@ struct ProviderReadinessPublication3163Tests {
         #expect(ModelPickerPanel.readinessFilteredModels(for: .custom(f.provider), chat: f.chat).isEmpty)
         #expect(!f.chat.applyChatModel(providerID: Fixture.providerName, modelID: Fixture.modelID))
         #expect(try f.readinessBytes() == afterDelete)
-        #expect(await transport.operations() == [.reachability, .authentication, .modelDiscovery])
+        // 目录请求遇到 503 这类暂时性失败会在检查内重试，所以首轮三步之后只允许多出目录重试。
+        let operations = await transport.operations()
+        #expect(Array(operations.prefix(3)) == [.reachability, .authentication, .modelDiscovery])
+        #expect(operations.dropFirst(3).allSatisfy { $0 == .modelDiscovery })
     }
 
     @Test("older failure cannot overwrite the newer successful report and picker")

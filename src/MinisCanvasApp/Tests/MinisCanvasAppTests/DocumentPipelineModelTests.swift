@@ -192,4 +192,16 @@ struct DocumentPipelineCodableTests {
             DocumentStage.self, from: JSONEncoder().encode(stage))
         #expect(decoded == stage)
     }
+
+    /// MC4-038：界面显示中文名，且与持久化 rawValue 无关。
+    @Test func stageStatesShowChineseDisplayNames() {
+        for status in StageStatus.allCases {
+            #expect(status.displayName != status.rawValue)
+            #expect(status.displayName.unicodeScalars.contains { $0.value > 0x2E80 })
+        }
+        for state in [DocumentStageRunState.pending, .running, .succeeded, .failed] {
+            #expect(state.displayName != state.rawValue)
+            #expect(state.displayName.unicodeScalars.contains { $0.value > 0x2E80 })
+        }
+    }
 }

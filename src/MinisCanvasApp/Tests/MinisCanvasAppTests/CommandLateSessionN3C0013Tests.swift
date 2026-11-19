@@ -233,7 +233,7 @@ struct CommandLateSessionN3C0013Tests {
         let response = try #require(originAfter.last)
         #expect(response.role == .assistant)
         switch scenario {
-        case .commandApproval: #expect(response.content.hasPrefix("⚠️ Composer 已拒绝画布操作："))
+        case .commandApproval: #expect(response.content.hasPrefix("⚠️ 已拒绝画布操作："))
         case .recoverDraft: #expect(response.content.hasPrefix("❌ 草稿恢复已拒绝："))
         case .importNovel: #expect(response.content == "❌ 导入失败：无法创建小说节点。")
         }

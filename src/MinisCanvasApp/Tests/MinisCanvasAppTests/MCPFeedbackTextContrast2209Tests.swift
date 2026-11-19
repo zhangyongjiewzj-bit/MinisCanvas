@@ -60,14 +60,28 @@ struct MCPFeedbackTextContrast2209Tests {
             if backgrounds.allSatisfy({ ThemeContrast.evaluate(role: .secondary, foreground: source, background: $0).passes }) {
                 #expect(color == source)
             }
-            // A 3:1 status foreground is not necessarily a readable caption.
-            if provider.mode == .light && succeeded {
-                #expect(!backgrounds.allSatisfy {
+            // 第 1 套浅色状态色（成功 #2A7549 / 危险 #B3261E）已按 4.5:1 取值，原色即可读，不再需要加深。
+            // “跟随系统”预设用系统绿，仍靠上面的兜底加深。
+            if provider.mode == .light && succeeded && preset != .system {
+                #expect(backgrounds.allSatisfy {
                     ThemeContrast.evaluate(role: .secondary, foreground: source, background: $0).passes
                 })
                 for surface in [original.background, original.sidebarBackground, original.surfaceRaised] {
                     #expect(ThemeContrast.evaluate(role: .status, foreground: source, background: surface).passes)
                 }
+            }
+        }
+        if provider.mode == .light {
+            // A 3:1 status foreground is not necessarily a readable caption: the 兜底 must still
+            // deepen a color that only clears the graphical gate (previous palette's success green).
+            let weak = ThemeColor(r: 0.42, g: 0.50, b: 0.37)
+            #expect(!backgrounds.allSatisfy {
+                ThemeContrast.evaluate(role: .secondary, foreground: weak, background: $0).passes
+            })
+            let readable = provider.readableStatusText(weak)
+            #expect(readable != weak)
+            for surface in backgrounds {
+                #expect(ThemeContrast.evaluate(role: .secondary, foreground: readable, background: surface).passes)
             }
         }
         #expect(provider.tokens == original)

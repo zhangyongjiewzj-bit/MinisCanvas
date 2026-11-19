@@ -129,4 +129,61 @@ struct MarkdownRenderTests {
         #expect(mixed.attributedString.string.contains("正常强调"))
     }
 
+    // MARK: 第二轮修复：行内代码、列表、链接、代码块复制
+
+    @Test func globAndStarsInsideInlineCodeDoNotTriggerFormatWarning() {
+        let state = MarkdownAttributedTextBuilder.renderState(
+            content: "用 `src/**/*.swift` 和 `**kwargs` 匹配", isMarkdown: true)
+        #expect(state.status == .rendered)
+        #expect(state.statusMessage == nil)
+        #expect(!state.attributedString.string.contains("Markdown 格式异常"))
+    }
+
+    @Test func unclosedBacktickIsOnlyFlaggedAfterStreamingEnds() {
+        let streaming = MarkdownAttributedTextBuilder.renderState(
+            content: "正在写 `code", isMarkdown: true, isStreaming: true)
+        #expect(streaming.status == .rendered)
+        let finished = MarkdownAttributedTextBuilder.renderState(content: "正在写 `code", isMarkdown: true)
+        #expect(finished.status == .fallback)
+    }
+
+    @Test func nestedAndRestartedOrderedListsRenderTheirOwnNumbers() {
+        let nested = MarkdownAttributedTextBuilder.build(
+            content: "1. 第一\n   - 子项\n2. 第二", isMarkdown: true).string
+        #expect(nested.contains("1. 第一"))
+        #expect(nested.contains("• 子项") || nested.contains("◦ 子项"))
+        #expect(nested.contains("2. 第二"))
+        let spaced = MarkdownAttributedTextBuilder.build(
+            content: "3. 三\n\n4. 四", isMarkdown: true).string
+        #expect(spaced.contains("3. 三"))
+        #expect(spaced.contains("4. 四"))
+        #expect(!spaced.contains("1. 四"))
+    }
+
+    @Test func bareURLAndExistingFilePathBecomeLinks() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("W6Link-\(UUID().uuidString).swift")
+        try "x".write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let text = MarkdownAttributedTextBuilder.build(
+            content: "见 https://example.com/docs。文件 \(file.path):42 与不存在的 /nope/none.txt", isMarkdown: true)
+        let ns = text.string as NSString
+        let url = ns.range(of: "https://example.com/docs")
+        #expect((text.attribute(TranscriptExternalLink.destination, at: url.location, effectiveRange: nil) as? URL)?
+            .absoluteString == "https://example.com/docs")
+        let path = ns.range(of: file.path)
+        #expect(text.attribute(TranscriptExternalLink.destination, at: path.location, effectiveRange: nil) != nil)
+        let missing = ns.range(of: "/nope/none.txt")
+        #expect(text.attribute(TranscriptExternalLink.destination, at: missing.location, effectiveRange: nil) == nil)
+    }
+
+    @Test func fencedCodeBlockCarriesAClickableCopyEntry() {
+        let text = MarkdownAttributedTextBuilder.build(content: "```swift\nlet a = 1\n```", isMarkdown: true)
+        let range = (text.string as NSString).range(of: TranscriptCodeCopy.label)
+        #expect(range.location != NSNotFound)
+        #expect(text.attribute(TranscriptCodeCopy.payload, at: range.location, effectiveRange: nil) as? String == "let a = 1")
+        let safe = ReadOnlyAttributedTextView.sanitized(text)
+        #expect(safe.attribute(.link, at: range.location, effectiveRange: nil) != nil)
+    }
+
 }

@@ -210,8 +210,7 @@ struct SessionMarkdownToolSummaryConsumerTests {
         #expect(!body.contains("工具摘要"))
         #expect(body.contains("合法工具正文"))
         let expectedBody = "# 会话\n\n" + messages.map { message in
-            let role = message.role == .user ? "用户" : message.role == .assistant ? "助手" : message.role == .system ? "系统" : "工具"
-            return "## \(role)\n\n" + redactor.redactVisibleConversationBody(message.content)
+            return SessionMarkdownExport.sectionHeader(for: message) + "\n\n" + redactor.redactVisibleConversationBody(message.content)
         }.joined(separator: "\n\n---\n\n") + "\n"
         #expect(body == expectedBody)
         let included = SessionMarkdownExport.markdown(title: "会话", messages: messages,
@@ -230,6 +229,36 @@ struct SessionMarkdownToolSummaryConsumerTests {
         #expect(try String(contentsOf: destination, encoding: .utf8) == body)
         try SessionMarkdownExport.write(markdown: included, to: destination)
         #expect(try String(contentsOf: destination, encoding: .utf8) == included)
+    }
+
+    @Test func exportCarriesTimeModelAndAttachmentNamesAndSuggestsATitleBasedFileName() {
+        let redactor = ChatTranscriptRedactor(secretValues: [])
+        let attachment = ChatAttachment(kind: .file, fileName: "/tmp/设计稿.pdf", fileType: .unknown, mimeType: "application/pdf")
+        var reply = ChatMessageUI(role: .assistant, content: "好的")
+        reply.turnModelID = "model-x"
+        let messages = [ChatMessageUI(role: .user, content: "看看这个", attachments: [attachment]), reply]
+        let markdown = SessionMarkdownExport.markdown(title: "导出", messages: messages, redactor: redactor)
+        #expect(markdown.contains("附件：设计稿.pdf"))
+        #expect(markdown.contains(" · model-x"))
+        #expect(markdown.contains(SessionMarkdownExport.sectionHeader(for: messages[0])))
+        let name = SessionMarkdownExport.suggestedFileName(title: "a/b: 方案*", redactor: redactor,
+            now: Date(timeIntervalSince1970: 0))
+        #expect(name.hasSuffix(".md") && name.hasPrefix("a b") && name.contains("方案") && !name.contains("/"))
+    }
+
+    @Test func forkBoundaryKeepsToolCallsPairedWithTheirResults() {
+        let call = LLMToolCall(id: "c1", name: "file_read", rawArguments: "{}", arguments: [:])
+        let messages = [
+            ChatMessageUI(role: .user, content: "q"),
+            ChatMessageUI(role: .assistant, content: "", toolCalls: [call]),
+            ChatMessageUI(role: .tool, content: "result", toolCallID: "c1"),
+            ChatMessageUI(role: .assistant, content: "done")
+        ]
+        // 落在带工具调用的助手消息上：把它的结果一起带上。
+        #expect(ChatStore.pairedForkPrefixCount(messages, rawCount: 2) == 3)
+        // 落在还没有结果的工具调用之后：整条去掉，避免留下孤立调用。
+        #expect(ChatStore.pairedForkPrefixCount(Array(messages.prefix(2)), rawCount: 2) == 1)
+        #expect(ChatStore.pairedForkPrefixCount(messages, rawCount: 4) == 4)
     }
 
     @Test func optInWithoutRecordedToolsDoesNotInventExecutionOrDuration() {

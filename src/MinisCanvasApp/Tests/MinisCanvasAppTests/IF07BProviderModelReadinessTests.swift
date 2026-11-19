@@ -47,7 +47,8 @@ struct IF07BProviderModelReadinessTests {
         let transport = IF07BMockProviderReadinessTransport(
             responses: [
                 .minimalModelRequest("model-a"): [
-                    .response(.init(statusCode: 500, body: "model-a failed")),
+                    // 2026-11-16：429/超时/5xx 在检查内会自动重试，所以用不会重试的 400 表示“这个模型失败”。
+                    .response(.init(statusCode: 400, body: "model-a failed")),
                     .response(.init(statusCode: 200, body: "model-a recovered"))
                 ],
                 .minimalModelRequest("model-b"): [

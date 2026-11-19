@@ -375,6 +375,39 @@ struct SessionStoreTests {
 
     // MARK: - Messages
 
+    /// 重试从最后一条用户消息重新开始：其后失败那一轮的工具调用、工具结果、半截回答和错误提示
+    /// 都去掉，之前的历史不动；看到的会话与落盘不一致时拒绝。
+    @Test func discardOutputAfterLastUserMessageKeepsHistoryAndRejectsStaleSnapshot() throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = SessionStore(directory: dir)
+        let session = try store.createSession()
+        let call = LLMToolCall(id: "call-1", name: "file_glob", rawArguments: "{}", arguments: [:])
+        let kept = [
+            LLMMessage(role: .user, content: "第一问"),
+            LLMMessage(role: .assistant, content: "第一答"),
+            LLMMessage(role: .user, content: "第二问"),
+        ]
+        let failed = [
+            LLMMessage(role: .assistant, content: "", toolCalls: [call]),
+            LLMMessage(role: .tool, content: "a.txt", toolCallID: "call-1"),
+            LLMMessage(role: .assistant, content: "半截回答"),
+            LLMMessage(role: .assistant, content: "**错误**：本会话累计用量已达上限"),
+        ]
+        for message in kept + failed { try store.saveMessage(message, sessionID: session.id) }
+        let before = try #require(store.loadSession(id: session.id))
+
+        let committed = try store.discardOutputAfterLastUserMessage(expectedSession: before)
+        #expect(committed.messages == kept)
+        #expect(committed.transcriptRevision == before.transcriptRevision + 1)
+        #expect(SessionStore(directory: dir).loadSession(id: session.id)?.messages == kept)
+
+        // 已经以用户消息结尾、或调用方拿的是旧快照：都拒绝，不改落盘。
+        #expect(throws: SessionStoreError.self) { try store.discardOutputAfterLastUserMessage(expectedSession: committed) }
+        #expect(throws: SessionStoreError.self) { try store.discardOutputAfterLastUserMessage(expectedSession: before) }
+        #expect(store.loadSession(id: session.id) == committed)
+    }
+
     @Test func saveMessageRoundTripsAcrossStoreInstances() throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }

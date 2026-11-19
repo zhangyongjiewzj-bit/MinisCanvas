@@ -316,7 +316,8 @@ struct HookApprovedWrite2761ConsumerTests {
                 return body
             }
         }
-        #expect(returned.contains { $0.contains("Policy violation: fileRootNotAllowed") })
+        #expect(returned.contains { $0.contains(PolicyEnforcedToolExecutorError.policyViolation(.fileRootNotAllowed).localizedDescription) })
+        #expect(!returned.contains { $0.contains("Policy violation") || $0.contains("fileRootNotAllowed") })
         #expect(!returned.contains { $0.contains("owned-hook2761-body") })
     }
 

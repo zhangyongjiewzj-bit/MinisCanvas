@@ -159,7 +159,9 @@ struct P0AApprovalPolicyGateTests {
         ask.attach(policy: .alwaysAsk)
         let askEngine = try #require(ask.bridge.chat.agentEngine as? AgentLoopChatEngine)
         let askGate = try #require(askEngine.loop.approvalGate)
-        #expect(askGate.policy(for: "browser") == .alwaysAsk)
+        // 用户 2026-11-16：浏览器只读动作不弹卡，因此 .alwaysAsk 下 browser 整体免问；
+        // 点击、输入、下载、上传这类写动作仍按输入逐次审批（BrowserSideEffectPolicy）。
+        #expect(askGate.policy(for: "browser") == .autoApprove)
         // 用户 2026-11-16：授权目录内只读文件工具不弹卡。
         #expect(askGate.policy(for: "file_read") == .autoApprove)
 
@@ -312,7 +314,7 @@ struct P0AApprovalPolicyGateTests {
         }
 
         let initialEngine = try #require(fixture.bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(initialEngine.loop.approvalGate?.policy(for: "browser") == .alwaysAsk)
+        #expect(initialEngine.loop.approvalGate?.policy(for: "browser") == .autoApprove)
         let initialRevision = fixture.bridge.chat.composerPolicyFacts.revision
         let initialEpoch = fixture.bridge.chat.composerPolicyFacts.grantEpoch
 

@@ -86,7 +86,7 @@ private final class CONC3HTTPServer: @unchecked Sendable {
                 let body = bytes[boundary.upperBound...]
                 if body.count >= length {
                     self.lock.withLock { self.requestBodies.append(Data(body.prefix(length))) }
-                    let text = id == 1 ? "OLD-HTTP-CONC3" : "FRESH-HTTP-CONC3-\(id)"
+                    let text = id == 1 ? "OLD-HTTP-CONC3 " : "FRESH-HTTP-CONC3-\(id)"
                     let delta = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\(text)\"},\"finish_reason\":null}]}\n\n"
                     let prefix = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
                     self.send(connection, prefix + self.chunk(delta))

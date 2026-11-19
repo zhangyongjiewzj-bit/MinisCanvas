@@ -24,6 +24,7 @@ private actor Child683Approval: ApprovalDelegate {
     func requestApproval(_ request: ApprovalRequest) async -> ApprovalDecision {
         if holdChildRead, !didHoldChildRead,
            request.taskID == "child683-builtin", request.toolName == "file_read" {
+            // 11/16 读文件免卡后，本测试改为挂住根外读取（child683-denied-read）的审批；根内读 note.txt 不再进入这里。
             didHoldChildRead = true
             await withCheckedContinuation { childWaiter = $0 }
         }
@@ -41,12 +42,15 @@ private final class Child683Provider: LLMProvider, ProviderRuntimeConfigurationI
     var runtimeConfigurationMaterial: String? = "child683-owned-config"
     private let workspace: URL
     private let emptyTasks: Bool?
+    private let outsideReadFile: URL?
     private let lock = NSLock()
     private var captured: [[LLMMessage]] = []
     private var capturedChildContext: AgentExecutionContextSnapshot?
     private var blocked = false
     private var cancelled = false
-    init(workspace: URL, emptyTasks: Bool? = nil) { self.workspace = workspace; self.emptyTasks = emptyTasks }
+    init(workspace: URL, emptyTasks: Bool? = nil, outsideReadFile: URL? = nil) {
+        self.workspace = workspace; self.emptyTasks = emptyTasks; self.outsideReadFile = outsideReadFile
+    }
     var requests: [[LLMMessage]] { lock.withLock { captured } }
     var childContext: AgentExecutionContextSnapshot? { lock.withLock { capturedChildContext } }
     var childIsBlocked: Bool { lock.withLock { blocked } }
@@ -70,9 +74,13 @@ private final class Child683Provider: LLMProvider, ProviderRuntimeConfigurationI
                 catch { lock.withLock { cancelled = true }; throw error }
                 throw Child683Error.unexpectedProviderCall
             }
+            // 11/16 读文件免卡后，本测试改为挂住授权根（root）之外的读取审批：根内读取不再请求审批，
+            // 根外读取仍请求审批，随后仍被子任务读范围拒绝。
+            let outsideRead = outsideReadFile
+                ?? workspace.deletingLastPathComponent().appendingPathComponent("outside-child.txt")
             let data = try JSONSerialization.data(withJSONObject: ["tool_calls": [
                 ["id": "child683-read", "name": "file_read", "input": ["path": workspace.appendingPathComponent("note.txt").path]],
-                ["id": "child683-denied-read", "name": "file_read", "input": ["path": workspace.deletingLastPathComponent().appendingPathComponent("outside-child.txt").path]]
+                ["id": "child683-denied-read", "name": "file_read", "input": ["path": outsideRead.path]]
             ]])
             return LLMResponse(text: String(decoding: data, as: UTF8.self), stopReason: "stop", usage: nil)
         }
@@ -288,7 +296,11 @@ struct ChildCancellation683ConsumerTests {
         let workspace = root.appendingPathComponent("workspace")
         try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
         try "683 owned note".write(to: workspace.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
-        try "683 outside child scope".write(to: root.appendingPathComponent("outside-child.txt"), atomically: true, encoding: .utf8)
+        // 11/16 读文件免卡后，本测试改为……：授权根内的读取不再请求审批，所以拒绝读的目标放到授权根之外
+        // （隔离 profile 根下），让子任务读它时仍请求审批，从而保留“等待审批”挂起点。
+        let outsideRead = profile.rootDirectory.appendingPathComponent("child683-outside-\(UUID().uuidString).txt")
+        try "683 outside child scope".write(to: outsideRead, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: outsideRead) }
         let sessionsURL = root.appendingPathComponent("sessions")
         let seed = SessionStore(directory: sessionsURL)
         let parentID = UUID(), otherID = UUID()
@@ -303,7 +315,7 @@ struct ChildCancellation683ConsumerTests {
             createdByTaskID: "683-legacy-task", createdByRunID: "683-legacy-run")
         let tasksURL = root.appendingPathComponent("tasks.json")
         let tasks = try AgentTaskStore(persistenceURL: tasksURL)
-        let provider = Child683Provider(workspace: workspace)
+        let provider = Child683Provider(workspace: workspace, outsideReadFile: outsideRead)
         let approval = Child683Approval(holdChildRead: true)
         let fixture = try await makeBridge(root: root, store: tasks, provider: provider,
             runner: Child683Runner(), approval: approval)
@@ -403,7 +415,7 @@ struct ChildCancellation683ConsumerTests {
         let actualPayload = try await AgentExecutionContext.$current.withValue(capturedContext) {
             try await probe.readThrough(route, path: readPath)
         }
-        #expect(actualPayload == "683 owned note" && probe.readCount == 1)
+        #expect(actualPayload == "     1\t683 owned note" && probe.readCount == 1)
         func copiedContext(ledger: ToolExecutionFactLedger?, binding: AgentChildToolRuntimeBinding?) -> AgentExecutionContextSnapshot {
             AgentExecutionContextSnapshot(provider: capturedContext.provider,
                 approvalGate: capturedContext.approvalGate, turnController: capturedContext.turnController,

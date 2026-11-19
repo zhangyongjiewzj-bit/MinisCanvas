@@ -181,7 +181,12 @@ public struct ApprovalRequest: Sendable, Equatable {
     public var webFetchAuthority: String? = nil
     /// Redacted path for presentation only; excluded from approval binding.
     public var displayTargetPath: String? = nil
+    /// orchestrate 子任务标题（已脱敏、单行、截断），只给审批卡展示；不含任务正文，
+    /// 不参与请求身份、摘要或授权判断。
+    public var displayTaskTitles: [String] = []
     public var isHookAsk: Bool = false
+    /// 敏感文件读写卡、项目外写入卡：回车不批准，必须点击（仅展示层使用，不进身份）。
+    public var requiresExplicitClick: Bool = false
     public var sessionScopeEligible = false
     public var hookAskReason: String? = nil
     public let filePreview: ApprovalFilePreview?
@@ -259,6 +264,7 @@ public struct ApprovalRequest: Sendable, Equatable {
             identityDigest: identityDigest, actorID: actorID, runID: runID, effectID: effectID,
             expiresAt: expiresAt, filePreview: preview, webFetchAuthority: webFetchAuthority,
             displayTargetPath: displayTargetPath)
+        result.displayTaskTitles = displayTaskTitles
         result.skillDiff = skillDiff
         result.skillDeletionIntent = skillDeletionIntent
         result.source = source
@@ -269,6 +275,7 @@ public struct ApprovalRequest: Sendable, Equatable {
         result.browserRiskWarning = browserRiskWarning
         result.terminalPolicyDisposition = terminalPolicyDisposition
         result.isHookAsk = isHookAsk
+        result.requiresExplicitClick = requiresExplicitClick
         result.sessionScopeEligible = sessionScopeEligible
         result.hookAskReason = hookAskReason
         return result
@@ -502,13 +509,44 @@ extension ApprovalError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .denied(let reason):
-            return Self.boundedDenialReason(reason).map { "审批被拒绝: \($0)" } ?? "审批被拒绝"
+            return Self.boundedDenialReason(reason.map(Self.localizedInternalReason))
+                .map { "审批被拒绝: \($0)" } ?? "审批被拒绝"
         case .expired(let requestID): return "审批已过期（请求 \(requestID)），请重新发起"
         case .revoked(let requestID): return "审批已撤销（请求 \(requestID)），请重新授权"
         case .cancelled(let requestID): return "审批已取消（请求 \(requestID)），可重新尝试"
         case .bindingMismatch(let requestID): return "审批绑定不匹配（请求 \(requestID)），请检查任务后重试"
         case .missingIdentity(let requestID): return "审批缺少完整身份（请求 \(requestID)），请重新发起"
         case .alreadyConsumed(let requestID): return "审批已被消费（请求 \(requestID)），请重新发起"
+        }
+    }
+
+    /// 门内部使用英文原因串（审计与测试按原值比较）；展示给用户时统一转成中文。
+    /// 用户或模型自己写的原因原样保留。
+    static func localizedInternalReason(_ raw: String) -> String {
+        func quoted(after prefix: String, before suffix: String) -> String? {
+            guard raw.hasPrefix(prefix), raw.hasSuffix(suffix),
+                  raw.count > prefix.count + suffix.count else { return nil }
+            return String(raw.dropFirst(prefix.count).dropLast(suffix.count))
+        }
+        if let tool = quoted(after: "Unknown capability '", before: "' is blocked") {
+            return "未知的工具「\(tool)」已被拦截，请确认该工具已启用后重试"
+        }
+        if let tool = quoted(after: "Tool '", before: "' is blocked by policy") {
+            return "工具「\(tool)」已被审批策略禁用，如需使用请到 设置 → 权限 调整"
+        }
+        if let tool = quoted(after: "Input requires approval for tool '", before: "'") {
+            return "「\(tool)」这次的参数需要你批准，当前没有可用的审批入口，请在应用内重新发起"
+        }
+        if let tool = quoted(after: "No approval delegate configured for tool '", before: "'") {
+            return "「\(tool)」需要审批，但当前没有可用的审批入口，请在应用内重新发起"
+        }
+        switch raw {
+        case "Settings calls require explicit approval": return "修改设置必须经过你的明确批准"
+        case "No approval delegate configured for settings": return "修改设置需要审批，但当前没有可用的审批入口"
+        case "L3 requires second confirmation": return "这项操作需要二次确认，请在审批卡上确认后再执行"
+        case "Capability is blocked by approval policy": return "该工具已被审批策略禁用，如需使用请到 设置 → 权限 调整"
+        case "command denied by terminal policy": return "该命令被终端策略拒绝，请到 设置 → 终端策略 查看拒绝表"
+        default: return raw
         }
     }
 

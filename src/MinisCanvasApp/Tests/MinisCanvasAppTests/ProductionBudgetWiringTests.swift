@@ -10,6 +10,8 @@ private final class ProductionBudgetProvider: LLMProvider, @unchecked Sendable {
     private(set) var calls = 0
     private(set) var receivedToolNames: [String] = []
     private(set) var receivedMaxTokens: [Int] = []
+    /// R3-07：每次请求收到的温度；主对话不传温度，所以应全是 nil。
+    private(set) var receivedTemperatures: [Double?] = []
     var repeatToolCall = false
 
     func sendMessage(
@@ -20,6 +22,7 @@ private final class ProductionBudgetProvider: LLMProvider, @unchecked Sendable {
     ) async throws -> LLMResponse {
         calls += 1
         receivedMaxTokens.append(maxTokens)
+        receivedTemperatures.append(temperature)
         if repeatToolCall {
             return LLMResponse(
                 text: #"{"tool_calls":[{"id":"budget-call","name":"shell_execute","input":{"command":"true"}}]}"#,
@@ -56,7 +59,8 @@ private final class ProductionBudgetProvider: LLMProvider, @unchecked Sendable {
         maxTokens: Int,
         temperature: Double?
     ) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
-        AsyncThrowingStream { continuation in
+        receivedTemperatures.append(temperature)
+        return AsyncThrowingStream { continuation in
             continuation.yield(.finished(stopReason: "stop"))
             continuation.finish()
         }
@@ -65,6 +69,50 @@ private final class ProductionBudgetProvider: LLMProvider, @unchecked Sendable {
 
 @Suite("生产预算硬门禁接线")
 struct ProductionBudgetWiringTests {
+    /// R3-07：主对话（生产循环和回退直连两条路径）都不传温度，对齐 Claude Code / Codex，各模型用自己的默认值。
+    @Test func mainChatRequestsCarryNoTemperature() async throws {
+        let loopProvider = ProductionBudgetProvider()
+        let workspaceID = "temperature-r307"
+        let facts = ComposerPolicyFactSource(
+            knownCapabilities: [], grantedCapabilities: [], allowedWriteRoots: [],
+            workspaceID: workspaceID, revision: "temperature-revision", grantEpoch: "temperature-epoch",
+            leaseID: "temperature-lease", expiresAt: .distantFuture, autonomyCeiling: .l1)
+        let snapshot = ComposerSubmissionSnapshot(
+            mode: .manual, approvalScope: .request, effort: .standard, sessionID: workspaceID,
+            turnID: 1, taskID: "temperature-task", messageID: "temperature-assistant",
+            workspaceID: workspaceID, createdAt: Date(timeIntervalSince1970: 1),
+            policyRevision: facts.revision, grantEpoch: facts.grantEpoch,
+            autonomyCeiling: facts.autonomyCeiling)
+        let loopStream = try await AgentLoopChatEngine(
+            toolExecutor: BuiltinToolExecutor(allowedRoot: FileManager.default.temporaryDirectory),
+            composerPolicyFacts: facts
+        ).streamReply(
+            provider: loopProvider,
+            history: [ChatMessageUI(role: .user, content: "温度")],
+            systemPrompt: "test",
+            maxTokens: 16,
+            conversationID: workspaceID,
+            authorizedSessionReadSessionID: nil,
+            authorizedSessionReadScope: nil,
+            turnID: 1,
+            composerSnapshot: snapshot
+        )
+        for try await _ in loopStream {}
+        #expect(!loopProvider.receivedTemperatures.isEmpty)
+        #expect(loopProvider.receivedTemperatures.allSatisfy { $0 == nil })
+
+        let fallbackProvider = ProductionBudgetProvider()
+        let fallbackStream = try await FallbackChatEngine().streamReply(
+            provider: fallbackProvider,
+            history: [ChatMessageUI(role: .user, content: "温度")],
+            systemPrompt: "test",
+            maxTokens: 16
+        )
+        for try await _ in fallbackStream {}
+        #expect(!fallbackProvider.receivedTemperatures.isEmpty)
+        #expect(fallbackProvider.receivedTemperatures.allSatisfy { $0 == nil })
+    }
+
     @Test func budgetRecordingDecoratorForwardsNativeTools() async throws {
         let provider = ProductionBudgetProvider()
         let wrapped = BudgetRecordingProvider(base: provider, onRecorded: { _ in })

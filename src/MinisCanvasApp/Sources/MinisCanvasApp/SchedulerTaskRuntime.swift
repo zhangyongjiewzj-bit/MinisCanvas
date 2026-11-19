@@ -223,8 +223,10 @@ final class SchedulerTaskRuntime {
                     pinnedVersion: task.version)
                 let watermark = store.occurrences.filter { $0.taskID == task.id }
                     .map(\.scheduledMinute).max() ?? task.createdAt
+                // 暂停后再启用：从启用时刻往后算，不补跑暂停期间错过的触发。
                 guard let missed = try TaskScheduler.mostRecentMissedOccurrence(for: definition,
-                    after: max(task.createdAt, watermark), before: date) else { continue }
+                    after: max(task.createdAt, watermark, task.enabledAt ?? .distantPast),
+                    before: date) else { continue }
                 var calendar = Calendar(identifier: .gregorian)
                 guard let zone = TimeZone(identifier: zoneID) else {
                     throw TaskScheduleValidationError.invalidTimeZone
@@ -316,6 +318,19 @@ final class SchedulerTaskRuntime {
             proofToken: proofToken,
             now: now
         )
+    }
+
+    /// 用户在失败记录上点“重新执行”：按任务当前版本新建一条本分钟的触发记录并立刻驱动。
+    /// 失败的定时任务不会自动重试，只有这个由用户发起的入口。只接受明确失败（.failed）的记录，
+    /// 结果不确定的记录仍走“先对账”流程，避免重复执行。
+    @discardableResult
+    func rerunFailedOccurrence(id: UUID, now: Date = Date()) -> Bool {
+        guard let failed = store.occurrence(id: id), failed.state == .failed,
+              let task = store.task(id: failed.taskID), !task.isDeleted, task.isEnabled,
+              let fresh = store.reserveOccurrence(taskID: task.id, at: now),
+              fresh.id != failed.id, fresh.state == .triggered else { return false }
+        pollNow(at: now)
+        return true
     }
 
     @discardableResult

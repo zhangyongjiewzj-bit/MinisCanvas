@@ -30,6 +30,19 @@ struct ProviderReadinessAdapterTests {
         #expect(minimum.httpMethod == "POST")
         #expect(minimum.url?.path == "/v1/chat/completions")
         #expect(minimum.value(forHTTPHeaderField: "Authorization") == "Bearer \(fakeCredential)")
+        // 与对话请求一致（MC4-012）：自定义兼容端点 + 非推理模型用 max_tokens。
+        let minimumBody = try jsonObject(from: minimum)
+        #expect(minimumBody["max_tokens"] as? Int == 16)
+        #expect(minimumBody["max_completion_tokens"] == nil)
+        // 推理模型（gpt-5 / o 系列）与 OpenAI 官方端点仍用 max_completion_tokens。
+        let reasoning = try adapter.makeRequest(
+            operation: .modelRequest(modelID: "gpt-5"), baseURL: baseURL, modelID: "gpt-5", apiKey: fakeCredential)
+        #expect(try jsonObject(from: reasoning)["max_completion_tokens"] as? Int == 16)
+        #expect(try jsonObject(from: reasoning)["max_tokens"] == nil)
+        let official = try adapter.makeRequest(
+            operation: .modelRequest(modelID: "gpt-test"), baseURL: URL(string: "https://api.openai.com/v1")!,
+            modelID: "gpt-test", apiKey: fakeCredential)
+        #expect(try jsonObject(from: official)["max_completion_tokens"] as? Int == 16)
         #expect(try jsonObject(from: minimum)["stream"] as? Bool == false)
         #expect(try jsonObject(from: minimum)["model"] as? String == "gpt-test")
     }
@@ -78,7 +91,7 @@ struct ProviderReadinessAdapterTests {
             let body = try jsonObject(from: minimum)
             #expect(body["model"] as? String == "gpt-test")
             #expect(body["stream"] as? Bool == false)
-            #expect(body["max_output_tokens"] as? Int == 1)
+            #expect(body["max_output_tokens"] as? Int == 16)
             #expect(body["messages"] == nil)
             #expect(body["max_tokens"] == nil)
             let input = try #require(body["input"] as? [[String: Any]])
@@ -112,7 +125,7 @@ struct ProviderReadinessAdapterTests {
             Data(#"{"status":"completed","output":[]}"#.utf8),
             Data(#"{"status":"completed","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}"#.utf8),
             Data([0xFF, 0xFE]),
-            Data(repeating: 0x20, count: 1_048_577)
+            Data(repeating: 0x20, count: 16 * 1_048_576 + 1)
         ]
         for body in invalidBodies {
             #expect(throws: ProviderReadinessWireAdapterError.malformedModelResponse) {
@@ -146,8 +159,28 @@ struct ProviderReadinessAdapterTests {
         #expect(minimum.url?.path == "/v1/messages")
         #expect(minimum.value(forHTTPHeaderField: "x-api-key") == fakeCredential)
         #expect(minimum.value(forHTTPHeaderField: "anthropic-version") == "2023-06-01")
-        #expect(try jsonObject(from: minimum)["max_tokens"] as? Int == 1)
+        #expect(try jsonObject(from: minimum)["max_tokens"] as? Int == 16)
         #expect(try jsonObject(from: minimum)["model"] as? String == "claude-test")
+    }
+
+    @Test("Anthropic 网关地址不带 /v1：连接检查与对话同样补 /v1")
+    func anthropicGatewayWithoutV1GetsV1() throws {
+        let adapter = ProviderReadinessWireAdapterFactory.make(for: .anthropic)
+        let gateway = URL(string: "https://gateway.example.com/anthropic/")!
+        let catalog = try adapter.makeRequest(
+            operation: .modelCatalog, baseURL: gateway, modelID: nil, apiKey: fakeCredential
+        )
+        #expect(catalog.url?.path == "/anthropic/v1/models")
+        let auth = try adapter.makeRequest(
+            operation: .authentication, baseURL: gateway, modelID: nil, apiKey: fakeCredential
+        )
+        #expect(auth.url?.path == "/anthropic/v1/models")
+        let minimum = try adapter.makeRequest(
+            operation: .modelRequest(modelID: "m"), baseURL: gateway, modelID: "m", apiKey: fakeCredential
+        )
+        #expect(minimum.url?.path == "/anthropic/v1/messages")
+        let paged = try adapter.makeCatalogPageRequest(baseURL: gateway, apiKey: fakeCredential, afterID: "x")
+        #expect(paged.url?.path == "/anthropic/v1/models")
     }
 
     @Test("Anthropic catalog uses its own schema and does not accept OpenAI-shaped data")
@@ -171,18 +204,17 @@ struct ProviderReadinessAdapterTests {
         }
     }
 
-    @Test("Catalog decoding rejects duplicate or empty model identity")
-    func catalogIdentityMustBeUniqueAndNonEmpty() throws {
+    @Test("Catalog decoding dedupes repeated IDs and rejects a catalog with no usable ID")
+    func catalogIdentityIsDedupedAndNonEmpty() throws {
         let openAI = ProviderReadinessWireAdapterFactory.make(for: .openaiCompatible)
         let duplicateOpenAI = try JSONSerialization.data(withJSONObject: [
             "data": [
                 ["id": "gpt-test"],
-                ["id": " gpt-test " ]
+                ["id": " gpt-test " ],
+                ["id": "gpt-other"]
             ]
         ])
-        #expect(throws: ProviderReadinessWireAdapterError.malformedModelCatalog) {
-            try openAI.decodeModelCatalog(from: duplicateOpenAI)
-        }
+        #expect(try openAI.decodeModelCatalog(from: duplicateOpenAI).map(\.id) == ["gpt-test", "gpt-other"])
 
         let anthropic = ProviderReadinessWireAdapterFactory.make(for: .anthropic)
         let emptyAnthropic = try JSONSerialization.data(withJSONObject: [
@@ -195,28 +227,45 @@ struct ProviderReadinessAdapterTests {
         }
     }
 
-    @Test("Catalog envelopes are bounded, valid UTF-8, and reject duplicate or unknown keys")
-    func catalogEnvelopeIsStrictAndBounded() throws {
+    @Test("Catalog accepts large relay catalogs and unknown root keys but still rejects broken JSON")
+    func catalogEnvelopeIsTolerantAndBounded() throws {
         let adapter = ProviderReadinessWireAdapterFactory.make(for: .openaiCompatible)
 
         #expect(throws: ProviderReadinessWireAdapterError.malformedModelCatalog) {
             try adapter.decodeModelCatalog(from: Data(#"{"data":[{"id":"first","id":"second"}]}"#.utf8))
         }
+        let withExtraRootKey = try JSONSerialization.data(withJSONObject: [
+            "data": [["id": "gpt-test"]],
+            "success": true
+        ])
+        #expect(try adapter.decodeModelCatalog(from: withExtraRootKey).map(\.id) == ["gpt-test"])
+
+        let large = try JSONSerialization.data(withJSONObject: [
+            "data": (0..<3_000).map { ["id": "gpt-\($0)"] }
+        ])
+        #expect(try adapter.decodeModelCatalog(from: large).count == 3_000)
         #expect(throws: ProviderReadinessWireAdapterError.malformedModelCatalog) {
-            let body = try JSONSerialization.data(withJSONObject: [
-                "data": [["id": "gpt-test"]],
-                "unexpected": true
-            ])
-            _ = try adapter.decodeModelCatalog(from: body)
-        }
-        #expect(throws: ProviderReadinessWireAdapterError.malformedModelCatalog) {
-            let entries = (0..<257).map { ["id": "gpt-\($0)"] }
+            let entries = (0..<5_001).map { ["id": "gpt-\($0)"] }
             let body = try JSONSerialization.data(withJSONObject: ["data": entries])
             _ = try adapter.decodeModelCatalog(from: body)
         }
         #expect(throws: ProviderReadinessWireAdapterError.malformedModelCatalog) {
             try adapter.decodeModelCatalog(from: Data([0xFF, 0xFE, 0x00]))
         }
+    }
+
+    @Test("Anthropic catalog requests limit=1000 and follows has_more with last_id")
+    func anthropicCatalogPaginates() throws {
+        let adapter = ProviderReadinessWireAdapterFactory.make(for: .anthropic)
+        let first = try adapter.makeCatalogPageRequest(baseURL: baseURL, apiKey: fakeCredential, afterID: nil)
+        #expect(first.url?.query == "limit=1000")
+        let next = try adapter.makeCatalogPageRequest(baseURL: baseURL, apiKey: fakeCredential, afterID: "claude-a")
+        #expect(next.url?.query?.contains("after_id=claude-a") == true)
+
+        let page = Data(#"{"data":[{"id":"claude-a","type":"model"}],"has_more":true,"last_id":"claude-a"}"#.utf8)
+        #expect(adapter.nextCatalogPageCursor(from: page) == "claude-a")
+        let lastPage = Data(#"{"data":[{"id":"claude-b","type":"model"}],"has_more":false,"last_id":"claude-b"}"#.utf8)
+        #expect(adapter.nextCatalogPageCursor(from: lastPage) == nil)
     }
 
     @Test("Opaque model IDs retain case and Unicode distinctions")

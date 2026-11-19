@@ -37,8 +37,8 @@ struct P3AcceptanceM07SecondConfirmationTerminalTests {
             autonomyCeiling: .l3
         )
         let facts = ComposerPolicyFactSource(
-            knownCapabilities: ["file_write"],
-            grantedCapabilities: ["file_write"],
+            knownCapabilities: ["file_delete"],
+            grantedCapabilities: ["file_delete"],
             allowedWriteRoots: ["/synthetic"],
             workspaceID: snapshot.workspaceID,
             revision: snapshot.policyRevision,
@@ -63,8 +63,8 @@ struct P3AcceptanceM07SecondConfirmationTerminalTests {
         let callData = try JSONSerialization.data(withJSONObject: [
             "tool_calls": [[
                 "id": callID,
-                "name": "file_write",
-                "input": ["path": "/synthetic/unconfirmed.txt", "content": "sample"]
+                "name": "file_delete",
+                "input": ["path": "/synthetic/unconfirmed.txt"]
             ]]
         ])
         let envelope = try #require(String(data: callData, encoding: .utf8))
@@ -78,7 +78,7 @@ struct P3AcceptanceM07SecondConfirmationTerminalTests {
             systemPrompt: "test",
             provider: ToolApprovalMockLLMProvider(responses: [envelope, "done"]),
             toolExecutor: executor,
-            tools: minisCoreToolContractCatalog(["file_write"]),
+            tools: minisCoreToolContractCatalog(["file_delete"]),
             maxTokens: 1024,
             composerSnapshot: snapshot,
             executionIdentity: identity

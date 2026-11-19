@@ -40,16 +40,29 @@ public enum FileImportError: Error, Equatable, Sendable, LocalizedError {
 }
 
 public enum FileImporter {
+    /// 源码、配置与脚本类扩展名：按文本注入。`.env` 本身不在其中（可能含密钥），只收 `.env.example`（见 `declaredType(forFileName:)`）。
+    private static let sourceCodeExtensions = "yaml yml toml ini conf cfg plist xml html htm css js ts tsx jsx swift py mdx "
+        + "go rs java kt kts c h cpp hpp cc cxx m mm vue sh zsh bash sql gradle rb php lua r scala dart"
+
+    /// 无扩展名但约定俗成是纯文本的文件名（小写比较）。
+    private static let plainTextFileNames: Set<String> = [
+        "makefile", "dockerfile", "readme", "license", "licence", "changelog", "gemfile", "rakefile"
+    ]
+
+    /// 内容是文本标记但不应把原始标记当纯文本注入的扩展名：归为未知/文件引用，
+    /// 也不参与“前 8 KB 像 UTF-8 就按文本”的嗅探，交给后续的富文本提取。
+    private static let referenceOnlyExtensions: Set<String> = ["rtf", "rtfd"]
+
     private static let extensions: [(FileType, String)] = [
-        (.text, "txt log rtf csv tsv yaml yml toml ini conf plist xml html htm css js ts swift py mdx"),
+        (.text, "txt log csv tsv svg " + sourceCodeExtensions),
         (.markdown, "md markdown mdown mkd"), (.json, "json jsonl ndjson geojson"),
-        (.image, "png jpg jpeg gif webp heic heif bmp tiff tif svg ico avif"),
+        (.image, "png jpg jpeg gif webp heic heif bmp tiff tif ico avif"),
         (.audio, "mp3 wav aac m4a flac ogg opus aiff caf wma"),
         (.video, "mp4 mov m4v avi mkv webm wmv flv 3gp mpg mpeg")
     ]
 
     private static let mimeExtensions: [(String, String)] = [
-        ("text/plain", "txt log csv tsv yaml yml toml ini conf plist xml html htm css js ts swift py"),
+        ("text/plain", "txt log csv tsv " + sourceCodeExtensions),
         ("text/markdown", "md markdown mdown mkd"), ("application/json", "json jsonl ndjson geojson"),
         ("application/pdf", "pdf"), ("image/png", "png"), ("image/jpeg", "jpg jpeg"),
         ("image/gif", "gif"), ("image/webp", "webp"), ("image/svg+xml", "svg"),
@@ -59,6 +72,36 @@ public enum FileImporter {
         ("video/quicktime", "mov"), ("video/webm", "webm"),
         ("video/x-matroska", "mkv"), ("video/mpeg", "mpg mpeg")
     ]
+
+    /// 按文件名判定类型：先看扩展名，再看无扩展名的约定文件名与 `env.example`。
+    public static func declaredType(forFileName name: String) -> FileType? {
+        let lower = name.lowercased()
+        if let byExtension = type(forExtension: (lower as NSString).pathExtension) { return byExtension }
+        if lower == "env.example" || lower == ".env.example" || lower.hasSuffix(".env.example") { return .text }
+        return plainTextFileNames.contains(lower) ? .text : nil
+    }
+
+    /// 嗅探前 8 KB 判断“未知类型却是文本”时是否允许：富文本等标记格式排除。
+    public static func allowsTextSniffing(forExtension value: String) -> Bool {
+        !referenceOnlyExtensions.contains(value.lowercased())
+    }
+
+    /// 前 8 KB（或更短）是否像文本：非空、无 NUL、是合法 UTF-8。
+    /// `truncated` 为真时，末尾被字节截断的不完整 UTF-8 序列不算非法。
+    public static func looksLikeUTF8Text(_ prefix: Data, truncated: Bool) -> Bool {
+        guard !prefix.isEmpty, !prefix.contains(0) else { return false }
+        return utf8DecodedAllowingTruncatedTail(prefix, truncated: truncated) != nil
+    }
+
+    /// 按 UTF-8 解码；字节被截断时丢掉末尾最多 3 个不完整字节后再解码。
+    public static func utf8DecodedAllowingTruncatedTail(_ data: Data, truncated: Bool) -> String? {
+        if let text = String(data: data, encoding: .utf8) { return text }
+        guard truncated else { return nil }
+        for dropped in 1...3 where data.count > dropped {
+            if let text = String(data: data.prefix(data.count - dropped), encoding: .utf8) { return text }
+        }
+        return nil
+    }
 
     public static func type(forExtension value: String) -> FileType? {
         let key = value.lowercased()
@@ -82,7 +125,7 @@ public enum FileImporter {
     }
 
     public static func classify(url: URL) -> FileType {
-        if let category = type(forExtension: url.pathExtension) { return category }
+        if let category = declaredType(forFileName: url.lastPathComponent) { return category }
         return mimeType(of: url).flatMap { type(forMIME: $0) } ?? .unknown
     }
 

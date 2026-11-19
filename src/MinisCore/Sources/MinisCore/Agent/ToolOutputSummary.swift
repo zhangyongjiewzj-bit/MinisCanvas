@@ -11,6 +11,42 @@ public enum ToolOutputSummary: Codable, Equatable, Hashable, Sendable {
     // cases are emitted only when a fixed, content-free signal was recognized.
     case textWithSignals(bytes: Int, lines: Int, signals: [ContentSignal])
     case shellWithSignals(exitCode: Int, stdoutBytes: Int, stdoutLines: Int, stderrBytes: Int, stderrLines: Int, signals: [ContentSignal])
+    /// 统计之外，再带一份已脱敏、按长度截断的调用内容（完整命令/路径/模式）与输出正文，
+    /// 供工具卡片展开查看。只由 `captureWithDetail` 产生；旧数据不含此 case，照常解码。
+    indirect case withDetail(summary: ToolOutputSummary, detail: ToolCallDetail)
+
+    /// 工具卡片展开后显示的调用内容与输出正文。两者都已按 `ContentSecretRedactor` 脱敏。
+    public struct ToolCallDetail: Codable, Equatable, Hashable, Sendable {
+        /// 完整命令、完整路径或检索模式；没有可展示的目标时为 nil。
+        public let input: String?
+        /// 输出正文前 `ToolOutputSummary.maxDetailLines` 行；没有输出时为 nil。
+        public let output: String?
+        /// 因行数上限被省略的行数。
+        public let omittedLines: Int
+        /// 输出（或调用内容）因字符上限被截断。
+        public let isTruncated: Bool
+        /// 完整输出已落盘时的文件路径（会话输出目录内）；卡片据此提供“打开完整输出”。旧数据没有此字段。
+        public let fullOutputPath: String?
+
+        public init(input: String?, output: String?, omittedLines: Int, isTruncated: Bool,
+                    fullOutputPath: String? = nil) {
+            self.input = input
+            self.output = output
+            self.omittedLines = max(0, omittedLines)
+            self.isTruncated = isTruncated
+            self.fullOutputPath = fullOutputPath
+        }
+    }
+
+    public static let maxDetailLines = 200
+    public static let maxDetailOutputCharacters = 16_000
+    public static let maxDetailInputCharacters = 4_000
+
+    /// 卡片展开用的调用内容与输出正文；无详情（旧数据、纯统计）为 nil。
+    public var detail: ToolCallDetail? {
+        if case .withDetail(_, let detail) = self { return detail }
+        return nil
+    }
 
     /// Closed vocabulary: no tool-returned string, path or diff ID can enter
     /// a durable fact through a signal. A signal describes what the tool
@@ -42,6 +78,107 @@ public enum ToolOutputSummary: Codable, Equatable, Hashable, Sendable {
                 return nil
             }
         }
+    }
+
+    /// 在 `capture` 的统计之外附带脱敏后的调用内容与输出前若干行（用户可展开查看）。
+    /// `argumentsJSON` 为模型给出的原始参数 JSON。
+    /// `detailOutput` 给出时，统计仍按 `output`，展开用的正文取 `detailOutput`（调用方已按已知密钥处理过）。
+    public static func captureWithDetail(toolName: String, argumentsJSON: String, output: String,
+                                         detailOutput: String? = nil) -> ToolOutputSummary {
+        let base = capture(toolName: toolName, output: output)
+        let input = inputDetail(toolName: toolName, argumentsJSON: argumentsJSON)
+        let body = outputDetail(toolName: toolName, output: detailOutput ?? output)
+        guard input != nil || body.text != nil else { return base }
+        return .withDetail(
+            summary: base,
+            detail: ToolCallDetail(input: input, output: body.text,
+                                   omittedLines: body.omittedLines, isTruncated: body.truncated,
+                                   fullOutputPath: fullOutputPath(output: output))
+        )
+    }
+
+    /// 工具结果里已经落盘的完整输出路径：shell 的 stdout/stderr 落盘、web_fetch 全文、
+    /// 以及 MCP 等工具返回的 full_output_path。只认绝对路径，不读文件内容。
+    private static func fullOutputPath(output: String) -> String? {
+        // MCP 超限输出是纯文本：末尾单独一行 "full_output_path: /绝对路径"。
+        if output.first != "{", let range = output.range(of: "\nfull_output_path: ", options: .backwards) {
+            let tail = output[range.upperBound...]
+            let line = String(tail.prefix(while: { $0 != "\n" })).trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("/"), !SensitiveFilePolicy.contains(line) { return line }
+        }
+        guard output.utf8.count <= 1_048_576,
+              output.first == "{",
+              let data = output.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        var candidates: [String?] = [object["full_output_path"] as? String, object["full_content_path"] as? String]
+        for key in ["stdout_artifact", "stderr_artifact"] {
+            candidates.append((object[key] as? [String: Any])?["path"] as? String)
+        }
+        return candidates.compactMap { $0 }.first { $0.hasPrefix("/") && !SensitiveFilePolicy.contains($0) }
+    }
+
+    private static func inputDetail(toolName: String, argumentsJSON: String) -> String? {
+        guard let data = argumentsJSON.data(using: .utf8), data.count <= 1_048_576,
+              let args = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        var value: String
+        switch toolName {
+        case "shell_execute":
+            guard let command = args["command"] as? String else { return nil }
+            value = command
+        case "file_read", "file_write", "file_edit", "file_delete":
+            guard let path = args["path"] as? String, !path.isEmpty else { return nil }
+            value = SensitiveFilePolicy.contains(path) ? "敏感文件" : path
+        case "file_grep", "file_glob":
+            guard let pattern = args["pattern"] as? String, !pattern.isEmpty else { return nil }
+            value = pattern
+            if let path = args["path"] as? String, !path.isEmpty,
+               !SensitiveFilePolicy.contains(path) {
+                value += "\n范围：" + path
+            }
+        default:
+            return nil
+        }
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if value.count > maxDetailInputCharacters { value = String(value.prefix(maxDetailInputCharacters)) + "…" }
+        return ContentSecretRedactor.redact(value)
+    }
+
+    private static func outputDetail(toolName: String, output: String)
+        -> (text: String?, omittedLines: Int, truncated: Bool) {
+        var text = output
+        if toolName == "shell_execute",
+           let data = output.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["exit_code"] is Int,
+           let stdout = object["stdout"] as? String,
+           let stderr = object["stderr"] as? String {
+            text = stderr.isEmpty ? stdout : (stdout.isEmpty ? stderr : stdout + "\n[标准错误]\n" + stderr)
+        }
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return (nil, 0, false) }
+        var lines: [Substring] = []
+        var used = 0
+        var truncated = false
+        var full = false
+        var omitted = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if full || lines.count >= maxDetailLines { omitted += 1; continue }
+            if used + line.count + 1 > maxDetailOutputCharacters {
+                full = true
+                truncated = true
+                if lines.isEmpty {
+                    lines.append(line.prefix(maxDetailOutputCharacters))
+                } else {
+                    omitted += 1
+                }
+                continue
+            }
+            used += line.count + 1
+            lines.append(line)
+        }
+        let joined = lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
+        guard !joined.isEmpty else { return (nil, 0, false) }
+        return (ContentSecretRedactor.redact(joined), omitted, truncated)
     }
 
     public static func capture(toolName: String, output: String) -> ToolOutputSummary {
@@ -98,6 +235,8 @@ public enum ToolOutputSummary: Codable, Equatable, Hashable, Sendable {
     /// Only fixed labels and integers cross into a conversation event.
     public var displaySuffix: String? {
         switch self {
+        case .withDetail(let summary, _):
+            return summary.displaySuffix
         case .text(let bytes, let lines):
             guard bytes >= 0, lines >= 0 else { return nil }
             return Self.metricsOnly("返回 \(bytes) 字节、\(lines) 行")

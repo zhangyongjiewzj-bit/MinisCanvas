@@ -6,9 +6,8 @@ import Testing
 struct AgentOrchestratorMCPDiagnosticTests {
     private let remoteToolToken = "DMCP06_REMOTE_TOOL_9A6C3D"
     private let remotePropertyToken = "DMCP06_REMOTE_PROPERTY_41E8B7"
-    private let fixedMessage = "Invalid MCP tool schema"
 
-    @Test("child MCP schema failure redacts remote identity from every sink")
+    @Test("child skips a malformed MCP tool schema without leaking remote identity")
     func childMalformedMCPToolSchemaRedactsRemoteIdentityFromFailureReport() async throws {
         let fullName = MCPBoundTool.makeFullName(
             serverID: "dmcp06-server",
@@ -86,36 +85,24 @@ struct AgentOrchestratorMCPDiagnosticTests {
         )
         let report = try #require(reports.first)
         let receipt = try #require(store.allReceipts().first)
-        let envelope = try #require(receipt.childResultEnvelope)
-        let reportError = try #require(report.result.error)
-        let envelopeError = try #require(envelope.error)
         let orchestrationSummary = OrchestrationToolExecutor.makeSummary(reports: reports)
         let ledgerDetails = store.events(runID: receipt.runID)
             .map(\.detail)
             .joined(separator: "\n")
         let receiptDescription = String(describing: receipt)
 
-        #expect(reportError == fixedMessage)
-        #expect(envelopeError == fixedMessage)
-        #expect(report.summaryLine.contains(fixedMessage))
-        #expect(orchestrationSummary.contains(fixedMessage))
-        #expect(reportError != remoteToolToken)
-        #expect(envelopeError != remotePropertyToken)
+        // 对齐 Claude Code：schema 无法使用的 MCP 工具只被跳过，子任务本身照常完成，不再失败；
+        // 远端给出的工具名、属性名不得出现在任何用户可见或留档的位置。
+        #expect(report.result.error == nil)
+        #expect(report.result.isSuccess)
 
-        let userSurfaces = [
-            reportError,
-            envelopeError,
+        let surfaces = [
             report.summaryLine,
-            orchestrationSummary
+            orchestrationSummary,
+            ledgerDetails,
+            receiptDescription
         ]
-        for surface in userSurfaces {
-            #expect(surface.contains(fixedMessage))
-            #expect(!surface.contains(remoteToolToken))
-            #expect(!surface.contains(remotePropertyToken))
-        }
-
-        let rawLikeSurfaces = [ledgerDetails, receiptDescription]
-        for surface in rawLikeSurfaces {
+        for surface in surfaces {
             #expect(!surface.contains(remoteToolToken))
             #expect(!surface.contains(remotePropertyToken))
         }

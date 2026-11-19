@@ -99,6 +99,35 @@ struct MCPServerEditConsumer576Tests {
         #expect(draft.server() == nil)
     }
 
+    @Test func environmentTextAcceptsLinesCommasInValuesAndLegacyCommaForm() throws {
+        var draft = MCPServerEditDraft()
+        draft.id = "env576"
+        draft.name = "Env"
+        draft.command = "fixture"
+        draft.envText = "TOKEN=a,b=c\nDEBUG=1"
+        #expect(draft.server()?.env == ["TOKEN": "a,b=c", "DEBUG": "1"])
+        draft.envText = "A=1, B=2"
+        #expect(draft.server()?.env == ["A": "1", "B": "2"])
+        draft.envText = "A=1\nbroken"
+        #expect(draft.server() == nil)
+        #expect(draft.problem?.contains("第 2 行") == true)
+        draft.envText = ""
+        draft.callTimeoutText = "1200"
+        #expect(draft.server()?.callTimeoutSeconds == 1200)
+        draft.callTimeoutText = "abc"
+        #expect(draft.server() == nil && draft.problem != nil)
+    }
+
+    @Test func httpHeaderMayBeEmptyAndBlankRowsAreIgnored() throws {
+        var draft = MCPServerEditDraft()
+        draft.id = "header576"
+        draft.name = "Header"
+        draft.type = .http
+        draft.url = "https://example.invalid/mcp"
+        draft.headerRows = [MCPHeaderEditRow(name: "X-Empty"), MCPHeaderEditRow(name: "")]
+        #expect(draft.server()?.headers == ["X-Empty": ""])
+    }
+
     @Test func editSaveDisableEnableAndReopenFeedCanonicalNextTurn() async throws {
         let fixture = try Fixture()
         let center = fixture.center

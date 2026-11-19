@@ -84,6 +84,26 @@ public struct EnvVarEntry: Identifiable, Codable, Equatable, Sendable {
     /// 自定义模型的上下文窗口（tokens），键为 `modelNames` 中的模型名；
     /// nil/缺省 = 全部按目录或启发式取值。旧版 envvars.json 无此键。
     public var modelContextWindows: [String: Int]?
+    /// 用户对「该模型支持图片输入」的显式声明，键为 `modelNames` 中的模型名。
+    /// 键缺失 = 用户未声明，按 `ModelModalityInference` 推断；`false` 是显式取消
+    /// （覆盖推断）。nil/缺省 = 全部未声明；旧版 envvars.json 无此键。
+    public var modelImageInput: [String: Bool]?
+    /// 同上，针对音频输入。
+    public var modelAudioInput: [String: Bool]?
+    /// 用户为自定义模型声明的单次最大输出（tokens），键为 `modelNames` 中的模型名；
+    /// 键缺失 = 未声明，按目录值或默认值请求。nil/缺省 = 全部未声明；旧版 envvars.json 无此键。
+    public var modelMaxOutputTokens: [String: Int]?
+    /// 该供应商的自定义请求头与代理；nil/缺省 = 无自定义头、跟随系统代理。旧版 envvars.json 无此键。
+    public var networkOptions: ProviderNetworkOptions?
+
+    /// 用户声明优先，其次按模型名推断。
+    public func supportsImageInput(modelID: String) -> Bool {
+        modelImageInput?[modelID] ?? ModelModalityInference.supportsImageInput(modelID: modelID)
+    }
+
+    public func supportsAudioInput(modelID: String) -> Bool {
+        modelAudioInput?[modelID] ?? ModelModalityInference.supportsAudioInput(modelID: modelID)
+    }
 
     /// 是否承载供应商配置（区分「模型供应商」与「普通环境变量」）。
     public var isProviderRecord: Bool {
@@ -101,7 +121,11 @@ public struct EnvVarEntry: Identifiable, Codable, Equatable, Sendable {
         baseURL: String? = nil,
         modelNames: [String] = [],
         protocolType: ProviderWireProtocol = .openaiCompatible,
-        modelContextWindows: [String: Int]? = nil
+        modelContextWindows: [String: Int]? = nil,
+        modelImageInput: [String: Bool]? = nil,
+        modelAudioInput: [String: Bool]? = nil,
+        modelMaxOutputTokens: [String: Int]? = nil,
+        networkOptions: ProviderNetworkOptions? = nil
     ) {
         self.id = id
         self.name = name
@@ -114,6 +138,10 @@ public struct EnvVarEntry: Identifiable, Codable, Equatable, Sendable {
         self.modelNames = modelNames
         self.protocolType = protocolType
         self.modelContextWindows = modelContextWindows
+        self.modelImageInput = modelImageInput
+        self.modelAudioInput = modelAudioInput
+        self.modelMaxOutputTokens = modelMaxOutputTokens
+        self.networkOptions = networkOptions
     }
 
     // MARK: Codable（U5 向后兼容：旧数据缺省字段用默认值解码）
@@ -122,6 +150,7 @@ public struct EnvVarEntry: Identifiable, Codable, Equatable, Sendable {
         case id, name, displayName, value, isSecret, createdAt
         case valueInKeychain
         case baseURL, modelNames, protocolType, modelContextWindows
+        case modelImageInput, modelAudioInput, modelMaxOutputTokens, networkOptions
     }
 
     public init(from decoder: Decoder) throws {
@@ -139,6 +168,10 @@ public struct EnvVarEntry: Identifiable, Codable, Equatable, Sendable {
         protocolType = try container.decodeIfPresent(ProviderWireProtocol.self, forKey: .protocolType)
             ?? .openaiCompatible
         modelContextWindows = try container.decodeIfPresent([String: Int].self, forKey: .modelContextWindows)
+        modelImageInput = try container.decodeIfPresent([String: Bool].self, forKey: .modelImageInput)
+        modelAudioInput = try container.decodeIfPresent([String: Bool].self, forKey: .modelAudioInput)
+        modelMaxOutputTokens = try container.decodeIfPresent([String: Int].self, forKey: .modelMaxOutputTokens)
+        networkOptions = try container.decodeIfPresent(ProviderNetworkOptions.self, forKey: .networkOptions)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -156,6 +189,52 @@ public struct EnvVarEntry: Identifiable, Codable, Equatable, Sendable {
         try container.encode(modelNames, forKey: .modelNames)
         try container.encode(protocolType, forKey: .protocolType)
         try container.encodeIfPresent(modelContextWindows, forKey: .modelContextWindows)
+        // 只在非空时写，保持旧数据字节形态不变。
+        if let modelImageInput, !modelImageInput.isEmpty {
+            try container.encode(modelImageInput, forKey: .modelImageInput)
+        }
+        if let modelAudioInput, !modelAudioInput.isEmpty {
+            try container.encode(modelAudioInput, forKey: .modelAudioInput)
+        }
+        if let modelMaxOutputTokens, !modelMaxOutputTokens.isEmpty {
+            try container.encode(modelMaxOutputTokens, forKey: .modelMaxOutputTokens)
+        }
+        if let networkOptions, !networkOptions.isDefault {
+            try container.encode(networkOptions, forKey: .networkOptions)
+        }
+    }
+}
+
+/// 自定义供应商模型的输入模态推断（纯函数）。仅在用户未显式声明时使用；
+/// 推断来自模型名启发式，未对真实端点验证，勾选/取消以用户为准。
+public enum ModelModalityInference {
+    private static let imageMarkers = [
+        "gpt-4o", "gpt-4.1", "gpt-4.5", "gpt-4-turbo", "gpt-4-vision", "gpt-5",
+        "claude-", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qvq",
+        "glm-4v", "glm-4.5v", "gemini", "llava", "pixtral", "internvl", "-vision", "-vl-"
+    ]
+    private static let audioMarkers = [
+        "gemini", "gpt-4o-audio", "gpt-audio", "qwen-omni", "qwen2.5-omni", "qwen2-audio", "-omni"
+    ]
+    private static let excludedMarkers = ["embedding", "whisper", "tts", "rerank", "o3-mini"]
+
+    /// 小写、去掉 `vendor/` 前缀后的名字。
+    private static func normalized(_ modelID: String) -> String {
+        let lowered = modelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowered.split(separator: "/").last.map(String.init) ?? lowered
+    }
+
+    public static func supportsImageInput(modelID: String) -> Bool {
+        let name = normalized(modelID)
+        guard !excludedMarkers.contains(where: name.contains) else { return false }
+        if name.hasPrefix("o3") || name.hasPrefix("o4") { return true }
+        return imageMarkers.contains { name.contains($0) } || name.hasSuffix("-vl")
+    }
+
+    public static func supportsAudioInput(modelID: String) -> Bool {
+        let name = normalized(modelID)
+        guard !excludedMarkers.contains(where: name.contains) else { return false }
+        return audioMarkers.contains { name.contains($0) }
     }
 }
 
@@ -294,6 +373,11 @@ public final class EnvVarStore: @unchecked Sendable {
     /// Typed startup cleanup failure.  The formal metadata remains loadable;
     /// callers can surface this diagnostic without terminating the app.
     public private(set) var lastMetadataRecoveryFailure: CredentialMetadataRecovery.Failure?
+    /// 启动时 `envvars.json` 存在但读取或解码失败（F1-02）。此时内存表为空只是"读不出来"，
+    /// 不是"没有变量"：所有写盘一律拒绝，原文件原样保留，界面据此提示用户。
+    public private(set) var metadataUnreadable = false
+    /// 供界面提示用的原文件路径；仅在 `metadataUnreadable` 时有意义。
+    public var metadataFilePath: String { fileURL.path }
 
     /// NSLock 的 lock/unlock 在 Swift 6 中不可直接从 async 上下文调用，
     /// 统一通过同步作用域辅助函数进入临界区。
@@ -323,8 +407,9 @@ public final class EnvVarStore: @unchecked Sendable {
         self.keychain = keychain
         self.credentialBindingMetadataReadObserver = credentialBindingMetadataReadObserver
         self.privacyStore = privacyStore
-        let (loaded, migrated) = Self.load(from: fileURL, keychain: keychain)
+        let (loaded, migrated, unreadable) = Self.load(from: fileURL, keychain: keychain)
         self.entries = loaded
+        self.metadataUnreadable = unreadable
         if case .failure(let failure) = recovery {
             self.lastMetadataRecoveryFailure = failure
         } else {
@@ -746,6 +831,14 @@ public final class EnvVarStore: @unchecked Sendable {
             return ProviderPreset.deepSeek.suggestion
         case "HERMES_CUSTOM_NEW_API_KEY":
             return ProviderPreset.newAPI.suggestion
+        case "GEMINI_API_KEY":
+            return ProviderPreset.gemini.suggestion
+        case "MOONSHOT_API_KEY":
+            return ProviderPreset.kimi.suggestion
+        case "ZHIPU_API_KEY":
+            return ProviderPreset.zhipu.suggestion
+        case "SILICONFLOW_API_KEY":
+            return ProviderPreset.siliconFlow.suggestion
         default:
             if n.hasSuffix("_API_KEY") {
                 return ProviderSuggestion(
@@ -824,6 +917,72 @@ public final class EnvVarStore: @unchecked Sendable {
             protocolType: protocolType,
             modelContextWindows: modelContextWindows
         )
+    }
+
+    private static func prunedDeclarations(_ source: [String: Bool]?, keeping models: [String]) -> [String: Bool]? {
+        guard let source else { return nil }
+        let kept = source.filter { models.contains($0.key) }
+        return kept.isEmpty ? nil : kept
+    }
+
+    private static func prunedMaxOutputTokens(_ source: [String: Int]?, keeping models: [String]) -> [String: Int]? {
+        guard let source else { return nil }
+        let kept = source.filter { models.contains($0.key) && $0.value > 0 }
+        return kept.isEmpty ? nil : kept
+    }
+
+    /// 整体替换某供应商的单次最大输出声明（空字典 = 清空）；只写元数据，不触碰凭据。
+    /// 键限定在该记录的 `modelNames` 内，只保留正整数。供应商不存在或写盘失败返回 false。
+    @discardableResult
+    public func setModelMaxOutputTokens(name: String, tokens: [String: Int]) -> Bool {
+        let canonical = Self.canonicalName(name)
+        lock.lock(); defer { lock.unlock() }
+        guard var entry = entries[canonical], entry.isProviderRecord else { return false }
+        let previous = entry
+        entry.modelMaxOutputTokens = Self.prunedMaxOutputTokens(tokens, keeping: entry.modelNames)
+        entries[canonical] = entry
+        guard saveLocked() else {
+            entries[canonical] = previous
+            return false
+        }
+        return true
+    }
+
+    /// 整体替换某供应商的自定义请求头与代理（默认值 = 清空）；只写元数据，不触碰凭据。
+    /// 供应商不存在或写盘失败返回 false。
+    @discardableResult
+    public func setProviderNetworkOptions(name: String, options: ProviderNetworkOptions) -> Bool {
+        let canonical = Self.canonicalName(name)
+        lock.lock(); defer { lock.unlock() }
+        guard var entry = entries[canonical], entry.isProviderRecord else { return false }
+        let previous = entry
+        entry.networkOptions = options.isDefault ? nil : options
+        entries[canonical] = entry
+        guard saveLocked() else {
+            entries[canonical] = previous
+            return false
+        }
+        return true
+    }
+
+    /// 整体替换某供应商的图片/音频输入声明（空字典 = 清空）；只写元数据，
+    /// 不触碰凭据。键限定在该记录的 `modelNames` 内。供应商不存在或写盘失败返回 false。
+    @discardableResult
+    public func setModelModalityDeclarations(
+        name: String, image: [String: Bool], audio: [String: Bool]
+    ) -> Bool {
+        let canonical = Self.canonicalName(name)
+        lock.lock(); defer { lock.unlock() }
+        guard var entry = entries[canonical], entry.isProviderRecord else { return false }
+        let previous = entry
+        entry.modelImageInput = Self.prunedDeclarations(image, keeping: entry.modelNames)
+        entry.modelAudioInput = Self.prunedDeclarations(audio, keeping: entry.modelNames)
+        entries[canonical] = entry
+        guard saveLocked() else {
+            entries[canonical] = previous
+            return false
+        }
+        return true
     }
 
     /// Save provider metadata with an explicit credential lifecycle intent.
@@ -916,6 +1075,10 @@ public final class EnvVarStore: @unchecked Sendable {
             }
         }
         entry.modelContextWindows = finalWindows
+        // 模态声明随模型名列表修剪；不在本接口修改（由 setModelModalityDeclarations 写入）。
+        entry.modelImageInput = Self.prunedDeclarations(entry.modelImageInput, keeping: finalModels)
+        entry.modelAudioInput = Self.prunedDeclarations(entry.modelAudioInput, keeping: finalModels)
+        entry.modelMaxOutputTokens = Self.prunedMaxOutputTokens(entry.modelMaxOutputTokens, keeping: finalModels)
         let previousEntry = entries[canonical]
         if let displayName {
             let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1286,10 +1449,15 @@ public final class EnvVarStore: @unchecked Sendable {
 
     // MARK: - Persistence
 
-    private static func load(from url: URL, keychain: KeychainStore) -> ([String: EnvVarEntry], Bool) {
+    /// 返回 (条目, 是否需要重写, 文件存在但读不出来)。文件不存在是正常的空表；
+    /// 存在却读取/解码失败时第三项为 true，调用方不得把它当空表去覆盖原文件。
+    private static func load(from url: URL, keychain: KeychainStore) -> ([String: EnvVarEntry], Bool, Bool) {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return ([:], false, false)
+        }
         guard let data = try? Data(contentsOf: url),
               let list = try? JSONDecoder().decode([EnvVarEntry].self, from: data) else {
-            return ([:], false)
+            return ([:], false, true)
         }
         var requiresRewrite = false
         var result: [String: EnvVarEntry] = [:]
@@ -1313,7 +1481,7 @@ public final class EnvVarStore: @unchecked Sendable {
             }
             result[entry.name] = entry
         }
-        return (result, requiresRewrite)
+        return (result, requiresRewrite, false)
     }
 
     /// 按 secret 状态决定值存哪：secret 值写入 Keychain（`valueInKeychain = true`，
@@ -1343,6 +1511,10 @@ public final class EnvVarStore: @unchecked Sendable {
 
     @discardableResult
     private func saveLocked() -> Bool {
+        if metadataUnreadable {
+            lastPersistenceError = .metadataWriteFailed
+            return false
+        }
         let mutation = metadataConsistency.begin("metadata")!
         defer { _ = metadataConsistency.end("metadata", began: mutation) }
         let list = entries.values.sorted { $0.name < $1.name }
@@ -1368,6 +1540,10 @@ public final class EnvVarStore: @unchecked Sendable {
     /// file. The final path is untouched until the Keychain upsert succeeds.
     /// Callers must hold the lock.
     private func stageMetadataLocked(_ snapshot: [String: EnvVarEntry]) -> URL? {
+        if metadataUnreadable {
+            lastPersistenceError = .metadataWriteFailed
+            return nil
+        }
         do {
             let parent = fileURL.deletingLastPathComponent()
             try FileManager.default.createDirectory(

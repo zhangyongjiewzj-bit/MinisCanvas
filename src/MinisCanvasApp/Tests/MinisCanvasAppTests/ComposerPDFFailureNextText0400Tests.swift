@@ -64,8 +64,10 @@ struct ComposerPDFFailureNextText0400Tests {
         try #require(condition(), "original PDF preparation or real ordinary turn did not settle")
     }
 
-    @Test("missing, nonregular, corrupt and textless PDF stay visible and cannot contaminate a later real text request",
-          arguments: ["missing", "nonregular", "corrupt", "textless"])
+    // 目录改为路径引用、无文字层的 PDF 改为渲染成图片（见 ChatStore.resolvePDFAttachment），
+    // 不再属于“失败后保持可见”的场景，所以这里只保留 missing 与 corrupt。
+    @Test("missing and corrupt PDF stay visible and cannot contaminate a later real text request",
+          arguments: ["missing", "corrupt"])
     func failedPDFThenExplicitRemovalSendsOnlyNewText(failure: String) async throws {
         let profile = try RuntimeIsolationProfile.makeIsolatedTest(
             label: "ComposerPDFNextText0400", processEnvironment: [:],

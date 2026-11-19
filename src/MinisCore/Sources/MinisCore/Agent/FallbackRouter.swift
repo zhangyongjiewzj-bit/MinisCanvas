@@ -23,10 +23,18 @@ extension FallbackRouterError: LocalizedError {
 /// One existing backoff wait, optionally presented by the owning conversation.
 /// No raw error body or response header crosses this boundary.
 public struct LLMRateLimitWaitRequest: Sendable {
+    /// 等待的原因，界面据此说人话：被限流，还是服务暂时不可用（过载、5xx、连接失败）。
+    public enum Reason: Sendable, Equatable {
+        case rateLimited
+        case serviceUnavailable
+    }
     public let delay: Duration
+    public let reason: Reason
     public let sleep: @Sendable (Duration) async throws -> Void
-    public init(delay: Duration, sleep: @escaping @Sendable (Duration) async throws -> Void) {
+    public init(delay: Duration, reason: Reason = .rateLimited,
+                sleep: @escaping @Sendable (Duration) async throws -> Void) {
         self.delay = delay
+        self.reason = reason
         self.sleep = sleep
     }
 }
@@ -70,27 +78,55 @@ public struct LLMRetryPolicy: Sendable {
     /// Injectable sleep (tests inject a no-op recorder).
     public let sleeper: @Sendable (Duration) async throws -> Void
 
-    private var limitsRetriesToRateLimitAndOverload = false
+    private var isMainConversation = false
     private var carriesExhaustion = false
 
     fileprivate func trackingExhaustion() -> Self {
         var policy = self
-        policy.carriesExhaustion = limitsRetriesToRateLimitAndOverload
+        policy.carriesExhaustion = isMainConversation
         return policy
     }
 
-
-    public static var rateLimitAndOverloadOnly: Self {
-        var policy = Self()
-        policy.limitsRetriesToRateLimitAndOverload = true
+    /// 主对话的重试策略（对齐 Claude Code：429、过载、5xx 和"请求还没发出去"的连接失败都重试，指数退避）。
+    /// - 可重试：429、500、502、503、504、529，瞬时错误（含流在 message_stop 前断开），
+    ///   以及连不上主机 / 解析不了域名 / 没有网络这类请求还没发出去的失败。
+    ///   超时、连接中断这类"服务端可能已经收到"的失败不在内。
+    /// - 次数与退避：最多重试 8 次，0.5 / 1 / 2 / 4 / 8 / 16 / 32 / 32 秒，累计约 95 秒。
+    ///   Claude Code 是最多 10 次、同样从 0.5 秒起翻倍、单次上限 32 秒；这里次数少 2 次，
+    ///   因为每次等待在界面上可见、可取消、可"立即重试"，且用完后还会按路线换备用服务商。
+    /// - 流已经吐出任何内容之后不再重试（见 `retriesBeforeFirstStreamEvent`），避免重复输出。
+    /// `sleeper` 默认真实等待；测试注入零等待记录器。
+    public static func mainConversation(
+        sleeper: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) -> Self {
+        var policy = Self(maxRetries: 8, backoff: mainConversationBackoff, sleeper: sleeper)
+        policy.isMainConversation = true
         return policy
     }
+
+    /// 主对话退避：0.5s 起每次翻倍，单次上限 32s（与 Claude Code 一致）。
+    public static let mainConversationBackoff: @Sendable (Int) -> Duration = { attempt in
+        .milliseconds(min(500 * (1 << min(max(0, attempt - 1), 10)), 32_000))
+    }
+
+    /// 服务端给的"多少秒后再试"按它等，但单次最多等 60 秒；更长的只等到上限，再失败就由重试次数兜住。
+    public static let maximumServerRetryAfter: Duration = .seconds(60)
+
+    /// 流式请求是否在拿到第一个事件之前就算作"还没开始输出"，失败时可以整体重发。
+    /// 只有主对话策略这样做；第一个事件一旦交出去（含思考增量），后续失败原样抛给调用方，不重试。
+    var retriesBeforeFirstStreamEvent: Bool { isMainConversation }
 
     private func admitsRetry(_ error: Error) -> Bool {
-        guard limitsRetriesToRateLimitAndOverload else { return true }
+        guard isMainConversation else { return true }
         switch error as? LLMError {
-        case .httpStatus(code: 429, detail: _)?, .httpStatus(code: 529, detail: _)?: return true
-        default: return false
+        case .httpStatus(code: let code, detail: _)?:
+            return [429, 500, 502, 503, 504, 529].contains(code)
+        case .transientError?:
+            return true
+        case .networkError?:
+            return FallbackRouter.isPreDispatchConnectionFailure(error)
+        default:
+            return false
         }
     }
 
@@ -149,23 +185,21 @@ public struct LLMRetryPolicy: Sendable {
                 retriesUsed += 1
                 let localDelay = backoff(retriesUsed)
                 let delay: Duration
-                let isRateLimited: Bool
+                // 非 nil 时这次等待交给界面展示（可取消、可立即重试）。
+                let waitReason: LLMRateLimitWaitRequest.Reason?
                 switch error as? LLMError {
                 case .httpStatus(code: 429, detail: let detail)?:
-                    isRateLimited = true
-                    delay = max(localDelay, Self.compatibleRetryAfter(detail) ?? localDelay)
-                case .httpStatus(code: 529, detail: _)? where limitsRetriesToRateLimitAndOverload:
-                    isRateLimited = true
-                    delay = localDelay
+                    waitReason = .rateLimited
+                    delay = max(localDelay, Self.serverRetryAfter(detail) ?? localDelay)
                 case .rateLimited?:
-                    isRateLimited = true
+                    waitReason = .rateLimited
                     delay = localDelay
                 default:
-                    isRateLimited = false
+                    waitReason = isMainConversation ? .serviceUnavailable : nil
                     delay = localDelay
                 }
-                if isRateLimited, let wait = LLMRetryWaitContext.rateLimitWait {
-                    try await wait(LLMRateLimitWaitRequest(delay: delay, sleep: sleeper))
+                if let waitReason, let wait = LLMRetryWaitContext.rateLimitWait {
+                    try await wait(LLMRateLimitWaitRequest(delay: delay, reason: waitReason, sleep: sleeper))
                 } else {
                     try await sleeper(delay)
                 }
@@ -174,19 +208,30 @@ public struct LLMRetryPolicy: Sendable {
         }
     }
 
-    /// Consume only the OpenAI-compatible adapter's complete safe projection.
-    /// The hint is advisory and bounded independently of the error's origin.
-    private static func compatibleRetryAfter(_ detail: String) -> Duration? {
-        let prefix = "status=429; category=rateLimited; retry_after="
-        let suffix = "; request_id=present"
-        guard detail.hasPrefix(prefix) else { return nil }
-        var digits = detail.dropFirst(prefix.count)
-        if digits.hasSuffix(suffix) { digits = digits.dropLast(suffix.count) }
-        guard (1...5).contains(digits.utf8.count),
+    /// Consume only the two providers' complete safe projections:
+    /// - OpenAI 兼容端：`status=429; category=rateLimited; retry_after=N[; request_id=present]`
+    /// - Anthropic：`status=429; category=rate_limited; retry_after=N[; request_id=present][; reason=标签]`
+    ///   （N 来自 Retry-After 或 anthropic-ratelimit-*-reset，由 Anthropic 错误投影换算好）
+    /// The hint is advisory: bounded to a 60 s single wait (`maximumServerRetryAfter`),
+    /// and any other shape is ignored in favour of the local backoff.
+    private static func serverRetryAfter(_ detail: String) -> Duration? {
+        let styles: [(prefix: String, allowsReason: Bool)] = [
+            ("status=429; category=rateLimited; retry_after=", false),
+            ("status=429; category=rate_limited; retry_after=", true),
+        ]
+        guard let style = styles.first(where: { detail.hasPrefix($0.prefix) }) else { return nil }
+        var fields = detail.dropFirst(style.prefix.count).components(separatedBy: "; ")
+        let digits = fields.removeFirst()
+        if fields.first == "request_id=present" { fields.removeFirst() }
+        if style.allowsReason, let reason = fields.first, reason.hasPrefix("reason="), reason.count > 7 {
+            fields.removeFirst()
+        }
+        guard fields.isEmpty,
+              (1...5).contains(digits.utf8.count),
               digits.utf8.allSatisfy({ (48...57).contains($0) }),
               let seconds = Int(digits), seconds <= 86_400,
               digits == String(seconds) else { return nil }
-        return .seconds(seconds)
+        return min(Duration.seconds(seconds), maximumServerRetryAfter)
     }
 }
 
@@ -558,11 +603,44 @@ public struct RetryingLLMProvider: UsageRouteIdentityProviding, LLMProvider, Sta
     }
 }
 
+/// 把一条 assistant 事件流拆成"先取第一个事件、再接着转发其余事件"两步，
+/// 让主对话重试能在第一个事件到手之前把失败当成建流失败。只有一个消费者，按顺序访问迭代器。
+final class AssistantStreamEventSource: @unchecked Sendable {
+    private var iterator: AsyncThrowingStream<LLMAssistantStreamEvent, Error>.Iterator
+
+    init(_ stream: AsyncThrowingStream<LLMAssistantStreamEvent, Error>) {
+        iterator = stream.makeAsyncIterator()
+    }
+
+    func next() async throws -> LLMAssistantStreamEvent? {
+        try await iterator.next()
+    }
+
+    /// 第一个事件之后原样转发；调用方取消时连带取消上游流。
+    func continuing(after first: LLMAssistantStreamEvent?) -> AsyncThrowingStream<LLMAssistantStreamEvent, Error> {
+        AsyncThrowingStream { continuation in
+            guard let first else { continuation.finish(); return }
+            let forwarding = Task {
+                do {
+                    continuation.yield(first)
+                    while let event = try await self.next() { continuation.yield(event) }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in forwarding.cancel() }
+        }
+    }
+}
+
 // D-CHAT-03：assistant 增量流装饰器。遵守与 `streamMessage` 相同的纪律：
 // 只对流的「获取」重试，一旦流建立、中途错误归调用方处理。base 不符合
 // 流式协议时，合成单 `.completed` 事件并复用本类型自己的缓冲
 // `sendMessage(tools:)` 路径 —— 重试退避、POST 幂等回放栅栏、预算语义
 // 与今天逐字节一致（零行为变化）。
+// 例外：主对话策略（`LLMRetryPolicy.mainConversation`）把"取到第一个事件"也算进获取，
+// 第一个事件之前的失败整体重发；第一个事件交出之后仍归调用方，不再重试。
 extension RetryingLLMProvider: AssistantStreamingLLMProvider {
     public func streamAssistantMessage(
         messages: [LLMMessage],
@@ -584,6 +662,25 @@ extension RetryingLLMProvider: AssistantStreamingLLMProvider {
         let box = baseBox
         if let streaming = box.value as? any AssistantStreamingLLMProvider {
             let policy = policy
+            if policy.retriesBeforeFirstStreamEvent {
+                // 主对话：流刚建好、还没产出任何事件就失败（Anthropic 的流内 overloaded、网关半路断流等），
+                // 和建流失败一样整体重发；第一个事件一旦交给调用方就不再重试，已经输出的内容不会重复。
+                let (first, source) = try await policy.run {
+                    try await self.runBudgeted { () async throws -> (LLMAssistantStreamEvent?, AssistantStreamEventSource) in
+                        let stream = try await streaming.streamAssistantMessage(
+                            messages: messages,
+                            systemPrompt: systemPrompt,
+                            tools: tools,
+                            maxTokens: maxTokens,
+                            temperature: temperature, thinkingLevel: thinkingLevel
+                        )
+                        let source = AssistantStreamEventSource(stream)
+                        let first = try await source.next()
+                        return (first, source)
+                    }
+                }
+                return source.continuing(after: first)
+            }
             return try await policy.run {
                 try await self.runBudgeted {
                     try await streaming.streamAssistantMessage(
@@ -868,6 +965,15 @@ public struct FallbackRouter: Sendable {
         return code == NSURLErrorTimedOut || code == NSURLErrorNetworkConnectionLost
     }
 
+    /// 请求肯定还没发到服务端的连接失败（连不上主机、解析不了域名、没有网络）。
+    /// 只看传输错误码，与 `isAmbiguousPostDispatchTransport` 互斥；证书、TLS 握手失败等
+    /// 重试也不会好的不在内。
+    fileprivate static func isPreDispatchConnectionFailure(_ error: Error) -> Bool {
+        guard let code = transportCode(from: error) else { return false }
+        return code == NSURLErrorCannotConnectToHost || code == NSURLErrorCannotFindHost
+            || code == NSURLErrorDNSLookupFailed || code == NSURLErrorNotConnectedToInternet
+    }
+
     private static func transportCode(from error: Error, depth: Int = 0) -> Int? {
         guard depth < 4 else { return nil }
         if let urlError = error as? URLError {
@@ -897,6 +1003,19 @@ public struct FallbackRouter: Sendable {
         }
     }
 
+    /// 换到下一个供应商（或模型）重试时，清掉历史里的 thinking 块：它们带着上一个
+    /// 供应商的签名，发给别的供应商会被拒（Anthropic 要求签名与原模型一致）。
+    static func messagesForAttempt(_ messages: [LLMMessage], afterFailure: Bool) -> [LLMMessage] {
+        guard afterFailure,
+              messages.contains(where: { $0.toolCalls.contains { !$0.thinkingBlocks.isEmpty } })
+        else { return messages }
+        return messages.map { message in
+            var copy = message
+            for index in copy.toolCalls.indices { copy.toolCalls[index].thinkingBlocks = [] }
+            return copy
+        }
+    }
+
     // MARK: - Non-streaming request
 
     /// Send a message through the chain, falling back on failure.
@@ -918,6 +1037,7 @@ public struct FallbackRouter: Sendable {
             guard !tried.contains(providerID) else { continue }
             tried.insert(providerID)
             lastRetryExhaustion = nil
+            let messages = Self.messagesForAttempt(messages, afterFailure: !failures.isEmpty)
 
             var resolvedProvider: (any LLMProvider)?
             do {
@@ -1017,6 +1137,7 @@ public struct FallbackRouter: Sendable {
             guard !tried.contains(providerID) else { continue }
             tried.insert(providerID)
             lastRetryExhaustion = nil
+            let messages = Self.messagesForAttempt(messages, afterFailure: !failures.isEmpty)
 
             var resolvedProvider: (any LLMProvider)?
             do {
@@ -1111,6 +1232,7 @@ public struct FallbackRouter: Sendable {
             guard !tried.contains(providerID) else { continue }
             tried.insert(providerID)
             lastRetryExhaustion = nil
+            let messages = Self.messagesForAttempt(messages, afterFailure: !failures.isEmpty)
 
             do {
                 try await preflightBudget()
@@ -1210,6 +1332,7 @@ public struct FallbackRouter: Sendable {
             guard !tried.contains(providerID) else { continue }
             tried.insert(providerID)
             lastRetryExhaustion = nil
+            let messages = Self.messagesForAttempt(messages, afterFailure: !failures.isEmpty)
 
             var resolvedProvider: (any LLMProvider)?
             var streamingAcquisition = false

@@ -33,9 +33,14 @@ private struct ProductionSessionBoundBrowserExecutor: ToolExecutor {
     let tool: BrowserTool
 
     func execute(name: String, input: [String: Any]) async throws -> String {
-        guard let context = AgentExecutionContext.current,
-              context.currentConversationID == conversationID,
-              let bound = context.approvalGate?.delegate
+        guard let context = AgentExecutionContext.current else {
+            throw ToolExecutorError.resourceScopeInvalid
+        }
+        // 回合属于另一个会话（切走后仍在后台跑）：只有这种情况给"会话不在前台"的提示。
+        guard context.currentConversationID == conversationID else {
+            throw ToolExecutorError.browserSessionUnavailable
+        }
+        guard let bound = context.approvalGate?.delegate
                 as? ProductionBrowserGenerationApprovalDelegate,
               bound.generationID == generationID else {
             throw ToolExecutorError.resourceScopeInvalid
@@ -830,13 +835,13 @@ final class BridgeStore {
         let model = safeComposerIdentifier(receipt.modelID)
         let health: String
         switch launchStatus?.state {
-        case .some(.ready): health = "构造成功；不代表本次请求已连通"
-        case .some(.degraded(.credentialUnavailable)): health = "凭据不可用"
+        case .some(.ready): health = "已就绪，能否连通以实际发送为准"
+        case .some(.degraded(.credentialUnavailable)): health = "读不到密钥"
         case .some(.degraded(.keychainUnavailable)): health = "钥匙串不可用"
-        case .some(.degraded(.initializationFailed)): health = "构造失败"
-        case nil: health = "构造状态未观测"
+        case .some(.degraded(.initializationFailed)): health = "初始化失败"
+        case nil: health = "状态未知"
         }
-        return "已应用 Provider/Model：\(provider) / \(model)；Provider \(health)。"
+        return "当前模型：\(provider) / \(model)（\(health)）。"
     }
 
     private static func safeComposerIdentifier(_ raw: String) -> String {
@@ -1238,6 +1243,19 @@ final class BridgeStore {
                 "Provider 运行时观察日志已损坏，原始字节已整体移动到 \(quarantine.path)，"
                     + "本次启动继续使用新的日志。"
             )
+        }
+        if let center = SettingsCenter.active {
+            if let backup = center.settingsStore.corruptBackupURL {
+                notices.append(
+                    "设置文件读不出来，已改用默认设置；原文件已备份到 \(backup.path)。"
+                )
+            }
+            if center.envStore.metadataUnreadable {
+                notices.append(
+                    "环境变量文件读不出来，为避免覆盖已暂停修改环境变量和服务商；原文件保留在 "
+                        + "\(center.envStore.metadataFilePath)。"
+                )
+            }
         }
         if let failedURL = toolLifecycleRecoveryFailureURL {
             notices.append(
@@ -2111,13 +2129,17 @@ final class BridgeStore {
             }.map { .init(id: $0.id, path: $0.path, scope: $0.sessionID == nil ? "本项目" : "本会话") }
         }
         approvalCenter.projectInstructionTrustRows = { [weak self] in
-            self?.productionProjectSessionHandler?.grants.instructionTrustRows().map {
+            guard let grants = self?.productionProjectSessionHandler?.grants else { return [] }
+            return grants.instructionTrustRows().map {
                 ApprovalPromptCenter.ProjectInstructionTrustRow(projectID: $0.projectID, path: $0.path, hash: $0.hash)
-            } ?? []
+            } + grants.instructionRefusalRows().map {
+                ApprovalPromptCenter.ProjectInstructionTrustRow(projectID: $0.projectID, path: $0.path, hash: $0.hash, refused: true)
+            }
         }
         approvalCenter.revokeProjectInstructionTrust = { [weak self] projectID in
             guard let handler = self?.productionProjectSessionHandler else { throw ProjectSessionAppError.grantUnavailable }
             try handler.grants.revokeInstructionTrust(projectID: projectID)
+            try handler.grants.revokeInstructionRefusal(projectID: projectID)
         }
         approvalCenter.permissionProjects = { [weak self] in
             guard let handler = self?.productionProjectSessionHandler else { return [] }
@@ -2263,7 +2285,7 @@ final class BridgeStore {
                                 $0.id == checkpointID && $0.producerSessionID == summary.producerSessionID
                             }
                 }
-                guard authorized else { throw FileCheckpointStore.Failure.changed }
+                guard authorized else { throw FileCheckpointStore.Failure.notAuthorized }
                 try version.validateCurrent()
                 // Store rechecks producer/verified parent ownership, path,
                 // retention and exact expected-after hash under its own lock.
@@ -2405,6 +2427,7 @@ final class BridgeStore {
     /// 且 Observation 宏不展开 lazy；首次访问时构建一次）。
     @ObservationIgnored private lazy var catalog = AppCommandCatalog.assembled(
         bridge: self,
+        customCommands: CustomSlashCommandLoader.load(projectRoot: nil),
         dependencies: CommandDependencies(
             env: commandEnvStore,
             log: chat.logManager,
@@ -2633,6 +2656,14 @@ final class BridgeStore {
             return try await self.prepareConversationGoalReviewPrimary(sessionID: sessionID)
         }
         deepLinkHandler.attach(bridge: self)
+        // 浏览器审批卡的"以后都允许该网站"：把域名并入"允许访问的网站"设置并保存。
+        BrowserInteractionApproval.persistAllowedDomain = { host in
+            guard let center = SettingsCenter.active else { return }
+            var defaults = center.policyRuntimeDefaults
+            guard !defaults.networkDomains.contains(host) else { return }
+            defaults.networkDomains.insert(host)
+            _ = center.updatePolicyRuntimeDefaults(defaults)
+        }
         chat.onOpenSettingsPage = { [weak self] pageID in
             self?.deepLinkHandler.handle(.openSettings(id: pageID))
         }
@@ -3448,7 +3479,7 @@ final class BridgeStore {
             composerSpeechPhase = .recording
             return true
         } catch {
-            failComposerSpeechInput(error.localizedDescription)
+            failComposerSpeechInput(UserFacingErrorText.describe(error))
             return false
         }
     }
@@ -4309,6 +4340,7 @@ final class BridgeStore {
         cancelComposerSpeechInput()
         stopProductionSpeechOutput()
         composerSpeechGeneralLanguage = speechGeneralLanguage
+        chat.audioTranscriptionGeneralLanguage = speechGeneralLanguage
         productionExternalNetworkAllowed = externalNetworkAllowed
         productionControlledFieldLoopbackAllowed = controlledFieldLoopbackAllowed
             && !externalNetworkAllowed
@@ -4438,6 +4470,10 @@ final class BridgeStore {
         }
         taskCenterControlConsumer.bindChildTranscriptSessionStore(sharedChildSessionStore)
         let sessionManager = chat.sessionManager ?? SessionManager(store: sessionStore)
+        // 会话之间的协作：共享任务看板落在会话存储目录旁；session_send 的投递与运行由 ChatStore 实现。
+        TaskBoardStore.shared.attach(
+            directory: sessionStore.directory.appendingPathComponent("task-boards", isDirectory: true))
+        SessionMessagingHub.shared.install(bridge: ChatStoreSessionMessagingBridge(store: chat))
         let productionSkillStore = skillStore ?? SkillStore()
         let maintenanceSettings = SkillsStore(appStore: productionSkillStore,
             stateFileURL: productionSkillStore.skillsRoot.deletingLastPathComponent()
@@ -4486,6 +4522,9 @@ final class BridgeStore {
         let configuredWebFetch = webFetchUnavailableReason == nil
             ? WebFetchTransport(allowedDomains: policyDefaults.networkDomains,
                 pinnedConfiguration: pinnedConfiguration) : nil
+        let configuredWebSearch: WebSearchService? = externalNetworkAllowed
+            ? WebSearchService(configurationProvider: { WebSearchSettingsStore.shared.configuration })
+            : nil
         let builtinExecutor = BuiltinToolExecutor(
             allowedRoot: allowedRootURL,
             defaultShellTimeout: agentSettings.shellCommandTimeoutSeconds,
@@ -4502,9 +4541,13 @@ final class BridgeStore {
                 sessionReadSecretStore.map { ChatTranscriptRedactor(store: $0).secretValues } ?? []
             },
             sessionDerivedRoot: fileAccessAllowedRoot == nil,
-            webFetch: configuredWebFetch
+            webFetch: configuredWebFetch,
+            webSearch: configuredWebSearch
         )
         if builtinExecutor.webFetchAvailable { builtinExecutor.registerToolNames([WebFetchToolContract.toolName]) }
+        // E1：外部网络整体允许时才组装搜索服务并登记工具名；是否向模型广播、能否执行
+        // 由用户当下的搜索设置决定（webSearchAvailable），设置改动无需重建执行器。
+        if builtinExecutor.webSearchConfigured { builtinExecutor.registerToolNames([WebSearchToolContract.toolName]) }
         let projectSessionHandler: ProjectSessionAppHandler?
         if didAttachChatPersistence {
             if let existing = productionProjectSessionHandler {
@@ -4600,6 +4643,15 @@ final class BridgeStore {
         }
         builtinExecutor.fileChangeLedger = fileChangeLedger
         builtinExecutor.fileChangeSessionID = chat.activeSessionID?.uuidString ?? ""
+        // 用户附上/@ 引用的文件视为已读：登记到读取记录（按会话键，任何执行器实例读写同一份）。
+        chat.fileReadMarker = { [weak builtinExecutor] path, sessionID in
+            builtinExecutor?.markFileRead(path: path, sessionID: sessionID)
+        }
+        // 普通会话的 @ 文件搜索把 /add-dir 加入的目录也算进来（目录授权失效时按没有处理）。
+        chat.additionalDirectoriesProvider = { [weak self, weak builtinExecutor] sessionID in
+            guard let self, let builtinExecutor else { return [] }
+            return ((try? self.additionalDirectories(for: sessionID, owner: builtinExecutor)) ?? []).map(\.path)
+        }
         productionFileChangeLedger = fileChangeLedger
         productionChildModelSettings = agentSettings
         productionTranscriptSecretStore = sessionReadSecretStore ?? F6EnvStoreSource.shared
@@ -4719,6 +4771,8 @@ final class BridgeStore {
             ? preparedChildGovernor : nil
         let resultConsumer = taskCenterControlConsumer
         let childUsageChat = chat
+        // 子任务只读引用父会话的持久规则库（规则、本对话规则），不新增规则。
+        let childParentPersistentRules = chat.composerGrantStore.persistentRules
         let orchestrationExecutor: OrchestrationToolExecutor? = effectiveEnableOrchestration
             ? OrchestrationToolExecutor(orchestrator: AgentOrchestrator(
                 defaultMaxConcurrent: canonicalChildSelection.effective,
@@ -4794,8 +4848,8 @@ final class BridgeStore {
                 turnController: context.turnController,
                 makeChildBudget: context.makeChildBudget,
                 boundParentRequestBudget: context.makeChildBudget?(),
-                childTimeout: context.deadline.map { max(0, $0.timeIntervalSinceNow) },
-                deadline: context.deadline,
+                childTimeout: AgentOrchestrator.hardMaxChildTimeout,
+                deadline: Date().addingTimeInterval(AgentOrchestrator.hardMaxChildTimeout),
                 currentConversationID: context.currentConversationID,
                 resolveChildProvider: resolveChildProvider,
                 prepareChildProvider: prepareChildProvider,
@@ -4983,6 +5037,7 @@ final class BridgeStore {
                 },
                 parentComposerSnapshot: context.composerSnapshot,
                 parentComposerFacts: context.composerPolicyFacts,
+                parentPersistentRules: childParentPersistentRules,
                 parentAuthorityCheck: context.parentAuthorityCheck,
                 concreteBuiltinToolExecutorOwner: boundOwner,
                 requiresPolicyRuntime: true,
@@ -5046,6 +5101,10 @@ final class BridgeStore {
         // Durable "allow from now on" rules live beside the other MinisCore
         // state of the active profile; a corrupt file loads as no rules.
         let persistentRules = chat.composerGrantStore.persistentRules
+        // 普通会话（不在项目里）的私有工作目录各不相同，shell 规则改用固定的"私有工作区"键，
+        // 所有普通会话共享；授权根本身不变。
+        PersistentApprovalRuleMatcher.ordinaryWorkspaceBase = SessionFileRootPolicy
+            .privateWorkspaceBase(sessionDirectory: sessionDocuments.directory).standardizedFileURL.path
         if !persistentRules.isAttached {
             persistentRules.attach(fileURL: sessionDocuments.directory
                 .deletingLastPathComponent()
@@ -5053,7 +5112,21 @@ final class BridgeStore {
                 .appendingPathComponent("persistent-approval-rules-v1.json"))
         }
         approvalCenter.persistentRules = persistentRules
+        // 审批呈现方式（行内提示条 / 弹窗）与超时自动拒绝：装回已保存的值，之后的改动写回设置，重启后保持。
+        approvalCenter.applyPersistedPresentation(
+            inline: agentSettings.approvalInlineEnabled,
+            expiration: agentSettings.approvalTimeoutSeconds)
+        approvalCenter.onPresentationPreferenceChanged = { inline, seconds in
+            _ = SettingsCenter.active?.setApprovalPresentation(inline: inline, timeoutSeconds: seconds)
+        }
         approvalCenter.skillRuleFactsProvider = { [weak chat = chat] in chat?.composerPolicyFacts }
+        approvalCenter.permissionRulesContextProvider = { [weak chat = chat] in
+            guard let chat else { return PermissionRulesPanelContext() }
+            return PermissionRulesPanelContext(
+                facts: chat.composerPolicyFacts,
+                workingDirectory: chat.sessions.first { $0.id == chat.activeSessionID }?.workingDirectory,
+                sessionID: chat.activeSessionID?.uuidString)
+        }
         browserInteractionRules.attach(fileURL: sessionDocuments.directory
             .deletingLastPathComponent()
             .appendingPathComponent("MinisCore", isDirectory: true)
@@ -5140,10 +5213,12 @@ final class BridgeStore {
         let orchestrationDefinitionSource: (@Sendable () async throws -> AgentToolDefinition)?
         if orchestrationExecutor != nil {
             orchestrationDefinitionSource = { @Sendable in
+                let custom = await CustomSubagentCatalog.current()
                 guard let models = await childModelSource(nil) else {
-                    return OrchestrationToolExecutor.makeDefinition()
+                    return OrchestrationToolExecutor.makeDefinition(customSubagents: custom)
                 }
-                return OrchestrationToolExecutor.makeDefinition(childModelPolicy: models.policy)
+                return OrchestrationToolExecutor.makeDefinition(
+                    childModelPolicy: models.policy, customSubagents: custom)
             }
         } else {
             orchestrationDefinitionSource = nil
@@ -5243,7 +5318,21 @@ final class BridgeStore {
             let projectDirectory: URL?
             let taskScopeID: String
             let trustedProjectRoot: String?
-            if let projectTargetID {
+            // 后台会话回合（session_send run）：目标是普通会话或项目会话本身，没有项目任务绑定；
+            // 按目标会话自己的工作目录与授权根准备，只暂存引擎，不动当前打开会话的引擎。
+            let isBackgroundSessionTurn = projectTargetID != nil && projectTask
+                && self.chat.isBackgroundSessionTurnTask(taskID)
+            // 后台回合的目标是项目会话时，同样要求该项目的原生目录授权仍然有效（与前台项目任务同一口径）；
+            // 不通过就不准备，调用方按失败处理（排队阶段已在 ChatStore 退回“等用户打开”）。
+            if isBackgroundSessionTurn, let backgroundID = projectTargetID,
+               let backgroundThread = self.chat.sessions.first(where: { $0.id == backgroundID }),
+               let backgroundProjectID = backgroundThread.projectID {
+                guard let backgroundDirectory = backgroundThread.workingDirectory,
+                      projectSessionHandler?.isTaskFileProjectAuthorized(
+                        projectID: backgroundProjectID, workingDirectory: backgroundDirectory) == true
+                else { return false }
+            }
+            if let projectTargetID, !isBackgroundSessionTurn {
                 guard let binding = self.projectWorkspaceBindings.lookup(sessionID: projectTargetID.uuidString).binding,
                       binding.targetSessionID == projectTargetID.uuidString, binding.taskID == taskID,
                       projectSessionHandler?.isWorkspaceAuthorized(binding) == true else { return false }
@@ -5274,13 +5363,19 @@ final class BridgeStore {
                 sessionDirectory: sessionDirectory, sessionID: taskSessionID)
             // The configured root is a safety ceiling, not a project default.
             // Canonicalize and validate before minting the task Goal/lease.
+            // 普通会话（无项目、无显式根）：对齐 Claude Code，总有一个工作目录——会话私有目录，
+            // 先建好；它既是文件工具的授权根（读写免审批），也是 shell 的默认 cwd。
+            let usesPrivateWorkspace = projectDirectory == nil && fileAccessAllowedRoot == nil
+            if usesPrivateWorkspace {
+                try? FileManager.default.createDirectory(at: selectedDirectory, withIntermediateDirectories: true)
+            }
             let directory = selectedDirectory.resolvingSymlinksInPath().standardizedFileURL
             let taskOwner: BuiltinToolExecutor
             do {
                 let approved = try self.additionalDirectories(for: taskSessionID, owner: builtinExecutor)
                 taskOwner = try Self.additionalDirectoryOwner(base: builtinExecutor, approved: approved)
             } catch {
-                self.chat.reportTaskPolicyPreparationFailure("额外目录授权已变化：\(error.localizedDescription)。请重新批准目录后再发送。")
+                self.chat.reportTaskPolicyPreparationFailure("额外目录授权已变化：\(UserFacingErrorText.describe(error))。请重新批准目录后再发送。")
                 return false
             }
             self.productionBuiltinOwnerReferences.removeAll { $0.value == nil }
@@ -5288,20 +5383,24 @@ final class BridgeStore {
                 self.productionBuiltinOwnerReferences.append(ProductionBuiltinOwnerReference(taskOwner))
             }
             let scopedEngine: AgentLoopChatEngine
-            if !projectTask, projectDirectory == nil, fileAccessAllowedRoot == nil {
+            if !projectTask, usesPrivateWorkspace, !FileManager.default.fileExists(atPath: directory.path) {
+                // 私有目录建不出来时退回旧行为：没有工作目录，文件工具照常询问。
                 scopedEngine = currentEngine.clearingToolWorkspace(terminalPolicySnapshot: builtinExecutor.terminalPolicySnapshot)
             } else {
                 do {
                     scopedEngine = try currentEngine.capturingToolWorkspace(
-                        directory: directory, owner: taskOwner, projectScoped: projectDirectory != nil,
+                        directory: directory, owner: taskOwner,
+                        projectScoped: projectDirectory != nil || usesPrivateWorkspace,
                         projectTask: projectTask)
                 } catch {
-                    self.chat.reportTaskPolicyPreparationFailure("任务目录授权不可用：\(error.localizedDescription)。请检查当前项目与目录。")
+                    self.chat.reportTaskPolicyPreparationFailure("任务目录授权不可用：\(UserFacingErrorText.describe(error))。请检查当前项目与目录。")
                     return false
                 }
             }
             let selectedRoots = projectDirectory == nil
-                ? (fileAccessAllowedRoot == nil ? [] : [allowedRootURL.path]) : [directory.path]
+                ? (fileAccessAllowedRoot == nil
+                    ? (usesPrivateWorkspace && FileManager.default.fileExists(atPath: directory.path) ? [directory.path] : [])
+                    : [allowedRootURL.path]) : [directory.path]
             let taskFileRoots = (selectedRoots + taskOwner.additionalAllowedRoots.map {
                 $0.resolvingSymlinksInPath().standardizedFileURL.path
             }).reduce(into: [String]()) { roots, path in
@@ -5345,7 +5444,7 @@ final class BridgeStore {
             let executor = makePolicyWrappedExecutor(goal, lease, taskOwner, taskSessionID,
                 selectedRoots + builtinExecutor.additionalAllowedRoots.map { $0.resolvingSymlinksInPath().path })
             var taskEngine = scopedEngine
-            if projectTask, self.legacyAutomaticApprovalCompatibilityActive {
+            if projectTask, !isBackgroundSessionTurn, self.legacyAutomaticApprovalCompatibilityActive {
                 taskEngine.loop.approvalGate = taskEngine.loop.approvalGate?.applyingLegacyUnattendedAutoApproval()
             }
             let preparedEngine = taskEngine.withTopLevelTaskPolicy(executor: executor, facts: facts)
@@ -5373,6 +5472,9 @@ final class BridgeStore {
             targetValidator: builtinExecutor.fileArtifactTargetValidator(),
             projectValidator: { [weak projectSessionHandler] projectID, directory in
                 projectSessionHandler?.isTaskFileProjectAuthorized(projectID: projectID, workingDirectory: directory) == true
+            },
+            grantCurrent: { [weak projectSessionHandler] projectID, producedAt in
+                projectSessionHandler?.isTaskFileGrantCurrent(projectID: projectID, producedAt: producedAt) == true
             }
         )
 
@@ -5792,7 +5894,7 @@ final class BridgeStore {
                 chat.touchSession(sourceSessionID)
             } catch {
                 completion?(false)
-                chat.appendAssistant("⚠️ 命令执行失败：\(error.localizedDescription)", toSession: sourceSessionID)
+                chat.appendAssistant("⚠️ 命令执行失败：\(UserFacingErrorText.describe(error))", toSession: sourceSessionID)
                 chat.touchSession(sourceSessionID)
             }
         }
@@ -5884,7 +5986,7 @@ final class BridgeStore {
             } catch is SafetyRuntimeAdmissionError {
                 return
             } catch {
-                self?.chat.appendAssistant("⚠️ Composer 已拒绝画布操作：\(error.localizedDescription)", toSession: sourceSessionID)
+                self?.chat.appendAssistant("⚠️ 已拒绝画布操作：\(error.localizedDescription)", toSession: sourceSessionID)
                 self?.chat.touchSession(sourceSessionID)
             }
         }
@@ -6278,7 +6380,7 @@ final class BridgeStore {
             } catch is SafetyRuntimeAdmissionError {
                 return
             } catch {
-                chat.appendAssistant("❌ 草稿恢复已拒绝：\(error.localizedDescription)", toSession: originSessionID)
+                chat.appendAssistant("❌ 草稿恢复已拒绝：\(UserFacingErrorText.describe(error))", toSession: originSessionID)
                 chat.touchSession(originSessionID)
             }
         }
@@ -6443,7 +6545,7 @@ final class BridgeStore {
                 chat.appendAssistant("✅ 已导入小说到「\(node.title)」（\(content.count) 字）：\(Self.preview(content))", toSession: sourceSessionID)
                 chat.touchSession(sourceSessionID)
             } catch {
-                chat.appendAssistant("❌ 导入失败：\(error.localizedDescription)", toSession: sourceSessionID)
+                chat.appendAssistant("❌ 导入失败：\(UserFacingErrorText.describe(error))", toSession: sourceSessionID)
                 chat.touchSession(sourceSessionID)
             }
         } else {

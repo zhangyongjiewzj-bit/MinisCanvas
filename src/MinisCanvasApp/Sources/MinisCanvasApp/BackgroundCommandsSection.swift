@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import MinisCore
 
@@ -7,13 +8,13 @@ import MinisCore
 /// no background command has ever been started in this app run.
 ///
 /// The registry is a reference type, so SwiftUI cannot see its contents change.
-/// The enclosing `TimelineView` (0.5 s) therefore passes its tick as `now`:
-/// a changed input forces `body` to re-run and re-read the snapshots, and it
-/// is also the clock for the elapsed-time text.
+/// This section therefore owns a small 0.5 s `TimelineView`: each tick re-reads
+/// the snapshots and is the clock for the elapsed-time text. The rest of the
+/// Task Center no longer ticks with it.
 struct BackgroundCommandsSection: View {
     let registry: BackgroundShellRegistry
-    /// The timeline tick; see the type comment. Do not default it.
-    let now: Date
+    /// Session id -> title, passed in by the Task Center (no extra observation here).
+    let sessionTitles: [String: String]
     @Environment(\.typographyTokens) private var typography
     @State private var expandedID: String?
 
@@ -44,22 +45,69 @@ struct BackgroundCommandsSection: View {
     }
 
     var body: some View {
-        let rows = registry.snapshots()
-        if !rows.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("后台命令（\(rows.filter { $0.state == .running }.count) 个运行中）")
-                    .font(typography?.headline ?? .headline)
-                ForEach(rows) { row in
-                    commandRow(row)
+        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            let rows = registry.snapshots()
+            if !rows.isEmpty {
+                let labels = TaskCenterRowLabelFormatter.sourceLabels(
+                    ids: rows.map(\.sessionID), knownTitles: sessionTitles
+                )
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("后台命令（\(rows.filter { $0.state == .running }.count) 个运行中）")
+                        .font(typography?.headline ?? .headline)
+                    ForEach(rows) { row in
+                        commandRow(row, now: context.date, sessionLabel: labels[row.sessionID] ?? "来源会话不可用")
+                    }
                 }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("task-center-background-commands")
             }
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("task-center-background-commands")
+        }
+    }
+
+    /// 输出可滚动，各取最后 64KB；标准输出和标准错误分开显示，可在访达中显示完整日志。
+    @ViewBuilder
+    private func outputView(row: BackgroundShellSnapshot,
+                            output: (stdout: String, stderr: String, logPath: String?)) -> some View {
+        let font = typography?.monospaced ?? .system(.caption, design: .monospaced)
+        VStack(alignment: .leading, spacing: 6) {
+            if output.stdout.isEmpty && output.stderr.isEmpty {
+                Text(row.outputDiscarded ? "（会话已结束，输出已清除）" : "（暂无输出）")
+                    .font(font).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if !output.stdout.isEmpty {
+                            Text("标准输出").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                            Text(output.stdout)
+                                .font(font).foregroundStyle(.secondary).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .accessibilityIdentifier("background-command-output-\(row.id)")
+                        }
+                        if !output.stderr.isEmpty {
+                            Text("标准错误").font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+                            Text(output.stderr)
+                                .font(font).foregroundStyle(.secondary).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .accessibilityIdentifier("background-command-stderr-\(row.id)")
+                        }
+                    }
+                }
+                .frame(maxHeight: 220)
+                Text("只显示最后 64KB，更早的内容在完整日志里。")
+                    .font(typography?.caption ?? .caption).foregroundStyle(.secondary)
+            }
+            if let path = output.logPath, FileManager.default.fileExists(atPath: path) {
+                Button("在访达中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                }
+                .buttonStyle(.borderless)
+                .accessibilityIdentifier("background-command-reveal-\(row.id)")
+            }
         }
     }
 
     @ViewBuilder
-    private func commandRow(_ row: BackgroundShellSnapshot) -> some View {
+    private func commandRow(_ row: BackgroundShellSnapshot, now: Date, sessionLabel: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 Text(row.commandPreview)
@@ -80,18 +128,12 @@ struct BackgroundCommandsSection: View {
                 .buttonStyle(.borderless)
                 .accessibilityIdentifier("background-command-output-toggle-\(row.id)")
             }
-            Text("会话：\(row.sessionID) · " + Self.detailLine(row, now: now))
+            Text("会话：\(sessionLabel) · " + Self.detailLine(row, now: now))
                 .font(typography?.caption ?? .caption)
                 .foregroundStyle(.secondary)
                 .accessibilityIdentifier("background-command-status-\(row.id)")
-            if expandedID == row.id, let tail = registry.tail(id: row.id) {
-                let text = [tail.stdout, tail.stderr].filter { !$0.isEmpty }.joined(separator: "\n")
-                Text(text.isEmpty ? (row.outputDiscarded ? "（会话已结束，输出已清除）" : "（暂无输出）") : text)
-                    .font(typography?.monospaced ?? .system(.caption, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(12)
-                    .accessibilityIdentifier("background-command-output-\(row.id)")
+            if expandedID == row.id, let output = registry.displayOutput(id: row.id) {
+                outputView(row: row, output: output)
             }
         }
     }

@@ -66,6 +66,10 @@ public enum MCPJSONValue: Codable, Equatable, Sendable {
         switch any {
         case let v as MCPJSONValue: return v
         case _ as NSNull: return .null
+        case let v as NSNumber:
+            // JSONSerialization 给出的 NSNumber：整数 0/1 不能被当成布尔。
+            if CFGetTypeID(v) == CFBooleanGetTypeID() { return .bool(v.boolValue) }
+            return .number(v.doubleValue)
         case let v as Bool: return .bool(v)
         case let v as Int: return .number(Double(v))
         case let v as Double: return .number(v)
@@ -87,16 +91,50 @@ public struct MCPTool: Codable, Equatable, Sendable {
     /// Stored as an arbitrary JSON value so non-standard schemas round-trip.
     public var inputSchema: MCPJSONValue?
     public var _meta: MCPJSONValue?
+    /// 服务器在 tools/list 里给出的 `annotations`（如 `readOnlyHint`）。只是服务器的自述：
+    /// 仅用于计划模式放行，绝不用来免审批；不参与工具摘要（见 `encode`），避免翻转提示就让已有授权失效。
+    public var annotations: MCPJSONValue?
     public var requiresUserInteraction: Bool {
         guard case .object(let metadata)? = _meta else { return false }
         return metadata["anthropic/requiresUserInteraction"] == .bool(true)
     }
+    /// 服务器自述这个工具只读（`annotations.readOnlyHint == true`）。
+    public var readOnlyHint: Bool {
+        guard case .object(let values)? = annotations else { return false }
+        return values["readOnlyHint"] == .bool(true)
+    }
 
-    public init(name: String, description: String? = nil, inputSchema: MCPJSONValue? = nil, _meta: MCPJSONValue? = nil) {
+    public init(
+        name: String, description: String? = nil, inputSchema: MCPJSONValue? = nil,
+        _meta: MCPJSONValue? = nil, annotations: MCPJSONValue? = nil
+    ) {
         self.name = name
         self.description = description
         self.inputSchema = inputSchema
         self._meta = _meta
+        self.annotations = annotations
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, description, inputSchema, _meta, annotations
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        inputSchema = try container.decodeIfPresent(MCPJSONValue.self, forKey: .inputSchema)
+        _meta = try container.decodeIfPresent(MCPJSONValue.self, forKey: ._meta)
+        annotations = try container.decodeIfPresent(MCPJSONValue.self, forKey: .annotations)
+    }
+
+    /// 编码结果同时用于工具摘要，所以不写出 `annotations`（只读提示不影响授权绑定）。
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(description, forKey: .description)
+        try container.encodeIfPresent(inputSchema, forKey: .inputSchema)
+        try container.encodeIfPresent(_meta, forKey: ._meta)
     }
 
     /// `inputSchema` as a `[String: Any]` dictionary (nil if not an object).
@@ -258,8 +296,18 @@ public struct MCPServer: Codable, Identifiable, Equatable, Sendable {
     public var url: String?
     public var headers: [String: String]
 
-    /// Per-request / handshake timeout in seconds (default 60).
+    /// Handshake / `tools/list` timeout in seconds (default 60). Part of the
+    /// descriptor fingerprint, so it is kept stable for existing grants.
     public var timeoutSeconds: Int
+    /// 工具调用超时（秒）。nil 表示默认 10 分钟（对齐 Claude Code 的长时工具）；
+    /// 不进入描述指纹，修改它不会让已有授权失效。
+    public var callTimeoutSeconds: Int?
+    /// 从项目 .mcp.json 导入的本地服务器在该项目根目录启动。nil = 默认目录。
+    /// 只有非空时才进入描述指纹，已有服务器的授权不受影响。
+    public var workingDirectory: String?
+
+    public static let defaultCallTimeoutSeconds = 600
+    public var effectiveCallTimeoutSeconds: Int { callTimeoutSeconds ?? Self.defaultCallTimeoutSeconds }
 
     public init(
         id: String,
@@ -271,8 +319,11 @@ public struct MCPServer: Codable, Identifiable, Equatable, Sendable {
         env: [String: String] = [:],
         url: String? = nil,
         headers: [String: String] = [:],
-        timeoutSeconds: Int = 60
+        timeoutSeconds: Int = 60,
+        callTimeoutSeconds: Int? = nil,
+        workingDirectory: String? = nil
     ) {
+        self.workingDirectory = workingDirectory
         self.id = id
         self.name = name
         self.type = type
@@ -283,6 +334,7 @@ public struct MCPServer: Codable, Identifiable, Equatable, Sendable {
         self.url = url
         self.headers = headers
         self.timeoutSeconds = timeoutSeconds
+        self.callTimeoutSeconds = callTimeoutSeconds
     }
 
     /// Human-readable transport target ("https://…" or "npx …").
@@ -315,8 +367,17 @@ public struct MCPServer: Codable, Identifiable, Equatable, Sendable {
             var url: String?
             var timeoutSeconds: Int
         }
+        struct DescriptorWithDirectory: Codable {
+            var base: Descriptor
+            var workingDirectory: String
+        }
         let descriptor = Descriptor(type: type, command: command, args: args, url: url, timeoutSeconds: timeoutSeconds)
         let encoder = JSONEncoder()
+        if let workingDirectory, !workingDirectory.isEmpty {
+            encoder.outputFormatting = [.sortedKeys]
+            guard let data = try? encoder.encode(DescriptorWithDirectory(base: descriptor, workingDirectory: workingDirectory)) else { return "invalid" }
+            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(descriptor) else { return "invalid" }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -986,6 +1047,13 @@ public enum MCPClientError: Error, Equatable, Sendable {
     /// Tool discovery is not an execution grant. The bridge raises this when
     /// a discovered tool is outside its explicit allowlist.
     case permissionDenied(String)
+}
+
+/// 工具自己报告失败（`tools/call` 结果里 `isError: true`）。内容是工具返回的说明文字。
+public struct MCPToolReportedError: Error, LocalizedError, Equatable, Sendable {
+    public let message: String
+    public init(message: String) { self.message = message }
+    public var errorDescription: String? { message }
 }
 
 extension MCPClientError: LocalizedError {

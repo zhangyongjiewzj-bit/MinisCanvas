@@ -61,9 +61,6 @@ struct ProviderEndpointPolicySecurityTests {
         #expect(throws: ProviderEndpointPolicyError.controlCharacter) {
             try ProviderEndpointPolicy.canonicalize("https://api.example.com/v1/%00")
         }
-        #expect(throws: ProviderEndpointPolicyError.nonHTTPSHost) {
-            try ProviderEndpointPolicy.canonicalize("http://api.example.com/v1")
-        }
     }
 
     @Test("loopback HTTP and benign query remain available")

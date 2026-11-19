@@ -286,7 +286,7 @@ enum DocumentStageRunner {
                 messages: [LLMMessage(role: .user, content: prompt)],
                 systemPrompt: nil,
                 maxTokens: maxTokens,
-                temperature: 0.7
+                temperature: nil
             )
             return response.text
         }

@@ -28,6 +28,7 @@ extension EnvironmentValues {
 /// The status text derived below is display-only; live enforcement keeps
 /// re-checking `isAuthorizationActive` at admission and after every await.
 struct ExternalSessionAuthorizationLedgerView: View {
+    @Environment(\.themeTokens) private var theme
     @Environment(\.externalSessionAuthorizationComposition) private var composition
     @Environment(\.typographyTokens) private var typography
 
@@ -586,7 +587,7 @@ struct ExternalSessionAuthorizationLedgerView: View {
                     + "到期 \(Self.expiryText(grant.expiresAt)) · \(status.title)"
                 )
                     .font(typography?.caption2 ?? .caption2)
-                    .foregroundStyle(status == .active ? Color.secondary : Color.orange)
+                    .foregroundStyle(status == .active ? Color.secondary : (theme?.statusWarningText ?? AppStatusColor.warning))
                     .textSelection(.enabled)
                     .accessibilityIdentifier(
                         "external-session-authorization-read-grant-\(grant.authorizationID.rawValue)"

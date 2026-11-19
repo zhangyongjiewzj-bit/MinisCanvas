@@ -74,6 +74,28 @@ struct AJ58ArchiveSearchTests {
         #expect(chat.archivedList.first?.session.id == id)
     }
 
+    /// S-07：不带年份的写法（"11-17""11月17日"）按月和日匹配，不再被解析成 2000 年而永远搜不到。
+    @Test func archiveSearchByDateWithoutYear() throws {
+        let chat = ChatStore()
+        let id = chat.activeSessionID!
+        chat.appendUser("无年份日期内容")
+        chat.archiveSession(id: id)
+
+        let parts = Calendar.current.dateComponents([.month, .day], from: Date())
+        let month = try #require(parts.month)
+        let day = try #require(parts.day)
+        chat.searchText = String(format: "%02d-%02d", month, day)
+        #expect(chat.archivedList.first?.session.id == id)
+        chat.searchText = "\(month)月\(day)日"
+        #expect(chat.archivedList.first?.session.id == id)
+
+        // 月日不同 → 无匹配（取明天的月日，跨年也不同）。
+        let other = Calendar.current.dateComponents([.month, .day],
+            from: Calendar.current.date(byAdding: .day, value: 1, to: Date())!)
+        chat.searchText = String(format: "%02d-%02d", other.month!, other.day!)
+        #expect(chat.archivedList.isEmpty)
+    }
+
     // MARK: 归档搜索 + 恢复
 
     @Test func archiveSearchThenRestore() {
