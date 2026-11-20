@@ -419,6 +419,9 @@ struct GlobalComposerView: View {
     @State private var isInputFocused = false
     @State private var goalObjective = ""
     @State private var showsGoalInput = false
+    /// 11/19 用户：目标卡片的预算、续跑状态、复核与证据默认收起，只留一行标题和操作按钮，
+    /// 免得输入框上方占掉半屏；"待你处理"和"先调高预算"这类要你动手的提示照常显示。
+    @State private var goalDetailsExpanded = false
     @State private var goalActionFailed = false
     @State private var goalActionFailureText = "未能更新会话目标。"
     @State private var pendingGoalSessionBudgetReset: SessionBudgetResetTarget?
@@ -487,6 +490,15 @@ struct GlobalComposerView: View {
                     || goal.budget.tokenLimit.map { goal.budget.usedTokens >= $0 } == true
                     || goal.budget.durationLimitSeconds.map { goal.budget.usedDurationSeconds >= $0 } == true
                 HStack(spacing: 8) {
+                    Button {
+                        goalDetailsExpanded.toggle()
+                    } label: {
+                        MinisIconView(goalDetailsExpanded ? .caretDown : .caretRight, size: 10)
+                            .frame(width: 12)
+                    }
+                    .help(goalDetailsExpanded ? "收起目标详情" : "展开目标详情（预算、续跑状态、复核与证据）")
+                    .accessibilityLabel(goalDetailsExpanded ? "收起目标详情" : "展开目标详情")
+                    .accessibilityIdentifier("composer.goal-details-toggle")
                     MinisIconView(.target, size: MinisIconTokens.smallSize)
                         .accessibilityHidden(true)
                     Text(goal.reviewNeedsAttention ? "目标复核待处理"
@@ -533,13 +545,19 @@ struct GlobalComposerView: View {
                     }
                 }
                 .font(typography?.status ?? .caption)
-                goalBudgetSummary(goal)
+                // 预算用尽、要重置本会话预算时，按钮在摘要里，收起状态下也照常显示。
+                if goalDetailsExpanded
+                    || chat.sessionBudgetResetTarget?.sessionID == goal.sessionID
+                    || goal.budgetPauseReason != nil
+                    || goal.isPausedForSessionTokenLimit == true {
+                    goalBudgetSummary(goal)
+                }
                 if (goal.status == .paused || goal.status == .blocked) && goalBudgetExhausted {
                     Text("先调高预算，再点恢复。")
                         .font(typography?.status ?? .caption)
                         .foregroundStyle(.secondary)
                 }
-                if let review = goal.lastReview {
+                if goalDetailsExpanded || goal.reviewNeedsAttention, let review = goal.lastReview {
                     VStack(alignment: .leading, spacing: 2) {
                         let title = "上次复核 · " + goalReviewOutcomeTitle(review.outcome)
                         let message = review.reason.map { Text(title + "：") + Text(verbatim: $0) } ?? Text(title)
@@ -559,7 +577,7 @@ struct GlobalComposerView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
-                if let reason = goal.blockedReason {
+                if goalDetailsExpanded, let reason = goal.blockedReason {
                     Text(reason).font(.caption).foregroundStyle(.secondary)
                 }
                 if !goal.blockers.isEmpty {
@@ -587,7 +605,7 @@ struct GlobalComposerView: View {
                     }
                     .font(.caption)
                 }
-                if !goal.evidence.isEmpty {
+                if goalDetailsExpanded, !goal.evidence.isEmpty {
                     DisclosureGroup("完成证据") {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(goal.evidence.indices, id: \.self) { index in
@@ -659,7 +677,9 @@ struct GlobalComposerView: View {
             Text("会话累计 Token \(chat.budgetUsedTokens.formatted()) / \(sessionLimit)")
                 .accessibilityIdentifier("composer.goal-session-budget.usage")
             if let loopLimit {
-                Text("每回合循环上限（基础配置）\(loopLimit.formatted())")
+                Text(loopLimit >= AgentLoop.unlimitedIterations
+                     ? "每回合循环上限（基础配置）不限"
+                     : "每回合循环上限（基础配置）\(loopLimit.formatted())")
             }
             Text("受运行安全上限约束")
             if !goal.autoContinueEnabled {

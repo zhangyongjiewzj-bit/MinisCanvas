@@ -683,6 +683,17 @@ enum SettingsStateClassification {
             uiBindings: ["tokenBudgetUnlimited"]
         ),
         PersistentStateDescriptor(
+            stateClass: .canonicalSetting, owner: "SettingsCenter", priority: 100,
+            scope: "app/agent user-only control", defaultValue: "true",
+            reset: "SettingsCenter.resetToDefaults()",
+            persistence: "SettingsStore.settings.json agent.loopIterationsUnlimited",
+            restart: "next agent-loop composition (BridgeStore AgentLoop.maxIterations)",
+            validation: "Explicit Bool; missing defaults true; setting a finite maxLoopIterations turns it off",
+            consumer: "AgentSettings.effectiveLoopIterations -> BridgeStore/AgentLoopChatEngine AgentLoop.maxIterations",
+            settingsKey: "agent.loopIterationsUnlimited", effectiveSource: "SettingsCenter.loopIterationsUnlimited",
+            uiBindings: ["loopIterationsUnlimited"]
+        ),
+        PersistentStateDescriptor(
             stateClass: .canonicalSetting,
             owner: "SettingsCenter",
             priority: 100,

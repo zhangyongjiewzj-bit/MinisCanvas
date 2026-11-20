@@ -705,6 +705,50 @@ struct ToolExecutionFactV2Tests {
         #expect(ledger.facts == result.toolExecutionFacts)
     }
 
+    /// 失败的调用也带卡片详情：展开就能看到发给模型的同一条报错（用户 11/20 会话 893B52D5）。
+    @Test func failedToolFactCarriesTheErrorInItsCardDetail() async throws {
+        let url = try v2LedgerURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let ledger = try ToolExecutionFactLedger(persistenceURL: url)
+        let provider = V2FactProvider([
+            LLMResponse(text: v2Envelope(id: "failed-call"), stopReason: nil, usage: nil),
+            LLMResponse(text: "done", stopReason: nil, usage: nil),
+        ])
+        let result = try await AgentLoop(maxIterations: 2, approvalGate: v2AutoApproveGate(), toolExecutionFactLedger: ledger).run(
+            messages: [],
+            systemPrompt: nil,
+            provider: provider,
+            toolExecutor: V2FactExecutor(.failed),
+            tools: [v2Tool()],
+            executionIdentity: v2Identity(attempt: 1)
+        )
+        let fact = try #require(result.toolExecutionFacts.first)
+        #expect(fact.status == .failed)
+        let detail = try #require(fact.outputSummary?.detail)
+        #expect(detail.output?.contains("synthetic-missing") == true)
+        #expect(try ToolExecutionFactLedger(persistenceURL: url).facts.first?.outputSummary == fact.outputSummary)
+    }
+
+    /// 有执行事实账本时（与正式环境一致），真正执行过且记为失败的调用连续 8 次就停下回合。
+    @Test func executedFailuresOfOneToolStopTheTurnAtTheLimit() async throws {
+        let url = try v2LedgerURL()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let ledger = try ToolExecutionFactLedger(persistenceURL: url)
+        let limit = RepeatedToolFailureCounter.limit
+        let provider = V2FactProvider((1...(limit + 3)).map {
+            LLMResponse(text: v2Envelope(id: "repeat-\($0)"), stopReason: nil, usage: nil)
+        })
+        let executor = V2FactExecutor(.failed)
+        let outcome = await AgentLoop(maxIterations: AgentLoop.unlimitedIterations, approvalGate: v2AutoApproveGate(),
+                                      loopDetector: nil, toolExecutionFactLedger: ledger).runOutcome(
+            messages: [], systemPrompt: nil, provider: provider, toolExecutor: executor,
+            tools: [v2Tool()], executionIdentity: v2Identity(attempt: 1))
+        #expect(outcome.failure?.agentError == .repeatedToolFailure(tool: v2Tool().name, count: limit))
+        #expect(executor.callCount == limit)
+        #expect(outcome.toolExecutionFacts.count == limit)
+        #expect(outcome.toolExecutionFacts.allSatisfy { $0.status == .failed })
+    }
+
     @Test func actualToolOutputBecomesContentFreeDurableEventSummary() async throws {
         let url = try v2LedgerURL()
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

@@ -316,7 +316,7 @@ struct SettingsDescriptorOrphanGate148Tests {
                 "concurrentToolLimit", "contextLengthTokens", "customUserAgent", "customViewportHeight",
                 "customViewportWidth", "defaultModelID", "defaultProviderID",
                 "expirationInterval", "fallbackEnabled", "fileCheckpointsEnabled", "historyTurnLimit", "idleTabTimeoutMinutes", "killSwitchEnabled",
-                "language", "liveLogLevel", "maxLoopIterations", "maxTokensPerSession", "tokenBudgetUnlimited", "memoryEnabled", "globalInstructionsEnabled",
+                "language", "liveLogLevel", "maxLoopIterations", "maxTokensPerSession", "tokenBudgetUnlimited", "loopIterationsUnlimited", "memoryEnabled", "globalInstructionsEnabled",
                 "memoryLimitMB", "modelSpeedTier", "newMessageInterruptsGeneration",
                 "persona", "personaEnabled", "privacyLogLevel",
                 "safeModeEnabled", "sessionRetentionDays", "subModelID",

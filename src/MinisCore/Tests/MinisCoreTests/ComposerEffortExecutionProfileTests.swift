@@ -439,6 +439,34 @@ struct CCRound2IterationLimitTests {
         #expect(AgentLoop(maxIterations: 999).maxIterations == 100)
     }
 
+    @Test func unlimitedIterationsStayUnlimitedAtEveryEffort() throws {
+        for effort in [ComposerEffort.low, .standard, .high] {
+            let profile = ComposerEffortExecutionProfile(effort: effort,
+                baseMaxIterations: AgentLoop.unlimitedIterations, baseMaxTokens: 4096)
+            #expect(profile.maxIterations == AgentLoop.unlimitedIterations)
+        }
+        // 有限值仍按旧规则。
+        #expect(AgentLoop.normalizedIterations(999) == 100)
+        #expect(AgentLoop.normalizedIterations(0) == 1)
+        #expect(ComposerEffortExecutionProfile(effort: .high,
+            baseMaxIterations: 10, baseMaxTokens: 4096).maxIterations == 15)
+    }
+
+    @Test func settingsDefaultAndLegacyFilesAreUnlimitedButExplicitFiniteStaysFinite() throws {
+        #expect(AgentSettings.default.loopIterationsUnlimited)
+        #expect(AgentSettings.default.effectiveLoopIterations == AgentLoop.unlimitedIterations)
+        let legacy = try JSONDecoder().decode(AgentSettings.self, from: Data(#"{"maxLoopIterations":100}"#.utf8))
+        #expect(legacy.loopIterationsUnlimited)
+        #expect(legacy.maxLoopIterations == 100)
+        let finite = try JSONDecoder().decode(AgentSettings.self,
+            from: Data(#"{"maxLoopIterations":30,"loopIterationsUnlimited":false}"#.utf8))
+        #expect(finite.effectiveLoopIterations == 30)
+        let roundTrip = try JSONDecoder().decode(AgentSettings.self, from: JSONEncoder().encode(finite))
+        #expect(!roundTrip.loopIterationsUnlimited)
+        #expect(AgentSettings(maxLoopIterations: 12).effectiveLoopIterations == AgentLoop.unlimitedIterations)
+        #expect(AgentSettings(maxLoopIterations: 12, loopIterationsUnlimited: false).effectiveLoopIterations == 12)
+    }
+
     @Test func parentBindingCompositionIsSingleAssignment() throws {
         let first = ParentContextSnapshotV1(providerID: "synthetic", modelID: "a", configurationFingerprint: "frozen")
         let other = ParentContextSnapshotV1(providerID: "synthetic", modelID: "b", configurationFingerprint: "frozen")

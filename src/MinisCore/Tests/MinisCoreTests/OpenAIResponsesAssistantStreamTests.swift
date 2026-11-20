@@ -235,6 +235,51 @@ struct W5048ResponsesAssistantStreamTests {
         #expect(deltas.allSatisfy { !$0.contains("comm") && !$0.contains("arguments") })
     }
 
+    /// 11/19 用户现场：ChatGPT 账号在 response.created / response.completed 里回显整份
+    /// 工具定义。接上 Chrome DevTools MCP 后回显的字段数逼近旧的 2048 个总键上限，
+    /// 只调工具的回复还能过，"先说一句再调工具"的回复多出消息项就被判成 invalid SSE JSON。
+    @Test("terminal events that echo a large tool catalog are not rejected as invalid JSON")
+    func largeEchoedToolCatalogIsAccepted() async throws {
+        defer { W5048ResponsesMockURLProtocol.reset() }
+        let isolation = try isolateCheckpointDirectory()
+        defer { restore(isolation) }
+        // 120 个工具、每个约 30 个键：整份回显约 3600 个键，远小于单事件 1MB 的字节上限。
+        let echoedTools = (0..<120).map { index -> String in
+            let properties = (0..<6).map { p in
+                #""p\#(p)":{"type":"string","description":"d","enum":["a","b"]}"#
+            }.joined(separator: ",")
+            return #"{"type":"function","name":"tool_\#(index)","description":"fixture","strict":false,"parameters":{"type":"object","properties":{\#(properties)},"required":["p0"],"additionalProperties":false}}"#
+        }.joined(separator: ",")
+        let echo = #""tools":[\#(echoedTools)],"instructions":"fixture""#
+        W5048ResponsesMockURLProtocol.handler = {
+            responsesSSE([
+                (event: "response.created",
+                 data: #"{"type":"response.created","response":{"id":"resp_echo_1","status":"in_progress",\#(echo),"output":[]}}"#),
+                (event: "response.output_item.added",
+                 data: #"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#),
+                (event: "response.output_text.delta",
+                 data: #"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"先看页面"}"#),
+                (event: "response.output_text.done",
+                 data: #"{"type":"response.output_text.done","item_id":"msg_1","output_index":0,"content_index":0,"text":"先看页面"}"#),
+                (event: "response.output_item.done",
+                 data: #"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"先看页面"}]}}"#),
+                (event: "response.output_item.added",
+                 data: #"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"run_command","arguments":""}}"#),
+                (event: "response.function_call_arguments.done",
+                 data: #"{"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":1,"arguments":"{\"command\":\"ls\"}"}"#),
+                (event: "response.output_item.done",
+                 data: #"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"run_command","arguments":"{\"command\":\"ls\"}"}}"#),
+                (event: "response.completed",
+                 data: #"{"type":"response.completed","response":{"id":"resp_echo_1","status":"completed",\#(echo),"output":[{"type":"message","id":"msg_1","content":[{"type":"output_text","text":"先看页面"}]},{"type":"function_call","id":"fc_1","call_id":"call_1","name":"run_command","arguments":"{\"command\":\"ls\"}"}],"usage":{"input_tokens":9,"output_tokens":4}}}"#),
+            ])
+        }
+        let events = try await collect(stream(makeProvider(session: W5048ResponsesMockURLProtocol.makeSession(), checkpointDirectory: isolation.directory)))
+        var terminal: LLMResponse?
+        for case .completed(let response) in events { terminal = response }
+        #expect(terminal?.text == "先看页面")
+        #expect(terminal?.toolCalls.first?.name == "run_command")
+    }
+
     @Test("completed response with null error closes the stream with buffered parity")
     func completedNullErrorHasBufferedParity() async throws {
         defer { W5048ResponsesMockURLProtocol.reset() }

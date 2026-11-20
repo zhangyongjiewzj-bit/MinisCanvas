@@ -2505,7 +2505,7 @@ struct MinisCanvasAppMain: App {
                 .onChange(of: [settingsCenter.maxTokensPerSession, settingsCenter.tokenBudgetUnlimited ? 1 : 0]) { _, _ in
                     bridge.refreshProductionAgentSettings(settingsCenter.settings.agent)
                 }
-                .onChange(of: settingsCenter.maxLoopIterations) { _, _ in
+                .onChange(of: [settingsCenter.maxLoopIterations, settingsCenter.loopIterationsUnlimited ? 1 : 0]) { _, _ in
                     bridge.refreshProductionAgentSettings(settingsCenter.settings.agent)
                 }
                 .onChange(of: settingsCenter.toolTimeoutSeconds) { _, _ in

@@ -145,7 +145,6 @@ struct HookRegisteredAppConsumer704Tests {
         #expect(fact.toolCallID == Hook704Provider.callID)
         #expect(fact.executionIdentity == f.identity)
         #expect(fact.status == .failed)
-        #expect(fact.outputSummary == nil)
         let reason: HookDecisionReason = mode == .deny ? .hookDeny : .hookHandlerIdentityMismatch
         #expect(f.provider.requests.count == 2)
         let result = try #require(f.provider.requests.last?.last)
@@ -155,6 +154,12 @@ struct HookRegisteredAppConsumer704Tests {
             ? ComposerAuthorizationError.hookRejected("Hook 阻止本次工具调用").localizedDescription
             : ComposerAuthorizationError.hookDecisionDenied(reason).localizedDescription
         #expect(result.content == "Error executing tool file_read: " + expected)
+        // 失败卡片只带拦截原因（用户 11/20 会话 893B52D5），不带文件正文。
+        guard case .withDetail(_, let detail)? = fact.outputSummary else {
+            Issue.record("失败事实应带原因详情"); return
+        }
+        #expect(detail.output == result.content)
+        #expect(detail.output?.contains("owned-hook704-content") == false)
     }
 
     fileprivate enum ReceiptMismatch: CaseIterable, Sendable {

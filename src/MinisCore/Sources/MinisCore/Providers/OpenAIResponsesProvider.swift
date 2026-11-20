@@ -194,7 +194,11 @@ public final class OpenAIResponsesProvider: LLMProvider, ProviderRuntimeConfigur
     private static let maxDurableResponseBodyBytes = 16 * 1024 * 1024
     private static let maxDurableReceiptHistory = 8
     private static let maxJSONDepth = 32
-    private static let maxJSONKeyCount = 2_048
+    /// 整份 JSON 的键总数。ChatGPT 账号会在 response.created / response.completed 里
+    /// 回显整份工具定义，接几个 MCP 服务器就有几千个键；旧值 2048 让"先说话再调工具"的
+    /// 回复被判成 invalid SSE JSON（11/19 现场）。解析成本仍由单事件 1MB、整流 16MB 的
+    /// 字节上限兜住，这里只防病态的超多小键。
+    private static let maxJSONKeyCount = 262_144
     private static let maxJSONStringBytes = 1024 * 1024
     private static let nonStreamingResponseSchemaFingerprint = "responses-json-v1"
     private static let streamingResponseSchemaFingerprint = "responses-sse-v1"

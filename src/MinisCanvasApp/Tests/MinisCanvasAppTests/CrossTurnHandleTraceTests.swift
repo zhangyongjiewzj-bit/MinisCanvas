@@ -231,26 +231,33 @@ struct CrossTurnHandleTraceTests {
         try expectPairsAreWellFormed(first)
     }
 
-    // MARK: T5 失败不落（守卫：基线即绿，防止泛化后把失败结果写进转录）
+    // MARK: T5 失败留简要记录（用户 11/20：失败的工具调用也存进对话记录；只留路径与报错，不留写入正文）
 
-    @Test func failedFileEditLeavesNoTrace() async throws {
+    @Test func failedFileEditLeavesACompactFailureTraceWithoutBodies() async throws {
         let h = try Harness(label: "d1-failed", capabilities: ["file_edit"])
         defer { h.cleanup() }
         let target = h.root.appendingPathComponent("d1-c.txt")
         try "SYNTH_PRESENT_ZZZ_007".write(to: target, atomically: true, encoding: .utf8)
         let turn1 = ScriptProvider { ordinal, _ in
             ordinal == 1 ? [try makeCall("d1-bad-edit", "file_edit", [
-                "path": target.path, "old_string": "SYNTH_ABSENT_ZZZ_008", "new_string": "x", "replace_all": false])] : []
+                "path": target.path, "old_string": "SYNTH_ABSENT_ZZZ_008", "new_string": "SYNTH_NEW_ZZZ_010", "replace_all": false])] : []
         }
         try await h.run(turn1, "d1 edit something that is not there")
         try #require(try String(contentsOf: target, encoding: .utf8) == "SYNTH_PRESENT_ZZZ_007")
         let turn2 = ScriptProvider { _, _ in [] }
         try await h.run(turn2, "d1 second turn")
         let first = try #require(turn2.requests.first)
-        #expect(!toolCalls(in: first).contains { $0.id == "d1-bad-edit" })
-        #expect(!toolResults(in: first).contains { $0.id == "d1-bad-edit" })
+        let call = try #require(toolCalls(in: first).first { $0.id == "d1-bad-edit" })
+        #expect(call.arguments["path"] as? String == target.path)
+        #expect(call.arguments["old_string"] == nil)
+        #expect(call.arguments["new_string"] == nil)
+        let result = try #require(toolResults(in: first).first { $0.id == "d1-bad-edit" })
+        #expect(result.content.hasPrefix("[工具执行失败]"))
+        #expect(!result.content.contains("SYNTH_NEW_ZZZ_010"))
         let cold = try h.coldMessages()
-        #expect(!cold.flatMap(\.toolCalls).contains { $0.id == "d1-bad-edit" })
+        #expect(cold.flatMap(\.toolCalls).filter { $0.id == "d1-bad-edit" }.count == 1)
+        #expect(!cold.flatMap(\.toolCalls).contains { $0.rawArguments.contains("SYNTH_NEW_ZZZ_010") })
+        try expectPairsAreWellFormed(first)
     }
 
     // MARK: T6 混合编排回合：每个 toolCallID 在落盘转录里恰有一条 tool 消息（守卫）

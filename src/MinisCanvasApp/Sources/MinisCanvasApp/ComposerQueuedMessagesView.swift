@@ -62,26 +62,35 @@ struct ComposerContextNoticeView: View {
                     .foregroundStyle(.secondary)
                     .accessibilityIdentifier("composer.continuation-notice")
             }
-            Button {
-                presentsContextSources.toggle()
-            } label: {
-                Label {
-                    Text("上下文 \(chat.contextOccupancy?.display ?? "—")")
-                } icon: {
-                    MinisIconView(.analytics, size: 12)
-                        .accessibilityHidden(true)
+            // 11/19 用户：上下文占用和"恢复文件检查点"并排一行，少占输入框上方一行。
+            HStack(spacing: 8) {
+                Button {
+                    presentsContextSources.toggle()
+                } label: {
+                    Label {
+                        Text("上下文 \(chat.contextOccupancy?.display ?? "—")")
+                    } icon: {
+                        MinisIconView(.analytics, size: 12)
+                            .accessibilityHidden(true)
+                    }
+                    .foregroundStyle(contextOccupancyColor)
                 }
-                .foregroundStyle(contextOccupancyColor)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help(chat.contextOccupancyHelp)
-            .accessibilityIdentifier("composer.context-occupancy")
-            .popover(isPresented: $presentsContextSources, arrowEdge: .top) {
-                contextSources
-            }
-            .onChange(of: chat.activeSessionID) { _, _ in
-                presentsContextSources = false
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(chat.contextOccupancyHelp)
+                .accessibilityIdentifier("composer.context-occupancy")
+                .popover(isPresented: $presentsContextSources, arrowEdge: .top) {
+                    contextSources
+                }
+                .onChange(of: chat.activeSessionID) { _, _ in
+                    presentsContextSources = false
+                }
+                if !chat.fileCheckpoints.isEmpty {
+                    Button("恢复文件检查点…") { presentsCheckpoints = true }
+                        .disabled(chat.isActiveSessionGenerating)
+                        .help(FileCheckpointStore.scopeDisclosure)
+                        .accessibilityIdentifier("composer.file-checkpoints")
+                }
             }
             if let reason = chat.contextLimitReason {
                 HStack {
@@ -123,12 +132,6 @@ struct ComposerContextNoticeView: View {
                 }
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier("composer.permission-rules-notice")
-            }
-            if !chat.fileCheckpoints.isEmpty {
-                Button("恢复文件检查点…") { presentsCheckpoints = true }
-                    .disabled(chat.isActiveSessionGenerating)
-                    .help(FileCheckpointStore.scopeDisclosure)
-                    .accessibilityIdentifier("composer.file-checkpoints")
             }
         }
         .font(typography?.caption ?? .caption)

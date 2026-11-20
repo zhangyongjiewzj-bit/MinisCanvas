@@ -46,21 +46,25 @@ public struct ComposerEffortExecutionProfile: Equatable, Sendable {
         self.selectedEffort = selectedEffort
         self.effectiveEffort = effectiveEffort
         self.effort = selectedEffort
+        let unlimitedIterations = baseMaxIterations >= AgentLoop.unlimitedIterations
         let safeIterations = max(1, min(baseMaxIterations, Self.maxIterationCap))
         let safeTokens = max(1, min(baseMaxTokens, Self.maxTokenCap))
 
         let scaledTokens: Int
+        let scaledIterations: Int
         switch effectiveEffort {
         case .low:
-            maxIterations = max(1, safeIterations / 2)
+            scaledIterations = max(1, safeIterations / 2)
             scaledTokens = max(1, safeTokens / 2)
         case .standard:
-            maxIterations = safeIterations
+            scaledIterations = safeIterations
             scaledTokens = safeTokens
         case .high:
-            maxIterations = min(Self.maxIterationCap, max(1, safeIterations * 3 / 2))
+            scaledIterations = min(Self.maxIterationCap, max(1, safeIterations * 3 / 2))
             scaledTokens = min(Self.maxTokenCap, max(1, safeTokens * 3 / 2))
         }
+        // 不限循环次数时，档位只缩放输出 Token，不把“不限”折回有限次数。
+        maxIterations = unlimitedIterations ? AgentLoop.unlimitedIterations : scaledIterations
         // A selected context length is an independent hard boundary. In
         // particular, high effort must not inflate a clipped base past it.
         maxTokens = maxOutputTokensCeiling.map { min(scaledTokens, max(0, $0)) }

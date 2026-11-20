@@ -617,7 +617,7 @@ final class TurnToolCallAccumulator: @unchecked Sendable {
 
     func recordTraceSettlement(_ fact: ToolExecutionFact) {
         lock.withLock {
-            guard !observationsClosed, fact.status == .succeeded,
+            guard !observationsClosed, CrossTurnToolTracePolicy.isTracedStatus(fact.status),
                   CrossTurnToolTracePolicy.rule(for: fact.toolName) != nil,
                   !forwardedSettlements.contains(SettlementID(key: fact.compositeKey, receiptID: fact.receiptID))
             else { return }
@@ -639,6 +639,7 @@ final class TurnToolCallAccumulator: @unchecked Sendable {
                 guard fact.executionIdentity == executionIdentity,
                       let call = producedCall(id: fact.toolCallID), call.name == fact.toolName else { continue }
                 var results: [String] = []
+                let failed = fact.status == .failed
                 for message in producedMessages {
                     if message.role == .tool, message.toolCallID == call.id {
                         results.append(message.content)
@@ -648,7 +649,7 @@ final class TurnToolCallAccumulator: @unchecked Sendable {
                         results += parts.compactMap { part in
                             guard part["type"] as? String == "tool_result",
                                   part["tool_use_id"] as? String == call.id,
-                                  part["is_error"] as? Bool != true else { return nil }
+                                  (part["is_error"] as? Bool == true) == failed else { return nil }
                             return part["content"] as? String
                         }
                     }
@@ -660,7 +661,7 @@ final class TurnToolCallAccumulator: @unchecked Sendable {
                 // that persists the pairs, see `CrossTurnExcerptWindow`.
                 let transcript = CrossTurnToolTracePolicy.transcript(
                     call: call, result: content,
-                    knownSecrets: ModelShellEnvironment.knownCredentialValues()) ?? []
+                    knownSecrets: ModelShellEnvironment.knownCredentialValues(), failed: failed) ?? []
                 completed.append((fact, transcript))
             }
             for (fact, _) in completed { pendingTraceFacts.removeValue(forKey: fact.receiptID) }
@@ -2279,7 +2280,7 @@ struct AgentLoopChatEngine: ChatAgentEngine {
     /// 记录值，fallback 开关的真实作用点是 BridgeStore 的逐轮路由工厂，同样在
     /// 刷新缝内更新。
     mutating func reapplyRuntimeAgentSettings(_ settings: AgentSettings) {
-        loop.maxIterations = max(1, settings.maxLoopIterations)
+        loop.maxIterations = settings.effectiveLoopIterations
         toolTimeoutSeconds = settings.toolTimeoutSeconds
         loop.otherToolTimeout = TimeInterval(settings.toolTimeoutSeconds)
         fallbackEnabled = settings.fallbackEnabled

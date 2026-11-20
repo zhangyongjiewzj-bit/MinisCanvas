@@ -9556,7 +9556,8 @@ final class ChatStore {
         immediateTraceMessageIDs: inout Set<UUID>,
         excerptWindow: inout CrossTurnExcerptWindow
     ) -> Bool {
-        let isTrace = CrossTurnToolTracePolicy.rule(for: fact.toolName) != nil && fact.status == .succeeded
+        let isTrace = CrossTurnToolTracePolicy.rule(for: fact.toolName) != nil
+            && CrossTurnToolTracePolicy.isTracedStatus(fact.status)
         guard (fact.toolName == OrchestrationToolExecutor.toolName || isTrace),
               fact.executionIdentity == executionIdentity,
               activeExecutionIdentities[sessionID] == executionIdentity,
@@ -21697,7 +21698,8 @@ final class ChatStore {
                  .emptyResponse, .timedOut(_), .composerSnapshotMismatch,
                  .composerAuthorizationUnavailable, .toolExecutionFactsUnavailable,
                  .invalidToolExecutionAttempt, .executionIdentityMismatch,
-                 .parentTerminalPersistenceFailed, .compactionCheckpointUnavailable(_):
+                 .parentTerminalPersistenceFailed, .compactionCheckpointUnavailable(_),
+                 .repeatedToolFailure(_, _):
                 return loop.localizedDescription
             default:
                 break

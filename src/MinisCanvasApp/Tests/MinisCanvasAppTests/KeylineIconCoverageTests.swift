@@ -312,7 +312,8 @@ struct KeylineIconCoverageTests {
         // 历史审查补修（11/18）：重新生成按钮加 refresh、记忆读取失败用 warning、目标待办清除等界面
         // 新增 Keyline 图标共 +4，都是 MinisIconView，没有新增 SF Symbol。
         // 包上旅程发现下拉菜单按钮会把 copy/more 图标压成黑色剪影，这两处改回文字标签（-2）。
-        #expect(keylineCalls == 195)
+        // 目标详情折叠（11/19）：输入框上方目标栏加展开/收起箭头 caretDown/caretRight（+1），没有新增 SF Symbol。
+        #expect(keylineCalls == 196)
 
         // Preserve the same 13-file scope and exclusions, but count complete
         // constructors: the old per-line scan silently missed multiline Label.
@@ -342,7 +343,7 @@ struct KeylineIconCoverageTests {
         // unallowlisted regression artificially improves Keyline coverage.
         let denominator = keylineCalls + nonExcludedLines.count
         // Same 13-file scope: prior icons plus reviewed Keyline A display changes.
-        #expect(denominator == 221)
+        #expect(denominator == 222)
         #expect(Double(keylineCalls) / Double(denominator) >= 0.80)
         #expect(Double(nonExcludedLines.count) / Double(denominator) <= 0.20)
     }

@@ -2293,9 +2293,9 @@ private struct AgentSettingsTab: View {
             }
             Section("循环与工具") {
                 if center.maxLoopIterationsNoticePending {
-                    Text("你已保存的循环上限为10。新版默认50、最多100；当前仍保留10，请选择是否更新。")
+                    Text("你已保存的循环上限为10。新版默认不限次数；当前仍保留10，请选择是否更新。")
                     HStack {
-                        Button("改为50") { center.acknowledgeLoopLimitNotice(useNewDefault: true) }
+                        Button("改为不限") { center.acknowledgeLoopLimitNotice(useNewDefault: true) }
                         Button("保留10") { center.acknowledgeLoopLimitNotice(useNewDefault: false) }
                     }
                 }
@@ -2320,6 +2320,12 @@ private struct AgentSettingsTab: View {
                     in: 1...100,
                     accessibilityIdentifier: "settings.agent.max-loop-iterations"
                 )
+                .disabled(center.loopIterationsUnlimited)
+                Toggle("不限制每回合循环次数", isOn: Binding(
+                    get: { center.loopIterationsUnlimited }, set: { center.loopIterationsUnlimited = $0 }))
+                    .accessibilityIdentifier("settings.agent.loop-iterations-unlimited")
+                Text("默认不限，和 Claude Code、Codex 一样；仍受累计 Token 上限、重复调用检测和手动停止约束。")
+                    .font(.caption).foregroundStyle(.secondary)
                 ValidatedNumericSettingField(
                     "命令超时（秒，默认120，最多600）",
                     value: Binding(

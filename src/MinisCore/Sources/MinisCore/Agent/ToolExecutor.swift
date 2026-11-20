@@ -2905,7 +2905,10 @@ public final class BuiltinToolExecutor: ToolCatalogValidatingExecutor, SessionRe
         }
     }
 
-    private func runFileRead(_ input: [String: Any]) throws -> String {
+    private func runFileRead(_ rawInput: [String: Any]) throws -> String {
+        // 可选参数显式传 null（ChatGPT 等模型常把未用的可选项填成 null）等同于没传；
+        // 否则文本文件会因 page_start/page_count 为 null 被当成“仅适用于 PDF”而反复失败（用户 11/20 会话 893B52D5）。
+        let input = rawInput.filter { !($0.value is NSNull) }
         let result = try performFileRead(input)
         if let path = input["path"] as? String, !path.isEmpty { markFileRead(path: path) }
         return result

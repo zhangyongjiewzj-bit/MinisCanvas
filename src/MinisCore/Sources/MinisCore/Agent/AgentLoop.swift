@@ -125,6 +125,8 @@ public enum AgentLoopError: LocalizedError, Equatable, Sendable {
     /// Window admission: occupancy is at or above 95% of the window and
     /// neither reduction nor compaction can lower it. No Provider request was made.
     case contextWindowFull(fraction: Double)
+    /// 同一个工具在本回合连续失败达到上限，回合已停下（失败结果已写回对话）。
+    case repeatedToolFailure(tool: String, count: Int)
 
     private static func truncationDescription(count: Int, isChinese: Bool) -> String {
         isChinese
@@ -136,6 +138,10 @@ public enum AgentLoopError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         let isChinese = Locale.current.language.languageCode?.identifier.lowercased().hasPrefix("zh") ?? false
         switch self {
+        case .repeatedToolFailure(let tool, let count):
+            return isChinese
+                ? "工具 \(tool) 已连续失败 \(count) 次，本回合先停下。请展开失败的工具卡片查看原因，处理后点「继续」"
+                : "Tool \(tool) failed \(count) times in a row, so this turn stopped. Expand the failed tool card for the reason, then continue."
         case .maxIterationsExceeded(let n):
             return isChinese
                 ? "本回合的工具调用已达上限（\(n) 次），已先停下。点「继续」可接着做，也可以把任务拆小后再试"
@@ -334,8 +340,18 @@ public enum AgentContextTokenBudget {
 /// `AgentLoopError.maxIterationsExceeded`.
 public struct AgentLoop: Sendable {
 
-    /// Maximum LLM round-trips before giving up. Defaults to 10.
+    /// Maximum LLM round-trips before giving up. `unlimitedIterations`
+    /// means no per-turn cap (settings「不限制循环次数」).
     public var maxIterations: Int
+
+    /// Sentinel for "no per-turn round-trip cap". Token budgets, the loop
+    /// detector and cancellation still stop a run.
+    public static let unlimitedIterations = Int.max
+
+    /// 有限值仍按旧规则限制在 1…100；“不限”原样保留。
+    public static func normalizedIterations(_ value: Int) -> Int {
+        value >= unlimitedIterations ? unlimitedIterations : min(100, max(1, value))
+    }
 
     /// Optional approval gate (E1 工具审批流). A nil gate is not approval:
     /// unclassified, high-risk, and input-escalated calls fail closed. When
@@ -565,7 +581,7 @@ public struct AgentLoop: Sendable {
         requiresPolicyRuntime: Bool = false,
         toolExecutionFactLedger: ToolExecutionFactLedger? = nil
     ) {
-        self.maxIterations = min(100, max(1, maxIterations))
+        self.maxIterations = Self.normalizedIterations(maxIterations)
         self.approvalGate = childBoundary?.approvalGate ?? approvalGate
         self.turnController = childBoundary?.childTurnController ?? turnController
         self.loopDetector = loopDetector
@@ -831,7 +847,7 @@ public struct AgentLoop: Sendable {
             provider: effectiveProvider,
             toolExecutor: effectiveToolExecutor,
             tools: tools,
-            maxIterations: effortProfile?.maxIterations ?? min(100, max(1, maxIterations)),
+            maxIterations: effortProfile?.maxIterations ?? Self.normalizedIterations(maxIterations),
             maxTokens: providerMaxTokens,
             contextSettings: contextSettings,
             temperature: temperature,
@@ -1089,6 +1105,7 @@ public struct AgentLoop: Sendable {
             // Only runs that actually offer todo_write nudge about its checklist.
             var todoReminder = SessionTodoReminder(
                 history: tools.contains { $0.name == SessionTodoProgress.toolName } ? initialMessages : [])
+            var repeatedToolFailures = RepeatedToolFailureCounter()
 
         for iteration in 1...maxIterations {
             if let childBoundary {
@@ -2373,6 +2390,7 @@ public struct AgentLoop: Sendable {
                             ledger,
                             receipt: receipt,
                             status: .failed,
+                            outputSummary: await failureOutputSummary(call: call, error: error),
                             failureCategory: { if case .shellTimeout = error { return .timeout }; return nil }(),
                             liveFailureReason: Self.fileReadFailureFeedback(
                                 error, toolName: call.name, dispatchedAt: dispatchStartedAtNanoseconds,
@@ -2451,6 +2469,7 @@ public struct AgentLoop: Sendable {
                             ledger,
                             receipt: receipt,
                             status: .failed,
+                            outputSummary: await failureOutputSummary(call: call, error: error),
                             dispatchStartedAtNanoseconds: dispatchStartedAtNanoseconds
                         )
                     }
@@ -2574,6 +2593,20 @@ public struct AgentLoop: Sendable {
                 admittedMessageIndex += 1
             }
             todoReminder.recordRound(toolNames: calls.map(\.name), messages: messages)
+            // 同一个工具连续失败到上限就结束本回合（结果已写回对话），交给用户处理，
+            // 不让模型在不限循环次数下反复重试同一种失败（用户 11/20 会话 893B52D5）。
+            // 只数真正执行过、执行事实记为失败的调用；被权限拦下、没执行的不算（那归审批与重复调用检测管）。
+            let failedFactCallIDs: Set<String>? = toolExecutionFactLedger.map { ledger in
+                let ids = Set(calls.map(\.id))
+                return Set(ledger.facts.filter { ids.contains($0.toolCallID) && $0.status == .failed }.map(\.toolCallID))
+            }
+            for (index, call) in calls.enumerated() {
+                let isError = index < resultParts.count && (resultParts[index]["is_error"] as? Bool) == true
+                let failed = isError && (failedFactCallIDs?.contains(call.id) ?? false)
+                if let stop = repeatedToolFailures.record(tool: call.name, failed: failed) {
+                    throw AgentLoopError.repeatedToolFailure(tool: stop.tool, count: stop.count)
+                }
+            }
         }
 
             throw AgentLoopError.maxIterationsExceeded(maxIterations)
@@ -2928,6 +2961,7 @@ public struct AgentLoop: Sendable {
                 || { if case ToolExecutorError.toolTimeout = error { return true }; return false }()
             if ledger.pendingReceipts.contains(where: { $0.receiptID == receipt.receiptID }) {
                 try settleToolExecutionFact(ledger, receipt: receipt, status: cancelled ? .cancelled : .failed,
+                    outputSummary: cancelled ? nil : await failureOutputSummary(call: call, error: error),
                     failureCategory: timedOut ? .timeout : nil,
                     liveFailureReason: cancelled ? nil : Self.fileReadFailureFeedback(
                         error, toolName: call.name, dispatchedAt: dispatchedAt, verifiedBuiltinOwner: true
@@ -3646,10 +3680,34 @@ extension AgentLoop {
             toolName: call.name, argumentsJSON: arguments, output: body, detailOutput: detailBody)
     }
 
+    /// 失败调用也留一份卡片详情：调用参数＋发给模型的同一条报错，界面展开即可看到失败原因
+    /// （用户 11/20 会话 893B52D5：读取文件连续失败，卡片只写“请查看结果详情”，原因却看不到）。
+    private func failureOutputSummary(call: ParsedToolCall, error: Error) async -> ToolOutputSummary {
+        await toolOutputSummaryWithDetail(
+            call: call, output: "Error executing tool \(call.name): \(error.localizedDescription)")
+    }
+
     /// 工具卡片展开详情用的参数 JSON（键排序，便于稳定显示）。
     static func toolArgumentsJSON(_ input: [String: Any]) -> String {
         guard JSONSerialization.isValidJSONObject(input),
               let data = try? JSONSerialization.data(withJSONObject: input, options: [.sortedKeys]) else { return "{}" }
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+
+/// 本回合内同一个工具的连续失败计数：该工具成功一次即清零，换成别的工具失败则重新计数。
+struct RepeatedToolFailureCounter {
+    static let limit = 8
+    private var tool: String?
+    private var count = 0
+
+    mutating func record(tool name: String, failed: Bool) -> (tool: String, count: Int)? {
+        guard failed else {
+            if name == tool { tool = nil; count = 0 }
+            return nil
+        }
+        if name == tool { count += 1 } else { tool = name; count = 1 }
+        return count >= Self.limit ? (name, count) : nil
     }
 }

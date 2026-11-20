@@ -141,6 +141,7 @@ struct LiveSettingsReapplyP103A149Tests {
         var narrowed = engine
         narrowed.reapplyRuntimeAgentSettings(AgentSettings(
             maxLoopIterations: 12,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 90,
             concurrentToolLimit: 1,
             fallbackEnabled: true
@@ -156,6 +157,7 @@ struct LiveSettingsReapplyP103A149Tests {
         var raised = narrowed
         raised.reapplyRuntimeAgentSettings(AgentSettings(
             maxLoopIterations: 12,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 90,
             concurrentToolLimit: 5,
             fallbackEnabled: true
@@ -173,6 +175,7 @@ struct LiveSettingsReapplyP103A149Tests {
         var loweredAgain = raised
         loweredAgain.reapplyRuntimeAgentSettings(AgentSettings(
             maxLoopIterations: 12,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 90,
             concurrentToolLimit: 2,
             fallbackEnabled: true
@@ -201,11 +204,13 @@ struct LiveSettingsReapplyP103A149Tests {
         let attachedEngine = try #require(
             bridge.chat.agentEngine as? AgentLoopChatEngine
         )
-        #expect(attachedEngine.loop.maxIterations == 50)
+        // 11/19 起默认不限循环次数（AgentSettings.default.loopIterationsUnlimited）。
+        #expect(attachedEngine.loop.maxIterations == AgentLoop.unlimitedIterations)
         #expect(attachedEngine.composedExecutor is ConcurrentToolLimitingExecutor)
 
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 42,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 90,
             shellCommandTimeoutSeconds: 45,
             concurrentToolLimit: 1,
@@ -256,6 +261,7 @@ struct LiveSettingsReapplyP103A149Tests {
 
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 10,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 300,
             concurrentToolLimit: 4,
             fallbackEnabled: true
@@ -267,6 +273,7 @@ struct LiveSettingsReapplyP103A149Tests {
         // 同一 harness、无任何重新装配，再关回去。
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 10,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 300,
             concurrentToolLimit: 4,
             fallbackEnabled: false
@@ -292,6 +299,7 @@ struct LiveSettingsReapplyP103A149Tests {
 
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 10,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 300,
             concurrentToolLimit: 4,
             fallbackEnabled: true
@@ -327,6 +335,7 @@ struct LiveSettingsReapplyP103A149Tests {
 
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 30,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 60,
             concurrentToolLimit: 2,
             fallbackEnabled: false
@@ -391,6 +400,7 @@ struct LiveSettingsReapplyP103A149Tests {
 
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 42,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 45,
             concurrentToolLimit: 1,
             fallbackEnabled: false
@@ -460,6 +470,7 @@ struct LiveSettingsReapplyP103A149Tests {
         // 刷新缝不得掉 governor 接线，也不得丢回执轨。
         bridge.refreshProductionAgentSettings(AgentSettings(
             maxLoopIterations: 20,
+            loopIterationsUnlimited: false,
             toolTimeoutSeconds: 75,
             concurrentToolLimit: 3,
             fallbackEnabled: true

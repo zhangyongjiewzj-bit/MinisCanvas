@@ -3622,6 +3622,7 @@ final class BridgeStore {
         let generation: UInt64
         let source: Source
         let maxLoopIterations: Int
+        let loopIterationsUnlimited: Bool
         let toolTimeoutSeconds: Int
         let shellCommandTimeoutSeconds: Int
         let concurrentToolLimit: Int
@@ -3644,6 +3645,7 @@ final class BridgeStore {
             generation: agentSettingsReapplyGeneration,
             source: source,
             maxLoopIterations: settings.maxLoopIterations,
+            loopIterationsUnlimited: settings.loopIterationsUnlimited,
             toolTimeoutSeconds: settings.toolTimeoutSeconds,
             shellCommandTimeoutSeconds: settings.shellCommandTimeoutSeconds,
             concurrentToolLimit: settings.concurrentToolLimit,
@@ -5225,7 +5227,7 @@ final class BridgeStore {
         }
         let engine = AgentLoopChatEngine(
             toolExecutor: recordingExecutor,
-            maxIterations: agentSettings.maxLoopIterations,
+            maxIterations: agentSettings.effectiveLoopIterations,
             requestBudget: chat.budgetTracker,
             concurrentToolLimit: agentSettings.concurrentToolLimit,
             toolTimeoutSeconds: agentSettings.toolTimeoutSeconds,

@@ -189,6 +189,21 @@ struct FloatingMenuOverlay: View {
         return CGSize(width: x, height: y)
     }
 
+    /// 按菜单项估出的面板高度（子菜单按收起算）：行高 13pt 字 + 上下各 5pt、
+    /// 分隔线 1pt + 上下各 2pt、行间距 2pt、面板内边距上下各 5pt。
+    /// 11/19 包上实测：会话右键菜单（15 行）在窗口下半部弹出时整块伸出窗口底部，
+    /// 运行时量到的高度没有进 clamp；clamp 取「实测、估算」中较大者，量不到也不会伸出窗口。
+    nonisolated static func estimatedPanelHeight(_ items: [FloatingMenuItem]) -> CGFloat {
+        guard !items.isEmpty else { return 0 }
+        let rowHeight: CGFloat = 26
+        let dividerHeight: CGFloat = 5
+        let content = items.reduce(CGFloat(0)) { total, item in
+            if case .divider = item.kind { return total + dividerHeight }
+            return total + rowHeight
+        }
+        return content + CGFloat(items.count - 1) * 2 + 10
+    }
+
     var body: some View {
         GeometryReader { geo in
             let size = geo.size
@@ -212,7 +227,8 @@ struct FloatingMenuOverlay: View {
                     .onPreferenceChange(MenuHeightKey.self) { menuHeight = $0 }
                     .offset(Self.anchorOffset(windowPoint: host.windowPoint,
                                               size: size,
-                                              menuSize: CGSize(width: 232, height: menuHeight)))
+                                              menuSize: CGSize(width: 232, height: max(
+                                                  menuHeight, Self.estimatedPanelHeight(host.items)))))
                     .onExitCommand { host.dismiss() }
                     .escapeShortcut(closePopover: host.escapeDismissalAction())
                 }

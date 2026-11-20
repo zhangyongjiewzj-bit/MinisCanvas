@@ -117,6 +117,7 @@ struct SettingsDescriptorCoverageCloseEntry155Tests {
             "shellCommandTimeoutSeconds": \.shellCommandTimeoutSeconds,
             "maxTokensPerSession": \.maxTokensPerSession,
             "tokenBudgetUnlimited": \.tokenBudgetUnlimited,
+            "loopIterationsUnlimited": \.loopIterationsUnlimited,
             "maxLoopIterationsNoticePending": \.maxLoopIterationsNoticePending,
             "stripModelShellCredentials": \.stripModelShellCredentials,
             "modelShellNoninteractive": \.modelShellNoninteractive,

@@ -562,6 +562,43 @@ struct AgentLoopTests {
         #expect(mock.receivedHistory.count == 2)
     }
 
+    /// 11/19 用户“改成不限”：不限时跑过旧的 100 次上限，模型给出纯文本即正常结束。
+    @Test func unlimitedIterationsRunPastOldCapUntilModelStops() async throws {
+        let fixture = AgentLoopFixture()
+        let rounds = 120
+        var responses = (1...rounds).map {
+            toolCallEnvelope(id: "call_\($0)", name: "web_search", input: ["query": "q\($0)"])
+        }
+        responses.append("全部做完了。")
+        let mock = MockLLMProvider(responses: responses)
+        let loop = AgentLoop(maxIterations: AgentLoop.unlimitedIterations, loopDetector: nil)
+        #expect(loop.maxIterations == AgentLoop.unlimitedIterations)
+        let result = try await loop.run(
+            messages: [],
+            systemPrompt: nil,
+            provider: mock,
+            toolExecutor: fixture.executor,
+            tools: AgentToolCatalog.makeTools()
+        )
+        #expect(mock.receivedHistory.count == rounds + 1)
+        #expect(result.messages.last?.content.contains("全部做完了") == true)
+    }
+
+    /// 只数同一个工具的连续失败：换工具重新计数，同工具成功一次清零，别的工具成功不影响。
+    @Test func repeatedFailureCounterCountsOnlyConsecutiveFailuresOfOneTool() {
+        let limit = RepeatedToolFailureCounter.limit
+        var counter = RepeatedToolFailureCounter()
+        for _ in 1..<limit { #expect(counter.record(tool: "a", failed: true) == nil) }
+        #expect(counter.record(tool: "a", failed: false) == nil)
+        for _ in 1..<limit { #expect(counter.record(tool: "a", failed: true) == nil) }
+        #expect(counter.record(tool: "b", failed: true) == nil)
+        for _ in 2..<limit { #expect(counter.record(tool: "b", failed: true) == nil) }
+        #expect(counter.record(tool: "c", failed: false) == nil)
+        let stop = counter.record(tool: "b", failed: true)
+        #expect(stop?.tool == "b")
+        #expect(stop?.count == RepeatedToolFailureCounter.limit)
+    }
+
     @Test func runCarriesCompositionRootExecutionIdentityIntoResult() async throws {
         let fixture = AgentLoopFixture()
         let mock = MockLLMProvider(responses: ["固定身份回写。"])

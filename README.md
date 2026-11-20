@@ -8,7 +8,7 @@
 
 MinisCanvas 是一个 macOS 原生的智能体（Agent）客户端：在本机用对话驱动模型读写文件、运行命令、浏览网页，并在有风险的动作前让你审批。交互思路参考 Claude Code（例如逐次工具审批、会话内排队、项目指令文件），但它是独立实现的另一个项目，与 Anthropic、OpenAI 等公司没有从属或背书关系。
 
-> 状态：早期版本（0.1.0），可能有缺陷。请先阅读文末免责声明。
+> 状态：早期版本（0.1.x），可能有缺陷。请先阅读文末免责声明。
 
 ### 主要功能
 
@@ -100,7 +100,7 @@ GPL-3.0-only，全文见 [LICENSE](./LICENSE)；版权与第三方组件声明�
 
 MinisCanvas is a native macOS agent client. You chat with a model that can read and write files, run shell commands and browse the web on your machine, with approval prompts before risky actions. Its interaction model draws on Claude Code (per-call tool approval, queued messages, project instruction files), but it is an independent project with no affiliation with or endorsement by Anthropic, OpenAI or any other vendor.
 
-> Status: early release (0.1.0); expect bugs. Read the disclaimer below.
+> Status: early release (0.1.x); expect bugs. Read the disclaimer below.
 
 ### Features
 

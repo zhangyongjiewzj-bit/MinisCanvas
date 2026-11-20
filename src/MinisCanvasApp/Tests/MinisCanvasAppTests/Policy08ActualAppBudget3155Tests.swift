@@ -171,6 +171,7 @@ struct Policy08ActualAppBudget3155Tests {
         let defaults = profile.makeUserDefaults()
         let store = SettingsStore(directory: profile.settingsDirectory)
         store.update(\.agent.maxLoopIterations, to: 10)
+        store.update(\.agent.loopIterationsUnlimited, to: false)
         store.update(\.agent.approvalPolicy, to: .autoApprove)
         store.update(\.agent.policyRuntimeDefaults, to: ProductionPolicyDefaults(
             budget: 100, deadlineHorizon: 600, autonomyLevel: .l3, networkDomains: []))

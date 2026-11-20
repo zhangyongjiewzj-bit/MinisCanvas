@@ -219,6 +219,7 @@ struct F6SettingsChainTests {
         let bridge = BridgeStore()
         var agent = AgentSettings.default
         agent.maxLoopIterations = 7
+        agent.loopIterationsUnlimited = false   // 11/19 起默认不限，这里显式选有限值
         agent.toolTimeoutSeconds = 90
         agent.concurrentToolLimit = 2
         agent.fallbackEnabled = false
@@ -239,7 +240,7 @@ struct F6SettingsChainTests {
         let bridge = BridgeStore()
         bridge.attachProductionServices()
         let engine = try! #require(bridge.chat.agentEngine as? AgentLoopChatEngine)
-        #expect(engine.loop.maxIterations == 50)           // AgentSettings.default（H07）
+        #expect(engine.loop.maxIterations == AgentLoop.unlimitedIterations) // AgentSettings.default：11/19 起默认不限
         #expect(engine.toolTimeoutSeconds == 300)          // AgentSettings.default
         #expect(engine.fallbackEnabled == false)           // AgentSettings.default（跨供应商自动回退默认关闭，2026-11-16）
         #expect(engine.concurrentToolLimit == 4)           // AgentSettings.default

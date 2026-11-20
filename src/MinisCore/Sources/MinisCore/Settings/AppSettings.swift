@@ -783,6 +783,15 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     /// 单轮任务最大循环迭代次数。
     public var maxLoopIterations: Int
     public var maxLoopIterationsNoticeAcknowledged: Bool
+    /// 不限制每回合的循环（工具调用）次数，对齐 Claude Code / Codex 没有固定回合上限的做法；
+    /// 打开时 maxLoopIterations 只保留为关掉开关后的数值。停止仍靠累计 Token 上限、
+    /// 重复调用检测和用户中断。11/19 用户：“改成不限”。旧数据没有这个键时按不限处理。
+    public var loopIterationsUnlimited: Bool
+
+    /// 实际交给 AgentLoop 的上限：不限时是 `AgentLoop.unlimitedIterations`。
+    public var effectiveLoopIterations: Int {
+        loopIterationsUnlimited ? AgentLoop.unlimitedIterations : min(100, max(1, maxLoopIterations))
+    }
     /// Finite cumulative token cap. Invalid legacy values remain bounded.
     public var maxTokensPerSession: Int
     public var tokenBudgetUnlimited: Bool
@@ -886,6 +895,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     public init(
         maxLoopIterations: Int = 50,
         maxLoopIterationsNoticeAcknowledged: Bool = true,
+        loopIterationsUnlimited: Bool = true,
         maxTokensPerSession: Int = 1_000_000,
         tokenBudgetUnlimited: Bool = false,
         toolTimeoutSeconds: Int = 300,
@@ -922,6 +932,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
     ) {
         self.maxLoopIterations = min(100, max(1, maxLoopIterations))
         self.maxLoopIterationsNoticeAcknowledged = maxLoopIterationsNoticeAcknowledged
+        self.loopIterationsUnlimited = loopIterationsUnlimited
         self.maxTokensPerSession = max(1, maxTokensPerSession)
         self.tokenBudgetUnlimited = tokenBudgetUnlimited
         self.toolTimeoutSeconds = toolTimeoutSeconds
@@ -970,7 +981,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         case legacyAutomaticApprovalCompatibilityActive, legacyApprovalPolicyOriginal, legacyApprovalPolicyNoticePending, legacyApprovalScopeNoticePending, approvalPolicyBeforeToolsDisabled
         case approvalInlineEnabled, approvalTimeoutSeconds, approvalTimeoutDefaultMigrated
         case backgroundAutoContinueEnabled
-        case browserWriteEnabled, childMutationsExplicitlySelected, maxLoopIterationsNoticeAcknowledged, maxTokensPerSession, tokenBudgetDefaultMigrated, tokenBudgetUnlimited, maxLoopIterations, toolTimeoutSeconds, shellCommandTimeoutSeconds, stripModelShellCredentials, modelShellNoninteractive, concurrentToolLimit, childConcurrencyUserSelected, childConcurrencyEnabledSessionCount, autoCompactThreshold, contextLengthTokens, historyTurnLimit, fallbackEnabled, fallbackDefaultOffMigrated, personaEnabled, personaPreset, persona, memoryEnabled, globalInstructionsEnabled, approvalPolicy, availableModelWhitelist, newMessageInterruptsGeneration, fileCheckpointsEnabled, childMutationsEnabled, childModelOverridesEnabled, childModelThinkingLevelCeiling, childDeletionAutoReviewEnabled, childDeletionAutoReviewWhitelist, composerPolicy, policyRuntimeDefaults, terminalPolicy
+        case browserWriteEnabled, childMutationsExplicitlySelected, maxLoopIterationsNoticeAcknowledged, loopIterationsUnlimited, maxTokensPerSession, tokenBudgetDefaultMigrated, tokenBudgetUnlimited, maxLoopIterations, toolTimeoutSeconds, shellCommandTimeoutSeconds, stripModelShellCredentials, modelShellNoninteractive, concurrentToolLimit, childConcurrencyUserSelected, childConcurrencyEnabledSessionCount, autoCompactThreshold, contextLengthTokens, historyTurnLimit, fallbackEnabled, fallbackDefaultOffMigrated, personaEnabled, personaPreset, persona, memoryEnabled, globalInstructionsEnabled, approvalPolicy, availableModelWhitelist, newMessageInterruptsGeneration, fileCheckpointsEnabled, childMutationsEnabled, childModelOverridesEnabled, childModelThinkingLevelCeiling, childDeletionAutoReviewEnabled, childDeletionAutoReviewWhitelist, composerPolicy, policyRuntimeDefaults, terminalPolicy
     }
 
     public init(from decoder: Decoder) throws {
@@ -979,6 +990,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         let storedIterations = try c.decodeIfPresent(Int.self, forKey: .maxLoopIterations)
         maxLoopIterations = min(100, max(1, storedIterations ?? d.maxLoopIterations))
         maxLoopIterationsNoticeAcknowledged = try c.decodeIfPresent(Bool.self, forKey: .maxLoopIterationsNoticeAcknowledged) ?? (storedIterations != 10)
+        loopIterationsUnlimited = try c.decodeIfPresent(Bool.self, forKey: .loopIterationsUnlimited) ?? d.loopIterationsUnlimited
         // 旧默认 10 万迁移到新默认 100 万：只迁移恰好等于旧默认、且尚未迁移过的已存值；
         // 迁移后落盘会带标记，之后用户再手动设为 10 万不会被改回。
         let storedTokenCap = try c.decodeIfPresent(Int.self, forKey: .maxTokensPerSession)
@@ -1100,6 +1112,7 @@ public struct AgentSettings: Codable, Equatable, Sendable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(min(100, max(1, maxLoopIterations)), forKey: .maxLoopIterations)
         try c.encode(maxLoopIterationsNoticeAcknowledged, forKey: .maxLoopIterationsNoticeAcknowledged)
+        try c.encode(loopIterationsUnlimited, forKey: .loopIterationsUnlimited)
         try c.encode(max(1, maxTokensPerSession), forKey: .maxTokensPerSession)
         try c.encode(true, forKey: .tokenBudgetDefaultMigrated)
         try c.encode(tokenBudgetUnlimited, forKey: .tokenBudgetUnlimited)

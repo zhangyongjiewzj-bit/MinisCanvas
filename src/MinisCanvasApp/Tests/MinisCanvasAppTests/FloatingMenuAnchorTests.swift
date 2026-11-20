@@ -103,4 +103,25 @@ struct FloatingMenuAnchorTests {
         // y = min(308, max(8, 600-0-8=592)) = 308（未触发 clamp）
         #expect(offset.height == 308)
     }
+
+    /// 11/19 包上：会话右键菜单（15 行 + 4 条分隔线）在窗口下半部弹出时伸出窗口底部。
+    /// 实测高度没进 clamp 时，按菜单项估出的高度也要把菜单整块收进窗口。
+    @Test func sessionMenuStaysInsideWindowWithoutMeasuredHeight() {
+        var items: [FloatingMenuItem] = []
+        for index in 0..<15 {
+            items.append(FloatingMenuItem(kind: .button(title: "项\(index)", icon: nil, role: nil, help: nil) {}))
+            if [2, 4, 6, 10].contains(index) { items.append(FloatingMenuItem(kind: .divider)) }
+        }
+        let estimated = FloatingMenuOverlay.estimatedPanelHeight(items)
+        // 15×26 + 4×5 + 18×2 + 10 = 456
+        #expect(estimated == 456)
+        let size = CGSize(width: 1000, height: 830)
+        let offset = FloatingMenuOverlay.anchorOffset(
+            windowPoint: CGPoint(x: 150, y: 830 - 665), // 截图里的点击位置：离窗口顶部 665pt
+            size: size,
+            menuSize: CGSize(width: 232, height: max(0, estimated))
+        )
+        #expect(offset.height + estimated <= size.height - 8)
+        #expect(FloatingMenuOverlay.estimatedPanelHeight([]) == 0)
+    }
 }

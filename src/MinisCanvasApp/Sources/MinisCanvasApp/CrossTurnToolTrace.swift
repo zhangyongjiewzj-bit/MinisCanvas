@@ -135,18 +135,58 @@ enum CrossTurnToolTracePolicy {
         return toolName == OrchestrationToolExecutor.toolName ? nil : CrossTurnToolExcerptRules.defaultExcerpt
     }
 
-    /// Eligibility at settlement time: a succeeded fact whose call the rule admits.
+    /// 留进对话记录的结算状态：成功，以及失败（只留调用要点和报错，下一回合模型能看到自己失败过，
+    /// 不再从头重试同一种做法；用户 11/20 会话 893B52D5 读取文件连续失败 56 次）。
+    static func isTracedStatus(_ status: ToolExecutionStatus) -> Bool {
+        status == .succeeded || status == .failed
+    }
+
+    static let failureResultByteLimit = 512
+
+    /// Eligibility at settlement time: a succeeded or failed fact whose call the rule admits.
     static func admits(_ fact: ToolExecutionFact, call: LLMToolCall?) -> Bool {
-        guard fact.status == .succeeded, let call, call.name == fact.toolName,
+        guard isTracedStatus(fact.status), let call, call.name == fact.toolName,
               let traceRule = rule(for: fact.toolName) else { return false }
         return traceRule.admitsCall(call)
     }
 
     /// The persisted pair: one assistant message with one call, one tool message.
-    static func transcript(call: LLMToolCall, result: String, knownSecrets: [String]) -> [LLMMessage]? {
-        guard let traceRule = rule(for: call.name), let projected = traceRule.project(call, result, knownSecrets) else { return nil }
+    static func transcript(call: LLMToolCall, result: String, knownSecrets: [String],
+                           failed: Bool = false) -> [LLMMessage]? {
+        let projected: (call: LLMToolCall, result: String)?
+        if failed {
+            guard rule(for: call.name) != nil else { return nil }
+            projected = failureProjection(call: call, result: result, knownSecrets: knownSecrets)
+        } else {
+            guard let traceRule = rule(for: call.name) else { return nil }
+            projected = traceRule.project(call, result, knownSecrets)
+        }
+        guard let projected else { return nil }
         return [LLMMessage(role: .assistant, content: "", toolCalls: [projected.call]),
                 LLMMessage(role: .tool, content: projected.result, toolCallID: projected.call.id)]
+    }
+
+    /// 失败调用只留定位要点（路径、模式、命令预览、标题和标量参数），不留写入正文；
+    /// 结果是发给模型的同一条报错，脱敏后截到 512 字节。
+    static func failureProjection(call: LLMToolCall, result: String,
+                                  knownSecrets: [String]) -> (call: LLMToolCall, result: String)? {
+        var arguments: [String: Any] = [:]
+        for key in ["path", "pattern", "glob", "command", "url", "query", "tool_title"] {
+            guard let text = call.arguments[key] as? String, !text.isEmpty else { continue }
+            if key == "path" {
+                // 路径与成功记录一样原样保留（不截断），敏感路径整对不留。
+                guard !SensitiveFilePolicy.contains(text) else { return nil }
+                arguments[key] = text
+                continue
+            }
+            arguments[key] = preview(text, knownSecrets)
+        }
+        for (key, value) in call.arguments where arguments[key] == nil {
+            if let number = value as? NSNumber { arguments[key] = number }
+        }
+        guard let projectedCall = rebuild(call, arguments: arguments) else { return nil }
+        let redacted = ContentSecretRedactor.redact(result, knownSecrets: knownSecrets)
+        return (projectedCall, "[工具执行失败] " + utf8Prefix(redacted, bytes: failureResultByteLimit))
     }
 
     /// Structural check on the consumer side, independent of the producer.

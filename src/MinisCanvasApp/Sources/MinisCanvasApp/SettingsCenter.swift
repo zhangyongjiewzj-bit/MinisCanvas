@@ -1686,9 +1686,16 @@ final class SettingsCenter {
                 settingsStore.update(\.agent) {
                     $0.maxLoopIterations = min(100, max(1, newValue))
                     $0.maxLoopIterationsNoticeAcknowledged = true
+                    // 填了具体次数就是选择有限上限。
+                    $0.loopIterationsUnlimited = false
                 }
             }
         }
+    }
+
+    var loopIterationsUnlimited: Bool {
+        get { settingsMirror.agent.loopIterationsUnlimited }
+        set { persistSettings { settingsStore.update(\.agent.loopIterationsUnlimited, to: newValue) } }
     }
 
     var maxLoopIterationsNoticePending: Bool {
@@ -1699,6 +1706,8 @@ final class SettingsCenter {
         persistSettings {
             settingsStore.update(\.agent) {
                 if useNewDefault { $0.maxLoopIterations = 50 }
+                // 选“保留10”就是要有限上限；选新默认则不限。
+                $0.loopIterationsUnlimited = useNewDefault
                 $0.maxLoopIterationsNoticeAcknowledged = true
             }
         }

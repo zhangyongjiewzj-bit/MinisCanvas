@@ -189,6 +189,7 @@ struct Policy09LowerTransport3178Tests {
         let approval = Policy09DenyApproval3178()
         let store = SettingsStore(directory: profile.settingsDirectory)
         store.update(\.agent.maxLoopIterations, to: 10)
+        store.update(\.agent.loopIterationsUnlimited, to: false)
         store.update(\.agent.approvalPolicy, to: .autoApprove)
         store.update(\.agent.policyRuntimeDefaults, to: ProductionPolicyDefaults(
             budget: 100, deadlineHorizon: 600, autonomyLevel: .l3, networkDomains: ["allowed.example.com"]))
