@@ -415,6 +415,7 @@ struct GlobalComposerView: View {
     /// E11 文件拖放悬停（输入区高亮提示）
     @State private var showInputHistorySearch = false
     @State private var isDropTargeted = false
+    @State private var isCheckingDefaultProvider = false
     /// G-10：原生输入框是否持有焦点（由 NSTextView 的 first responder 变化回调），只驱动外框描边。
     @State private var isInputFocused = false
     @State private var goalObjective = ""
@@ -758,6 +759,22 @@ struct GlobalComposerView: View {
         }
     }
 
+    /// 就地检查默认供应商的连接；外场审计通道要求出站动作带票据，那时改为打开设置由用户点检查。
+    private func checkDefaultProvider(_ record: EnvVarEntry) {
+        guard let center = SettingsCenter.active else { return }
+        if center.mm01FieldLane?.requiresOwnedOutboundAudit == true {
+            ProviderConnectionRoute.preferredProviderID = record.name
+            bridge.deepLinkHandler.handle(.openSettings(id: ProviderConnectionRoute.id))
+            return
+        }
+        isCheckingDefaultProvider = true
+        Task { @MainActor in
+            _ = await center.checkProviderReadiness(forProviderName: record.name)
+            isCheckingDefaultProvider = false
+            chat.adoptFirstReadyChatModelIfDemo()
+        }
+    }
+
     var body: some View {
         let credentialSheetBinding = Binding<Bool>(
             get: {
@@ -774,12 +791,24 @@ struct GlobalComposerView: View {
         VStack(spacing: ComposerLayoutMetrics.stackSpacing) {
             InlineInteractionHost(chat: chat)
             if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty,
-               chat.shouldShowModelConnectionCard {
-                ProviderConnectionCard(repairProviderName: chat.providerNeedingRepairName) {
+               let pending = chat.defaultProviderAwaitingFirstCheck {
+                // 默认供应商配好了但从没检查过：演示模式不会改发给别家，就地给“检查连接”，通过后自动切过去。
+                ProviderConnectionCard(
+                    uncheckedDefaultName: ProviderDisplayLabel.resolve(record: pending),
+                    isChecking: isCheckingDefaultProvider,
+                    onCheck: { checkDefaultProvider(pending) }
+                ) {
+                    ProviderConnectionRoute.preferredProviderID = pending.name
                     bridge.deepLinkHandler.handle(.openSettings(id: ProviderConnectionRoute.id))
                 }
-            }
-            if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty,
+            } else if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty,
+               chat.shouldShowModelConnectionCard {
+                ProviderConnectionCard(repairProviderName: chat.providerNeedingRepairName) {
+                    // 打开的必须是卡片上写的那一家（设置页自己挑会挑到别家）。
+                    ProviderConnectionRoute.preferredProviderID = chat.providerNeedingRepair?.name
+                    bridge.deepLinkHandler.handle(.openSettings(id: ProviderConnectionRoute.id))
+                }
+            } else if chat.providerReadinessStore != nil, chat.chatModelPickerItems.isEmpty,
                chat.shouldShowUncheckedProviderHint {
                 Text("模型服务商还没检查过连接，首次发送前会自动检查。")
                     .font(typography?.status ?? .caption)

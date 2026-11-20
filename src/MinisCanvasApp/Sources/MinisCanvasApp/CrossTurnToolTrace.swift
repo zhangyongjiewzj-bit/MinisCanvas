@@ -147,7 +147,14 @@ enum CrossTurnToolTracePolicy {
     static func admits(_ fact: ToolExecutionFact, call: LLMToolCall?) -> Bool {
         guard isTracedStatus(fact.status), let call, call.name == fact.toolName,
               let traceRule = rule(for: fact.toolName) else { return false }
+        if fact.status == .failed, !tracesFailure(of: fact.toolName) { return false }
         return traceRule.admitsCall(call)
+    }
+
+    /// 失败调用是否留记录：待办清单失败不留（失败的待办不能发布新清单，也没有可留的定位信息；
+    /// 留了会过不了 isWellFormed，写回被拒会让整个回合中途停掉——11/20 回归测试发现）。
+    static func tracesFailure(of toolName: String) -> Bool {
+        toolName != SessionTodoProgress.toolName && rule(for: toolName) != nil
     }
 
     /// The persisted pair: one assistant message with one call, one tool message.
@@ -155,7 +162,7 @@ enum CrossTurnToolTracePolicy {
                            failed: Bool = false) -> [LLMMessage]? {
         let projected: (call: LLMToolCall, result: String)?
         if failed {
-            guard rule(for: call.name) != nil else { return nil }
+            guard tracesFailure(of: call.name) else { return nil }
             projected = failureProjection(call: call, result: result, knownSecrets: knownSecrets)
         } else {
             guard let traceRule = rule(for: call.name) else { return nil }

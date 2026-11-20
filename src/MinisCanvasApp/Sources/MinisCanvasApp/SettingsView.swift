@@ -5522,6 +5522,7 @@ struct EnvironmentSettingsTab: View {
     @State private var hasOpenedConnectionFlow = false
     @State private var showingAddSheet = false
     @State private var showingAddProviderSheet = false
+    @State private var addProviderInitialPresetID: String?
     @State private var showingKeyImportSheet = false
     @State private var editingEntry: EnvVarEntry?
     @State private var editingProvider: EnvVarEntry?
@@ -5640,7 +5641,13 @@ struct EnvironmentSettingsTab: View {
                 // 已有供应商（但没有可用模型）时直接打开它的编辑表单；没有才新增。
                 let preferredID = ProviderConnectionRoute.preferredProviderID
                 ProviderConnectionRoute.preferredProviderID = nil
-                if preferredID == ChatGPTAccountSession.providerName {
+                let preferredPresetID = ProviderConnectionRoute.preferredPresetID
+                ProviderConnectionRoute.preferredPresetID = nil
+                if let preferredPresetID {
+                    // 模型选择里点了还没有记录的内置服务商：直接新增它（预选对应预设），不去编辑别家。
+                    addProviderInitialPresetID = preferredPresetID.isEmpty ? nil : preferredPresetID
+                    showingAddProviderSheet = true
+                } else if preferredID == ChatGPTAccountSession.providerName {
                     // ChatGPT 账号没有 Key 可编辑：停在页面上方的登录卡，由用户重新登录。
                 } else if let preferredID,
                    let preferred = center.providerRecords.first(where: {
@@ -5681,11 +5688,12 @@ struct EnvironmentSettingsTab: View {
                 lastImportMessage = summary
             }
         }
-        .sheet(isPresented: $showingAddProviderSheet) {
+        .sheet(isPresented: $showingAddProviderSheet, onDismiss: { addProviderInitialPresetID = nil }) {
             ProviderEditSheet(
                 existing: nil,
                 suggestion: nil,
                 fromConnectionRoute: opensProviderConnection,
+                initialPresetID: addProviderInitialPresetID,
                 onRenamePreview: nil,
                 onProbe: { name, apiKey, baseURL, protocolType in
                     await center.probeProviderDraft(
@@ -7306,6 +7314,7 @@ private struct ProviderEditSheet: View {
         credentialSettings: SettingsCenter? = nil,
         initialFocus: ProviderEditFocus? = nil,
         fromConnectionRoute: Bool = false,
+        initialPresetID: String? = nil,
         onRenamePreview: ((String, String, ProviderEditDraft) throws -> SettingsDeletionRequest)?,
         onProbe: @escaping (String, String, String, ProviderWireProtocol) async -> ProviderDraftProbeState,
         onSave: @escaping (ProviderEditDraft) -> ProviderEditSaveOutcome
@@ -7317,8 +7326,12 @@ private struct ProviderEditSheet: View {
         self.onRenamePreview = onRenamePreview
         self.onProbe = onProbe
         self.onSave = onSave
+        self.initialPresetID = initialPresetID
         _presetForm = State(initialValue: .initial(fromConnectionRoute: fromConnectionRoute))
     }
+
+    /// 打开时预选的预设（模型选择里点了某个还没配置的内置服务商）。
+    private let initialPresetID: String?
 
     private var isEditing: Bool { existing != nil }
 
@@ -7912,6 +7925,9 @@ private struct ProviderEditSheet: View {
                     proxyMode = options.proxy.mode
                     proxyURL = options.proxy.url ?? ""
                 }
+            }
+            if existing == nil, offersPresets, let initialPresetID {
+                applyPreset(id: initialPresetID)
             }
             // 新增或转换时默认给一行空白模型输入，降低首次使用门槛。
             if modelRows.isEmpty {

@@ -118,6 +118,56 @@ struct IF07EChatModelPickerAdapterTests {
         #expect(ChatStore.providerRecordNeedingRepair(records: [healthy, broken], readiness: [])?.name == healthy.name)
     }
 
+    @Test("repair card prefers the user's default provider when it has not passed")
+    func repairTargetPrefersUncheckedOrFailedDefault() throws {
+        let other = providerRecord(name: "OTHER", models: ["o"])
+        let mine = providerRecord(name: "MINE", models: ["m"])
+        let otherFailed = ProviderReadinessPersistenceRecord(
+            providerID: "OTHER", modelID: "o", status: .unavailable, readinessState: .blocked,
+            checkedAt: Date(timeIntervalSince1970: 1_787_200_000), errorCategory: .unauthorized,
+            isApplied: true)
+        // 用户 11/20 旅程：别家检查失败、自己的默认还没检查 → 指向默认这家，而不是失败的别家。
+        #expect(ChatStore.providerRecordNeedingRepair(
+            records: [other, mine], readiness: [otherFailed], defaultProviderID: "custom.mine")?.name == "MINE")
+        // 默认已通过：仍指向真正失败的那家。
+        let minePassed = record(providerID: "MINE", modelID: "m", status: .passed, readinessState: .mock,
+                                evidenceID: "ok", isApplied: true)
+        #expect(ChatStore.providerRecordNeedingRepair(
+            records: [other, mine], readiness: [otherFailed, minePassed], defaultProviderID: "custom.MINE")?.name == "OTHER")
+        // 默认是内置服务商：不改原有挑法。
+        #expect(ChatStore.providerRecordNeedingRepair(
+            records: [other, mine], readiness: [otherFailed], defaultProviderID: "deepseek")?.name == "OTHER")
+    }
+
+    @Test("default custom provider with no check result at all asks for an in-place connection check")
+    func defaultProviderAwaitingFirstCheck() throws {
+        let mine = providerRecord(name: "MINE", models: ["m"])
+        #expect(ChatStore.defaultProviderAwaitingFirstCheck(
+            defaultProviderID: "custom.mine", records: [mine], readiness: [])?.name == "MINE")
+        let failed = ProviderReadinessPersistenceRecord(
+            providerID: "MINE", modelID: "m", status: .unavailable, readinessState: .blocked,
+            checkedAt: Date(timeIntervalSince1970: 1_787_200_000), errorCategory: .unauthorized,
+            isApplied: true)
+        // 检查过（哪怕失败）就交给“去修复”卡，不再显示“检查连接”。
+        #expect(ChatStore.defaultProviderAwaitingFirstCheck(
+            defaultProviderID: "custom.mine", records: [mine], readiness: [failed]) == nil)
+        #expect(ChatStore.defaultProviderAwaitingFirstCheck(
+            defaultProviderID: "deepseek", records: [mine], readiness: []) == nil)
+        #expect(ChatStore.defaultProviderAwaitingFirstCheck(
+            defaultProviderID: nil, records: [mine], readiness: []) == nil)
+    }
+
+    @Test("model picker 'go to settings' maps built-in providers without a record to their own preset")
+    func unreadyBuiltInProviderOpensItsPreset() {
+        let presetIDs = Set(ProviderPreset.all.map(\.id))
+        for type in [ProviderType.openAI, .anthropic, .gemini, .openRouter, .deepSeek, .dashScope, .local] {
+            let id = ChatStore.providerPresetID(for: type)
+            #expect(id != nil && presetIDs.contains(id!), "\(type) 没有对应预设")
+        }
+        #expect(ChatStore.providerPresetID(for: .deepSeek) == DeepSeekProviderContract.providerID)
+        #expect(ChatStore.providerPresetID(for: .openAIResponses) == nil)
+    }
+
     @Test("transient check failure keeps earlier result and says so; send-time feedback uses typed message")
     func transientFailureGuidance() {
         let failed = ProviderModelReadiness(

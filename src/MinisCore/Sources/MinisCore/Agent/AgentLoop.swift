@@ -140,8 +140,8 @@ public enum AgentLoopError: LocalizedError, Equatable, Sendable {
         switch self {
         case .repeatedToolFailure(let tool, let count):
             return isChinese
-                ? "工具 \(tool) 已连续失败 \(count) 次，本回合先停下。请展开失败的工具卡片查看原因，处理后点「继续」"
-                : "Tool \(tool) failed \(count) times in a row, so this turn stopped. Expand the failed tool card for the reason, then continue."
+                ? "工具 \(tool) 已连续失败 \(count) 次，本回合先停下。请展开失败的工具卡片查看原因，处理后点「重试」"
+                : "Tool \(tool) failed \(count) times in a row, so this turn stopped. Expand the failed tool card for the reason, then click Retry."
         case .maxIterationsExceeded(let n):
             return isChinese
                 ? "本回合的工具调用已达上限（\(n) 次），已先停下。点「继续」可接着做，也可以把任务拆小后再试"

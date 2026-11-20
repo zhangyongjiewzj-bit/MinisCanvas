@@ -233,6 +233,21 @@ struct CrossTurnHandleTraceTests {
 
     // MARK: T5 失败留简要记录（用户 11/20：失败的工具调用也存进对话记录；只留路径与报错，不留写入正文）
 
+    @Test func failedTodoWriteLeavesNoTraceSoTheTurnIsNotStopped() {
+        // 11/20 回归：失败的待办调用若留记录，会过不了 isWellFormed，写回被拒导致整回合中途停掉、只剩空回复。
+        let todo = LLMToolCall(id: "todo-1", name: SessionTodoProgress.toolName,
+                               rawArguments: #"{"progress":{"todos":[{"content":"x","status":"bad"}]}}"#,
+                               arguments: ["progress": ["todos": [["content": "x", "status": "bad"]]]])
+        #expect(!CrossTurnToolTracePolicy.tracesFailure(of: SessionTodoProgress.toolName))
+        #expect(CrossTurnToolTracePolicy.transcript(call: todo, result: "Error executing tool todo_write: 无效",
+                                                     knownSecrets: [], failed: true) == nil)
+        let read = LLMToolCall(id: "read-1", name: "file_read", rawArguments: #"{"path":"/tmp/a.txt"}"#,
+                               arguments: ["path": "/tmp/a.txt"])
+        #expect(CrossTurnToolTracePolicy.tracesFailure(of: "file_read"))
+        #expect(CrossTurnToolTracePolicy.transcript(call: read, result: "Error executing tool file_read: 文件不存在",
+                                                     knownSecrets: [], failed: true)?.count == 2)
+    }
+
     @Test func failedFileEditLeavesACompactFailureTraceWithoutBodies() async throws {
         let h = try Harness(label: "d1-failed", capabilities: ["file_edit"])
         defer { h.cleanup() }

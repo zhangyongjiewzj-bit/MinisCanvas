@@ -20407,11 +20407,67 @@ final class ChatStore {
 
     /// 已添加了供应商、但没有任何可用模型时，返回第一个需要修复的供应商显示名（供“去修复”卡片用）。
     var providerNeedingRepairName: String? {
-        guard let record = Self.providerRecordNeedingRepair(
+        providerNeedingRepair.map { ProviderDisplayLabel.resolve(record: $0) }
+    }
+
+    /// “去修复”卡片指向的供应商记录；用户设了默认自定义供应商且它没通过检查时优先指向它。
+    var providerNeedingRepair: EnvVarEntry? {
+        Self.providerRecordNeedingRepair(
+            records: providerRecordsSource?() ?? [],
+            readiness: providerReadinessStore?.records ?? [],
+            defaultProviderID: SettingsCenter.active?.settings.general.defaultProviderID)
+    }
+
+    /// 用户设为默认的自定义供应商已配置、但从没有过检查结果（例如导入或外部写入后没跑检查）。
+    /// 这时演示模式不会回落到别家（见 defaultCustomProviderBlocksFallback），输入框上方改为就地“检查连接”。
+    var defaultProviderAwaitingFirstCheck: EnvVarEntry? {
+        Self.defaultProviderAwaitingFirstCheck(
+            defaultProviderID: SettingsCenter.active?.settings.general.defaultProviderID,
             records: providerRecordsSource?() ?? [],
             readiness: providerReadinessStore?.records ?? [])
-        else { return nil }
-        return ProviderDisplayLabel.resolve(record: record)
+    }
+
+    nonisolated static func defaultProviderAwaitingFirstCheck(
+        defaultProviderID: String?,
+        records: [EnvVarEntry],
+        readiness: [ProviderReadinessPersistenceRecord]
+    ) -> EnvVarEntry? {
+        guard let record = defaultCustomProviderRecord(defaultProviderID: defaultProviderID, records: records),
+              record.protocolType != .other else { return nil }
+        let own = readiness.filter { $0.providerID.caseInsensitiveCompare(record.name) == .orderedSame }
+        return own.isEmpty ? record : nil
+    }
+
+    nonisolated static func defaultCustomProviderRecord(defaultProviderID: String?, records: [EnvVarEntry]) -> EnvVarEntry? {
+        guard let id = defaultProviderID, id.hasPrefix("custom.") else { return nil }
+        let name = String(id.dropFirst("custom.".count))
+        return records.first { $0.isProviderRecord && $0.name.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    /// 模型选择里点未就绪服务商时要打开的设置入口：已有记录就编辑它，内置服务商没有记录就按预设新增。
+    func providerSettingsTarget(for option: ChatProvider) -> (recordName: String?, presetID: String?) {
+        switch option {
+        case .custom(let record):
+            return (record.name, nil)
+        case .builtIn(let type):
+            if let record = boundBuiltinRecord(for: type, in: providerRecordsSource?() ?? []) {
+                return (record.name, nil)
+            }
+            return (nil, Self.providerPresetID(for: type))
+        }
+    }
+
+    nonisolated static func providerPresetID(for type: ProviderType) -> String? {
+        switch type {
+        case .openAI: return "openai"
+        case .anthropic: return "anthropic"
+        case .gemini: return "gemini"
+        case .openRouter: return "openrouter"
+        case .deepSeek: return DeepSeekProviderContract.providerID
+        case .dashScope: return "dashscope"
+        case .local: return "ollama"
+        default: return nil
+        }
     }
 
     /// 输入框上方“连接卡”是否显示：没有任何供应商时显示“连接一个模型”；
@@ -20443,11 +20499,17 @@ final class ChatStore {
     /// 其次是还没有任何通过模型的，最后才是第一个。多个供应商并存时不再总指向第一个。
     nonisolated static func providerRecordNeedingRepair(
         records: [EnvVarEntry],
-        readiness: [ProviderReadinessPersistenceRecord]
+        readiness: [ProviderReadinessPersistenceRecord],
+        defaultProviderID: String? = nil
     ) -> EnvVarEntry? {
         let candidates = records.filter { $0.isProviderRecord && $0.protocolType != .other }
         func rows(_ record: EnvVarEntry) -> [ProviderReadinessPersistenceRecord] {
             readiness.filter { $0.providerID.caseInsensitiveCompare(record.name) == .orderedSame }
+        }
+        // 用户指定的默认供应商没通过检查时先修它：演示模式不会回落到别家，修别家对当前对话没用。
+        if let preferred = defaultCustomProviderRecord(defaultProviderID: defaultProviderID, records: candidates),
+           !rows(preferred).contains(where: { $0.status == .passed }) {
+            return preferred
         }
         if let failed = candidates.first(where: { record in
             let own = rows(record)

@@ -548,8 +548,12 @@ struct ModelPickerPanel: View {
         case .builtIn(let type): name = type.displayName
         case .custom(let record): name = chat.presentationProviderLabel(for: record.name)
         }
+        let target = chat.providerSettingsTarget(for: option)
         let open = {
             isPresented = false
+            // 带上点的是哪一家：有记录就编辑它，内置服务商没记录就按预设新增；不带的话设置页会挑“第一个待修”的别家。
+            ProviderConnectionRoute.preferredProviderID = target.recordName
+            ProviderConnectionRoute.preferredPresetID = target.recordName == nil ? (target.presetID ?? "") : nil
             openSettingsPage(ProviderConnectionRoute.id)
         }
         return Button(action: open) {
