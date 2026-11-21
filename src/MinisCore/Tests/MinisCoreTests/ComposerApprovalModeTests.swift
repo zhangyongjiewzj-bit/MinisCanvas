@@ -1038,7 +1038,8 @@ struct ComposerApprovalModeTests {
             input = ["source": "codex", "session": UUID().uuidString, "message": "synthetic"]
         default:
             capability = "shell_execute"
-            input = ["command": "rm -- /tmp/workspace/nonexistent-synthetic.txt"]
+            // 方案一（用户 2026-11-21）：临时目录和授权目录里面的删除不再弹卡；这里删授权范围外的文件，必须弹卡。
+            input = ["command": "rm -- /synthetic/outside/nonexistent-synthetic.txt"]
         }
         let frozen = try ComposerToolInput(input)
         let unconfirmed = ComposerAuthorizationController(

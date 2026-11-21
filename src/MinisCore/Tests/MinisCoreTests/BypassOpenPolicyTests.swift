@@ -18,6 +18,35 @@ struct BypassOpenPolicyTests {
         }
     }
 
+    /// 方案一（用户 2026-11-21）：绕过档下只删临时目录或授权目录里面的东西不弹卡，其余照旧二次确认。
+    @Test func bypassDeletionInsideTemporaryOrGrantedRootsNeedsNoCard() throws {
+        let temp = BypassSystemFloor.temporaryRoots
+        let free = { (command: String, cwd: String?, roots: [String]) in
+            BypassSystemFloor.deletionStaysInFreeRoots(command: command, workingDirectory: cwd, freeRoots: roots)
+        }
+        #expect(free("rm -rf /tmp/pptwork/render", nil, temp))
+        #expect(free("cd /tmp/pptwork && rm -f out.png && python3 b.py", nil, temp))
+        #expect(free("rm -f /tmp/pptwork/*.png", nil, temp))
+        #expect(free("find /tmp/pptwork -name '*.png' -delete", nil, temp))
+        let project = try makeTempDirectory().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: project) }
+        #expect(free("rm -rf build/cache", project.path, [project.path]))
+        // 删目录本身、删外面、看不清目标、没有工作目录的相对路径：照旧要确认。
+        #expect(!free("rm -rf /tmp", nil, temp))
+        #expect(!free("rm -rf \(project.path)", project.path, [project.path]))
+        #expect(!free("rm -rf ~/Desktop/report.pptx", nil, temp))
+        #expect(!free("rm -rf /tmp/pptwork/../../Users/someone/a", nil, temp))
+        #expect(!free("rm -rf $OUT/x", nil, temp))
+        #expect(!free("rm -rf render", nil, temp))
+        #expect(!free("rm -rf /tmp/pptwork/x && rm -rf ~/Documents/y", nil, temp))
+        // 不是文件删除的不可逆操作：照旧要确认。
+        #expect(!free("git clean -fd", project.path, [project.path]))
+        // 临时目录里的符号链接指向外面：按真实位置判断。
+        let link = project.appendingPathComponent("outside-link")
+        try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "/usr")
+        #expect(!free("rm -rf \(link.path)/share", nil, [project.path]))
+    }
+
     @Test func outsideBypassWriteKeepsADurableCheckpointAndRestoresWithoutWideningTheStore() async throws {
         let project = try makeTempDirectory().resolvingSymlinksInPath()
         let outside = try makeTempDirectory().resolvingSymlinksInPath()

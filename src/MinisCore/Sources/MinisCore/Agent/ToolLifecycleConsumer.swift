@@ -478,7 +478,9 @@ public final class ToolLifecycleConsumer: @unchecked Sendable {
     /// outcome needs the already-journaled true UI presentation; an automatic
     /// gate result or a rejected UI presentation cannot invent waiting.
     @discardableResult
-    public func ingestApprovalLifecycleFact(_ fact: ApprovalLifecycleFact) async -> Bool {
+    /// - Parameter targetDisplay: 已脱敏的调用目标摘要（命令/路径），只用于事后能看出这张审批卡拦的是什么；
+    ///   不参与任何授权判断（用户 11/21 会话 BE8372C4：审批卡过期后查不到拦的是哪条命令）。
+    public func ingestApprovalLifecycleFact(_ fact: ApprovalLifecycleFact, targetDisplay: String? = nil) async -> Bool {
         let key = fact.compositeKey
         let execution = fact.executionIdentity
         guard key.isValid, execution.isValid,
@@ -518,6 +520,7 @@ public final class ToolLifecycleConsumer: @unchecked Sendable {
                 status: projection.status,
                 summary: "\(projection.summary)：\(fact.toolName)",
                 toolName: fact.toolName,
+                toolTargetDisplay: targetDisplay,
                 toolCallID: key.toolCallID,
                 approvalCompositeKey: key,
                 approvalIdentityDigest: fact.identityDigest,

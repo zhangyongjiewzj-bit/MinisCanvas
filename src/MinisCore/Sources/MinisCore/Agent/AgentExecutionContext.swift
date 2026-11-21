@@ -173,13 +173,36 @@ public struct TaskFileArtifactProjectGrant: Sendable, Equatable {
 ///
 /// The context is task-local so concurrent top-level turns never share a provider,
 /// cancellation controller, conversation identity, or budget accidentally.
+/// 主对话回合的截止时钟：每轮拿到模型回复后由 AgentLoop 续期一次，
+/// 审批绑定有效期与审批层的超时信号按“这一轮的工具阶段”计时，不再从回合开头算起。
+/// 以前固定为“回合开始 + 单次请求上限（15 分钟）”，长任务跑满 15 分钟后每个工具一启动就被判超时、
+/// 需要审批的动作也随之过期（用户 11/21 会话 BE8372C4）。
+public final class TurnDeadlineClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date?
+    public init(_ initial: Date?) { value = initial }
+    public var current: Date? { lock.withLock { value } }
+    public func renew(_ deadline: Date?) { lock.withLock { value = deadline } }
+    /// 剩余不到半个时间窗才续到完整时间窗。审批绑定的身份指纹含有效期，频繁续期会让同一调用在相邻
+    /// 两轮得到不同指纹、绕开“同一审批只出一张回执”的防重放；只在快到期时续，正常节奏下指纹不变。
+    public func renewIfHalfSpent(window: TimeInterval, now: Date = Date()) {
+        lock.withLock {
+            guard let current = value, current.timeIntervalSince(now) < window / 2 else { return }
+            value = now.addingTimeInterval(window)
+        }
+    }
+}
+
 public struct AgentExecutionContextSnapshot: @unchecked Sendable {
     public let provider: any LLMProvider
     public let approvalGate: ApprovalGate?
     public let turnController: TurnController?
     public let currentConversationID: String?
     public let makeChildBudget: (@Sendable () -> BudgetTracker?)?
-    public let deadline: Date?
+    private let fixedDeadline: Date?
+    /// 有续期时钟时取时钟的当前值，否则是构造时给定的固定截止。
+    public let deadlineClock: TurnDeadlineClock?
+    public var deadline: Date? { deadlineClock?.current ?? fixedDeadline }
     public let taskStore: AgentTaskStore?
     /// The active loop's existing durable authority; child loops never create a second writer.
     public let toolExecutionFactLedger: ToolExecutionFactLedger?
@@ -232,14 +255,16 @@ public struct AgentExecutionContextSnapshot: @unchecked Sendable {
         childMutationsEnabled: Bool = true,
         trustedProjectInstructions: TrustedProjectInstructionSnapshot? = TrustedProjectInstructionContext.current,
         parentAuthorityCheck: (@Sendable () async -> Bool)? = nil,
-        executionIdentity: AgentExecutionIdentity? = nil
+        executionIdentity: AgentExecutionIdentity? = nil,
+        deadlineClock: TurnDeadlineClock? = nil
     ) {
         self.provider = provider
         self.approvalGate = approvalGate
         self.turnController = turnController
         self.currentConversationID = currentConversationID
         self.makeChildBudget = makeChildBudget
-        self.deadline = deadline
+        self.fixedDeadline = deadline
+        self.deadlineClock = deadlineClock
         self.taskStore = taskStore
         self.toolExecutionFactLedger = toolExecutionFactLedger
         self.parentBinding = parentBinding

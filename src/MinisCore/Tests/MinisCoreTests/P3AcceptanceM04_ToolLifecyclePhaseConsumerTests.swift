@@ -203,6 +203,21 @@ struct P3AcceptanceM04_ApprovalLifecycleConsumerTests {
         #expect(!(await consumer.ingestApprovalLifecycleFact(denied)))
     }
 
+    /// 用户 11/21 会话 BE8372C4：审批卡过期后查不到拦的是哪条命令；审批事件要带上脱敏的目标摘要。
+    @Test("approval events keep the redacted target so an expired card can be traced")
+    func approvalEventsKeepTheRedactedTarget() async throws {
+        let (context, request) = fixture()
+        let consumer = ToolLifecycleConsumer()
+        let display = "cd [local path] && rm -rf render"
+        #expect(await consumer.ingestApprovalLifecycleFact(try fact(context, request, .presented, at: 10),
+                                                           targetDisplay: display))
+        #expect(consumer.events.first?.toolTargetDisplay == display)
+        #expect(await consumer.ingestApprovalLifecycleFact(try fact(context, request, .authorityExpired, at: 11),
+                                                           targetDisplay: display))
+        #expect(consumer.events.first?.status == .failed)
+        #expect(consumer.events.first?.toolTargetDisplay == display)
+    }
+
     @Test("only the frozen session, turn, message, operation, attempt, call and digest map")
     func exactRequestBinding() {
         let (context, _) = fixture()

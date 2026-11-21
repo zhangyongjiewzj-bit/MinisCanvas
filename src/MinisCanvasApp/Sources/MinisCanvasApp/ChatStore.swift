@@ -8403,12 +8403,13 @@ final class ChatStore {
         _ fact: ApprovalLifecycleFact,
         expectedExecutionIdentity: AgentExecutionIdentity,
         expectedAttemptID: String,
-        expectedConsumer: MinisCore.ToolLifecycleConsumer
+        expectedConsumer: MinisCore.ToolLifecycleConsumer,
+        targetDisplay: String? = nil
     ) async -> Bool {
         guard toolLifecycleConsumer === expectedConsumer,
               fact.executionIdentity == expectedExecutionIdentity,
               fact.compositeKey.attemptID == expectedAttemptID else { return false }
-        let accepted = await expectedConsumer.ingestApprovalLifecycleFact(fact)
+        let accepted = await expectedConsumer.ingestApprovalLifecycleFact(fact, targetDisplay: targetDisplay)
         if accepted { toolLifecyclePresentationRevision &+= 1 }
         return accepted
     }
@@ -17672,7 +17673,9 @@ final class ChatStore {
                     fact,
                     expectedExecutionIdentity: executionIdentity,
                     expectedAttemptID: expectedAttemptID,
-                    expectedConsumer: approvalConsumer
+                    expectedConsumer: approvalConsumer,
+                    targetDisplay: self.toolTargetDisplaysByExecution[executionIdentity]?
+                        .display(for: fact.compositeKey.toolCallID)
                 ), !isConcise {
                     self.recordInlineToolAnchor(sessionID: sessionID, messageID: messageID,
                         identity: identity, key: fact.compositeKey)
@@ -21822,12 +21825,18 @@ final class ChatStore {
             case .contextLengthExceeded: return "当前上下文已超过设置的长度上限，本次请求未执行。请缩短输入或在新会话继续。"
             }
         }
+        // 工具超时以前落到"未归类的内部错误"（用户 11/21 会话 BE8372C4）。只给固定文字，不带工具参数或路径。
+        if let toolError = error as? ToolExecutorError, case .toolTimeout = toolError {
+            return Self.toolTimeoutTurnMessage
+        }
         // 第七版旅程：拒绝 shell 后落到这里却看不出是哪种错误。只记类型名（不含内容），供复现定位。
         let category = unknownErrorCategory(error)
         os.Logger(subsystem: "com.miniscanvas.chat", category: "unknown-error")
             .error("CHAT-UNKNOWN category=\(category.rawValue, privacy: .public) type=\(String(reflecting: type(of: error)), privacy: .public)")
         return unknownErrorMessage(category)
     }
+
+    static let toolTimeoutTurnMessage = "有一个工具调用超时，本回合已停下。点「重试」可以接着做（CHAT-TOOL:timeout）。"
 
     /// 执行校验失败的四类处置。内部代码只放括号末尾，主句只说发生了什么与下一步。
     enum ExecutionValidationClass { case retryable, reauthorize, uncertain, changed }

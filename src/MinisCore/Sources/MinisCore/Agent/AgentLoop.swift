@@ -1036,13 +1036,17 @@ public struct AgentLoop: Sendable {
                 taskArtifactProject = await owner.captureChildTaskArtifactProject(
                     workingDirectory: childToolRuntimeBinding.boundary.identity.workingDirectory)
             } else { taskArtifactProject = nil }
+            // 主对话（非子任务）用可续期时钟：每轮拿到模型回复后续期，见 TurnDeadlineClock。
+            let initialDeadline = timeout.map { Date().addingTimeInterval($0) }
+            let deadlineClock: TurnDeadlineClock? = (childBoundary == nil && initialDeadline != nil)
+                ? TurnDeadlineClock(initialDeadline) : nil
             let executionContext = AgentExecutionContextSnapshot(
                 provider: provider,
                 approvalGate: approvalGate,
                 turnController: turnController,
                 currentConversationID: currentConversationID,
                 makeChildBudget: makeChildBudget,
-                deadline: timeout.map { Date().addingTimeInterval($0) },
+                deadline: initialDeadline,
                 taskStore: taskStore,
                 toolExecutionFactLedger: toolExecutionFactLedger,
                 parentBinding: resolvedParentBinding ?? ParentContextSnapshotV1(
@@ -1062,7 +1066,8 @@ public struct AgentLoop: Sendable {
                 offeredToolNames: Set(tools.map(\.name)),
                 childMutationsEnabled: childMutationsEnabled,
                 parentAuthorityCheck: parentAuthorityCheck,
-                executionIdentity: suppliedExecutionIdentity
+                executionIdentity: suppliedExecutionIdentity,
+                deadlineClock: deadlineClock
             )
             return try await ChildToolWorkspaceScope.$current.withValue(childWorkspaceScope) {
             try await AgentExecutionContext.$current.withValue(executionContext) {
@@ -1363,6 +1368,8 @@ public struct AgentLoop: Sendable {
             }
             try Task.checkCancellation()
 
+            // 这一轮的工具阶段（含审批）至少还有半个时间窗；快到期才续，不从回合开头算死。
+            if let timeout { deadlineClock?.renewIfHalfSpent(window: timeout) }
             let text = response.text
             let nativeCalls = response.toolCalls
 

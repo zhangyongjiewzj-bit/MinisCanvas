@@ -238,6 +238,14 @@ struct ErrorMessageTests {
         #expect(ChatTranscriptFormatter.accessibilityText([message]).contains("已中断"))
     }
 
+    /// 用户 11/21 会话 BE8372C4：工具超时以前显示"应用内部出现未归类的错误"。
+    @Test func toolTimeoutIsShownAsAPlainRetryableMessage() {
+        let message = ChatStore.userErrorMessage(ToolExecutorError.toolTimeout("shell_execute"))
+        #expect(message == ChatStore.toolTimeoutTurnMessage)
+        #expect(!message.contains("CHAT-UNKNOWN"))
+        #expect(!message.contains("shell_execute"))
+    }
+
     @Test func rawURLErrorIsMappedToFriendlyChineseReason() {
         let error = URLError(.cannotConnectToHost)
         let message = ChatStore.userErrorMessage(error)

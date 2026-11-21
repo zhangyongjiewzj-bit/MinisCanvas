@@ -1398,7 +1398,14 @@ public actor ComposerAuthorizationController {
                     ?? ShellNestedCommandInspector.violation(command: command) {
                     throw ComposerAuthorizationError.approvalDenied(denial)
                 }
-                if BypassSystemFloor.requiresIrreversibleDeletionApproval(command: command) {
+                // 方案一（用户 2026-11-21）：删除只落在临时目录或授权目录里面时不弹卡；其余不可逆操作照旧二次确认。
+                if BypassSystemFloor.requiresIrreversibleDeletionApproval(command: command),
+                   !BypassSystemFloor.deletionStaysInFreeRoots(
+                    command: command,
+                    workingDirectory: input.shellWorkingDirectory
+                        ?? ChildToolWorkspaceScope.current?.workingDirectory ?? facts.trustedProjectRoot,
+                    freeRoots: BypassSystemFloor.temporaryRoots
+                        + (ChildToolWorkspaceScope.current?.writeRoots ?? facts.allowedWriteRoots)) {
                     return .requestApproval(requiresSecondConfirmation: true)
                 }
                 // 静态看不清内容的 osascript（脚本文件、含 $ 的脚本等）：绕过档下也要问；本对话内问过一次并选了"都允许"就不再问。

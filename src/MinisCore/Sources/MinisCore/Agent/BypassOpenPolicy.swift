@@ -378,8 +378,87 @@ public enum BypassSystemFloor {
     /// Explicit irreversible operations visible in the shell command. This
     /// uses the same tokenization as the floors and cannot inspect scripts.
     static func requiresIrreversibleDeletionApproval(command: String) -> Bool {
-        segments(command).contains { segment in
+        segments(command).contains { isIrreversible(words: stripWrappers($0.words)) }
+    }
+
+    /// 文件删除命令（rm 等、find -delete）。只有这一类能因为目标在临时目录或授权目录里而免卡。
+    private static let fileDeletionVerbs: Set<String> = ["rm", "unlink", "rmdir", "srm", "shred"]
+
+    /// 系统临时目录：按公开路径写，运行时解析符号链接得到真实路径。
+    static var temporaryRoots: [String] {
+        ["/tmp", "/var/folders", (NSTemporaryDirectory() as NSString).standardizingPath]
+            .compactMap(PolicyRuntimePathBoundary.canonicalPath)
+    }
+
+    /// 方案一（用户 2026-11-21）：绕过档下，命令里的删除如果只删临时目录或授权目录**里面**的东西就不弹卡；
+    /// 删其他位置、删这些目录本身、看不清目标（变量、命令替换、~user）、以及 git 强制操作、清空废纸篓，照旧二次确认。
+    /// 会跟踪命令里的 `cd`，相对路径按当时的目录换算；路径先解析符号链接再判断。
+    static func deletionStaysInFreeRoots(command: String, workingDirectory: String?, freeRoots: [String]) -> Bool {
+        let roots = freeRoots.compactMap { PolicyRuntimePathBoundary.canonicalPath(($0 as NSString).standardizingPath) }
+        guard !roots.isEmpty else { return false }
+        var cwd = workingDirectory
+        var sawDeletion = false
+        for segment in segments(command) {
             let words = stripWrappers(segment.words)
+            guard let executable = words.first else { continue }
+            let verb = (executable as NSString).lastPathComponent
+            let arguments = Array(words.dropFirst())
+            if verb == "cd" {
+                let target = arguments.first { !$0.hasPrefix("-") } ?? "~"
+                cwd = resolveOperand(target, cwd: cwd)
+                continue
+            }
+            guard isIrreversible(words: words) else { continue }
+            // 不可逆但不是文件删除（git 强制操作、清空废纸篓）：照旧要确认。
+            let targets: [String]
+            if fileDeletionVerbs.contains(verb) {
+                var operands: [String] = []
+                var afterDoubleDash = false
+                for argument in arguments {
+                    if !afterDoubleDash && argument == "--" { afterDoubleDash = true; continue }
+                    if !afterDoubleDash && argument.hasPrefix("-") { continue }
+                    operands.append(argument)
+                }
+                targets = operands
+            } else if verb == "find" {
+                let starts = arguments.prefix { !$0.hasPrefix("-") && $0 != "(" && $0 != "!" }
+                targets = starts.isEmpty ? ["."] : Array(starts)
+            } else {
+                return false
+            }
+            for target in targets {
+                guard let path = resolveOperand(target, cwd: cwd),
+                      roots.contains(where: { path.hasPrefix($0 + "/") }) else { return false }
+            }
+            sawDeletion = true
+        }
+        return sawDeletion
+    }
+
+    /// 把命令里的一个路径操作数换算成真实绝对路径；看不清（变量、命令替换、~user、相对路径但不知道当前目录）返回 nil。
+    /// 通配符：取第一个通配符之前那一段所在的目录作为删除范围。
+    private static func resolveOperand(_ raw: String, cwd: String?) -> String? {
+        guard !raw.isEmpty, !raw.contains("$"), !raw.contains("`") else { return nil }
+        var text = raw
+        if text == "~" || text.hasPrefix("~/") {
+            text = NSHomeDirectory() + text.dropFirst()
+        } else if text.hasPrefix("~") {
+            return nil
+        }
+        if let glob = text.firstIndex(where: { "*?[".contains($0) }) {
+            let prefix = String(text[..<glob])
+            text = prefix.hasSuffix("/") ? String(prefix.dropLast()) : (prefix as NSString).deletingLastPathComponent
+            if text.isEmpty { return nil }
+        }
+        if !text.hasPrefix("/") {
+            guard let cwd, cwd.hasPrefix("/") else { return nil }
+            text = (cwd as NSString).appendingPathComponent(text)
+        }
+        return PolicyRuntimePathBoundary.canonicalPath((text as NSString).standardizingPath)
+    }
+
+    private static func isIrreversible(words: [String]) -> Bool {
+        do {
             guard let executable = words.first else { return false }
             let arguments = words.dropFirst()
             switch (executable as NSString).lastPathComponent {

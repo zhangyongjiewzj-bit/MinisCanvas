@@ -350,7 +350,7 @@ struct AgentLoopTests {
             )
         }
 
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(250))
         let cancellationStarted = clock.now
         task.cancel()
 
@@ -372,7 +372,7 @@ struct AgentLoopTests {
             )
         }
 
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(250))
         let cancellationStarted = clock.now
         task.cancel()
 
@@ -582,6 +582,37 @@ struct AgentLoopTests {
         )
         #expect(mock.receivedHistory.count == rounds + 1)
         #expect(result.messages.last?.content.contains("全部做完了") == true)
+    }
+
+    /// 用户 11/21 会话 BE8372C4：主对话的回合截止不能从回合开头固定算起；
+    /// 否则跑满 15 分钟后每个工具一启动就被判超时（审批绑定也随之过期）、整轮失败。
+    @Test func mainLoopRenewsTheTurnDeadlineAfterEveryModelResponse() async throws {
+        let fixture = AgentLoopFixture()
+        let provider = DeadlineProbeProvider(responses: [
+            toolCallEnvelope(id: "call_1", name: "web_search", input: ["query": "q1"]),
+            toolCallEnvelope(id: "call_2", name: "web_search", input: ["query": "q2"]),
+            "好了。"
+        ])
+        // 时间窗 0.6 秒、每次请求停 0.25 秒：第一轮后还剩一半多不续；第二轮后过半，续到完整时间窗。
+        let loop = AgentLoop(maxIterations: 6, loopDetector: nil, timeout: 0.6)
+        _ = try await loop.run(messages: [], systemPrompt: nil, provider: provider,
+                               toolExecutor: fixture.executor, tools: AgentToolCatalog.makeTools())
+        let seen = provider.deadlines
+        #expect(seen.count == 3)
+        let first = try #require(seen[0])
+        let second = try #require(seen[1])
+        let third = try #require(seen[2])
+        #expect(second == first)
+        #expect(third.timeIntervalSince(first) > 0.3)
+    }
+
+    @Test func turnDeadlineClockRenewsOnlyAfterHalfTheWindow() {
+        let start = Date(timeIntervalSince1970: 1_795_000_000)
+        let clock = TurnDeadlineClock(start.addingTimeInterval(900))
+        clock.renewIfHalfSpent(window: 900, now: start.addingTimeInterval(400))
+        #expect(clock.current == start.addingTimeInterval(900))
+        clock.renewIfHalfSpent(window: 900, now: start.addingTimeInterval(500))
+        #expect(clock.current == start.addingTimeInterval(1400))
     }
 
     /// 只数同一个工具的连续失败：换工具重新计数，同工具成功一次清零，别的工具成功不影响。
@@ -1108,5 +1139,32 @@ private actor PreflightRetryApproval: ApprovalDelegate {
         count += 1
         return ApprovalDecision(approved: true, confirmed: true,
             requestID: request.requestID, bindingDigest: request.identityDigest)
+    }
+}
+
+/// 每次被请求时记下执行上下文里的回合截止，并停 0.25 秒制造时间差。
+private final class DeadlineProbeProvider: LLMProvider, @unchecked Sendable {
+    var name: String { "DeadlineProbe" }
+    var model: LLMModel = .claudeHaiku45
+    var capabilities: Set<ProviderCapability> { [.tools] }
+    private let lock = NSLock()
+    private var queue: [String]
+    private var seen: [Date?] = []
+    var deadlines: [Date?] { lock.withLock { seen } }
+    init(responses: [String]) { queue = responses }
+    func sendMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int, temperature: Double?) async throws -> LLMResponse {
+        let deadline = AgentExecutionContext.current?.deadline
+        let text: String = lock.withLock {
+            seen.append(deadline)
+            return queue.isEmpty ? "" : queue.removeFirst()
+        }
+        try await Task.sleep(for: .milliseconds(250))
+        return LLMResponse(text: text, stopReason: nil, usage: nil)
+    }
+    func sendMessage(messages: [LLMMessage], systemPrompt: String?, tools: [AgentToolDefinition], maxTokens: Int, temperature: Double?) async throws -> LLMResponse {
+        try await sendMessage(messages: messages, systemPrompt: systemPrompt, maxTokens: maxTokens, temperature: temperature)
+    }
+    func streamMessage(messages: [LLMMessage], systemPrompt: String?, maxTokens: Int, temperature: Double?) async throws -> AsyncThrowingStream<LLMStreamChunk, Error> {
+        throw LLMError.unsupportedCapability(.streaming)
     }
 }
